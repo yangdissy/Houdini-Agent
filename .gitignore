@@ -10,6 +10,9 @@ build/
 # Cache
 cache/
 
+# Third-party libraries (installed deps, not source)
+lib/
+
 # IDE
 .idea/
 .vscode/
