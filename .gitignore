@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# Cache
+cache/
+
+# IDE
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+
+# Config (contains API keys)
+config/houdini_ai.ini
+
+# Training data (user-specific)
+trainData/
+
+# Temp/backup files
+*_backup.py
+*_new.py
+
+# Legacy directory (renamed to houdini_agent)
+HOUDINI_HIP_MANAGER/
+
+# OS
+Thumbs.db
+.DS_Store
