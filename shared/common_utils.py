@@ -5,6 +5,8 @@ Shared Utilities for Houdini Agent
 import os
 from datetime import datetime
 
+from .user_paths import UserPaths, normalize_username
+
 def get_repo_root(start_dir=None):
     """获取仓库根目录（包含 README.md 的目录作为仓库根）"""
     try:
@@ -88,6 +90,72 @@ def save_config(config_name, config, dcc_type=None):
             for key, value in config.items():
                 f.write(f"{key}:{value}\n")
         return True, config_path
+    except Exception as e:
+        print(f"保存配置失败: {e}")
+        return False, ""
+
+
+# API key 字段永远不允许出现在全局共享配置文件中
+# 只能存放在各用户自己的 cache/users/{username}/config.ini 或通过环境变量注入
+_SENSITIVE_CONFIG_KEYS = frozenset({
+    'openai_api_key', 'deepseek_api_key', 'glm_api_key',
+    'duojie_api_key', 'openrouter_api_key', 'kimi_coding_api_key',
+    'siliconflow_api_key', 'of3d_api_key', 'custom_api_key',
+})
+
+
+def _load_ini_file(path: str) -> dict:
+    data = {}
+    if not os.path.exists(path):
+        return data
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            for line in lines:
+                if ":" in line:
+                    key, value = line.strip().split(":", 1)
+                    data[key] = value
+    except Exception as e:
+        print(f"加载配置失败: {e}")
+    return data
+
+
+def load_user_config(username: str, config_name: str = "ai", dcc_type: str = "houdini"):
+    """加载用户配置（全局配置 + 用户覆盖层）。
+
+    全局配置只提供非敏感设置（URL、模型名等），API key 等敏感字段
+    仅从用户私有配置 cache/users/{username}/config.ini 读取。
+    """
+    global_cfg, _ = load_config(config_name, dcc_type=dcc_type)
+    # 从全局配置中过滤掉敏感字段，防止共享文件泄露 API key
+    merged = {k: v for k, v in (global_cfg or {}).items()
+              if k not in _SENSITIVE_CONFIG_KEYS}
+    try:
+        uname = normalize_username(username)
+    except Exception:
+        return merged, ""
+
+    user_path = UserPaths(uname).user_config_path()
+    user_cfg = _load_ini_file(str(user_path))
+    if user_cfg:
+        merged.update(user_cfg)
+    return merged, str(user_path)
+
+
+def save_user_config(username: str, config: dict, config_name: str = "ai", dcc_type: str = "houdini"):
+    """保存用户配置覆盖层（不修改全局配置）。"""
+    try:
+        uname = normalize_username(username)
+    except Exception:
+        return False, ""
+
+    user_path = UserPaths(uname).user_config_path()
+    user_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(user_path, "w", encoding="utf-8") as f:
+            for key, value in config.items():
+                f.write(f"{key}:{value}\n")
+        return True, str(user_path)
     except Exception as e:
         print(f"保存配置失败: {e}")
         return False, ""

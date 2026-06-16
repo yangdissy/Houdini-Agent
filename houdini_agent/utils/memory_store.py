@@ -13,6 +13,7 @@
 import json
 import math
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -22,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from .embedding import get_embedder, LocalEmbedder, EMBEDDING_DIM
+from shared.user_paths import UserPaths, normalize_username
 
 # ============================================================
 # 数据库路径
@@ -137,6 +139,9 @@ class MemoryStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.embedder = embedder or get_embedder()
         self._conn: Optional[sqlite3.Connection] = None
+        self._force_delete = False  # 网络盘 fallback: 跳过 WAL，直接用 DELETE 模式
+        # 单连接多线程共享时，必须由上层显式串行化访问。
+        self._db_lock = threading.RLock()
         self._init_db()
 
     # ==========================================================
@@ -145,14 +150,83 @@ class MemoryStore:
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
+            conn = sqlite3.connect(
+                str(self.db_path),
+                check_same_thread=False,
+                timeout=30.0,
+            )
+            if self._force_delete:
+                # 已知网络盘，直接跳过 WAL 尝试
+                conn.execute("PRAGMA journal_mode=DELETE")
+                conn.execute("PRAGMA synchronous=FULL")
+                print("[Memory] 使用 DELETE 模式（网络盘兼容）")
+            else:
+                try:
+                    result = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                    if result and result[0] == "wal":
+                        conn.execute("PRAGMA synchronous=NORMAL")
+                    else:
+                        # WAL 未生效（如网络盘），回退 DELETE 模式
+                        conn.execute("PRAGMA journal_mode=DELETE")
+                        conn.execute("PRAGMA synchronous=FULL")
+                        print("[Memory] WAL 不可用，使用 DELETE 模式（网络盘兼容）")
+                except sqlite3.DatabaseError:
+                    # WAL 锁协议失败（SMB/NFS），关闭损坏连接并重建
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = sqlite3.connect(
+                        str(self.db_path),
+                        check_same_thread=False,
+                        timeout=30.0,
+                    )
+                    conn.execute("PRAGMA journal_mode=DELETE")
+                    conn.execute("PRAGMA synchronous=FULL")
+                    print("[Memory] WAL 不可用，使用 DELETE 模式（网络盘兼容）")
+            conn.execute("PRAGMA busy_timeout=30000")
+            self._conn = conn
         return self._conn
 
+    def _execute(self, sql: str, params: tuple = ()):
+        with self._db_lock:
+            return self._get_conn().execute(sql, params)
+
+    def _fetchone(self, sql: str, params: tuple = ()):
+        with self._db_lock:
+            return self._get_conn().execute(sql, params).fetchone()
+
+    def _fetchall(self, sql: str, params: tuple = ()):
+        with self._db_lock:
+            return self._get_conn().execute(sql, params).fetchall()
+
+    def _commit(self):
+        with self._db_lock:
+            self._get_conn().commit()
+
     def _init_db(self):
-        conn = self._get_conn()
-        conn.executescript("""
+        with self._db_lock:
+            try:
+                self._init_db_with_conn()
+            except sqlite3.DatabaseError as e:
+                if "locking protocol" in str(e).lower() or "unable to open" in str(e).lower():
+                    # WAL 模式在网络盘上写入失败，重置连接并强制 DELETE 模式重试
+                    print(f"[Memory] 检测到网络盘锁协议问题，切换 DELETE 模式重试: {e}")
+                    try:
+                        if self._conn:
+                            self._conn.close()
+                    except Exception:
+                        pass
+                    self._conn = None
+                    self._force_delete = True
+                    self._init_db_with_conn()
+                else:
+                    raise
+
+    def _init_db_with_conn(self):
+        with self._db_lock:
+            conn = self._get_conn()
+            conn.executescript("""
             CREATE TABLE IF NOT EXISTS episodic_memory (
                 id TEXT PRIMARY KEY,
                 timestamp REAL,
@@ -200,9 +274,9 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_semantic_confidence ON semantic_memory(confidence);
             CREATE INDEX IF NOT EXISTS idx_procedural_priority ON procedural_memory(priority);
         """)
-        conn.commit()
-        # ── DB migration: 添加 abstraction_level 列（兼容旧数据库） ──
-        self._migrate_add_abstraction_level(conn)
+            conn.commit()
+            # ── DB migration: 添加 abstraction_level 列（兼容旧数据库） ──
+            self._migrate_add_abstraction_level(conn)
 
     @staticmethod
     def _migrate_add_abstraction_level(conn: sqlite3.Connection):
@@ -218,9 +292,10 @@ class MemoryStore:
             print(f"[MemoryStore] Migration 失败 (非致命): {e}")
 
     def close(self):
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        with self._db_lock:
+            if self._conn:
+                self._conn.close()
+                self._conn = None
 
     # ==========================================================
     # Episodic Memory CRUD
@@ -233,8 +308,7 @@ class MemoryStore:
             text = f"{record.task_description} {record.result_summary}"
             record.embedding = self.embedder.encode(text)
 
-        conn = self._get_conn()
-        conn.execute(
+        self._execute(
             """INSERT OR REPLACE INTO episodic_memory
                (id, timestamp, session_id, task_description, actions,
                 result_summary, success, error_count, retry_count,
@@ -256,26 +330,22 @@ class MemoryStore:
                 json.dumps(record.tags, ensure_ascii=False),
             ),
         )
-        conn.commit()
+        self._commit()
         return record.id
 
     def get_episodic(self, record_id: str) -> Optional[EpisodicRecord]:
         """根据 ID 获取事件记忆"""
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT * FROM episodic_memory WHERE id=?", (record_id,)
-        ).fetchone()
+        row = self._fetchone("SELECT * FROM episodic_memory WHERE id=?", (record_id,))
         if not row:
             return None
         return self._row_to_episodic(row)
 
     def get_recent_episodic(self, limit: int = 20) -> List[EpisodicRecord]:
         """获取最近的事件记忆"""
-        conn = self._get_conn()
-        rows = conn.execute(
+        rows = self._fetchall(
             "SELECT * FROM episodic_memory ORDER BY timestamp DESC LIMIT ?",
             (limit,)
-        ).fetchall()
+        )
         return [self._row_to_episodic(r) for r in rows]
 
     def search_episodic(self, query: str, top_k: int = 5, min_importance: float = 0.1) -> List[Tuple[EpisodicRecord, float]]:
@@ -285,11 +355,10 @@ class MemoryStore:
             [(record, similarity_score), ...] 按相似度降序
         """
         query_vec = self.embedder.encode(query)
-        conn = self._get_conn()
-        rows = conn.execute(
+        rows = self._fetchall(
             "SELECT * FROM episodic_memory WHERE importance >= ? ORDER BY importance DESC",
             (min_importance,)
-        ).fetchall()
+        )
 
         if not rows:
             return []
@@ -308,63 +377,64 @@ class MemoryStore:
 
     def update_episodic_importance(self, record_id: str, new_importance: float):
         """更新事件记忆的重要度"""
-        conn = self._get_conn()
-        conn.execute(
+        self._execute(
             "UPDATE episodic_memory SET importance=? WHERE id=?",
             (new_importance, record_id)
         )
-        conn.commit()
+        self._commit()
 
     def update_episodic_reward(self, record_id: str, reward_score: float, importance: float):
         """更新事件记忆的 reward 和 importance"""
-        conn = self._get_conn()
-        conn.execute(
+        self._execute(
             "UPDATE episodic_memory SET reward_score=?, importance=? WHERE id=?",
             (reward_score, importance, record_id)
         )
-        conn.commit()
+        self._commit()
 
     def update_episodic_tags(self, record_id: str, tags: List[str]):
         """更新事件记忆的 tags"""
-        conn = self._get_conn()
-        conn.execute(
+        self._execute(
             "UPDATE episodic_memory SET tags=? WHERE id=?",
             (json.dumps(tags, ensure_ascii=False), record_id)
         )
-        conn.commit()
+        self._commit()
 
     def count_episodic(self) -> int:
         """统计事件记忆总数"""
-        conn = self._get_conn()
-        return conn.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0]
+        row = self._fetchone("SELECT COUNT(*) FROM episodic_memory")
+        return row[0] if row else 0
 
     def get_episodic_by_session(self, session_id: str) -> List[EpisodicRecord]:
         """获取某个 session 的所有事件记忆"""
-        conn = self._get_conn()
-        rows = conn.execute(
+        rows = self._fetchall(
             "SELECT * FROM episodic_memory WHERE session_id=? ORDER BY timestamp ASC",
             (session_id,)
-        ).fetchall()
+        )
         return [self._row_to_episodic(r) for r in rows]
 
     def delete_episodic(self, record_id: str) -> bool:
         """删除一条事件记忆"""
-        conn = self._get_conn()
-        cur = conn.execute("DELETE FROM episodic_memory WHERE id=?", (record_id,))
-        conn.commit()
+        cur = self._execute("DELETE FROM episodic_memory WHERE id=?", (record_id,))
+        self._commit()
         return cur.rowcount > 0
 
     # ==========================================================
     # Semantic Memory CRUD
     # ==========================================================
 
+    def _scale_similarity_threshold(self, threshold: float) -> float:
+        """根据 embedding 后端缩放相似度阈值。"""
+        if self.embedder.is_semantic:
+            return threshold
+        # fallback embedding (n-gram hash) 相似度值域显著偏低。
+        return threshold * 0.2
+
     def add_semantic(self, record: SemanticRecord) -> str:
         """写入一条抽象知识"""
         if record.embedding is None:
             record.embedding = self.embedder.encode(record.rule)
 
-        conn = self._get_conn()
-        conn.execute(
+        self._execute(
             """INSERT OR REPLACE INTO semantic_memory
                (id, created_at, updated_at, rule, source_episodes,
                 confidence, activation_count, embedding, category, abstraction_level)
@@ -382,15 +452,12 @@ class MemoryStore:
                 record.abstraction_level,
             ),
         )
-        conn.commit()
+        self._commit()
         return record.id
 
     def get_semantic(self, record_id: str) -> Optional[SemanticRecord]:
         """根据 ID 获取抽象知识"""
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT * FROM semantic_memory WHERE id=?", (record_id,)
-        ).fetchone()
+        row = self._fetchone("SELECT * FROM semantic_memory WHERE id=?", (record_id,))
         if not row:
             return None
         return self._row_to_semantic(row)
@@ -398,11 +465,10 @@ class MemoryStore:
     def search_semantic(self, query: str, top_k: int = 5, min_confidence: float = 0.2) -> List[Tuple[SemanticRecord, float]]:
         """向量检索抽象知识"""
         query_vec = self.embedder.encode(query)
-        conn = self._get_conn()
-        rows = conn.execute(
+        rows = self._fetchall(
             "SELECT * FROM semantic_memory WHERE confidence >= ?",
-            (min_confidence,)
-        ).fetchall()
+            (min_confidence,),
+        )
 
         if not rows:
             return []
@@ -420,52 +486,47 @@ class MemoryStore:
 
     def get_all_semantic(self, category: Optional[str] = None) -> List[SemanticRecord]:
         """获取所有抽象知识（可按分类过滤）"""
-        conn = self._get_conn()
         if category:
-            rows = conn.execute(
+            rows = self._fetchall(
                 "SELECT * FROM semantic_memory WHERE category=? ORDER BY confidence DESC",
                 (category,)
-            ).fetchall()
+            )
         else:
-            rows = conn.execute(
-                "SELECT * FROM semantic_memory ORDER BY confidence DESC"
-            ).fetchall()
+            rows = self._fetchall("SELECT * FROM semantic_memory ORDER BY confidence DESC")
         return [self._row_to_semantic(r) for r in rows]
 
     def increment_semantic_activation(self, record_id: str):
         """增加抽象知识的激活次数"""
-        conn = self._get_conn()
-        conn.execute(
+        self._execute(
             "UPDATE semantic_memory SET activation_count = activation_count + 1, updated_at=? WHERE id=?",
             (time.time(), record_id)
         )
-        conn.commit()
+        self._commit()
 
     def update_semantic_confidence(self, record_id: str, confidence: float):
         """更新抽象知识的置信度"""
-        conn = self._get_conn()
-        conn.execute(
+        self._execute(
             "UPDATE semantic_memory SET confidence=?, updated_at=? WHERE id=?",
             (confidence, time.time(), record_id)
         )
-        conn.commit()
+        self._commit()
 
     def find_duplicate_semantic(self, rule_text: str, threshold: float = 0.85) -> Optional[SemanticRecord]:
         """查找是否已存在高度相似的规则（去重用）"""
         results = self.search_semantic(rule_text, top_k=1, min_confidence=0.0)
-        if results and results[0][1] >= threshold:
+        effective_threshold = self._scale_similarity_threshold(threshold)
+        if results and results[0][1] >= effective_threshold:
             return results[0][0]
         return None
 
     def delete_semantic(self, record_id: str):
         """删除指定语义记忆"""
-        conn = self._get_conn()
-        conn.execute("DELETE FROM semantic_memory WHERE id=?", (record_id,))
-        conn.commit()
+        self._execute("DELETE FROM semantic_memory WHERE id=?", (record_id,))
+        self._commit()
 
     def count_semantic(self) -> int:
-        conn = self._get_conn()
-        return conn.execute("SELECT COUNT(*) FROM semantic_memory").fetchone()[0]
+        row = self._fetchone("SELECT COUNT(*) FROM semantic_memory")
+        return row[0] if row else 0
 
     # ==========================================================
     # 分层记忆检索（6 层抽象层级）
@@ -473,11 +534,10 @@ class MemoryStore:
 
     def get_core_memories(self, max_count: int = 5) -> List[SemanticRecord]:
         """获取 level=0 核心记忆，按 confidence 降序，最多 max_count 条"""
-        conn = self._get_conn()
-        rows = conn.execute(
+        rows = self._fetchall(
             "SELECT * FROM semantic_memory WHERE abstraction_level = 0 ORDER BY confidence DESC LIMIT ?",
             (max_count,)
-        ).fetchall()
+        )
         return [self._row_to_semantic(r) for r in rows]
 
     def search_by_level(
@@ -497,20 +557,16 @@ class MemoryStore:
             [(record, similarity_score), ...] 按综合分降序
         """
         query_vec = self.embedder.encode(query)
-        conn = self._get_conn()
-        rows = conn.execute(
+        rows = self._fetchall(
             "SELECT * FROM semantic_memory WHERE abstraction_level = ? AND confidence >= ?",
             (level, min_confidence)
-        ).fetchall()
+        )
 
         if not rows:
             return []
 
-        # ★ fallback embedding (n-gram hash) 的 cosine similarity 值域约 0~0.4，
-        #   远低于 sentence-transformers 的 0~1.0。动态缩放阈值以适配。
-        effective_threshold = threshold
-        if not self.embedder.is_semantic:
-            effective_threshold = threshold * 0.2  # 0.25 → 0.05, 0.15 → 0.03
+        # fallback embedding (n-gram hash) 的相似度值域偏低，需要动态缩放阈值。
+        effective_threshold = self._scale_similarity_threshold(threshold)
 
         results = []
         for row in rows:
@@ -540,17 +596,16 @@ class MemoryStore:
             [(record, similarity_score), ...] 按综合分降序
         """
         query_vec = self.embedder.encode(query)
-        conn = self._get_conn()
         if category:
-            rows = conn.execute(
+            rows = self._fetchall(
                 "SELECT * FROM semantic_memory WHERE category = ? AND confidence >= ?",
                 (category, min_confidence)
-            ).fetchall()
+            )
         else:
-            rows = conn.execute(
+            rows = self._fetchall(
                 "SELECT * FROM semantic_memory WHERE confidence >= ?",
                 (min_confidence,)
-            ).fetchall()
+            )
 
         if not rows:
             return []
@@ -576,8 +631,7 @@ class MemoryStore:
             text = f"{record.strategy_name}: {record.description}"
             record.embedding = self.embedder.encode(text)
 
-        conn = self._get_conn()
-        conn.execute(
+        self._execute(
             """INSERT OR REPLACE INTO procedural_memory
                (id, strategy_name, description, priority, success_rate,
                 usage_count, last_used, embedding, conditions)
@@ -594,14 +648,11 @@ class MemoryStore:
                 json.dumps(record.conditions, ensure_ascii=False),
             ),
         )
-        conn.commit()
+        self._commit()
         return record.id
 
     def get_procedural(self, record_id: str) -> Optional[ProceduralRecord]:
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT * FROM procedural_memory WHERE id=?", (record_id,)
-        ).fetchone()
+        row = self._fetchone("SELECT * FROM procedural_memory WHERE id=?", (record_id,))
         if not row:
             return None
         return self._row_to_procedural(row)
@@ -609,10 +660,7 @@ class MemoryStore:
     def search_procedural(self, query: str, top_k: int = 3) -> List[Tuple[ProceduralRecord, float]]:
         """向量检索策略记忆"""
         query_vec = self.embedder.encode(query)
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT * FROM procedural_memory ORDER BY priority DESC"
-        ).fetchall()
+        rows = self._fetchall("SELECT * FROM procedural_memory ORDER BY priority DESC")
 
         if not rows:
             return []
@@ -629,15 +677,11 @@ class MemoryStore:
         return results[:top_k]
 
     def get_all_procedural(self) -> List[ProceduralRecord]:
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT * FROM procedural_memory ORDER BY priority DESC"
-        ).fetchall()
+        rows = self._fetchall("SELECT * FROM procedural_memory ORDER BY priority DESC")
         return [self._row_to_procedural(r) for r in rows]
 
     def update_procedural_usage(self, record_id: str, success: bool):
         """更新策略使用统计"""
-        conn = self._get_conn()
         rec = self.get_procedural(record_id)
         if not rec:
             return
@@ -646,38 +690,33 @@ class MemoryStore:
         # 更新成功率（滑动平均）
         alpha = min(0.3, 1.0 / rec.usage_count)
         rec.success_rate = (1 - alpha) * rec.success_rate + alpha * (1.0 if success else 0.0)
-        conn.execute(
+        self._execute(
             "UPDATE procedural_memory SET usage_count=?, last_used=?, success_rate=? WHERE id=?",
             (rec.usage_count, rec.last_used, rec.success_rate, record_id)
         )
-        conn.commit()
+        self._commit()
 
     def update_procedural_priority(self, record_id: str, priority_delta: float):
         """调整策略优先级"""
-        conn = self._get_conn()
-        conn.execute(
+        self._execute(
             "UPDATE procedural_memory SET priority = MIN(1.0, MAX(0.0, priority + ?)) WHERE id=?",
             (priority_delta, record_id)
         )
-        conn.commit()
+        self._commit()
 
     def count_procedural(self) -> int:
-        conn = self._get_conn()
-        return conn.execute("SELECT COUNT(*) FROM procedural_memory").fetchone()[0]
+        row = self._fetchone("SELECT COUNT(*) FROM procedural_memory")
+        return row[0] if row else 0
 
     def delete_procedural(self, record_id: str) -> bool:
         """删除一条策略记忆"""
-        conn = self._get_conn()
-        cur = conn.execute("DELETE FROM procedural_memory WHERE id=?", (record_id,))
-        conn.commit()
+        cur = self._execute("DELETE FROM procedural_memory WHERE id=?", (record_id,))
+        self._commit()
         return cur.rowcount > 0
 
     def get_procedural_by_name(self, name: str) -> Optional[ProceduralRecord]:
         """按策略名查找"""
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT * FROM procedural_memory WHERE strategy_name=?", (name,)
-        ).fetchone()
+        row = self._fetchone("SELECT * FROM procedural_memory WHERE strategy_name=?", (name,))
         if not row:
             return None
         return self._row_to_procedural(row)
@@ -691,19 +730,211 @@ class MemoryStore:
 
         importance *= exp(-lambda * days_since_creation)
         """
-        conn = self._get_conn()
+        with self._db_lock:
+            conn = self._get_conn()
+            now = time.time()
+            rows = conn.execute("SELECT id, timestamp, importance FROM episodic_memory").fetchall()
+            for row_id, ts, imp in rows:
+                days = (now - ts) / 86400.0
+                new_imp = imp * math.exp(-lambda_decay * days)
+                new_imp = max(new_imp, 0.01)  # 不完全归零
+                if abs(new_imp - imp) > 0.001:
+                    conn.execute(
+                        "UPDATE episodic_memory SET importance=? WHERE id=?",
+                        (new_imp, row_id)
+                    )
+            conn.commit()
+
+    def decay_semantic_confidence(self, lambda_decay: float = 0.003) -> int:
+        """对 semantic 记忆执行时间衰减。
+
+        规则：越久未激活、激活次数越少的规则衰减越快；L0/L1 核心记忆保留较高下限。
+        Returns:
+            更新条目数
+        """
+        updated = 0
+        with self._db_lock:
+            conn = self._get_conn()
+            now = time.time()
+            rows = conn.execute(
+                "SELECT id, updated_at, confidence, activation_count, abstraction_level FROM semantic_memory"
+            ).fetchall()
+
+            for rec_id, updated_at, confidence, activation_count, abstraction_level in rows:
+                days = max(0.0, (now - (updated_at or now)) / 86400.0)
+                act_factor = 1.0 + math.log1p(max(0, activation_count))
+                decay_multiplier = math.exp(-lambda_decay * days / act_factor)
+                new_conf = confidence * decay_multiplier
+
+                # 核心记忆保底，避免用户偏好被过度淡化。
+                if abstraction_level <= 1:
+                    min_floor = 0.45
+                elif abstraction_level == 2:
+                    min_floor = 0.10
+                else:
+                    min_floor = 0.05
+
+                new_conf = max(min_floor, min(1.0, new_conf))
+                if abs(new_conf - confidence) > 0.001:
+                    conn.execute(
+                        "UPDATE semantic_memory SET confidence=?, updated_at=? WHERE id=?",
+                        (new_conf, now, rec_id),
+                    )
+                    updated += 1
+
+            conn.commit()
+        return updated
+
+    def decay_procedural_priority(self, lambda_decay: float = 0.002) -> int:
+        """对 procedural 策略优先级执行时间衰减。
+
+        规则：长期未使用且成功率低的策略会逐渐降级；高成功率策略保底更高。
+        Returns:
+            更新条目数
+        """
+        updated = 0
+        with self._db_lock:
+            conn = self._get_conn()
+            now = time.time()
+            rows = conn.execute(
+                "SELECT id, last_used, priority, success_rate, usage_count FROM procedural_memory"
+            ).fetchall()
+
+            for rec_id, last_used, priority, success_rate, usage_count in rows:
+                days = max(0.0, (now - (last_used or now)) / 86400.0)
+                usage_factor = 1.0 + math.log1p(max(0, usage_count))
+                decay_multiplier = math.exp(-lambda_decay * days / usage_factor)
+                decayed = priority * decay_multiplier
+
+                # 高成功率策略更稳定，低成功率策略允许更低优先级。
+                quality_floor = 0.15 + 0.25 * max(0.0, min(1.0, success_rate))
+                new_priority = max(quality_floor, min(1.0, decayed))
+
+                if abs(new_priority - priority) > 0.001:
+                    conn.execute(
+                        "UPDATE procedural_memory SET priority=? WHERE id=?",
+                        (new_priority, rec_id),
+                    )
+                    updated += 1
+
+            conn.commit()
+        return updated
+
+    def prune_semantic_memories(
+        self,
+        max_count: int = 1200,
+        stale_days: float = 45.0,
+        min_confidence: float = 0.22,
+        min_activation: int = 1,
+    ) -> int:
+        """清理低质量 semantic 记忆，优先删除长期未激活且低置信度条目。"""
         now = time.time()
-        rows = conn.execute("SELECT id, timestamp, importance FROM episodic_memory").fetchall()
-        for row_id, ts, imp in rows:
-            days = (now - ts) / 86400.0
-            new_imp = imp * math.exp(-lambda_decay * days)
-            new_imp = max(new_imp, 0.01)  # 不完全归零
-            if abs(new_imp - imp) > 0.001:
-                conn.execute(
-                    "UPDATE episodic_memory SET importance=? WHERE id=?",
-                    (new_imp, row_id)
-                )
-        conn.commit()
+        stale_cutoff = now - stale_days * 86400.0
+        deleted = 0
+
+        with self._db_lock:
+            conn = self._get_conn()
+
+            # 1) 删除明显低价值且陈旧的数据（不动 L0/L1）。
+            cur = conn.execute(
+                """
+                DELETE FROM semantic_memory
+                WHERE abstraction_level >= 2
+                  AND confidence < ?
+                  AND activation_count <= ?
+                  AND updated_at < ?
+                """,
+                (min_confidence, min_activation, stale_cutoff),
+            )
+            deleted += cur.rowcount if cur.rowcount > 0 else 0
+
+            # 2) 超过容量上限时，再按质量排序删除尾部。
+            row = conn.execute("SELECT COUNT(*) FROM semantic_memory").fetchone()
+            total = row[0] if row else 0
+            overflow = max(0, total - max_count)
+            if overflow > 0:
+                ids = conn.execute(
+                    """
+                    SELECT id FROM semantic_memory
+                    WHERE abstraction_level >= 2
+                    ORDER BY confidence ASC, activation_count ASC, updated_at ASC
+                    LIMIT ?
+                    """,
+                    (overflow,),
+                ).fetchall()
+                if ids:
+                    conn.executemany(
+                        "DELETE FROM semantic_memory WHERE id=?",
+                        ids,
+                    )
+                    deleted += len(ids)
+
+            conn.commit()
+
+        return deleted
+
+    def prune_procedural_memories(
+        self,
+        max_count: int = 300,
+        stale_days: float = 60.0,
+        min_priority: float = 0.25,
+        min_success_rate: float = 0.30,
+    ) -> int:
+        """清理低价值 procedural 策略。"""
+        now = time.time()
+        stale_cutoff = now - stale_days * 86400.0
+        deleted = 0
+
+        with self._db_lock:
+            conn = self._get_conn()
+
+            cur = conn.execute(
+                """
+                DELETE FROM procedural_memory
+                WHERE usage_count = 0
+                  AND priority < ?
+                  AND success_rate < ?
+                  AND last_used < ?
+                """,
+                (min_priority, min_success_rate, stale_cutoff),
+            )
+            deleted += cur.rowcount if cur.rowcount > 0 else 0
+
+            row = conn.execute("SELECT COUNT(*) FROM procedural_memory").fetchone()
+            total = row[0] if row else 0
+            overflow = max(0, total - max_count)
+            if overflow > 0:
+                ids = conn.execute(
+                    """
+                    SELECT id FROM procedural_memory
+                    ORDER BY priority ASC, success_rate ASC, usage_count ASC, last_used ASC
+                    LIMIT ?
+                    """,
+                    (overflow,),
+                ).fetchall()
+                if ids:
+                    conn.executemany(
+                        "DELETE FROM procedural_memory WHERE id=?",
+                        ids,
+                    )
+                    deleted += len(ids)
+
+            conn.commit()
+
+        return deleted
+
+    def maintain_long_term_memory(self) -> Dict[str, int]:
+        """执行长期记忆维护：衰减 + 淘汰。"""
+        semantic_decayed = self.decay_semantic_confidence()
+        procedural_decayed = self.decay_procedural_priority()
+        semantic_pruned = self.prune_semantic_memories()
+        procedural_pruned = self.prune_procedural_memories()
+        return {
+            "semantic_decayed": semantic_decayed,
+            "procedural_decayed": procedural_decayed,
+            "semantic_pruned": semantic_pruned,
+            "procedural_pruned": procedural_pruned,
+        }
 
     # ==========================================================
     # 统计信息
@@ -819,12 +1050,25 @@ class MemoryStore:
 # 全局单例
 # ============================================================
 
-_store_instance: Optional[MemoryStore] = None
+_store_instances: Dict[str, MemoryStore] = {}
+_store_instances_lock = threading.RLock()
 
-def get_memory_store() -> MemoryStore:
-    """获取全局 MemoryStore 实例"""
-    global _store_instance
-    if _store_instance is None:
-        _store_instance = MemoryStore()
-        _store_instance.seed_default_strategies()
-    return _store_instance
+def get_memory_store(username: Optional[str] = None) -> MemoryStore:
+    """获取 MemoryStore 实例（按用户隔离）。"""
+    global _store_instances
+    if not username:
+        key = "default"
+        with _store_instances_lock:
+            if key not in _store_instances:
+                _store_instances[key] = MemoryStore()
+                _store_instances[key].seed_default_strategies()
+            return _store_instances[key]
+
+    uname = normalize_username(username)
+    with _store_instances_lock:
+        if uname not in _store_instances:
+            user_paths = UserPaths(uname)
+            user_paths.ensure_dirs()
+            _store_instances[uname] = MemoryStore(db_path=user_paths.memory_db())
+            _store_instances[uname].seed_default_strategies()
+        return _store_instances[uname]

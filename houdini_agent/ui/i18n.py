@@ -83,7 +83,7 @@ _ZH = {
     # ===== Input Area =====
     'mode.tooltip': 'Agent: AI 自主操作节点\nAsk: 只读查询分析',
     'confirm': '确认',
-    'confirm.tooltip': '确认模式：创建节点/VEX 前先预览确认',
+    'confirm.tooltip': '【逐步确认 / 直接执行】点击切换\n\n✔ 逐步确认（默认，推荐）\n  执行创建节点、写入 VEX、连线等操作前\n  弹出预览卡片，确认后才执行\n  适合：调试期、不熟悉场景时\n\n⚡ 直接执行（HIGH-RISK）\n  所有操作立即执行，无需确认\n  适合：熟悉流程、批量任务时',
     'placeholder': '输入消息... (Enter 发送, Shift+Enter 换行, @提及节点)',
     'attach_image.tooltip': '添加图片附件（支持 PNG/JPG/GIF/WebP，也可直接粘贴/拖拽图片到输入框）',
     'train.tooltip': '导出当前对话为训练数据（用于大模型微调）',
@@ -518,7 +518,7 @@ _ZH = {
         '<task_complexity_detection>\n'
         '在回答用户之前，先评估任务复杂度。如果满足以下任一条件，建议用户切换到 Plan 模式：\n\n'
         '**触发条件**（满足任意一条即建议）：\n'
-        '- 需要创建 5 个以上节点\n'
+        '- 需要创建 5 个以上节点（这是建议切换 Plan 模式的阈值；5 个以内的小网络如需创建 2 个以上相关节点，仍应优先用 create_nodes_batch 一次创建并连接）\n'
         '- 涉及多阶段工作流（如"搭建完整的地形系统"、"创建 FLIP 流体模拟"、"建立完整的材质网络"）\n'
         '- 需要复杂的节点连接拓扑（分支、合并、循环引用）\n'
         '- 涉及模拟/解算/渲染等多步骤流程\n'
@@ -662,7 +662,7 @@ _EN = {
     # ===== Input Area =====
     'mode.tooltip': 'Agent: AI autonomously operates nodes\nAsk: Read-only query & analysis',
     'confirm': 'Confirm',
-    'confirm.tooltip': 'Confirm mode: Preview before creating nodes/VEX',
+    'confirm.tooltip': '[Step Confirm / Direct Execute] Click to toggle\n\n✔ Step Confirm (default, recommended)\n  Shows a preview card before creating nodes,\n  writing VEX, or connecting wires.\n  Best for: debugging, unfamiliar scenes\n\n⚡ Direct Execute (HIGH-RISK)\n  All operations run immediately without confirmation.\n  Best for: known workflows, batch tasks',
     'placeholder': 'Type a message... (Enter to send, Shift+Enter for newline, @mention nodes)',
     'attach_image.tooltip': 'Attach image (PNG/JPG/GIF/WebP, or paste/drag into input)',
     'train.tooltip': 'Export conversation as training data (for LLM fine-tuning)',

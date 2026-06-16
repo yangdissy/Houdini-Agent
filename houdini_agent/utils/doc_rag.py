@@ -211,7 +211,7 @@ class HoudiniDocIndex:
         改进:
         1. 递归加载子目录 Doc/**/*.txt
         2. 知识库缓存: 将解析结果序列化到 JSON 缓存
-        3. 增量检测: 按文件修改时间判断是否需要重新解析
+        3. 增量检测: 按文件修改时间+大小判断是否需要重新解析
         """
         if not self._doc_dir or not self._doc_dir.is_dir():
             return
@@ -223,11 +223,8 @@ class HoudiniDocIndex:
 
         kb_cache_file = self._cache_dir / "knowledge_base_cache.json"
 
-        # 构建文件指纹 {相对路径: mtime}
-        file_fingerprints = {}
-        for txt_path in txt_files:
-            rel = txt_path.relative_to(self._doc_dir)
-            file_fingerprints[str(rel)] = txt_path.stat().st_mtime
+        # 构建文件指纹 {相对路径: {mtime, size}}
+        file_fingerprints = self._build_kb_fingerprints(txt_files, self._doc_dir)
 
         # 尝试增量加载缓存
         if kb_cache_file.exists():
@@ -289,37 +286,61 @@ class HoudiniDocIndex:
                 print(f"[DocIndex] 知识库缓存保存失败: {e}")
 
     @staticmethod
+    def _build_kb_fingerprints(txt_files: List[Path], doc_root: Path) -> Dict[str, Dict[str, float]]:
+        """构建知识库文件指纹：mtime + size。"""
+        fingerprints: Dict[str, Dict[str, float]] = {}
+        for txt_path in txt_files:
+            st = txt_path.stat()
+            rel = str(txt_path.relative_to(doc_root)).replace("\\", "/")
+            fingerprints[rel] = {
+                "mtime": round(float(st.st_mtime), 6),
+                "size": float(st.st_size),
+            }
+        return fingerprints
+
+    @staticmethod
+    def _extract_chunk_keywords(title: str, content: str) -> List[str]:
+        """提取 chunk 的中英关键词，去重后返回。"""
+        keywords_en = [
+            w.lower() for w in
+            re.findall(r'[a-zA-Z_@][a-zA-Z0-9_@.]*', title + ' ' + content)
+            if len(w) >= 2
+        ]
+        keywords_cn = re.findall(r'[\u4e00-\u9fff]{2,}', title + ' ' + content[:300])
+        merged = keywords_en + keywords_cn
+        # 保序去重
+        return list(dict.fromkeys(merged))[:50]
+
+    @staticmethod
     def _parse_txt_sections(text: str, source: str) -> List[KnowledgeChunk]:
         """将 .txt 文件按 ## 标题分段
 
         每个以 ## 开头的行作为一个新段落的标题。
         段落内容最多保留 2000 字符。
+
+        如果文件没有有效 ## 标题，则退化到窗口切分，避免整篇文档无法入索引。
         """
         chunks: List[KnowledgeChunk] = []
         current_title = ""
         current_lines: List[str] = []
+        has_heading = False
 
         def _flush():
             if current_title and current_lines:
                 content = '\n'.join(current_lines).strip()
                 if len(content) > 30:  # 跳过过短的段落
-                    # 提取关键词：英文标识符 + 中文词组
-                    keywords_en = [w.lower() for w in
-                                   re.findall(r'[a-zA-Z_@][a-zA-Z0-9_@.]*', current_title + ' ' + content)
-                                   if len(w) >= 2]
-                    keywords_cn = re.findall(r'[\u4e00-\u9fff]{2,}', current_title)
-                    all_kw = list(set(keywords_en + keywords_cn))
                     chunks.append(KnowledgeChunk(
                         title=current_title,
                         content=content[:2000],
                         source=source,
-                        keywords=all_kw[:50],  # 最多50个关键词
+                        keywords=HoudiniDocIndex._extract_chunk_keywords(current_title, content),
                     ))
 
         for line in text.split('\n'):
             # 匹配 "## 标题" (二级标题)
             m = re.match(r'^##\s+(.+)', line)
             if m:
+                has_heading = True
                 title_text = m.group(1).strip()
                 # 跳过装饰分隔线 (如 "## ========" 或 "## ------")
                 if re.match(r'^[=\-#*~]{3,}$', title_text):
@@ -331,6 +352,56 @@ class HoudiniDocIndex:
                 current_lines.append(line)
 
         _flush()
+        if chunks:
+            return chunks
+
+        # fallback: 无标题文档按段落与窗口切分
+        if not has_heading:
+            base_name = Path(source).name or "knowledge"
+            paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if len(p.strip()) > 20]
+            if not paragraphs and text.strip():
+                paragraphs = [text.strip()]
+
+            window = 900
+            overlap = 180
+            blocks: List[str] = []
+            buf = ""
+
+            for para in paragraphs:
+                # 超长段落直接窗口切分
+                if len(para) > window * 2:
+                    if buf:
+                        blocks.append(buf)
+                        buf = ""
+                    step = max(200, window - overlap)
+                    for i in range(0, len(para), step):
+                        piece = para[i:i + window].strip()
+                        if len(piece) > 30:
+                            blocks.append(piece)
+                    continue
+
+                if not buf:
+                    buf = para
+                elif len(buf) + 2 + len(para) <= window:
+                    buf += "\n\n" + para
+                else:
+                    blocks.append(buf)
+                    buf = para
+
+            if buf:
+                blocks.append(buf)
+
+            for idx, block in enumerate(blocks, 1):
+                if len(block) <= 30:
+                    continue
+                title = f"{base_name} segment {idx}"
+                chunks.append(KnowledgeChunk(
+                    title=title,
+                    content=block[:2000],
+                    source=source,
+                    keywords=HoudiniDocIndex._extract_chunk_keywords(title, block),
+                ))
+
         return chunks
 
     def search_knowledge(self, query: str, top_k: int = 3) -> List[dict]:
@@ -340,40 +411,99 @@ class HoudiniDocIndex:
 
         ql = query.lower()
         # 提取查询中的关键词
-        query_words = set(re.findall(r'[a-zA-Z_@][a-zA-Z0-9_@.]*', ql))
+        query_words = {w.lower() for w in re.findall(r'[a-zA-Z_@][a-zA-Z0-9_@.]*', ql)}
         query_cn = set(re.findall(r'[\u4e00-\u9fff]{2,}', query))
+        query_terms = set(query_words) | set(query_cn)
+        if not query_terms:
+            return []
+
+        def _source_weight(source: str) -> float:
+            s = (source or "").lower()
+            if "houdini_knowledge_base" in s:
+                return 0.20
+            if "vex_" in s or "vex" in s:
+                return 0.18
+            if "labs" in s:
+                return 0.16
+            if "heightfields" in s or "copernicus" in s:
+                return 0.14
+            return 0.10
 
         scored: List[tuple] = []
         for chunk in self.knowledge_chunks:
             score = 0.0
-            # 英文关键词匹配
-            chunk_kw_set = set(chunk.keywords)
-            matched = query_words & chunk_kw_set
-            score += len(matched) * 0.3
-            # 中文关键词匹配
+            chunk_kw_set = {k.lower() for k in chunk.keywords}
+            title_l = chunk.title.lower()
+            content_l = chunk.content.lower()
+
+            matched_terms = set()
+
+            # 英文关键词匹配（关键词词表 + 标题）
+            matched_kw = query_words & chunk_kw_set
+            matched_title_en = {w for w in query_words if len(w) >= 3 and w in title_l}
+            matched_content_en = {w for w in query_words if len(w) >= 4 and w in content_l[:400]}
+            matched_terms.update(matched_kw)
+            matched_terms.update(matched_title_en)
+            matched_terms.update(matched_content_en)
+
+            score += len(matched_kw) * 0.25
+            score += len(matched_title_en) * 0.55
+            score += len(matched_content_en) * 0.20
+
+            # 中文关键词匹配（标题权重大于正文）
+            title_cn_hits = 0
+            content_cn_hits = 0
             for cn in query_cn:
-                if cn in chunk.title or cn in chunk.content[:200]:
-                    score += 0.5
-            # 精确子串匹配（标题）
-            for w in query_words:
-                if len(w) >= 3 and w in chunk.title.lower():
-                    score += 0.8
-            if score > 0.2:
-                scored.append((score, chunk))
+                if cn in chunk.title:
+                    title_cn_hits += 1
+                    matched_terms.add(cn)
+                elif cn in chunk.content[:260]:
+                    content_cn_hits += 1
+                    matched_terms.add(cn)
+            score += title_cn_hits * 0.70
+            score += content_cn_hits * 0.30
+
+            # 覆盖率加分：命中查询词越全面越靠前。
+            coverage = len(matched_terms) / max(1, len(query_terms))
+            score += min(0.40, 0.40 * coverage)
+
+            # 来源权重
+            score += _source_weight(chunk.source)
+
+            # 短片段惩罚，避免标题命中但信息不足的片段过于靠前。
+            content_len = len(chunk.content or "")
+            if content_len < 90:
+                score -= 0.20
+            elif content_len < 160:
+                score -= 0.08
+
+            if score > 0.30:
+                reasons = []
+                if matched_title_en or title_cn_hits > 0:
+                    reasons.append("title_match")
+                if matched_kw or matched_content_en or content_cn_hits > 0:
+                    reasons.append("content_match")
+                reasons.append(f"coverage={coverage:.2f}")
+                reasons.append(f"source={chunk.source}")
+
+                scored.append((score, chunk, sorted(matched_terms), ", ".join(reasons)))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         results = []
-        for score, chunk in scored[:top_k]:
+        for score, chunk, matched_terms, rank_reason in scored[:top_k]:
             # 截取内容摘要
             snippet = chunk.content[:300]
             if len(chunk.content) > 300:
                 snippet += "..."
+            normalized_score = max(0.0, min(score / 2.2, 1.0))
             results.append({
                 "type": "knowledge",
                 "name": chunk.title,
                 "snippet": f"[知识库] {chunk.title}\n{snippet}",
-                "score": min(score, 1.0),
+                "score": normalized_score,
                 "source": chunk.source,
+                "matched_terms": matched_terms[:12],
+                "rank_reason": rank_reason,
             })
         return results
 
@@ -761,6 +891,63 @@ class HoudiniDocIndex:
         """精确查找 HOM 类/方法"""
         return self.hom_index.get(name)
 
+    @staticmethod
+    def _detect_query_type(query: str) -> str:
+        q = (query or "").lower()
+        if "hou." in q or "python" in q or "hom" in q:
+            return "hom"
+        if "@" in query or "vex" in q or "wrangle" in q:
+            return "vex"
+        if "节点" in query or "node" in q or "sop" in q or "dop" in q:
+            return "node"
+        return "general"
+
+    @staticmethod
+    def _rerank_by_query_type(results: List[dict], query_type: str) -> List[dict]:
+        boosts = {
+            "node": {"node": 0.20, "knowledge": 0.08, "vex": -0.03, "hom": -0.03},
+            "vex": {"vex": 0.20, "knowledge": 0.10, "hom": 0.05, "node": -0.02},
+            "hom": {"hom": 0.22, "knowledge": 0.08, "vex": 0.04, "node": -0.03},
+            "general": {"knowledge": 0.05},
+        }
+        boost_table = boosts.get(query_type, {})
+        reranked = []
+        for r in results:
+            b = boost_table.get(r.get("type", ""), 0.0)
+            nr = dict(r)
+            nr["score"] = max(0.0, min(1.0, float(r.get("score", 0.0)) + b))
+            reranked.append(nr)
+        reranked.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        return reranked
+
+    @staticmethod
+    def _dedupe_and_diversify(results: List[dict], top_k: int) -> List[dict]:
+        seen_keys = set()
+        source_counts: Dict[str, int] = {}
+        diversified: List[dict] = []
+
+        for r in results:
+            r_type = r.get("type", "")
+            name = (r.get("name") or "").strip().lower()
+            source = (r.get("source") or "").strip().lower()
+            unique_key = f"{r_type}:{name}:{source}"
+            if unique_key in seen_keys:
+                continue
+
+            # 知识库结果做同源多样性约束，避免被单一 source 占满。
+            if r_type == "knowledge":
+                source_key = source or "_unknown"
+                if source_counts.get(source_key, 0) >= 2:
+                    continue
+                source_counts[source_key] = source_counts.get(source_key, 0) + 1
+
+            seen_keys.add(unique_key)
+            diversified.append(r)
+            if len(diversified) >= top_k:
+                break
+
+        return diversified
+
     def search(self, query: str, top_k: int = 5, **_kw) -> List[dict]:
         """多策略搜索
         
@@ -775,15 +962,21 @@ class HoudiniDocIndex:
         node = self.lookup_node(ql)
         if node:
             results.append({"type": "node", "name": node.node_type,
-                            "snippet": self._fmt_node(node), "score": 1.0})
+                            "snippet": self._fmt_node(node), "score": 1.0,
+                            "source": "nodes", "matched_terms": [ql],
+                            "rank_reason": "exact_match"})
         vex = self.lookup_vex(ql)
         if vex:
             results.append({"type": "vex", "name": vex.name,
-                            "snippet": self._fmt_vex(vex), "score": 1.0})
+                            "snippet": self._fmt_vex(vex), "score": 1.0,
+                            "source": "vex", "matched_terms": [ql],
+                            "rank_reason": "exact_match"})
         hom = self.lookup_hom(query)
         if hom:
             results.append({"type": "hom", "name": hom.name,
-                            "snippet": self._fmt_hom(hom), "score": 1.0})
+                            "snippet": self._fmt_hom(hom), "score": 1.0,
+                            "source": "hom", "matched_terms": [query],
+                            "rank_reason": "exact_match"})
 
         # --- 子串匹配 ---
         if len(results) < top_k:
@@ -797,21 +990,27 @@ class HoudiniDocIndex:
                     if w in ntype.lower() and ntype not in seen:
                         d = self.node_index[ntype]
                         results.append({"type": "node", "name": ntype,
-                                        "snippet": self._fmt_node(d), "score": 0.5})
+                                        "snippet": self._fmt_node(d), "score": 0.5,
+                                        "source": "nodes", "matched_terms": [w],
+                                        "rank_reason": "substring_match"})
                         seen.add(ntype)
                         if len(results) >= top_k:
                             break
                 for fname, d in self.vex_index.items():
                     if w in fname.lower() and fname not in seen:
                         results.append({"type": "vex", "name": fname,
-                                        "snippet": self._fmt_vex(d), "score": 0.4})
+                                        "snippet": self._fmt_vex(d), "score": 0.4,
+                                        "source": "vex", "matched_terms": [w],
+                                        "rank_reason": "substring_match"})
                         seen.add(fname)
                         if len(results) >= top_k:
                             break
                 for hname, d in self.hom_index.items():
                     if w in hname.lower() and hname not in seen:
                         results.append({"type": "hom", "name": hname,
-                                        "snippet": self._fmt_hom(d), "score": 0.4})
+                                        "snippet": self._fmt_hom(d), "score": 0.4,
+                                        "source": "hom", "matched_terms": [w],
+                                        "rank_reason": "substring_match"})
                         seen.add(hname)
                         if len(results) >= top_k:
                                     break
@@ -825,8 +1024,9 @@ class HoudiniDocIndex:
                     results.append(kr)
                     seen.add(kr["name"])
 
-        results.sort(key=lambda x: x["score"], reverse=True)
-        return results[:top_k]
+        query_type = self._detect_query_type(query)
+        reranked = self._rerank_by_query_type(results, query_type)
+        return self._dedupe_and_diversify(reranked, top_k)
     
     # ==========================================================
     # 自动检索（供 _run_agent 注入上下文）
@@ -866,20 +1066,36 @@ class HoudiniDocIndex:
         seen: set = set()
         total = 0
 
-        def _add(s: str, key: str):
+        # 固定配额：避免某一文档类型吞噬全部注入预算。
+        node_budget = max(80, int(max_chars * 0.36))
+        vex_budget = max(80, int(max_chars * 0.24))
+        hom_budget = max(60, int(max_chars * 0.18))
+        knowledge_budget = max(80, max_chars - node_budget - vex_budget - hom_budget)
+        bucket_limits = {
+            "node": node_budget,
+            "vex": vex_budget,
+            "hom": hom_budget,
+            "knowledge": knowledge_budget,
+        }
+        bucket_used = {k: 0 for k in bucket_limits}
+
+        def _add(s: str, key: str, bucket: str):
             nonlocal total
             if key in seen or total + len(s) > max_chars:
+                return
+            if bucket_used.get(bucket, 0) + len(s) > bucket_limits.get(bucket, max_chars):
                 return
             seen.add(key)
             snippets.append(s)
             total += len(s)
+            bucket_used[bucket] = bucket_used.get(bucket, 0) + len(s)
 
         # 1) hou.XXX 引用
         for ref in re.findall(r"hou\.([a-zA-Z_][a-zA-Z0-9_.]*)", user_message):
             full = f"hou.{ref}"
             doc = self.lookup_hom(full)
             if doc:
-                _add(self._fmt_hom(doc), full)
+                _add(self._fmt_hom(doc), full, "hom")
 
         # 2) 提取英文单词（ASCII-only，避免 \w 匹配中文）
         words = set(re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", user_message))
@@ -890,11 +1106,11 @@ class HoudiniDocIndex:
             # VEX 函数
             vdoc = self.vex_index.get(wl) or self.vex_index.get(w)
             if vdoc:
-                _add(self._fmt_vex(vdoc), vdoc.name)
+                _add(self._fmt_vex(vdoc), vdoc.name, "vex")
             # 节点
             ndoc = self.node_index.get(wl) or self.node_index.get(w)
             if ndoc:
-                _add(self._fmt_node(ndoc), ndoc.node_type)
+                _add(self._fmt_node(ndoc), ndoc.node_type, "node")
 
         # 3) 中文关键词 → 匹配节点标题
         for kw in re.findall(r"[\u4e00-\u9fff]{2,}", user_message)[:3]:
@@ -902,7 +1118,7 @@ class HoudiniDocIndex:
                 if "/" in ntype:
                     continue
                 if kw in ndoc.title or kw in ndoc.description:
-                    _add(self._fmt_node(ndoc), ndoc.node_type)
+                    _add(self._fmt_node(ndoc), ndoc.node_type, "node")
                     break
 
         # 4) 知识库匹配 — 涉及已收录主题时注入
@@ -937,12 +1153,27 @@ class HoudiniDocIndex:
             }
             msg_lower = user_message.lower()
             if any(h in msg_lower for h in _KB_HINTS):
-                kb_results = self.search_knowledge(user_message, top_k=2)
+                kb_results = self.search_knowledge(user_message, top_k=3)
+                best_kb_score = kb_results[0]["score"] if kb_results else 0.0
+                # 证据不足时不盲目注入知识库片段，改为引导精确检索工具。
+                if best_kb_score < 0.45:
+                    if not snippets:
+                        return (
+                            "[Houdini 文档参考]\n"
+                            "[证据不足] 建议调用 search_local_doc(query=...) 获取更精确文档。"
+                        )
+                
                 for kr in kb_results:
-                    if kr["score"] > 0.3:
-                        _add(kr["snippet"], kr["name"])
+                    if kr["score"] > 0.45:
+                        _add(kr["snippet"], f"{kr.get('source', '')}:{kr['name']}", "knowledge")
 
         if not snippets:
+            likely_doc_intent = bool(re.search(r"hou\.|@\w+|vex|node|节点|参数|函数|文档|python", user_message, re.IGNORECASE))
+            if likely_doc_intent:
+                return (
+                    "[Houdini 文档参考]\n"
+                    "[证据不足] 建议调用 search_local_doc(query=...) 获取更精确文档。"
+                )
             return ""
         return "[Houdini 文档参考]\n" + "\n".join(snippets)
 

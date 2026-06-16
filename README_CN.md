@@ -85,6 +85,9 @@ AI 以自主 **Agent 循环** 运行：接收用户请求 → 规划步骤 → �
 | `set_node_parameter` | 设置单个参数值（智能纠错、内联红绿 Diff 预览、一键撤销） |
 | `batch_set_parameters` | 批量设置多个节点的同一参数 |
 | `set_display_flag` | 设置节点的显示/渲染标志 |
+| `rename_node` | 重命名节点（自动清理非法字符，返回旧路径→新路径） |
+| `disconnect_nodes` | 断开节点的指定输入连接或全部输入连接 |
+| `set_node_flags` | 设置节点的 bypass（绕过/灰色）/ template（模板/橙色）/ lock（锁定）标志 |
 | `save_hip` | 保存当前 HIP 文件 |
 | `undo_redo` | 撤销或重做 |
 
@@ -521,33 +524,169 @@ Agent：[create_wrangle_node: vex_code="@Cd = set(rand(@ptnum), rand(@ptnum*13.3
 已创建 attribwrangle1，为所有点设置了随机 Cd 属性。
 ```
 
-## 常见问题
+## 常见问题与故障排查
 
-### API 连接问题
-- 使用「测试连接」按钮进行诊断
-- 检查 API Key 是否正确
-- 确认网络可以访问 API 端点
+### 启动失败
 
-### Agent 不调用工具
-- 确认所选提供商支持 Function Calling
-- DeepSeek、GLM-4.7、OpenAI、拼好饭（Claude）均支持工具调用
-- Ollama 需要支持工具调用的模型（如 `qwen2.5`）
+**窗口不出现 / 报 ImportError**
 
-### 节点操作失败
-- 确认在 Houdini 内运行（非独立 Python）
-- 检查节点路径是否为绝对路径（如 `/obj/geo1/box1`）
-- 查看工具执行结果中的具体错误信息
+1. 打开 **Houdini Python Shell**（Windows → Python Shell），粘贴以下代码：
+   ```python
+   import sys, traceback
+   sys.path.insert(0, r"C:\path\to\Houdini-Agent")
+   try:
+       import houdini_agent_launcher as l; l.show_tool()
+   except Exception:
+       traceback.print_exc()
+   ```
+   读取 Traceback，可以精确定位哪个导入失败。
 
-### UI 卡顿
-- 非 Houdini 工具（Shell、联网）应在后台线程运行
-- 如果执行 Shell 命令时 UI 卡顿，请更新到最新版本
+2. 常见原因：
+   - **路径不对** — 检查 `QUICK_SHELF_CODE.py` 中的 `launcher_file` 变量。
+   - **`lib/` 目录缺失** — 运行 `git submodule update --init` 或重新下载发布 ZIP。
+   - **PySide 版本不匹配** — Houdini ≤20.5 使用 PySide2，Houdini 21+ 使用 PySide6；`qt_compat.py` 会自动处理，若失败请确认 Houdini 版本。
+
+**窗口闪现后立即关闭**
+
+窗口在 `__init__` 阶段遇到了异常。检查 Houdini Python Shell 中的 Traceback。  
+临时设置 `HOUDINI_AGENT_DEV_RELOAD=1` 可强制全新加载模块：
+
+```python
+import os; os.environ["HOUDINI_AGENT_DEV_RELOAD"] = "1"
+```
+
+---
+
+### API Key 与连接
+
+**"Invalid API Key" / 401 错误**
+
+- 登录对应提供商控制台，确认密钥有效。
+- 在界面中点击 `···` → *设置 API Key…* → 重新输入并勾选 *保存到本地配置*。
+- 通过环境变量设置时，需重启 Houdini 使变量生效。
+
+**400 Bad Request（temperature 参数错误）**
+
+部分中转端点（例如 OF3D `gpt-5.5`）只接受 `temperature=1`，  
+而 VS Code Copilot 的 `customendpoint` 会发送 `temperature=0.1`，导致 400 错误。  
+解决方案：在使用该模型前先运行本地代理：
+
+```powershell
+python C:/Users/<你的用户名>/of3d_proxy.py   # 强制 temperature=1
+```
+然后将 `chatLanguageModels.json` 指向 `http://127.0.0.1:4891/v1/chat/completions`。
+
+**超时 / 连接中断**
+
+- 网页搜索使用 Brave → DuckDuckGo 降级；若两者都失败，关闭输入栏的 `Web` 开关。
+- 增大 `execute_shell` 参数的超时时间。
+- 使用 VPN / 公司代理：在启动 Houdini 前设置操作系统的 `HTTPS_PROXY` 环境变量。
+
+---
+
+### 三种模式对比（Ask / Agent / Plan）
+
+| | Ask（问答）| Agent（自主）| Plan（规划）|
+|---|---|---|---|
+| 读取节点信息 | ✓ | ✓ | ✓ |
+| 创建 / 修改 / 删除节点 | ✗ | ✓ | ✓（用户确认计划后）|
+| 执行 Python / Shell | ✗ | ✓ | ✓ |
+| 网页搜索 | ✓ | ✓ | ✓ |
+| 适合场景 | 诊断、问答 | 自主完成任务 | 复杂多步骤构建 |
+
+在输入栏的 `Agent / Ask / Plan` 下拉框切换模式。  
+**只想分析场景、不想改动任何内容？请用 Ask 模式。**
+
+---
+
+### 工具被策略拦截
+
+**"Ask mode blocked tool: execute_python"**
+
+当前处于 Ask 模式，该模式仅允许只读工具。  
+→ 切换到 Agent 或 Plan 模式即可。
+
+**"Missing required node_path for tool: get_node_parameters"**
+
+AI 没有传入 `node_path` 参数。请更明确地告诉 AI：  
+说 *"获取 `/obj/geo1/box1` 的参数"* 而不是 *"获取那个节点的参数"*。
+
+**确认弹窗频繁打断操作**
+
+勾选 *Confirm* 后，所有修改类工具都需要手动确认。  
+可取消工具栏中的 `Confirm` 复选框来跳过确认（Agent 模式下请谨慎）。
+
+**"工具已禁用" / 工具在列表中消失**
+
+打开 `···` → *插件管理器* → *工具* 标签，找到该工具并开启。
+
+---
+
+### Agent 卡住 / 提前停止
+
+1. 点击 **停止** 按钮，向运行中的 Agent 发送退出信号。
+2. 查看 **Policy（策略）** 按钮上的红色数字 — 数字非零说明存在策略失败。点击 → *Policy Timeline* 查看哪个工具被拦截及原因。
+3. 导出完整的诊断快照进行排查：
+   - 点击 **Policy** → **Export Diagnostics JSON**，或在输入框中输入 `/diagnostics`。
+   - 生成的 JSON 文件保存到 `cache/diagnostics/`，包含策略时间线、Harness 执行轨迹、调用记录和会话状态，**不包含对话内容**。
+4. 如果 Plan 模式的 Agent 循环在任务中途结束，自动续接机制会重新启动。若不生效，切换到 Agent 模式手动继续。
+
+---
+
+### 运行单元测试（开发者）
+
+无需 Houdini 即可运行——测试使用 `hou`、`PySide` 和第三方库的 Stub：
+
+```powershell
+# 从仓库根目录，使用 Houdini 自带的 Python：
+& "C:/Program Files/Side Effects Software/Houdini 18.5.759/python37/python.exe" `
+    -m unittest discover -s tests -v
+```
+
+或使用任意 Python 3.7+ 解释器（需已安装 PySide）：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+预期输出：`Ran 77 tests … OK`
+
+运行单个测试套件：
+```bash
+python -m unittest tests.test_harness_policy     # 策略引擎测试
+python -m unittest tests.test_tool_contracts     # 工具 Schema 契约测试
+python -m unittest tests.test_diagnostics_export # 诊断导出测试
+```
+
+---
+
+### 开发热更新（Hot-reload）
+
+默认情况下，Launcher 使用稳定的导入路径（不清除模块缓存）。  
+在积极开发阶段，可开启全量热更新，让每次启动都加载最新代码：
+
+```python
+# 在 QUICK_SHELF_CODE.py 中，将 "0" 改为 "1"：
+HOUDINI_AGENT_DEV_RELOAD = "1"
+```
+
+或在启动 Houdini 前设置环境变量：
+
+```powershell
+$env:HOUDINI_AGENT_DEV_RELOAD = "1"
+```
+
+生产环境设为 `"0"` 或保持未设置。
+
+---
 
 ### 更新
-- 点击工具栏中的 **Update** 按钮检查新版本
-- 插件启动时静默检查 GitHub，检测到新版本时在输入区上方显示 **更新通知横幅**
-- 横幅支持一键「立即更新」或关闭
-- 更新时保留 `config/`、`cache/`、`trainData/`、`plugins/`、`rules/` 目录
-- 更新后插件自动重启
+
+- 点击工具栏中的 **Update** 按钮检查新版本。
+- 插件启动时静默检查 GitHub，检测到新版本时在输入区上方显示 **更新通知横幅**。
+- 横幅支持一键「立即更新」或关闭。
+- 更新时保留 `config/`、`cache/`、`trainData/`、`plugins/`、`rules/` 目录。
+- 更新后插件自动重启。
 
 ## 版本历史
 

@@ -23,13 +23,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from shared.user_paths import UserPaths, normalize_username
+
 # ============================================================
 # 路径常量
 # ============================================================
 
 _PROJECT_ROOT = Path(__file__).parent.parent.parent          # DCC-ASSET-MANAGER/
 _CONFIG_DIR = _PROJECT_ROOT / "config"
-_RULES_FILE = _CONFIG_DIR / "user_rules.json"
 _RULES_DIR = _PROJECT_ROOT / "rules"
 
 # ============================================================
@@ -51,12 +52,21 @@ def _new_rule(title: str = "", content: str = "", enabled: bool = True) -> Dict[
 # 加载 / 保存 UI 规则 (config/user_rules.json)
 # ============================================================
 
-def _load_ui_rules() -> List[Dict[str, Any]]:
-    """从 config/user_rules.json 加载 UI 规则列表"""
-    if not _RULES_FILE.exists():
+def _get_ui_rules_path(username: Optional[str]) -> Path:
+    try:
+        uname = normalize_username(username or "")
+        return UserPaths(uname).user_rules_path()
+    except Exception:
+        return _CONFIG_DIR / "user_rules.json"
+
+
+def _load_ui_rules(username: Optional[str]) -> List[Dict[str, Any]]:
+    """从用户规则文件加载 UI 规则列表"""
+    rules_file = _get_ui_rules_path(username)
+    if not rules_file.exists():
         return []
     try:
-        with open(_RULES_FILE, "r", encoding="utf-8") as f:
+        with open(rules_file, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
             return data
@@ -66,11 +76,12 @@ def _load_ui_rules() -> List[Dict[str, Any]]:
         return []
 
 
-def _save_ui_rules(rules: List[Dict[str, Any]]):
-    """保存 UI 规则到 config/user_rules.json"""
-    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+def _save_ui_rules(rules: List[Dict[str, Any]], username: Optional[str]):
+    """保存 UI 规则到用户规则文件"""
+    rules_file = _get_ui_rules_path(username)
+    rules_file.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with open(_RULES_FILE, "w", encoding="utf-8") as f:
+        with open(rules_file, "w", encoding="utf-8") as f:
             json.dump(rules, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[Rules] Failed to save user_rules.json: {e}")
@@ -113,21 +124,29 @@ def _scan_file_rules() -> List[Dict[str, Any]]:
 # ============================================================
 
 # 内部缓存
-_ui_rules_cache: Optional[List[Dict[str, Any]]] = None
+_ui_rules_cache: Dict[str, List[Dict[str, Any]]] = {}
 
 
-def get_all_rules(force_reload: bool = False) -> List[Dict[str, Any]]:
+def _cache_key(username: Optional[str]) -> str:
+    try:
+        return normalize_username(username or "default")
+    except Exception:
+        return "default"
+
+
+def get_all_rules(username: Optional[str] = None, force_reload: bool = False) -> List[Dict[str, Any]]:
     """获取所有规则（UI 规则 + 文件规则）
 
     返回列表中每条规则包含:
         id, title, content, enabled, source("ui"|"file"), ...
     """
     global _ui_rules_cache
-    if force_reload or _ui_rules_cache is None:
-        _ui_rules_cache = _load_ui_rules()
+    key = _cache_key(username)
+    if force_reload or key not in _ui_rules_cache:
+        _ui_rules_cache[key] = _load_ui_rules(username)
 
     ui_rules = []
-    for r in _ui_rules_cache:
+    for r in _ui_rules_cache.get(key, []):
         rule = dict(r)
         rule.setdefault("source", "ui")
         ui_rules.append(rule)
@@ -136,81 +155,88 @@ def get_all_rules(force_reload: bool = False) -> List[Dict[str, Any]]:
     return ui_rules + file_rules
 
 
-def get_ui_rules() -> List[Dict[str, Any]]:
+def get_ui_rules(username: Optional[str] = None) -> List[Dict[str, Any]]:
     """仅获取 UI 规则"""
     global _ui_rules_cache
-    if _ui_rules_cache is None:
-        _ui_rules_cache = _load_ui_rules()
-    return list(_ui_rules_cache)
+    key = _cache_key(username)
+    if key not in _ui_rules_cache:
+        _ui_rules_cache[key] = _load_ui_rules(username)
+    return list(_ui_rules_cache.get(key, []))
 
 
-def add_rule(title: str = "", content: str = "") -> Dict[str, Any]:
+def add_rule(title: str = "", content: str = "", username: Optional[str] = None) -> Dict[str, Any]:
     """添加一条新的 UI 规则"""
     global _ui_rules_cache
-    if _ui_rules_cache is None:
-        _ui_rules_cache = _load_ui_rules()
+    key = _cache_key(username)
+    if key not in _ui_rules_cache:
+        _ui_rules_cache[key] = _load_ui_rules(username)
     rule = _new_rule(title=title, content=content, enabled=True)
-    _ui_rules_cache.append(rule)
-    _save_ui_rules(_ui_rules_cache)
+    _ui_rules_cache[key].append(rule)
+    _save_ui_rules(_ui_rules_cache[key], username)
     return rule
 
 
-def update_rule(rule_id: str, **kwargs):
+def update_rule(rule_id: str, username: Optional[str] = None, **kwargs):
     """更新指定 UI 规则的字段 (title, content, enabled)"""
     global _ui_rules_cache
-    if _ui_rules_cache is None:
-        _ui_rules_cache = _load_ui_rules()
-    for r in _ui_rules_cache:
+    key = _cache_key(username)
+    if key not in _ui_rules_cache:
+        _ui_rules_cache[key] = _load_ui_rules(username)
+    for r in _ui_rules_cache.get(key, []):
         if r.get("id") == rule_id:
             for k in ("title", "content", "enabled"):
                 if k in kwargs:
                     r[k] = kwargs[k]
-            _save_ui_rules(_ui_rules_cache)
+            _save_ui_rules(_ui_rules_cache[key], username)
             return True
     return False
 
 
-def delete_rule(rule_id: str) -> bool:
+def delete_rule(rule_id: str, username: Optional[str] = None) -> bool:
     """删除指定 UI 规则"""
     global _ui_rules_cache
-    if _ui_rules_cache is None:
-        _ui_rules_cache = _load_ui_rules()
-    before = len(_ui_rules_cache)
-    _ui_rules_cache = [r for r in _ui_rules_cache if r.get("id") != rule_id]
-    if len(_ui_rules_cache) < before:
-        _save_ui_rules(_ui_rules_cache)
+    key = _cache_key(username)
+    if key not in _ui_rules_cache:
+        _ui_rules_cache[key] = _load_ui_rules(username)
+    before = len(_ui_rules_cache.get(key, []))
+    _ui_rules_cache[key] = [r for r in _ui_rules_cache.get(key, []) if r.get("id") != rule_id]
+    if len(_ui_rules_cache.get(key, [])) < before:
+        _save_ui_rules(_ui_rules_cache[key], username)
         return True
     return False
 
 
-def set_rule_enabled(rule_id: str, enabled: bool) -> bool:
+def set_rule_enabled(rule_id: str, enabled: bool, username: Optional[str] = None) -> bool:
     """设置 UI 规则的启用/禁用状态"""
-    return update_rule(rule_id, enabled=enabled)
+    return update_rule(rule_id, username=username, enabled=enabled)
 
 
-def save_all_ui_rules(rules: List[Dict[str, Any]]):
+def save_all_ui_rules(rules: List[Dict[str, Any]], username: Optional[str] = None):
     """批量保存 UI 规则（从编辑器全量写回）"""
     global _ui_rules_cache
-    _ui_rules_cache = rules
-    _save_ui_rules(_ui_rules_cache)
+    key = _cache_key(username)
+    _ui_rules_cache[key] = rules
+    _save_ui_rules(_ui_rules_cache[key], username)
 
 
-def reload_rules():
+def reload_rules(username: Optional[str] = None):
     """强制重新加载所有规则（清除缓存）"""
     global _ui_rules_cache
-    _ui_rules_cache = None
+    key = _cache_key(username)
+    if key in _ui_rules_cache:
+        del _ui_rules_cache[key]
 
 
 # ============================================================
 # Prompt 注入
 # ============================================================
 
-def get_rules_for_prompt() -> str:
+def get_rules_for_prompt(username: Optional[str] = None) -> str:
     """将所有启用的规则合并为一段文本，用 <user_rules> 标签包裹
 
     返回空字符串表示没有任何启用的规则。
     """
-    all_rules = get_all_rules()
+    all_rules = get_all_rules(username=username)
     enabled = [r for r in all_rules if r.get("enabled", True)]
     if not enabled:
         return ""

@@ -1,23 +1,22 @@
-"""
-Houdini Agent - Quick Shelf Tool Script
-Copy this code into a Houdini Shelf Tool for one-click launch.
-"""
+import sys, os, importlib.util
 
-import sys
-import os
+# 开发测试预设：1=启用热重载，0=普通稳定启动
+HOUDINI_AGENT_DEV_RELOAD = "0"
+os.environ["HOUDINI_AGENT_DEV_RELOAD"] = HOUDINI_AGENT_DEV_RELOAD
 
-# Tool path
-tool_path = r"C:\path\to\Houdini-Agent"
-if tool_path not in sys.path:
-    sys.path.insert(0, tool_path)
-
-# Reload module (support hot-reload)
-if 'main' in sys.modules:
-    import importlib
-    import main
-    importlib.reload(main)
+if sys.platform.startswith('win'):
+    launcher_file = r"U:\CG_VFX\sfxLib\sfx_third_party\houdini\extensions\Houdini-Agent\houdini_agent_launcher.py"
 else:
-    import main
+    launcher_file = r"/mnt/CG_VFX/sfxLib/sfx_third_party/houdini/extensions/Houdini-Agent/houdini_agent_launcher.py"
 
-# Launch
-main.show_tool()
+mod_name = "houdini_agent_launcher"
+# 每次都重新从文件加载，避免 spec 丢失导致 reload 报错
+if mod_name in sys.modules:
+    del sys.modules[mod_name]
+
+spec = importlib.util.spec_from_file_location(mod_name, launcher_file)
+mod = importlib.util.module_from_spec(spec)
+sys.modules[mod_name] = mod
+spec.loader.exec_module(mod)
+
+mod.show_tool()

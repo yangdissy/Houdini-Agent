@@ -19,7 +19,7 @@ class HeaderMixin:
         header.setObjectName("headerFrame")
         
         outer = QtWidgets.QVBoxLayout(header)
-        outer.setContentsMargins(8, 2, 8, 2)
+        outer.setContentsMargins(8, 4, 8, 4)
         outer.setSpacing(0)
         
         # -------- 单行：Provider + Model + keyStatus + Web + Think + ⋯ --------
@@ -31,20 +31,22 @@ class HeaderMixin:
         self.provider_combo.setObjectName("providerCombo")
         self.provider_combo.addItem("Ollama", 'ollama')
         self.provider_combo.addItem("DeepSeek", 'deepseek')
-        self.provider_combo.addItem("GLM", 'glm')
-        self.provider_combo.addItem("OpenAI", 'openai')
-        self.provider_combo.addItem("Duojie", 'duojie')
-        self.provider_combo.addItem("OpenRouter", 'openrouter')
+        # self.provider_combo.addItem("GLM", 'glm')
+        # self.provider_combo.addItem("OpenAI", 'openai')
+        # self.provider_combo.addItem("Duojie", 'duojie')
+        # self.provider_combo.addItem("OpenRouter", 'openrouter')
         self.provider_combo.addItem("Kimi Coding", 'kimi_coding')
+        self.provider_combo.addItem("SiliconFlow", 'siliconflow')
+        self.provider_combo.addItem("OF3D", 'of3d')
         self.provider_combo.addItem("Custom", 'custom')
         self.provider_combo.setMinimumWidth(70)
-        self.provider_combo.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
-        row.addWidget(self.provider_combo)
+        self.provider_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        row.addWidget(self.provider_combo, 1)
         
         # Custom 配置按钮（仅在 Custom provider 时可见）
         self.btn_custom_config = QtWidgets.QPushButton("⚙")
         self.btn_custom_config.setObjectName("btnCustomConfig")
-        self.btn_custom_config.setFixedSize(22, 22)
+        self.btn_custom_config.setFixedSize(26, 26)
         self.btn_custom_config.setCursor(QtCore.Qt.PointingHandCursor)
         self.btn_custom_config.setToolTip("配置 Custom Model 的 URL、API Key 和模型名")
         self.btn_custom_config.setVisible(False)
@@ -56,7 +58,7 @@ class HeaderMixin:
         self.model_combo.setObjectName("modelCombo")
         self._model_map = {
             'ollama': ['qwen2.5:14b', 'qwen2.5:7b', 'llama3:8b', 'mistral:7b'],
-            'deepseek': ['deepseek-chat', 'deepseek-reasoner'],
+            'deepseek': ['deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-chat', 'deepseek-reasoner'],  # chat/reasoner 将于 2026/07/24 弃用
             'glm': ['glm-4.7'],
             'openai': ['gpt-5.2', 'gpt-5.3-codex'],
             'duojie': [
@@ -89,7 +91,20 @@ class HeaderMixin:
                 'qwen/qwen3-235b-a22b',
                 'mistralai/mistral-large-2512',
             ],
-            'kimi_coding': ['kimi-for-coding', 'k2p5'],
+            'kimi_coding': ['kimi-for-coding'],
+            'of3d': ['gpt-5.5', 'chatgpt-4o-latest'],
+            'siliconflow': [
+                'deepseek-ai/DeepSeek-V4-Pro',
+                'deepseek-ai/DeepSeek-V4-Flash',
+                'deepseek-ai/DeepSeek-V3',
+                'deepseek-ai/DeepSeek-R1',
+                'Pro/deepseek-ai/DeepSeek-V3',
+                'Pro/deepseek-ai/DeepSeek-R1',
+                'Qwen/Qwen3-235B-A22B',
+                'Qwen/Qwen3-30B-A3B',
+                'Qwen/Qwen3-8B',
+                'THUDM/GLM-Z1-32B-0414',
+            ],
             'custom': [],  # 由用户通过配置对话框动态填充
         }
         # Custom provider 的运行时配置（从持久化配置加载）
@@ -104,7 +119,8 @@ class HeaderMixin:
         self._load_custom_provider_config()
         self._model_context_limits = {
             'qwen2.5:14b': 32000, 'qwen2.5:7b': 32000, 'llama3:8b': 8000, 'mistral:7b': 32000,
-            'deepseek-chat': 128000, 'deepseek-reasoner': 128000,
+            'deepseek-v4-flash': 1048576, 'deepseek-v4-pro': 1048576,
+            'deepseek-chat': 1048576, 'deepseek-reasoner': 1048576,
             'glm-4.7': 200000,
             'gpt-5.2': 128000,
             'gpt-5.3-codex': 200000,
@@ -139,6 +155,20 @@ class HeaderMixin:
             # Kimi Coding
             'kimi-for-coding': 256000,
             'k2p5': 262144,
+            # OF3D
+            'chatgpt-4o-latest': 128000,
+            'gpt-5.5': 128000,
+            # SiliconFlow
+            'deepseek-ai/DeepSeek-V4-Pro': 1048576,
+            'deepseek-ai/DeepSeek-V4-Flash': 1048576,
+            'deepseek-ai/DeepSeek-V3': 65536,
+            'deepseek-ai/DeepSeek-R1': 16384,
+            'Pro/deepseek-ai/DeepSeek-V3': 65536,
+            'Pro/deepseek-ai/DeepSeek-R1': 16384,
+            'Qwen/Qwen3-235B-A22B': 131072,
+            'Qwen/Qwen3-30B-A3B': 32768,
+            'Qwen/Qwen3-8B': 32768,
+            'THUDM/GLM-Z1-32B-0414': 32768,
         }
         # 模型特性配置
         self._model_features = {
@@ -148,6 +178,8 @@ class HeaderMixin:
             'llama3:8b':                  {'supports_prompt_caching': True, 'supports_vision': False},
             'mistral:7b':                 {'supports_prompt_caching': True, 'supports_vision': False},
             # DeepSeek
+            'deepseek-v4-flash':           {'supports_prompt_caching': True, 'supports_vision': False},
+            'deepseek-v4-pro':             {'supports_prompt_caching': True, 'supports_vision': False},
             'deepseek-chat':              {'supports_prompt_caching': True, 'supports_vision': False},
             'deepseek-reasoner':          {'supports_prompt_caching': True, 'supports_vision': False},
             # GLM
@@ -189,6 +221,20 @@ class HeaderMixin:
             # Kimi Coding
             'kimi-for-coding':                    {'supports_prompt_caching': False, 'supports_vision': False},
             'k2p5':                               {'supports_prompt_caching': False, 'supports_vision': True},
+            # OF3D
+            'chatgpt-4o-latest':                  {'supports_prompt_caching': False, 'supports_vision': True},
+            'gpt-5.5':                            {'supports_prompt_caching': False, 'supports_vision': False},
+            # SiliconFlow
+            'deepseek-ai/DeepSeek-V4-Pro':        {'supports_prompt_caching': False, 'supports_vision': False},
+            'deepseek-ai/DeepSeek-V4-Flash':      {'supports_prompt_caching': False, 'supports_vision': False},
+            'deepseek-ai/DeepSeek-V3':            {'supports_prompt_caching': False, 'supports_vision': False},
+            'deepseek-ai/DeepSeek-R1':            {'supports_prompt_caching': False, 'supports_vision': False},
+            'Pro/deepseek-ai/DeepSeek-V3':        {'supports_prompt_caching': False, 'supports_vision': False},
+            'Pro/deepseek-ai/DeepSeek-R1':        {'supports_prompt_caching': False, 'supports_vision': False},
+            'Qwen/Qwen3-235B-A22B':               {'supports_prompt_caching': False, 'supports_vision': False},
+            'Qwen/Qwen3-30B-A3B':                 {'supports_prompt_caching': False, 'supports_vision': False},
+            'Qwen/Qwen3-8B':                      {'supports_prompt_caching': False, 'supports_vision': False},
+            'THUDM/GLM-Z1-32B-0414':              {'supports_prompt_caching': False, 'supports_vision': False},
         }
         self._refresh_models('ollama')
         self.model_combo.setMinimumWidth(100)
@@ -204,6 +250,14 @@ class HeaderMixin:
         from houdini_agent.qt_compat import QtCore as _qc
         self.key_status.setTextInteractionFlags(_qc.Qt.NoTextInteraction)
         row.addWidget(self.key_status)
+
+        # 当前用户
+        self.user_label = QtWidgets.QLabel()
+        self.user_label.setObjectName("userLabel")
+        uname = getattr(self, "_username", "")
+        self.user_label.setText(uname or "")
+        self.user_label.setToolTip("当前用户")
+        row.addWidget(self.user_label)
         
         # Web / Think 开关
         self.web_check = QtWidgets.QCheckBox("Web")
@@ -220,7 +274,7 @@ class HeaderMixin:
         # ⋯ 溢出菜单按钮
         self.btn_overflow = QtWidgets.QPushButton("···")
         self.btn_overflow.setObjectName("btnOverflow")
-        self.btn_overflow.setFixedSize(24, 22)
+        self.btn_overflow.setFixedSize(26, 26)
         self.btn_overflow.setCursor(QtCore.Qt.PointingHandCursor)
         self.btn_overflow.clicked.connect(self._show_overflow_menu)
         row.addWidget(self.btn_overflow)
@@ -268,7 +322,9 @@ class HeaderMixin:
         """显示溢出菜单：低频功能集中在此"""
         menu = QtWidgets.QMenu(self)
         
-        menu.addAction("API Key", self.btn_key.click)
+        # OF3D 内置 key，不暴露 API Key 入口
+        if self._current_provider() != 'of3d':
+            menu.addAction("API Key", self.btn_key.click)
         menu.addAction("Clear Chat", self.btn_clear.click)
         menu.addAction("Cache", self.btn_cache.click)
         menu.addAction("Optimize", self.btn_optimize.click)
@@ -278,6 +334,8 @@ class HeaderMixin:
         menu.addSeparator()
         menu.addAction(tr('rules.menu_label'), self._open_rules_editor)
         menu.addAction(tr('plugin.menu_label'), self._open_plugin_manager)
+        if hasattr(self, "_request_user_switch"):
+            menu.addAction("Switch User", self._request_user_switch)
         menu.addSeparator()
         
         # 语言子菜单
@@ -301,7 +359,7 @@ class HeaderMixin:
         """打开用户自定义规则编辑器"""
         try:
             from .cursor_widgets import RulesEditorDialog
-            dlg = RulesEditorDialog(parent=self)
+            dlg = RulesEditorDialog(parent=self, username=getattr(self, "_username", None))
             dlg.exec_()
         except Exception as e:
             print(f"[Header] Failed to open rules editor: {e}")
@@ -365,8 +423,8 @@ class HeaderMixin:
     def _load_custom_provider_config(self):
         """从持久化配置文件加载 Custom Provider 设置"""
         try:
-            from shared.common_utils import load_config
-            cfg, _ = load_config('ai', dcc_type='houdini')
+            from shared.common_utils import load_user_config
+            cfg, _ = load_user_config(getattr(self, "_username", ""), 'ai', dcc_type='houdini')
             if cfg:
                 self._custom_provider_config['api_url'] = cfg.get('custom_api_url', '')
                 self._custom_provider_config['api_key'] = cfg.get('custom_api_key', '')
@@ -389,8 +447,8 @@ class HeaderMixin:
     def _save_custom_provider_config(self):
         """将 Custom Provider 设置持久化到配置文件"""
         try:
-            from shared.common_utils import load_config, save_config
-            cfg, _ = load_config('ai', dcc_type='houdini')
+            from shared.common_utils import load_user_config, save_user_config
+            cfg, _ = load_user_config(getattr(self, "_username", ""), 'ai', dcc_type='houdini')
             cfg = cfg or {}
             cc = self._custom_provider_config
             cfg['custom_api_url'] = cc['api_url']
@@ -399,7 +457,7 @@ class HeaderMixin:
             cfg['custom_context_limit'] = str(cc['context_limit'])
             cfg['custom_supports_vision'] = 'true' if cc['supports_vision'] else 'false'
             cfg['custom_supports_fc'] = 'true' if cc['supports_fc'] else 'false'
-            save_config('ai', cfg, dcc_type='houdini')
+            save_user_config(getattr(self, "_username", ""), cfg, 'ai', dcc_type='houdini')
         except Exception as e:
             print(f"[Header] 保存 Custom 配置失败: {e}")
 

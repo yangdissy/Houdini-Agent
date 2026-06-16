@@ -13,7 +13,9 @@ import re
 from typing import List, Dict, Optional, Any, Callable, Generator, Tuple
 from urllib.parse import quote_plus
 
-from shared.common_utils import load_config, save_config
+from shared.common_utils import load_config, save_config, load_user_config, save_user_config
+from ..core.harness_engine import is_harness_v2_enabled
+from ..core.streaming_tool_executor import StreamingToolExecutor
 
 # 强制使用本地 lib 目录中的依赖库
 _lib_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'lib')
@@ -57,18 +59,18 @@ class WebSearcher:
         'Accept-Encoding': 'gzip, deflate',
     }
 
-    # 搜索结果缓存：key -> (timestamp, result)
-    _search_cache: Dict[str, tuple] = {}
+    # 缓存 TTL 常量（类级别，无隐私风险）
     _CACHE_TTL = 300  # 5 分钟
-
-    # 网页正文缓存：url -> (timestamp, text_lines)
-    _page_cache: Dict[str, tuple] = {}
     _PAGE_CACHE_TTL = 600  # 10 分钟
 
-    # Trafilatura 可用性
+    # Trafilatura 可用性（类级别，是能力检测不是用户数据）
     _HAS_TRAFILATURA = False
-    
+
     def __init__(self):
+        # 搜索结果缓存：实例变量，避免跨用户缓存泄露
+        self._search_cache: Dict[str, tuple] = {}
+        # 网页正文缓存：实例变量，同上
+        self._page_cache: Dict[str, tuple] = {}
         # 检测 trafilatura 可用性（只检测一次）
         if not WebSearcher._HAS_TRAFILATURA:
             try:
@@ -125,11 +127,13 @@ class WebSearcher:
     @staticmethod
     def _decode_entities(text: str) -> str:
         """解码 HTML 实体: &amp; &lt; &gt; &quot; &#xxxx; 等"""
+        if text is None:
+            return ""
         import html as _html
         try:
             return _html.unescape(text)
         except Exception:
-            return text
+            return text or ""
     
     # ------------------------------------------------------------------
     # 搜索（带缓存 + 三级降级）
@@ -581,7 +585,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "create_node",
-            "description": "创建单个节点。节点类型格式：'box' 或 'sop/box'（推荐直接写节点名如'box'，系统会自动识别类别）。如果创建失败，必须调用 search_node_types 查找正确的节点类型名再重试，不要盲目重试。",
+            "description": "创建单个孤立节点。若任务需要创建 2 个及以上节点并建立连接，必须优先使用 create_nodes_batch 一次声明 nodes 和 connections，以便系统自动连接、整理布局并减少路径猜测。节点类型格式：'box' 或 'sop/box'（推荐直接写节点名如'box'，系统会自动识别类别）。如果创建失败，必须调用 search_node_types 查找正确的节点类型名再重试，不要盲目重试。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -601,7 +605,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "create_nodes_batch",
-            "description": "批量创建节点并自动连接。nodes 数组中每个元素需要 id（临时标识）和 type（节点类型）；connections 数组指定连接关系，from/to 使用 nodes 中的 id。",
+            "description": "批量创建节点、自动连接并整理本批节点布局。只要需要创建 2 个及以上相关节点，尤其是 box->scatter->copytopoints 这类小网络，也应优先使用此工具；不要拆成多个 create_node + connect_nodes。nodes 数组中每个元素需要 id（临时标识）和 type（节点类型）；connections 数组指定连接关系，from/to 使用 nodes 中的 id。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -638,7 +642,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "connect_nodes",
-            "description": "连接两个节点。连接前应先用 get_node_inputs 查询目标节点的输入端口含义。input_index: 0=第一输入, 1=第二输入(如copytopoints的目标点), 2=第三输入。",
+            "description": "连接两个已有节点。仅在节点已经存在或需要补连/改线时使用；如果节点还没创建，优先用 create_nodes_batch 同时创建并连接。连接前应先用 get_node_inputs 查询目标节点的输入端口含义。input_index: 0=第一输入, 1=第二输入(如copytopoints的目标点), 2=第三输入。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -659,6 +663,53 @@ HOUDINI_TOOLS = [
                 "type": "object",
                 "properties": {
                     "node_path": {"type": "string", "description": "要删除的节点完整路径，如 '/obj/geo1/box1'"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rename_node",
+            "description": "重命名节点。将节点的名称改为新名称，节点路径中的名称部分将随之更新。名称中的空格和特殊字符会被自动替换为下划线。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "节点完整路径，如 '/obj/geo1/box1'"},
+                    "new_name": {"type": "string", "description": "新名称，如 'my_scatter'。建议仅使用字母、数字和下划线"}
+                },
+                "required": ["node_path", "new_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "disconnect_nodes",
+            "description": "断开节点的输入连接。可断开指定端口，或不传 input_index 以断开该节点的全部输入连接。网络重构、替换上游节点时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "要断开输入的节点完整路径，如 '/obj/geo1/scatter1'"},
+                    "input_index": {"type": "integer", "description": "要断开的输入端口索引（0-based）。省略则断开所有输入"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_node_flags",
+            "description": "设置节点的 bypass / template / lock 标志。bypass=True 使节点变灰并让数据透传（常用于调试对比）；template=True 将节点设为橙色模板节点；lock=True 锁定节点防止误修改。至少指定一个标志。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "节点完整路径，如 '/obj/geo1/box1'"},
+                    "bypass": {"type": "boolean", "description": "true=启用 bypass（节点变灰，数据透传），false=关闭 bypass"},
+                    "template": {"type": "boolean", "description": "true=设为模板节点（橙色），false=取消模板"},
+                    "lock": {"type": "boolean", "description": "true=锁定节点（防止修改），false=解锁"}
                 },
                 "required": ["node_path"]
             }
@@ -1119,7 +1170,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "layout_nodes",
-            "description": "自动布局节点位置。在 verify_and_summarize 通过后、创建 NetworkBox 之前调用，确保节点排列整齐。支持多种布局策略：auto（智能选择）、grid（网格排列）、columns（按拓扑深度分列）。",
+            "description": "自动布局节点位置。仅在以下两种情况下调用：1) 用户明确要求整理/排列节点；2) 即将调用 create_network_box 之前（NetworkBox.fitAroundContents() 依赖节点位置）。注意：必须通过 node_paths 指定要布局的节点，不要省略 node_paths——省略会触发 layoutChildren() 重排整个网络中所有节点，破坏用户已有的手动布局。支持布局策略：auto（智能选择）、tidy（推荐，美观拓扑布局：主链垂直、分支左右展开、多输入节点形成清晰汇合）、grid（网格排列）、columns（tidy 的兼容别名）。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1130,12 +1181,12 @@ HOUDINI_TOOLS = [
                     "node_paths": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "要布局的节点完整路径列表。留空则布局整个网络的所有子节点。"
+                        "description": "要布局的节点完整路径列表。强烈建议传入新建节点的路径，避免影响已有节点的手动布局。仅在用户明确要求整理整个网络时才省略此参数。"
                     },
                     "method": {
                         "type": "string",
-                        "enum": ["auto", "grid", "columns"],
-                        "description": "布局方法。auto=智能选择（推荐），grid=网格排列，columns=按拓扑深度分列。默认 auto。"
+                        "enum": ["auto", "tidy", "grid", "columns"],
+                        "description": "布局方法。tidy=推荐的美观拓扑布局，auto=智能选择，grid=网格排列，columns=tidy 的兼容别名。默认 auto。"
                     },
                     "spacing": {
                         "type": "number",
@@ -1378,8 +1429,11 @@ class AIClient:
     DUOJIE_ANTHROPIC_API_URL = "https://api.duojie.games/v1/messages"  # 拼好饭中转站（Anthropic 协议）
     OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"  # OpenRouter（OpenAI 兼容）
     KIMI_CODING_API_URL = "https://api.kimi.com/coding/v1/messages"  # Kimi K2.5 Coding（Anthropic 协议）
-    _KIMI_CODING_DEFAULT_KEY = "sk-kimi-HpyZ2cKXHe198GrRxasRMFXwXrzzu1CFHFCpXe1ariIxvkCyAvOnKx9wCEf3MGyD"
-    
+    SILICONFLOW_API_URL = "https://api.siliconflow.cn/v1/chat/completions"  # SiliconFlow（OpenAI 化）
+    OF3D_API_URL = "https://oneapi.of3d.com/v1/chat/completions"  # OF3D 公司内部中转（OpenAI 化）
+    # OF3D 统一 key（base64 混淆，非加密，仅防止明文直接可见）
+    _OF3D_KEY_B64: str = 'c2stOHREQnptS3NYZklLcjEzdTI4NTRBMjIyOWU0OTQyQWE5MjViQTk4NjA3QTgxMzQx'
+
     # 使用 Anthropic 协议的 Duojie 模型（GLM 系等）
     _DUOJIE_ANTHROPIC_MODELS = frozenset({'glm-4.7', 'glm-5', 'glm-5-turbo', 'glm-5.1'})
 
@@ -1396,7 +1450,11 @@ class AIClient:
     _CUSTOM_API_URL: str = ''
     _CUSTOM_SUPPORTS_FC: bool = True
 
-    def __init__(self, api_key: Optional[str] = None):
+    # Kimi Coding 内置预设 Key（默认空：未配置时优雅降级为「无 key」，而非抛 AttributeError）
+    _KIMI_CODING_DEFAULT_KEY: str = ''
+
+    def __init__(self, api_key: Optional[str] = None, username: Optional[str] = None):
+        self._username = (username or "").strip().lower() or None
         self._api_keys: Dict[str, Optional[str]] = {
             'openai': api_key or self._read_api_key('openai'),
             'deepseek': self._read_api_key('deepseek'),
@@ -1405,12 +1463,16 @@ class AIClient:
             'duojie': self._read_api_key('duojie'),
             'openrouter': self._read_api_key('openrouter'),
             'kimi_coding': self._read_api_key('kimi_coding'),
+            'siliconflow': self._read_api_key('siliconflow'),
+            'of3d': self._read_api_key('of3d') or self._decode_of3d_key(),
             'custom': self._read_api_key('custom'),
         }
         self._ssl_context = self._create_ssl_context()
         self._web_searcher = WebSearcher()
         self._tool_executor: Optional[Callable[[str, dict], dict]] = None
         self._batch_tool_executor: Optional[Callable[[list], list]] = None
+        self._harness_v2_streaming_executor_enabled = is_harness_v2_enabled(default=True)
+        self._streaming_tool_executor: Optional[StreamingToolExecutor] = None
         
         # Ollama 配置
         self._ollama_base_url = "http://localhost:11434"
@@ -1456,6 +1518,34 @@ class AIClient:
         如果未设置，批量执行会退化为逐个调用 _tool_executor。
         """
         self._batch_tool_executor = executor
+        if self._streaming_tool_executor is not None:
+            self._streaming_tool_executor.update_batch_executor(executor)
+
+    def _call_tool_executor(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        if not self._tool_executor:
+            return {"success": False, "error": "未设置工具执行器"}
+        return self._tool_executor(tool_name, **arguments)
+
+    def _get_streaming_tool_executor(self) -> StreamingToolExecutor:
+        def _runtime_profile_provider() -> Dict[str, set]:
+            try:
+                from .tool_registry import get_tool_registry
+                return get_tool_registry().build_streaming_executor_profile()
+            except Exception:
+                return {}
+
+        if self._streaming_tool_executor is None:
+            self._streaming_tool_executor = StreamingToolExecutor(
+                tool_executor=self._call_tool_executor,
+                web_search_executor=self._execute_web_search,
+                fetch_webpage_executor=self._execute_fetch_webpage,
+                batch_tool_executor=self._batch_tool_executor,
+                runtime_profile_provider=_runtime_profile_provider,
+            )
+        else:
+            self._streaming_tool_executor.update_batch_executor(self._batch_tool_executor)
+            self._streaming_tool_executor.update_runtime_profile_provider(_runtime_profile_provider)
+        return self._streaming_tool_executor
 
     # ----------------------------------------------------------
     # 工具结果分页：按行分段，让 AI 自主判断是否需要更多
@@ -1476,6 +1566,63 @@ class AIClient:
         'create_node', 'create_nodes_batch', 'connect_nodes',
         'set_node_parameter', 'create_wrangle_node',
     })
+    _SIMPLE_SUCCESS_TOOLS = frozenset({
+        'create_node', 'get_node_parameters', 'get_node_inputs',
+        'list_children', 'read_selection', 'check_errors',
+    })
+    _DEEP_THINK_TOOLS = frozenset({
+        'connect_nodes', 'delete_node', 'disconnect_nodes', 'rename_node',
+        'set_node_parameter', 'batch_set_parameters', 'create_nodes_batch',
+        'create_wrangle_node', 'copy_node', 'set_display_flag', 'set_node_flags',
+        'execute_python', 'execute_shell', 'save_hip', 'run_skill',
+    })
+
+    @classmethod
+    def _thinking_followup_hint(
+        cls,
+        enable_thinking: bool,
+        round_failed: bool,
+        parsed_calls: List[Tuple[str, str, Dict[str, Any], Dict[str, Any]]],
+        results_ordered: List[Dict[str, Any]],
+        iteration: int,
+    ) -> str:
+        """Return an adaptive follow-up hint after tool execution.
+
+        The hint guides the model without forcing every successful tool round
+        into a full visible <think> block.
+        """
+        if not enable_thinking:
+            return ""
+
+        tool_names = [call[1] for call in parsed_calls if len(call) > 1]
+        tool_count = len(tool_names)
+
+        if round_failed:
+            return (
+                "\n\n[注意：上述工具调用返回了错误，这是工具调用层面的参数或执行错误，"
+                "不是Houdini节点cooking错误，无需调用check_errors。"
+                "请直接根据错误信息修正参数后重新调用该工具。"
+                "如需继续，请使用简短或深度 <think> 分析失败原因和下一步；"
+                "不要为了格式输出冗长复盘。]"
+            )
+
+        if tool_count == 1 and tool_names[0] in cls._SIMPLE_SUCCESS_TOOLS and iteration <= 1:
+            return (
+                "\n\n[提示：工具已成功。如果用户请求已经满足，请直接简短总结；"
+                "不要为了格式而输出 <think>。只有还需要继续操作时才用简短 <think> 说明下一步。]"
+            )
+
+        if tool_count > 1 or any(name in cls._DEEP_THINK_TOOLS for name in tool_names):
+            return (
+                "\n\n[提示：工具已成功。如还需继续执行，请最多用 1-3 行简短 <think> 说明状态和下一步；"
+                "只有在连接、删除、代码执行、失败恢复或多步网络规划时才使用完整深度思考。"
+                "如任务已完成，请直接总结。]"
+            )
+
+        return (
+            "\n\n[提示：工具已成功。如任务已完成，请直接总结；"
+            "只有需要继续操作时才使用简短 <think>。]"
+        )
 
     @staticmethod
     def _paginate_result(text: str, max_lines: int = 50) -> str:
@@ -2009,11 +2156,29 @@ class AIClient:
     # ★ 主动式上下文压缩（agent_loop 内使用）
     # ----------------------------------------------------------
 
+    @staticmethod
+    def _count_tokens_for_text(text: str) -> int:
+        """对单段纯文本做中英混合 token 估算。
+
+        规则：
+          - 中文字符（U+4E00–U+9FFF）：约 1 字符 / token（实测 ~1.0–1.3）
+          - 其余字符（英文、数字、标点等）：约 4 字符 / token
+        用整数运算替代浮点除，避免精度噪声。
+        """
+        if not text:
+            return 0
+        chinese = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+        other = len(text) - chinese
+        # chinese * 1 token/char，other / 4 chars/token
+        return chinese + other // 4
+
     @classmethod
     def _estimate_messages_tokens(cls, messages: list, tools: Optional[list] = None) -> int:
         """快速估算消息列表 + 工具定义的 token 数。
 
         使用启发式方法，避免每轮都调用 tiktoken（性能开销）。
+        中英混合文本通过 _count_tokens_for_text 分别计算，修正了
+        纯 // 3 对中文内容约 30% 的低估问题。
         """
         total = 0
         for msg in messages:
@@ -2021,30 +2186,28 @@ class AIClient:
             if isinstance(content, list):
                 for part in content:
                     if isinstance(part, dict) and part.get('type') == 'text':
-                        total += len(part.get('text', '')) // 3
+                        total += cls._count_tokens_for_text(part.get('text', ''))
                     elif isinstance(part, dict) and part.get('type') == 'image_url':
                         total += 765
                     elif isinstance(part, str):
-                        total += len(part) // 3
+                        total += cls._count_tokens_for_text(part)
             else:
-                # 快速估算：英文 ~4 chars/token, 中文 ~1.5 chars/token
-                # 综合取 ~3 chars/token
-                total += len(content) // 3
+                total += cls._count_tokens_for_text(content)
             # tool_calls 开销
             tcs = msg.get('tool_calls')
             if tcs:
                 for tc in tcs:
                     fn = tc.get('function', {})
-                    total += len(fn.get('name', '')) + len(fn.get('arguments', '')) // 3 + 8
+                    total += len(fn.get('name', '')) + cls._count_tokens_for_text(fn.get('arguments', '')) + 8
             total += 4  # 消息格式开销
 
         # 工具定义 token（每个工具 ~100-200 tokens）
         if tools:
             for t in tools:
                 fn = t.get('function', {})
-                total += len(fn.get('description', '')) // 4
+                total += cls._count_tokens_for_text(fn.get('description', ''))
                 params = fn.get('parameters', {})
-                total += len(json.dumps(params)) // 4 if params else 0
+                total += cls._count_tokens_for_text(json.dumps(params)) if params else 0
                 total += 30  # 函数结构开销
 
         return total
@@ -2223,8 +2386,8 @@ class AIClient:
             to_summarize = rounds[:-3]
             to_keep = rounds[-3:]
 
-            # 确定摘要模型（优先用 deepseek-chat，否则用当前模型）
-            summary_model = 'deepseek-chat'
+            # 确定摘要模型（优先用 deepseek-v4-flash，否则用当前模型）
+            summary_model = 'deepseek-v4-flash'
             summary_provider = 'deepseek'
             # 检查是否有 deepseek key
             if not self._get_api_key('deepseek'):
@@ -2295,31 +2458,50 @@ class AIClient:
             'duojie': ['DUOJIE_API_KEY', 'DCC_AI_DUOJIE_API_KEY'],
             'openrouter': ['OPENROUTER_API_KEY', 'DCC_AI_OPENROUTER_API_KEY'],
             'kimi_coding': ['KIMI_CODING_API_KEY', 'DCC_AI_KIMI_CODING_API_KEY'],
+            'siliconflow': ['SILICONFLOW_API_KEY', 'DCC_AI_SILICONFLOW_API_KEY'],
+            'of3d': ['OF3D_API_KEY', 'DCC_AI_OF3D_API_KEY'],
             'custom': ['CUSTOM_API_KEY', 'DCC_AI_CUSTOM_API_KEY'],
         }
         for env_var in env_map.get(provider, []):
             key = os.environ.get(env_var)
             if key:
                 return key
-        cfg, _ = load_config('ai', dcc_type='houdini')
+        if self._username:
+            cfg, _ = load_user_config(self._username, 'ai', dcc_type='houdini')
+        else:
+            # 未设用户名时不从共享全局配置读取 API key，防止密钥泄露给其他成员
+            cfg = {}
         if cfg:
             key_map = {
                 'openai': 'openai_api_key', 'deepseek': 'deepseek_api_key',
                 'glm': 'glm_api_key', 'duojie': 'duojie_api_key',
                 'openrouter': 'openrouter_api_key',
                 'kimi_coding': 'kimi_coding_api_key',
+                'siliconflow': 'siliconflow_api_key',
+                'of3d': 'of3d_api_key',
                 'custom': 'custom_api_key',
             }
             return cfg.get(key_map.get(provider, '')) or None
-        # Kimi Coding 内置预设 Key
+        # Kimi Coding 内置预设 Key（为空则视为未配置）
         if provider == 'kimi_coding':
-            return self._KIMI_CODING_DEFAULT_KEY
+            return self._KIMI_CODING_DEFAULT_KEY or None
         return None
+
+    @classmethod
+    def _decode_of3d_key(cls) -> str:
+        try:
+            import base64
+            return base64.b64decode(cls._OF3D_KEY_B64).decode()
+        except Exception:
+            return ''
 
     def has_api_key(self, provider: str = 'openai') -> bool:
         provider = (provider or 'openai').lower()
         # Ollama 总是可用（本地服务）
         if provider == 'ollama':
+            return True
+        # OF3D 内置 key，始终可用
+        if provider == 'of3d':
             return True
         # Custom: 只要配置了 URL 就算可用（Key 可选）
         if provider == 'custom':
@@ -2336,13 +2518,21 @@ class AIClient:
             return False
         self._api_keys[provider] = key
         if persist:
-            cfg, _ = load_config('ai', dcc_type='houdini')
-            cfg = cfg or {}
-            key_map = {'openai': 'openai_api_key', 'deepseek': 'deepseek_api_key', 'glm': 'glm_api_key',
-                       'openrouter': 'openrouter_api_key', 'custom': 'custom_api_key'}
-            cfg[key_map.get(provider, f'{provider}_api_key')] = key
-            ok, _ = save_config('ai', cfg, dcc_type='houdini')
-            return ok
+            if self._username:
+                cfg, _ = load_user_config(self._username, 'ai', dcc_type='houdini')
+                cfg = cfg or {}
+                key_map = {'openai': 'openai_api_key', 'deepseek': 'deepseek_api_key', 'glm': 'glm_api_key',
+                           'openrouter': 'openrouter_api_key', 'custom': 'custom_api_key',
+                           'duojie': 'duojie_api_key', 'kimi_coding': 'kimi_coding_api_key',
+                           'siliconflow': 'siliconflow_api_key', 'of3d': 'of3d_api_key'}
+                cfg[key_map.get(provider, f'{provider}_api_key')] = key
+                ok, _ = save_user_config(self._username, cfg, 'ai', dcc_type='houdini')
+                return ok
+            else:
+                # 未设用户名时拒绝写入全局共享配置，防止 API key 泄露给其他成员
+                print("[AI Client] ⚠️ 未设用户名，API key 仅在本次会话内有效。"
+                      "如需持久化保存，请先在设置中配置用户名。")
+                return True
         return True
 
     def get_masked_key(self, provider: str = 'openai') -> str:
@@ -2351,6 +2541,8 @@ class AIClient:
         if provider == 'ollama':
             return 'Local'
         # Custom: 显示 URL 缩略
+        if provider == 'of3d':
+            return 'Built-in'
         if provider == 'custom':
             if self._CUSTOM_API_URL:
                 url = self._CUSTOM_API_URL
@@ -2392,6 +2584,10 @@ class AIClient:
             return self.OPENROUTER_API_URL
         elif provider == 'kimi_coding':
             return self.KIMI_CODING_API_URL
+        elif provider == 'siliconflow':
+            return self.SILICONFLOW_API_URL
+        elif provider == 'of3d':
+            return self.OF3D_API_URL
         elif provider == 'custom':
             return self._CUSTOM_API_URL or self.OPENAI_API_URL
         return self.OPENAI_API_URL
@@ -2401,7 +2597,7 @@ class AIClient:
             'openai': 'OpenAI', 'deepseek': 'DeepSeek',
             'glm': 'GLM（智谱AI）', 'ollama': 'Ollama',
             'duojie': '拼好饭', 'openrouter': 'OpenRouter',
-            'kimi_coding': 'Kimi Coding', 'custom': 'Custom',
+            'kimi_coding': 'Kimi Coding', 'siliconflow': 'SiliconFlow', 'of3d': 'OF3D', 'custom': 'Custom',
         }
         return names.get(provider, provider)
 
@@ -2484,7 +2680,7 @@ class AIClient:
     def _get_default_model(self, provider: str) -> str:
         defaults = {
             'openai': 'gpt-5.2', 
-            'deepseek': 'deepseek-chat', 
+            'deepseek': 'deepseek-v4-flash', 
             'glm': 'glm-4.7',
             'ollama': 'qwen2.5:14b',
             'openrouter': 'anthropic/claude-sonnet-4.6',
@@ -2506,6 +2702,7 @@ class AIClient:
         m = model.lower()
         return (
             'reasoner' in m or 'r1' in m
+            or 'v4-pro' in m
             or m == 'glm-4.7'
         )
     
@@ -2513,6 +2710,12 @@ class AIClient:
     def is_glm47(model: str) -> bool:
         """判断是否为 GLM-4.7 模型"""
         return model.lower() == 'glm-4.7'
+
+    @staticmethod
+    def requires_temperature_one(model: str) -> bool:
+        """判断模型是否只支持 temperature=1（不允许自定义值）"""
+        m = model.lower()
+        return 'k2' in m  # kimi-k2 系列
     
     # Duojie 思考模式说明：
     # 经测试 thinking/reasoningEffort API 参数对 Duojie 均无效（reasoning_tokens 始终 0）
@@ -2795,7 +2998,10 @@ class AIClient:
             'stream': True,
         }
         # temperature（Anthropic 范围 0-1）
-        if temperature is not None:
+        # 部分模型（kimi-k2 等）只支持默认值 1，直接固定，避免报错重试
+        if self.requires_temperature_one(model):
+            payload['temperature'] = 1
+        elif temperature is not None:
             payload['temperature'] = min(max(temperature, 0.0), 1.0)
         
         if system_text:
@@ -3759,24 +3965,22 @@ class AIClient:
             'total_tokens': 0,
             'cache_hit_tokens': 0,
             'cache_miss_tokens': 0,
+            'harness_trace': [],
         }
         
         # 防止死循环：检测重复工具调用
-        recent_tool_signatures = []  # 最近的工具调用签名
         max_tool_calls = 999  # 不限制总调用次数（仅保留连续重复检测）
         total_tool_calls = 0
         consecutive_same_calls = 0  # 连续相同调用计数
         last_call_signature = None
         server_error_retries = 0    # 连续服务端错误重试计数
         max_server_retries = 3      # 最多重试 3 次服务端错误
-        
-        # ★ Cursor 风格：同轮去重缓存
-        # 如果 AI 在同一 turn 中用相同参数调用相同工具，直接返回缓存结果
-        # key: "tool_name:sorted_args_json" → value: result dict
-        _turn_dedup_cache: Dict[str, dict] = {}
-        
+
         # ★ 消息清洗 dirty 标志（避免每轮都 O(n) 遍历消息列表）
         _needs_sanitize = True
+
+        _stream_tool_executor = self._get_streaming_tool_executor()
+        _stream_tool_executor.reset()
         
         while iteration < max_iterations:
             # 检查停止请求
@@ -3844,6 +4048,9 @@ class AIClient:
                 pass
             
             # 流式请求
+            # ★ 思考优化：只在第1轮（规划）和错误重试时开启 thinking，
+            #   工具调用续接轮（iteration>1 且无错误）关闭，大幅减少 thinking token 消耗
+            _this_iter_thinking = enable_thinking and (iteration == 1 or should_retry)
             for chunk in self.chat_stream(
                 messages=working_messages,
                 model=model,
@@ -3852,7 +4059,7 @@ class AIClient:
                 max_tokens=max_tokens,
                 tools=effective_tools,
                 tool_choice='auto',
-                enable_thinking=enable_thinking
+                enable_thinking=_this_iter_thinking
             ):
                 # 检查停止请求
                 if self._stop_event.is_set():
@@ -4205,285 +4412,137 @@ class AIClient:
                     arguments = {}
                 parsed_calls.append((tool_id, tool_name, arguments, tool_call))
 
-            # ★ 同轮去重：纯查询类工具用相同参数重复调用时直接返回缓存
-            # 只对无副作用的查询工具去重（execute_python/run_skill/web_search 等有副作用的不去重）
-            _DEDUP_TOOLS = frozenset({
-                'get_network_structure', 'get_node_parameters', 'list_children',
-                'read_selection', 'search_node_types', 'semantic_search_nodes',
-                'find_nodes_by_param', 'check_errors', 'search_local_doc',
-                'get_houdini_node_doc', 'get_node_inputs', 'list_skills',
-                'perf_stop_and_report',
-            })
-            
-            # 分离可并行工具（web + shell）和 Houdini 工具（需主线程串行）
-            _ASYNC_TOOL_NAMES = frozenset({'web_search', 'fetch_webpage', 'execute_shell'})
-            async_calls = [(i, pc) for i, pc in enumerate(parsed_calls) if pc[1] in _ASYNC_TOOL_NAMES]
-            houdini_calls = [(i, pc) for i, pc in enumerate(parsed_calls) if pc[1] not in _ASYNC_TOOL_NAMES]
+            # Harness V2: use extracted streaming tool executor and skip legacy dispatch block.
+            if _stream_tool_executor is not None:
+                _exec_out = _stream_tool_executor.execute_round(parsed_calls)
+                results_ordered = _exec_out.get('results_ordered', [])
+                dedup_flags = _exec_out.get('dedup_flags', [False] * len(parsed_calls))
+                _early_skip_count = int(_exec_out.get('early_skip_count', 0) or 0)
+                _dedup_hit_count = int(_exec_out.get('dedup_hit_count', 0) or 0)
+                _failed_count = int(_exec_out.get('failed_count', 0) or 0)
+                _async_count = int(_exec_out.get('async_count', 0) or 0)
+                _houdini_count = int(_exec_out.get('houdini_count', 0) or 0)
 
-            # 结果槽位：保持原始顺序
-            results_ordered = [None] * len(parsed_calls)
-            dedup_flags = [False] * len(parsed_calls)  # 标记哪些是缓存命中
+                total_usage['harness_trace'].append({
+                    'iteration': iteration,
+                    'tool_count': len(parsed_calls),
+                    'dedup_hits': _dedup_hit_count,
+                    'early_skips': _early_skip_count,
+                    'failed_tools': _failed_count,
+                    'async_tools': _async_count,
+                    'houdini_tools': _houdini_count,
+                })
+                if len(total_usage['harness_trace']) > 200:
+                    total_usage['harness_trace'] = total_usage['harness_trace'][-200:]
 
-            # --- 先检查去重缓存 ---
-            for idx, (tid, tname, targs, _tc) in enumerate(parsed_calls):
-                dedup_key = f"{tname}:{json.dumps(targs, sort_keys=True)}"
-                if tname in _DEDUP_TOOLS and dedup_key in _turn_dedup_cache:
-                    # ★ 缓存命中：直接返回之前的结果
-                    results_ordered[idx] = _turn_dedup_cache[dedup_key]
-                    dedup_flags[idx] = True
-                    print(f"[AI Client] ♻️ 同轮去重命中: {tname}({json.dumps(targs, ensure_ascii=False)[:80]})")
-
-            # 分离未缓存的调用
-            uncached_async = [(i, pc) for i, pc in enumerate(parsed_calls) 
-                             if pc[1] in _ASYNC_TOOL_NAMES and not dedup_flags[i]]
-            uncached_houdini = [(i, pc) for i, pc in enumerate(parsed_calls) 
-                               if pc[1] not in _ASYNC_TOOL_NAMES and not dedup_flags[i]]
-
-            # --- 并行执行未缓存的 async 工具（web + shell） ---
-            if len(uncached_async) > 1:
-                import concurrent.futures
-                def _exec_async(idx_pc):
-                    idx, (tid, tname, targs, _tc) = idx_pc
-                    if tname == 'web_search':
-                        return idx, self._execute_web_search(targs)
-                    elif tname == 'fetch_webpage':
-                        return idx, self._execute_fetch_webpage(targs)
-                    else:  # execute_shell
-                        return idx, self._tool_executor(tname, **targs)
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(uncached_async))) as pool:
-                    for idx, result in pool.map(_exec_async, uncached_async):
-                        results_ordered[idx] = result
-            elif len(uncached_async) == 1:
-                idx, (tid, tname, targs, _tc) = uncached_async[0]
-                if tname == 'web_search':
-                    results_ordered[idx] = self._execute_web_search(targs)
-                elif tname == 'fetch_webpage':
-                    results_ordered[idx] = self._execute_fetch_webpage(targs)
-                else:  # execute_shell
-                    results_ordered[idx] = self._tool_executor(tname, **targs)
-
-            # --- 执行未缓存的 Houdini 工具（需主线程） ---
-            # ★ 只读工具批量执行：减少 N 次信号往返为 1 次
-            _BATCH_READONLY = frozenset({
-                'get_network_structure', 'get_node_parameters', 'list_children',
-                'read_selection', 'search_node_types', 'semantic_search_nodes',
-                'find_nodes_by_param', 'get_node_inputs', 'check_errors',
-                'search_local_doc', 'get_houdini_node_doc', 'list_skills',
-                'get_node_positions', 'list_network_boxes',
-                'perf_start_profile', 'perf_stop_and_report',
-            })
-            # 分离只读和写入工具
-            readonly_batch = [(i, pc) for i, pc in uncached_houdini if pc[1] in _BATCH_READONLY]
-            mutating_calls = [(i, pc) for i, pc in uncached_houdini if pc[1] not in _BATCH_READONLY]
-
-            # 批量执行只读工具（如果有 batch executor 且 >1 个只读调用）
-            if len(readonly_batch) > 1 and self._batch_tool_executor:
-                batch_input = [(tname, targs) for _, (_, tname, targs, _) in readonly_batch]
-                try:
-                    batch_results = self._batch_tool_executor(batch_input)
-                    for (idx, _), result in zip(readonly_batch, batch_results):
-                        results_ordered[idx] = result
-                except Exception as e:
-                    print(f"[AI Client] 批量执行失败，回退串行: {e}")
-                    for idx, (tid, tname, targs, _tc) in readonly_batch:
-                        results_ordered[idx] = self._tool_executor(tname, **targs)
-            else:
-                # 单个只读工具或无 batch executor → 串行
-                for idx, (tid, tname, targs, _tc) in readonly_batch:
-                    results_ordered[idx] = self._tool_executor(tname, **targs)
-
-            # 写入工具始终串行（有副作用，顺序敏感）
-            for idx, (tid, tname, targs, _tc) in mutating_calls:
-                results_ordered[idx] = self._tool_executor(tname, **targs)
-
-            # ★ 早期终止：跳过冗余查询
-            # 当已执行的工具结果已提供足够信息时，跳过剩余同类查询
-            _early_skip_count = 0
-            if len(parsed_calls) > 2:
-                # 收集已有结果中的信息
-                _check_errors_paths = set()
-                _empty_network_paths = set()
-                for idx, (_, tname, targs, _) in enumerate(parsed_calls):
-                    if results_ordered[idx] is None:
-                        continue
-                    result = results_ordered[idx]
-                    # check_errors 发现错误 → 同路径的 get_node_parameters 不再需要
-                    if tname == 'check_errors' and result.get('success'):
-                        r_text = result.get('result', '')
-                        if '错误' in r_text or 'error' in r_text.lower():
-                            path = targs.get('node_path', '')
-                            if path:
-                                _check_errors_paths.add(path)
-                    # get_network_structure 返回空 → 同路径的子查询不需要
-                    if tname == 'get_network_structure' and result.get('success'):
-                        r_text = result.get('result', '')
-                        if '节点数量: 0' in r_text or 'Nodes: 0' in r_text or not r_text.strip():
-                            path = targs.get('network_path', '') or targs.get('node_path', '')
-                            if path:
-                                _empty_network_paths.add(path)
-
-                # 标记可跳过的工具（仅对尚未执行的 readonly 调用）
-                for idx, (tid, tname, targs, _tc) in enumerate(parsed_calls):
-                    if results_ordered[idx] is not None:
-                        continue  # 已有结果
-                    path = targs.get('node_path', '') or targs.get('network_path', '')
-                    # 规则 1：check_errors 已发现错误 → 跳过同路径的 get_node_parameters
-                    if tname == 'get_node_parameters' and path in _check_errors_paths:
-                        results_ordered[idx] = {
-                            "success": True,
-                            "result": f"[已跳过] {path} 已有错误信息，请先修复错误。"
-                        }
-                        _early_skip_count += 1
-                    # 规则 2：网络为空 → 跳过 list_children / get_node_parameters
-                    elif tname in ('list_children', 'get_node_parameters') and path in _empty_network_paths:
-                        results_ordered[idx] = {
-                            "success": True,
-                            "result": f"[已跳过] {path} 网络为空，无子节点。"
-                        }
-                        _early_skip_count += 1
                 if _early_skip_count > 0:
                     print(f"[AI Client] ⏭️ 早期终止: 跳过 {_early_skip_count} 个冗余查询")
-            
-            # --- 缓存维护 ---
-            # 如果本轮有操作类工具（创建/删除/连接节点等），清除网络结构相关缓存
-            # 因为操作改变了网络状态，之前缓存的查询结果可能已过期
-            _NETWORK_MUTATING_TOOLS = frozenset({
-                'create_node', 'create_nodes_batch', 'delete_node', 'connect_nodes',
-                'create_wrangle_node', 'copy_node', 'set_display_flag', 'undo_redo',
-            })
-            has_mutation = any(
-                pc[1] in _NETWORK_MUTATING_TOOLS 
-                for idx_m, pc in enumerate(parsed_calls) 
-                if not dedup_flags[idx_m]
-            )
-            if has_mutation:
-                # 清除 get_network_structure / list_children / check_errors 的缓存
-                keys_to_remove = [k for k in _turn_dedup_cache 
-                                  if k.startswith(('get_network_structure:', 'list_children:', 'check_errors:'))]
-                for k in keys_to_remove:
-                    del _turn_dedup_cache[k]
-            
-            # 将新执行的查询工具结果写入去重缓存
-            for idx, (tid, tname, targs, _tc) in enumerate(parsed_calls):
-                if not dedup_flags[idx] and tname in _DEDUP_TOOLS and results_ordered[idx]:
-                    dedup_key = f"{tname}:{json.dumps(targs, sort_keys=True)}"
-                    _turn_dedup_cache[dedup_key] = results_ordered[idx]
 
-            # --- 统一处理结果（保持原始顺序） ---
-            should_break_tool_limit = False
-            for i, (tool_id, tool_name, arguments, _tc) in enumerate(parsed_calls):
-                result = results_ordered[i]
+                should_break_tool_limit = False
+                for i, (tool_id, tool_name, arguments, _tc) in enumerate(parsed_calls):
+                    result = results_ordered[i] if i < len(results_ordered) else {
+                        'success': False,
+                        'error': '工具执行器返回索引越界'
+                    }
 
-                # 防止死循环：检测重复工具调用
-                total_tool_calls += 1
-                call_signature = f"{tool_name}:{json.dumps(arguments, sort_keys=True)}"
+                    # 防止死循环：检测重复工具调用
+                    total_tool_calls += 1
+                    call_signature = f"{tool_name}:{json.dumps(arguments, sort_keys=True)}"
 
-                if total_tool_calls > max_tool_calls:
-                    print(f"[AI Client] ⚠️ 达到最大工具调用次数限制 ({max_tool_calls})")
-                    should_break_tool_limit = True
-                    break
+                    if total_tool_calls > max_tool_calls:
+                        print(f"[AI Client] ⚠️ 达到最大工具调用次数限制 ({max_tool_calls})")
+                        should_break_tool_limit = True
+                        break
 
-                if call_signature == last_call_signature:
-                    consecutive_same_calls += 1
-                else:
-                    consecutive_same_calls = 1
-                    last_call_signature = call_signature
+                    if call_signature == last_call_signature:
+                        consecutive_same_calls += 1
+                    else:
+                        consecutive_same_calls = 1
+                        last_call_signature = call_signature
 
-                # ★ 循环检测：连续 3 次相同工具调用，向本条 tool 消息追加强制换策略提示
-                if consecutive_same_calls >= 3:
-                    print(f"[AI Client] ⚠️ 循环检测：{tool_name} 已连续 {consecutive_same_calls} 次相同调用，注入换策略提示")
-                    _loop_hint = (
-                        f"\n\n[循环检测] 你已连续 {consecutive_same_calls} 次用相同参数调用 {tool_name}，"
-                        "继续重试不会得到不同结果。请立即停止重试此工具，改用其他工具（如 search_node_types、"
-                        "search_local_doc、execute_python）或直接向用户说明无法找到相关信息。"
-                    )
-                    # 将提示预附加到当前工具结果中（先记录，后面 append tool message 时会用到）
-                    _loop_inject = True
-                else:
-                    _loop_inject = False
+                    # ★ 循环检测：连续 3 次相同工具调用，向本条 tool 消息追加强制换策略提示
+                    if consecutive_same_calls >= 3:
+                        print(f"[AI Client] ⚠️ 循环检测：{tool_name} 已连续 {consecutive_same_calls} 次相同调用，注入换策略提示")
+                        _loop_hint = (
+                            f"\n\n[循环检测] 你已连续 {consecutive_same_calls} 次用相同参数调用 {tool_name}，"
+                            "继续重试不会得到不同结果。请立即停止重试此工具，改用其他工具（如 search_node_types、"
+                            "search_local_doc、execute_python）或直接向用户说明无法找到相关信息。"
+                        )
+                        _loop_inject = True
+                    else:
+                        _loop_inject = False
 
-                # 回调
-                if on_tool_call:
-                    on_tool_call(tool_name, arguments)
+                    if on_tool_call:
+                        on_tool_call(tool_name, arguments)
 
-                tool_calls_history.append({
-                    'tool_name': tool_name,
-                    'arguments': arguments,
-                    'result': result
-                })
-
-                if on_tool_result:
-                    on_tool_result(tool_name, arguments, result)
-
-                result_content = self._compress_tool_result(tool_name, result)
-                
-                # ★ 去重命中时追加提示，引导 AI 不要再重复调用
-                if dedup_flags[i]:
-                    result_content = f"[缓存] 本轮已用相同参数调用过此工具，以下是之前的结果（无需再次调用）:\n{result_content}"
-
-                # ★ 循环检测命中时追加换策略提示
-                if _loop_inject:
-                    result_content += _loop_hint
-
-                working_messages.append({
-                    'role': 'tool',
-                    'tool_call_id': tool_id,
-                    'content': result_content
-                })
-                _needs_sanitize = True  # 新增 tool 消息，下轮需要清洗
-
-                # ★ 视口截图注入：如果工具返回了 _viewport_image，
-                # 追加一条包含图片的 user 消息，让模型可以视觉分析
-                if supports_vision and result.get('_viewport_image'):
-                    _img_b64 = result['_viewport_image']
-                    _img_mt = result.get('_image_media_type', 'image/jpeg')
-                    working_messages.append({
-                        'role': 'user',
-                        'content': [
-                            {"type": "text", "text": "[viewport snapshot attached — please analyze the current viewport state, check for visual issues or confirm the result is correct]"},
-                            {"type": "image_url", "image_url": {"url": f"data:{_img_mt};base64,{_img_b64}"}}
-                        ]
+                    tool_calls_history.append({
+                        'tool_name': tool_name,
+                        'arguments': arguments,
+                        'result': result,
                     })
-                    print(f"[AI Client] 📸 视口截图已注入消息 ({len(_img_b64)//1024}KB base64)")
 
-            if should_break_tool_limit:
-                return {
-                    'ok': True,
-                    'content': full_content + f"\n\n已达到工具调用次数限制({max_tool_calls})，自动停止。",
-                    'final_content': f"\n\n已达到工具调用次数限制({max_tool_calls})，自动停止。",
-                    'new_messages': working_messages[initial_msg_count:],
-                    'tool_calls_history': tool_calls_history,
-                    'call_records': call_records,
-                    'iterations': iteration,
-                    'usage': total_usage
-                }
-            
-            # 多轮思考引导：在最后一条工具结果后附加提示
-            # 检测本轮是否有工具调用失败
-            _round_failed = False
-            for _ri, (_tid, _tn, _ta, _tc) in enumerate(parsed_calls):
-                if not results_ordered[_ri].get('success'):
-                    _round_failed = True
-                    break
+                    if on_tool_result:
+                        on_tool_result(tool_name, arguments, result)
 
-            if working_messages and working_messages[-1].get('role') == 'tool':
-                if _round_failed:
-                    working_messages[-1]['content'] += (
-                        '\n\n[注意：上述工具调用返回了错误，这是工具调用层面的参数或执行错误，'
-                        '不是Houdini节点cooking错误，无需调用check_errors。'
-                        '请直接根据错误信息修正参数后重新调用该工具。]'
+                    result_content = self._compress_tool_result(tool_name, result)
+
+                    if i < len(dedup_flags) and dedup_flags[i]:
+                        result_content = f"[缓存] 本轮已用相同参数调用过此工具，以下是之前的结果（无需再次调用）:\n{result_content}"
+
+                    if _loop_inject:
+                        result_content += _loop_hint
+
+                    working_messages.append({
+                        'role': 'tool',
+                        'tool_call_id': tool_id,
+                        'content': result_content,
+                    })
+                    _needs_sanitize = True
+
+                    if supports_vision and result.get('_viewport_image'):
+                        _img_b64 = result['_viewport_image']
+                        _img_mt = result.get('_image_media_type', 'image/jpeg')
+                        working_messages.append({
+                            'role': 'user',
+                            'content': [
+                                {"type": "text", "text": "[viewport snapshot attached — please analyze the current viewport state, check for visual issues or confirm the result is correct]"},
+                                {"type": "image_url", "image_url": {"url": f"data:{_img_mt};base64,{_img_b64}"}},
+                            ],
+                        })
+                        print(f"[AI Client] 📸 视口截图已注入消息 ({len(_img_b64)//1024}KB base64)")
+
+                if should_break_tool_limit:
+                    return {
+                        'ok': True,
+                        'content': full_content + f"\n\n已达到工具调用次数限制({max_tool_calls})，自动停止。",
+                        'final_content': f"\n\n已达到工具调用次数限制({max_tool_calls})，自动停止。",
+                        'new_messages': working_messages[initial_msg_count:],
+                        'tool_calls_history': tool_calls_history,
+                        'call_records': call_records,
+                        'iterations': iteration,
+                        'usage': total_usage,
+                    }
+
+                _round_failed = False
+                for _ri in range(min(len(parsed_calls), len(results_ordered))):
+                    if not results_ordered[_ri].get('success'):
+                        _round_failed = True
+                        break
+
+                if working_messages and working_messages[-1].get('role') == 'tool':
+                    _followup_hint = self._thinking_followup_hint(
+                        enable_thinking,
+                        _round_failed,
+                        parsed_calls,
+                        results_ordered,
+                        iteration,
                     )
-                if enable_thinking:
-                    working_messages[-1]['content'] += (
-                        '\n\n[重要：你的下一条回复必须以 <think> 标签开头。'
-                        '在标签内分析以上执行结果和当前进度，'
-                        '检查 Todo 列表中哪些步骤已完成（用 update_todo 标记为 done），'
-                        '确认下一步计划后再继续执行。不要跳过 <think> 标签。]'
-                    )
-            
-            # 保存当前轮次的内容
-            full_content += round_content
-        
+                    if _followup_hint:
+                        working_messages[-1]['content'] += _followup_hint
+
+                full_content += round_content
+                continue
+
         # 如果循环结束但内容为空，且有工具调用历史，强制要求生成总结
         if not full_content.strip() and tool_calls_history:
             print("[AI Client] ⚠️ Stream模式：工具调用完成但无回复内容，强制要求生成总结")

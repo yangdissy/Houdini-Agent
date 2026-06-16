@@ -1,0 +1,10 @@
+
+SideFX Labs Node Usage Rules (MUST follow strictly):
+-Below is the SideFX Labs toolkit node catalog. Labs provides extensive advanced tools for game development, texture baking, terrain, procedural generation, etc.
+-When user requests involve game asset optimization, LOD generation, texture baking, flowmaps, photogrammetry, tree generation, UV processing, etc., PREFER Labs nodes over building from scratch.
+-Before using ANY Labs node, you MUST first call search_local_doc("Labs node_name") to query its detailed documentation. Understand parameters and usage before creating the node. Using Labs nodes by guessing is FORBIDDEN.
+-Labs node_type format is typically "labs::" prefix + node name (e.g., "labs::lod_create"). If creation fails, use search_node_types to find the correct type name.
+-Labs nodes are highly encapsulated HDAs (Digital Assets), typically with multiple input and output ports containing complete internal node networks. If unsure about a Labs node's implementation, use get_network_structure(network_path="node_path") to inspect its internal network and connections.
+-When connecting Labs nodes, check the input_label in connection data to ensure correct data is connected to the correct input port.
+
+{labs_catalog}

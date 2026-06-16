@@ -6,6 +6,11 @@ Agent Runner — Agent 循环辅助：标题生成、确认模式、工具调度
 - 自动 AI 标题生成
 - 确认模式拦截
 - 工具分类常量（Ask 模式白名单、后台安全工具、静默工具）
+
+工具分类常量统一维护在：
+  - houdini_agent/core/harness_policy_config.py  （策略类：CONFIRM_TOOLS, BG_SAFE_TOOLS 等）
+  - houdini_agent/utils/tool_registry.py          （模式白名单：_ASK_TOOLS, _PLAN_PLANNING_TOOLS）
+此处仅做导入，不再重复定义。
 """
 
 import threading
@@ -13,134 +18,27 @@ import queue
 from houdini_agent.qt_compat import QtWidgets, QtCore
 from ..ui.i18n import tr, get_language
 from ..ui.cursor_widgets import VEXPreviewInline
+from .harness_policy_config import (
+    CONFIRM_TOOLS,
+    BG_SAFE_TOOLS,
+    SILENT_TOOLS,
+    PLAN_SILENT_TOOLS,
+    PLAN_EXECUTION_EXTRA_TOOLS,
+)
+from ..utils.tool_registry import _ASK_TOOLS, _PLAN_PLANNING_TOOLS
 
 
 class AgentRunnerMixin:
     """Agent 循环辅助、工具调度常量"""
 
-    # 需要用户确认的工具（确认模式下）
-    _CONFIRM_TOOLS = frozenset({
-        # 创建
-        'create_wrangle_node',
-        'create_node',
-        'create_nodes_batch',
-        # 删除 / 修改
-        'delete_node',
-        'set_node_parameter',
-        'batch_set_parameters',
-        'connect_nodes',
-        'copy_node',
-        'set_display_flag',
-        # 代码执行
-        'execute_python',
-        'execute_shell',
-        # 保存
-        'save_hip',
-        # NetworkBox（会修改场景）
-        'create_network_box',
-        'add_nodes_to_box',
-        # 节点布局（会修改节点位置）
-        'layout_nodes',
-    })
-
-    # 不需要 Houdini 主线程的工具集合（纯 Python / 系统操作，可在后台线程直接执行）
-    _BG_SAFE_TOOLS = frozenset({
-        'execute_shell',       # subprocess.run，不依赖 hou
-        'search_local_doc',    # 纯 Python 文本检索
-        'list_skills',         # 纯 Python 列表
-        'search_memory',       # 纯 Python 记忆库检索
-    })
-
-    # 静默工具：不在执行列表 UI 中显示（AI 自行调用，用户无需感知）
-    _SILENT_TOOLS = frozenset({
-        'add_todo',
-        'update_todo',
-    })
-
-    # ★ Plan 模式规划阶段白名单：只读工具 + create_plan
-    _PLAN_PLANNING_TOOLS = frozenset({
-        # 查询 & 检查（复用 Ask 模式）
-        'get_network_structure',
-        'get_node_parameters',
-        'list_children',
-        'read_selection',
-        'search_node_types',
-        'semantic_search_nodes',
-        'find_nodes_by_param',
-        'get_node_inputs',
-        'check_errors',
-        'verify_and_summarize',
-        # 文档 & 搜索
-        'web_search',
-        'fetch_webpage',
-        'search_local_doc',
-        'get_houdini_node_doc',
-        # Skill
-        'list_skills',
-        # 任务管理
-        'add_todo',
-        'update_todo',
-        # 只读查询
-        'get_node_positions',
-        'list_network_boxes',
-        'perf_start_profile',
-        'perf_stop_and_report',
-        # 记忆搜索（只读）
-        'search_memory',
-        # 视口截图（只读）
-        'capture_viewport',
-        # ★ Plan 专用
-        'create_plan',
-        'ask_question',
-    })
-
-    # ★ Plan 模式执行阶段附加工具
-    _PLAN_EXECUTION_EXTRA_TOOLS = frozenset({
-        'update_plan_step',
-    })
-
-    # ★ Plan 模式静默工具（不在 UI 执行列表中显示）
-    _PLAN_SILENT_TOOLS = frozenset({
-        'create_plan',
-        'update_plan_step',
-        'ask_question',
-    })
-
-    # ★ Ask 模式白名单：只读 / 查询 / 分析工具（不包含任何修改场景的操作）
-    _ASK_MODE_TOOLS = frozenset({
-        # 查询 & 检查
-        'get_network_structure',
-        'get_node_parameters',
-        'list_children',
-        'read_selection',
-        'search_node_types',
-        'semantic_search_nodes',
-        'find_nodes_by_param',
-        'get_node_inputs',
-        'check_errors',
-        'verify_and_summarize',
-        # 文档 & 搜索
-        'web_search',
-        'fetch_webpage',
-        'search_local_doc',
-        'get_houdini_node_doc',
-        # Skill（只读查看）
-        'list_skills',
-        # 任务管理
-        'add_todo',
-        'update_todo',
-        # 节点布局（只读查询）
-        'get_node_positions',
-        # NetworkBox（只读查看）
-        'list_network_boxes',
-        # PerfMon 性能分析（只读）
-        'perf_start_profile',
-        'perf_stop_and_report',
-        # 记忆搜索（只读）
-        'search_memory',
-        # 视口截图（只读）
-        'capture_viewport',
-    })
+    # 工具分类常量：从统一配置文件导入，避免多处维护
+    _CONFIRM_TOOLS = CONFIRM_TOOLS
+    _BG_SAFE_TOOLS = BG_SAFE_TOOLS
+    _SILENT_TOOLS = SILENT_TOOLS
+    _PLAN_SILENT_TOOLS = PLAN_SILENT_TOOLS
+    _PLAN_EXECUTION_EXTRA_TOOLS = PLAN_EXECUTION_EXTRA_TOOLS
+    _PLAN_PLANNING_TOOLS = _PLAN_PLANNING_TOOLS
+    _ASK_MODE_TOOLS = _ASK_TOOLS
 
     # ---------- 自动 AI 标题生成 ----------
 

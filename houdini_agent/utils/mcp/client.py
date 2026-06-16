@@ -10,6 +10,7 @@ import sys
 import re
 import time
 import json
+from collections import OrderedDict
 from typing import Any, Optional, Dict, List, Tuple
 from pathlib import Path
 
@@ -103,12 +104,18 @@ class HoudiniMCP:
     _active_perf_profile: Any = None
 
     # 通用工具结果分页缓存：key = "tool_name:unique_key" → 完整文本
-    _tool_page_cache: Dict[str, str] = {}
-    _TOOL_PAGE_LINES = 50  # 每页行数
+    # 使用 OrderedDict 实现 LRU，上限 _TOOL_PAGE_CACHE_MAX 条，防止内存无限增长
+    _tool_page_cache: OrderedDict = OrderedDict()
+    _TOOL_PAGE_LINES = 50       # 每页行数
+    _TOOL_PAGE_CACHE_MAX = 100  # 最多缓存 100 条分页结果
 
     def __init__(self):
         import threading
         self._stop_event: Optional[threading.Event] = None
+        self._username: Optional[str] = None
+
+    def set_user(self, username: str):
+        self._username = username
 
     def set_stop_event(self, event):
         """设置停止事件（从 AIClient 传入，用于检测用户中断）
@@ -132,7 +139,12 @@ class HoudiniMCP:
         if not page_lines:
             page_lines = cls._TOOL_PAGE_LINES
 
+        # LRU 写入：先移除旧条目（如果存在），再插入到末尾
+        cls._tool_page_cache.pop(cache_key, None)
         cls._tool_page_cache[cache_key] = text
+        # 超出上限时淘汰最旧的条目
+        while len(cls._tool_page_cache) > cls._TOOL_PAGE_CACHE_MAX:
+            cls._tool_page_cache.popitem(last=False)
 
         lines = text.split('\n')
         total_lines = len(lines)
@@ -854,7 +866,7 @@ class HoudiniMCP:
             else:
                 # 获取当前网络
                 try:
-                    pane = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
+                    pane = hou.ui.curDesktop().paneTabOfType(hou.paneTabType.NetworkEditor)
                     target = pane.pwd() if pane else hou.node('/obj')
                 except Exception:
                     target = hou.node('/obj')
@@ -1502,14 +1514,14 @@ class HoudiniMCP:
         safe_name = self._sanitize_node_name(node_name)
         
         try:
-            # 根据文档，使用 force_valid_node_name=True 自动处理无效节点名
+            # run_init_scripts=False 防止 OnCreated 递归调用崩溃
+            # 不使用 force_valid_node_name（旧版 Houdini <19.5 不支持）
             new_node = network.createNode(
                 wrangle_type,
                 safe_name,
-                run_init_scripts=True,
+                run_init_scripts=False,
                 load_contents=True,
-                exact_type_name=False,  # 允许模糊匹配
-                force_valid_node_name=True  # 自动清理无效节点名
+                exact_type_name=True,  # wrangle 类型名固定，精确匹配避免误匹配
             )
         except Exception as exc:
             return False, f"创建 Wrangle 节点失败: {exc}"
@@ -1633,23 +1645,22 @@ class HoudiniMCP:
         # 清理节点名（但保留原始值用于错误提示）
         safe_name = self._sanitize_node_name(node_name)
         
-        # 根据文档，createNode 支持以下参数：
-        # createNode(node_type_name, node_name=None, run_init_scripts=True, 
-        #            load_contents=True, exact_type_name=False, force_valid_node_name=False)
-        # 
-        # 我们使用 force_valid_node_name=True 让 Houdini 自动处理无效节点名
-        # 使用 exact_type_name=False（默认）让 Houdini 进行模糊匹配
+        # 注意：
+        # - run_init_scripts=False 防止 OnCreated 回调递归调用 createNode 导致崩溃
+        # - 不传 force_valid_node_name，旧版 Houdini（<19.5）不支持该参数
+        # - 已由 _sanitize_node_name 保证 safe_name 合法
+        # - type_hint 剥离 sop/ 等前缀，防止模糊匹配时 C++ 层崩溃
+        
+        # 剥离类别前缀（如 "sop/box" → "box"）
+        clean_type = type_hint.split("/", 1)[-1] if "/" in (type_hint or "") else type_hint
         
         try:
-            # 直接使用 createNode，让它自己处理类型匹配
-            # 如果 node_name 无效，force_valid_node_name=True 会自动清理
             new_node = network.createNode(
-                type_hint,  # 直接传原始类型名，让 Houdini 处理匹配
-                safe_name,  # 如果为 None，Houdini 会自动生成名称
-                run_init_scripts=True,
+                clean_type,
+                safe_name,
+                run_init_scripts=False,
                 load_contents=True,
-                exact_type_name=False,  # 允许模糊匹配
-                force_valid_node_name=True  # 自动清理无效节点名
+                exact_type_name=False,
             )
         except hou.OperationFailed as exc:
             # 提供更详细的错误信息
@@ -1765,14 +1776,13 @@ class HoudiniMCP:
             
             if has_sop_node and current_cat_name.startswith("object"):
                 try:
-                    # 根据文档，直接使用 createNode，让它自己处理匹配
+                    # run_init_scripts=False 防止 OnCreated 递归导致崩溃
                     auto_container = network.createNode(
                         "geo",
-                        None,  # 让 Houdini 自动生成名称
-                        run_init_scripts=True,
-                        load_contents=True,
-                        exact_type_name=False,
-                        force_valid_node_name=True
+                        None,
+                        run_init_scripts=False,
+                        load_contents=False,
+                        exact_type_name=True,
                     )
                     auto_container.moveToGoodPosition()
                     messages.append(f"自动创建容器: {auto_container.name()}")
@@ -1806,15 +1816,15 @@ class HoudiniMCP:
                 node_name = spec.get("name")
                 safe_name = self._sanitize_node_name(node_name)
                 
-                # 直接使用 createNode，让它自己处理类型匹配
+                # 剥离类别前缀（如 "sop/box" → "box"），防止模糊匹配崩溃
+                clean_type = type_hint.split("/", 1)[-1] if "/" in (type_hint or "") else type_hint
                 try:
                     new_node = network.createNode(
-                        type_hint,  # 直接传原始类型名
+                        clean_type,
                         safe_name,
-                        run_init_scripts=True,
+                        run_init_scripts=False,
                         load_contents=True,
-                        exact_type_name=False,  # 允许模糊匹配
-                        force_valid_node_name=True  # 自动清理无效节点名
+                        exact_type_name=False,
                     )
                 except hou.OperationFailed as exc:
                     messages.append(f"[{node_id}] 创建失败: {type_hint} - {exc}")
@@ -1857,9 +1867,23 @@ class HoudiniMCP:
                     except Exception as exc:
                         messages.append(f"连接失败 {src_id}->{dst_id}: {exc}")
             
-            # 自动布局
+            # 自动布局：只整理本次创建的节点，避免破坏用户已有的手动布局。
             if created:
-                network.layoutChildren()
+                try:
+                    from . import hou_core
+                    created_paths = [
+                        created[nid].path()
+                        for nid in creation_order
+                        if nid in created and created[nid]
+                    ]
+                    hou_core.layout_nodes(
+                        parent_path=network.path(),
+                        node_paths=created_paths,
+                        method="tidy",
+                        spacing=1.0,
+                    )
+                except Exception:
+                    pass  # 布局失败不影响节点创建结果
                 if creation_order:
                     last_node = created[creation_order[-1]]
                     last_node.setSelected(True, clear_all_selected=True)
@@ -1910,9 +1934,78 @@ class HoudiniMCP:
         
         try:
             in_node.setInput(int(input_index), out_node, 0)
+            try:
+                from . import hou_core
+                related_paths = hou_core._collect_related_layout_paths([out_node, in_node])
+                if related_paths:
+                    hou_core.layout_nodes(
+                        parent_path=in_node.parent().path(),
+                        node_paths=related_paths,
+                        method="tidy",
+                        spacing=1.0,
+                    )
+            except Exception:
+                pass
             return True, f"已连接: {output_node_path} → {input_node_path}[{input_index}]"
         except Exception as exc:
             return False, f"连接失败: {exc}"
+
+    def disconnect_nodes(self, node_path: str,
+                         input_index: Optional[int] = None) -> Tuple[bool, str]:
+        """断开节点的一个或全部输入连接"""
+        if hou is None:
+            return False, "未检测到 Houdini API"
+        node = hou.node(node_path)
+        if node is None:
+            return False, f"未找到节点: {node_path}"
+        try:
+            max_inputs = node.type().maxNumInputs()
+            if input_index is not None:
+                idx = int(input_index)
+                if idx < 0 or idx >= max_inputs:
+                    return False, f"输入端口索引 {idx} 无效 (有效范围 0~{max_inputs - 1})"
+                node.setInput(idx, None)
+                return True, f"已断开 {node_path}[{idx}] 的输入连接"
+            else:
+                disconnected = []
+                for i in range(max_inputs):
+                    if node.input(i) is not None:
+                        node.setInput(i, None)
+                        disconnected.append(i)
+                if disconnected:
+                    return True, f"已断开 {node_path} 的全部输入连接（端口: {disconnected}）"
+                return True, f"节点 {node_path} 无活跃输入连接，无需操作"
+        except Exception as exc:
+            return False, f"断开连接失败: {exc}"
+
+    def set_node_flags(self, node_path: str,
+                       bypass: Optional[bool] = None,
+                       template: Optional[bool] = None,
+                       lock: Optional[bool] = None) -> Tuple[bool, str]:
+        """设置节点的 bypass / template / lock 标志"""
+        if hou is None:
+            return False, "未检测到 Houdini API"
+        node = hou.node(node_path)
+        if node is None:
+            return False, f"未找到节点: {node_path}"
+        if bypass is None and template is None and lock is None:
+            return False, "至少需要指定一个标志（bypass / template / lock）"
+        try:
+            applied = []
+            if bypass is not None and hasattr(node, 'bypass'):
+                node.bypass(bypass)
+                applied.append(f"bypass={'on' if bypass else 'off'}")
+            if template is not None and hasattr(node, 'setTemplateFlag'):
+                node.setTemplateFlag(template)
+                applied.append(f"template={'on' if template else 'off'}")
+            if lock is not None and hasattr(node, 'setHardLocked'):
+                node.setHardLocked(lock)
+                applied.append(f"lock={'on' if lock else 'off'}")
+            if applied:
+                return True, f"已设置 {node_path}: {', '.join(applied)}"
+            return False, f"节点类型 {node.type().name()} 不支持请求的标志"
+        except Exception as exc:
+            return False, f"设置标志失败: {exc}"
 
     # ========================================
     # 参数设置
@@ -2208,6 +2301,47 @@ class HoudiniMCP:
                 pass
         
         return True, f"已删除 {len(paths)} 个节点"
+
+    # ========================================
+    # 节点重命名
+    # ========================================
+
+    def rename_node(self, node_path: str, new_name: str) -> Tuple[bool, str]:
+        """重命名节点
+
+        Args:
+            node_path: 节点完整路径，如 '/obj/geo1/box1'
+            new_name:  新名称（仅允许字母、数字和下划线）
+
+        Returns:
+            (success, message)  message 包含 "旧路径 → 新路径" 或错误详情
+        """
+        if hou is None:
+            return False, "未检测到 Houdini API"
+
+        if not new_name or not new_name.strip():
+            return False, "新名称不能为空"
+
+        node = hou.node(node_path)
+        if node is None:
+            return False, f"未找到节点: {node_path}"
+
+        safe_name = self._sanitize_node_name(new_name)
+        if not safe_name:
+            return False, f"名称 '{new_name}' 包含非法字符，清理后为空，无法使用"
+
+        old_name = node.name()
+        old_path = node.path()
+
+        if old_name == safe_name:
+            return True, f"节点名称未变更: {old_path}"
+
+        try:
+            node.setName(safe_name)
+            new_path = node.path()
+            return True, f"已重命名: {old_path} → {new_path}"
+        except Exception as exc:
+            return False, f"重命名失败: {exc}"
 
     # ========================================
     # Python 代码执行（类似 Cursor 终端）
@@ -2626,6 +2760,28 @@ class HoudiniMCP:
         ok, msg = self.connect_nodes(from_path, to_path, args.get("input_index", 0))
         return {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
 
+    def _tool_disconnect_nodes(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_path = args.get("node_path", "")
+        if not node_path:
+            return {"success": False, "error": "缺少 node_path 参数"}
+        input_index = args.get("input_index")
+        if input_index is not None:
+            input_index = int(input_index)
+        ok, msg = self.disconnect_nodes(node_path, input_index)
+        return {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
+
+    def _tool_set_node_flags(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_path = args.get("node_path", "")
+        if not node_path:
+            return {"success": False, "error": "缺少 node_path 参数"}
+        bypass = args.get("bypass")
+        template = args.get("template")
+        lock = args.get("lock")
+        if bypass is None and template is None and lock is None:
+            return {"success": False, "error": "至少需要指定一个标志（bypass / template / lock）"}
+        ok, msg = self.set_node_flags(node_path, bypass, template, lock)
+        return {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
+
     def _tool_delete_node(self, args: Dict[str, Any]) -> Dict[str, Any]:
         node_path = args.get("node_path", "")
         if not node_path:
@@ -2635,6 +2791,16 @@ class HoudiniMCP:
         if ok and snapshot:
             result["_undo_snapshot"] = snapshot  # 供 UI 撤销使用，不会发给 AI
         return result
+
+    def _tool_rename_node(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_path = args.get("node_path", "")
+        new_name = args.get("new_name", "")
+        if not node_path:
+            return {"success": False, "error": "缺少 node_path 参数"}
+        if not new_name:
+            return {"success": False, "error": "缺少 new_name 参数"}
+        ok, msg = self.rename_node(node_path, new_name)
+        return {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
 
     def _tool_search_node_types(self, args: Dict[str, Any]) -> Dict[str, Any]:
         keyword = args.get("keyword", "")
@@ -3190,19 +3356,61 @@ class HoudiniMCP:
     def _tool_search_local_doc(self, args: Dict[str, Any]) -> Dict[str, Any]:
         if not HAS_DOC_RAG:
             return {"success": False, "error": "DocIndex 模块未加载"}
-        query = args.get("query", "")
+        # 兼容旧参数 keyword，统一收敛到 query。
+        query = args.get("query") or args.get("keyword", "")
         if not query:
-            return {"success": False, "error": "缺少 query 参数"}
+            return {"success": False, "error": "缺少 query 参数（或旧参数 keyword）"}
+
+        def _confidence_band(score: float) -> str:
+            if score >= 0.80:
+                return "high"
+            if score >= 0.55:
+                return "medium"
+            return "low"
+
         try:
             index = get_doc_rag()
             results = index.search(query, top_k=min(args.get("top_k", 5), 10))
             if not results:
-                return {"success": True, "result": f"未找到与 '{query}' 相关的文档"}
+                return {
+                    "success": True,
+                    "query": query,
+                    "count": 0,
+                    "items": [],
+                    "result": f"未找到与 '{query}' 相关的文档",
+                }
+
             parts = [f"找到 {len(results)} 个相关条目:\n"]
+            items = []
             for idx, r in enumerate(results, 1):
                 parts.append(f"{idx}. [{r['type'].upper()}] {r['name']} (score={r['score']:.1f})")
+                src = r.get("source", "")
+                if src:
+                    parts.append(f"   source: {src}")
+                rank_reason = r.get("rank_reason", "")
+                if rank_reason:
+                    parts.append(f"   reason: {rank_reason}")
                 parts.append(f"   {r['snippet']}\n")
-            return {"success": True, "result": "\n".join(parts)}
+
+                items.append({
+                    "rank": idx,
+                    "type": r.get("type", "unknown"),
+                    "name": r.get("name", ""),
+                    "score": round(float(r.get("score", 0.0)), 3),
+                    "confidence_band": _confidence_band(float(r.get("score", 0.0))),
+                    "source": r.get("source", ""),
+                    "matched_terms": r.get("matched_terms", []),
+                    "rank_reason": r.get("rank_reason", ""),
+                    "snippet": r.get("snippet", ""),
+                })
+
+            return {
+                "success": True,
+                "query": query,
+                "count": len(items),
+                "items": items,
+                "result": "\n".join(parts),
+            }
         except Exception as e:
             import traceback
             return {"success": False, "error": f"文档检索失败: {e}\n{traceback.format_exc()}"}
@@ -3377,6 +3585,7 @@ class HoudiniMCP:
         "create_wrangle_node": 'create_wrangle_node(parent_path="/obj/geo1", code="@P.y += 1;", name="my_wrangle")',
         "connect_nodes": 'connect_nodes(from_path="/obj/geo1/box1", to_path="/obj/geo1/merge1", input_index=0)',
         "delete_node": 'delete_node(node_path="/obj/geo1/box1")',
+        "rename_node": 'rename_node(node_path="/obj/geo1/box1", new_name="my_box")',
         "search_node_types": 'search_node_types(keyword="scatter", category="sop")',
         "semantic_search_nodes": 'semantic_search_nodes(query="随机散布点", category="sop")',
         "list_children": 'list_children(path="/obj/geo1", page=1)',
@@ -3390,7 +3599,7 @@ class HoudiniMCP:
         "execute_python": 'execute_python(code="import hou; print(hou.node(\\"/obj\\").children())")',
         "execute_shell": 'execute_shell(command="pip list", cwd="C:/project", timeout=30)',
         "check_errors": 'check_errors(node_path="/obj/geo1/box1")',
-        "search_local_doc": 'search_local_doc(keyword="scatter")',
+        "search_local_doc": 'search_local_doc(query="scatter")',
         "get_houdini_node_doc": 'get_houdini_node_doc(node_type="scatter", page=1)',
         "get_node_inputs": 'get_node_inputs(node_type="copytopoints", category="sop")',
         "run_skill": 'run_skill(skill_name="analyze_geometry_attribs", params={"node_path":"/obj/geo1/box1"})',
@@ -3416,13 +3625,16 @@ class HoudiniMCP:
         "create_node": "_tool_create_node",
         "create_nodes_batch": "_tool_create_nodes_batch",
         "connect_nodes": "_tool_connect_nodes",
+        "disconnect_nodes": "_tool_disconnect_nodes",
         "delete_node": "_tool_delete_node",
+        "rename_node": "_tool_rename_node",
         "search_node_types": "_tool_search_node_types",
         "semantic_search_nodes": "_tool_semantic_search_nodes",
         "list_children": "_tool_list_children",
         # "get_geometry_info" 已移除，由 skill 替代
         "read_selection": "_tool_read_selection",
         "set_display_flag": "_tool_set_display_flag",
+        "set_node_flags": "_tool_set_node_flags",
         "copy_node": "_tool_copy_node",
         "batch_set_parameters": "_tool_batch_set_parameters",
         "find_nodes_by_param": "_tool_find_nodes_by_param",
@@ -3586,7 +3798,7 @@ class HoudiniMCP:
     # ========================================
 
     def _tool_search_memory(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """搜索长期记忆库 — 跨层级 chunk 检索"""
+        """搜索长期记忆库 — 联合检索 semantic / episodic / procedural"""
         query = args.get("query", "")
         print(f"[search_memory] 收到搜索请求: query={query!r}, args={args}")
         if not query:
@@ -3597,30 +3809,41 @@ class HoudiniMCP:
 
         try:
             from ..memory_store import get_memory_store, ABSTRACTION_LEVELS
-            store = get_memory_store()
-            total = store.count_semantic()
-            print(f"[search_memory] 记忆库中有 {total} 条语义记忆")
+            store = get_memory_store(self._username)
+            sem_total = store.count_semantic()
+            epi_total = store.count_episodic()
+            proc_total = store.count_procedural()
+            print(
+                f"[search_memory] 记忆库统计: semantic={sem_total}, "
+                f"episodic={epi_total}, procedural={proc_total}"
+            )
 
-            results = store.search_all_levels(
+            sem_results = store.search_all_levels(
                 query=query,
                 category=category,
                 top_k=top_k,
                 min_confidence=0.1,
             )
-            print(f"[search_memory] 搜索结果: {len(results)} 条")
+            # Episodic/Procedural 通常作为辅助记忆，默认数量略小，降低噪音。
+            epi_results = store.search_episodic(
+                query=query,
+                top_k=min(3, top_k),
+                min_importance=0.2,
+            )
+            proc_results = store.search_procedural(
+                query=query,
+                top_k=min(3, top_k),
+            )
 
-            if not results:
-                return {
-                    "success": True,
-                    "count": 0,
-                    "memories": [],
-                    "message": f"未找到相关记忆（库中共 {total} 条语义记忆，min_confidence=0.1）",
-                }
+            is_semantic_backend = store.embedder.is_semantic
+            epi_threshold = 0.3 if is_semantic_backend else 0.05
+            proc_threshold = 0.25 if is_semantic_backend else 0.04
 
-            memories = []
-            for rec, score in results:
+            semantic_memories = []
+            for rec, score in sem_results:
                 level_name = ABSTRACTION_LEVELS.get(rec.abstraction_level, "unknown")
-                memories.append({
+                semantic_memories.append({
+                    "type": "semantic",
                     "rule": rec.rule,
                     "category": rec.category,
                     "abstraction_level": rec.abstraction_level,
@@ -3630,8 +3853,54 @@ class HoudiniMCP:
                     "activation_count": rec.activation_count,
                 })
 
+            episodic_memories = []
+            for rec, score in epi_results:
+                if score < epi_threshold:
+                    continue
+                episodic_memories.append({
+                    "type": "episodic",
+                    "task_description": rec.task_description,
+                    "result_summary": rec.result_summary,
+                    "success": rec.success,
+                    "importance": round(rec.importance, 2),
+                    "error_count": rec.error_count,
+                    "retry_count": rec.retry_count,
+                    "relevance": round(score, 3),
+                })
+
+            procedural_memories = []
+            for rec, score in proc_results:
+                if score < proc_threshold:
+                    continue
+                procedural_memories.append({
+                    "type": "procedural",
+                    "strategy_name": rec.strategy_name,
+                    "description": rec.description,
+                    "priority": round(rec.priority, 2),
+                    "success_rate": round(rec.success_rate, 2),
+                    "usage_count": rec.usage_count,
+                    "relevance": round(score, 3),
+                })
+
+            total_found = len(semantic_memories) + len(episodic_memories) + len(procedural_memories)
+            print(
+                f"[search_memory] 搜索结果: semantic={len(semantic_memories)}, "
+                f"episodic={len(episodic_memories)}, procedural={len(procedural_memories)}"
+            )
+
+            if total_found == 0:
+                return {
+                    "success": True,
+                    "count": 0,
+                    "memories": [],
+                    "message": (
+                        "未找到相关记忆"
+                        f"（semantic={sem_total}, episodic={epi_total}, procedural={proc_total}）"
+                    ),
+                }
+
             # 更新激活计数
-            for rec, _ in results:
+            for rec, _ in sem_results:
                 try:
                     store.increment_semantic_activation(rec.id)
                 except Exception:
@@ -3639,10 +3908,17 @@ class HoudiniMCP:
 
             return {
                 "success": True,
-                "count": len(memories),
+                "count": total_found,
                 "query": query,
                 "category_filter": category,
-                "memories": memories,
+                # 兼容旧返回字段：memories 保留语义层结果
+                "memories": semantic_memories,
+                "semantic_memories": semantic_memories,
+                "episodic_memories": episodic_memories,
+                "procedural_memories": procedural_memories,
+                "semantic_count": len(semantic_memories),
+                "episodic_count": len(episodic_memories),
+                "procedural_count": len(procedural_memories),
             }
 
         except Exception as e:
@@ -3683,7 +3959,7 @@ class HoudiniMCP:
             
             if viewer is None:
                 try:
-                    viewer = hou.ui.paneTabOfType(hou.paneTabType.SceneViewer)
+                    viewer = hou.ui.curDesktop().paneTabOfType(hou.paneTabType.SceneViewer)
                 except Exception:
                     pass
             
@@ -3911,14 +4187,14 @@ class HoudiniMCP:
             if current_name.startswith("object") and desired_name.startswith("sop"):
                 try:
                     print(f"[MCP Client] 自动创建 geo 容器，从 {current_name} 到 {desired_name}")
-                    # 根据文档，直接使用 createNode，让它自己处理匹配
+                    # run_init_scripts=False：不运行 OnCreated 防止递归调用崩溃
+                    # geo 容器只需要空壳，不需要默认 file1 节点
                     container = network.createNode(
                         "geo",
                         None,  # 让 Houdini 自动生成名称
-                        run_init_scripts=True,
-                        load_contents=True,
-                        exact_type_name=False,
-                        force_valid_node_name=True
+                        run_init_scripts=False,
+                        load_contents=False,
+                        exact_type_name=True,
                     )
                     if container:
                         container.moveToGoodPosition()

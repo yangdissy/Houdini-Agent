@@ -116,12 +116,24 @@ class InputAreaMixin:
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         toolbar_top.addWidget(self.mode_combo)
 
-        # 确认模式开关
-        self.chk_confirm_mode = QtWidgets.QCheckBox("Confirm")
+        # 确认模式开关（toggle button，颜色直观区分状态）
+        self.chk_confirm_mode = QtWidgets.QPushButton("✔ 逐步确认")
         self.chk_confirm_mode.setObjectName("chkConfirm")
+        self.chk_confirm_mode.setCheckable(True)
         self.chk_confirm_mode.setChecked(True)
         self.chk_confirm_mode.setCursor(QtCore.Qt.PointingHandCursor)
         self.chk_confirm_mode.setToolTip(tr('confirm.tooltip'))
+        self.chk_confirm_mode.setFixedHeight(22)
+        self.chk_confirm_mode.setStyleSheet(
+            "QPushButton#chkConfirm:checked {"
+            "  background:#f59e0b; color:#000; font-weight:700;"
+            "  border:1px solid #d97706; border-radius:3px; padding:0 6px;"
+            "}"
+            "QPushButton#chkConfirm:!checked {"
+            "  background:#374151; color:#9ca3af; font-weight:400;"
+            "  border:1px solid #4b5563; border-radius:3px; padding:0 6px;"
+            "}"
+        )
         self.chk_confirm_mode.toggled.connect(self._on_confirm_mode_toggled)
         toolbar_top.addWidget(self.chk_confirm_mode)
 
@@ -137,6 +149,21 @@ class InputAreaMixin:
         self.read_combo.setMinimumWidth(110)
         self.read_combo.currentIndexChanged.connect(self._on_auto_read_changed)
         toolbar_top.addWidget(self.read_combo)
+
+        # 模式风险徽标（持续可见）
+        self.mode_guard_label = QtWidgets.QLabel("ASK | RO")
+        self.mode_guard_label.setObjectName("modeGuardLabel")
+        self.mode_guard_label.setToolTip("当前模式与权限风险")
+        toolbar_top.addWidget(self.mode_guard_label)
+
+        # 策略/诊断入口（点击弹出菜单）
+        self.policy_timeline_btn = QtWidgets.QPushButton("Policy 0")
+        self.policy_timeline_btn.setObjectName("policyTimelineBtn")
+        self.policy_timeline_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.policy_timeline_btn.setFixedHeight(20)
+        if hasattr(self, '_show_policy_menu'):
+            self.policy_timeline_btn.clicked.connect(self._show_policy_menu)
+        toolbar_top.addWidget(self.policy_timeline_btn)
 
         # ★ 插件按钮容器（由 HookManager.PluginUIBridge 挂载按钮）
         self._plugin_button_container = QtWidgets.QHBoxLayout()
@@ -220,6 +247,9 @@ class InputAreaMixin:
         
         self.btn_export_train = QtWidgets.QPushButton("Train")
         self.btn_export_train.setVisible(False)
+
+        if hasattr(self, '_refresh_mode_guard_ui'):
+            self._refresh_mode_guard_ui()
         
         return container
 
@@ -241,6 +271,13 @@ class InputAreaMixin:
     
     def _on_confirm_mode_toggled(self, checked: bool):
         self._confirm_mode = checked
+        btn = self.chk_confirm_mode
+        if checked:
+            btn.setText("✔ 逐步确认")
+        else:
+            btn.setText("⚡ 直接执行")
+        if hasattr(self, '_refresh_mode_guard_ui'):
+            self._refresh_mode_guard_ui()
 
     # ---------- 自动读取节点模式切换 ----------
 
@@ -263,6 +300,8 @@ class InputAreaMixin:
         self.btn_send.setProperty("mode", mode)
         self.btn_send.style().unpolish(self.btn_send)
         self.btn_send.style().polish(self.btn_send)
+        if hasattr(self, '_refresh_mode_guard_ui'):
+            self._refresh_mode_guard_ui()
 
     # ---------- @提及节点自动补全 ----------
 

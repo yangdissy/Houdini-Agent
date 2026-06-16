@@ -531,10 +531,9 @@ def _load_single_plugin(filepath: Path, module_name: str,
                          manager: HookManager):
     """加载单个插件"""
     # ★ 清空装饰器收集器，防止多插件之间串扰
-    global _pending_hooks, _pending_tools, _pending_buttons
-    _pending_hooks = []
-    _pending_tools = []
-    _pending_buttons = []
+    _pending_hooks.clear()
+    _pending_tools.clear()
+    _pending_buttons.clear()
 
     spec = importlib.util.spec_from_file_location(
         f"houdini_plugins.{module_name}", str(filepath))
@@ -806,8 +805,6 @@ def ui_button(icon: str, tooltip: str):
 
 def _apply_decorators(ctx: PluginContext):
     """将装饰器收集的钩子/工具/按钮注册到 ctx"""
-    global _pending_hooks, _pending_tools, _pending_buttons
-
     for event, callback, priority in _pending_hooks:
         ctx.on(event, callback, priority)
     for t in _pending_tools:
@@ -821,9 +818,9 @@ def _apply_decorators(ctx: PluginContext):
         )
 
     # 清空收集器
-    _pending_hooks = []
-    _pending_tools = []
-    _pending_buttons = []
+    _pending_hooks.clear()
+    _pending_tools.clear()
+    _pending_buttons.clear()
 
 
 # ============================================================

@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .memory_store import MemoryStore, get_memory_store
+from shared.user_paths import UserPaths, normalize_username
 
 # ============================================================
 # 持久化路径
@@ -72,8 +73,9 @@ class GrowthTracker:
     记录每个任务的度量指标，计算趋势，形成个性特征。
     """
 
-    def __init__(self, store: Optional[MemoryStore] = None):
+    def __init__(self, store: Optional[MemoryStore] = None, file_path: Optional[Path] = None):
         self.store = store or get_memory_store()
+        self._file_path = file_path or _GROWTH_FILE
 
         # 滚动窗口
         self._metrics: deque = deque(maxlen=WINDOW_SIZE * 2)  # 保留 2 倍以计算趋势
@@ -311,7 +313,7 @@ class GrowthTracker:
     def _save(self):
         """保存成长数据到文件"""
         try:
-            _GROWTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self._file_path.parent.mkdir(parents=True, exist_ok=True)
             data = {
                 "total_tasks": self._total_tasks,
                 "skill_confidence": self._skill_confidence,
@@ -329,17 +331,17 @@ class GrowthTracker:
                     for m in self._metrics
                 ],
             }
-            with open(_GROWTH_FILE, "w", encoding="utf-8") as f:
+            with open(self._file_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"[GrowthTracker] 保存失败: {e}")
 
     def _load(self):
         """从文件加载成长数据"""
-        if not _GROWTH_FILE.exists():
+        if not self._file_path.exists():
             return
         try:
-            with open(_GROWTH_FILE, "r", encoding="utf-8") as f:
+            with open(self._file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
             self._total_tasks = data.get("total_tasks", 0)
@@ -380,11 +382,21 @@ class GrowthTracker:
 # 全局单例
 # ============================================================
 
-_tracker_instance: Optional[GrowthTracker] = None
+_tracker_instances: Dict[str, GrowthTracker] = {}
 
-def get_growth_tracker() -> GrowthTracker:
-    """获取全局 GrowthTracker 实例"""
-    global _tracker_instance
-    if _tracker_instance is None:
-        _tracker_instance = GrowthTracker()
-    return _tracker_instance
+def get_growth_tracker(username: Optional[str] = None) -> GrowthTracker:
+    """获取 GrowthTracker 实例（按用户隔离）。"""
+    global _tracker_instances
+    if not username:
+        key = "default"
+        if key not in _tracker_instances:
+            _tracker_instances[key] = GrowthTracker()
+        return _tracker_instances[key]
+
+    uname = normalize_username(username)
+    if uname not in _tracker_instances:
+        user_paths = UserPaths(uname)
+        user_paths.ensure_dirs()
+        store = get_memory_store(uname)
+        _tracker_instances[uname] = GrowthTracker(store=store, file_path=user_paths.growth_profile_path())
+    return _tracker_instances[uname]

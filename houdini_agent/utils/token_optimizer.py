@@ -80,8 +80,10 @@ def count_tokens(text: str, model: str = '') -> int:
 # reasoning: 推理 token 的输出价格（若无则用 output）
 MODEL_PRICING: Dict[str, Dict[str, float]] = {
     # ---- DeepSeek ----
-    'deepseek-chat':        {'input': 0.27,  'input_cache': 0.07,  'output': 1.10},
-    'deepseek-reasoner':    {'input': 0.55,  'input_cache': 0.14,  'output': 2.19, 'reasoning': 2.19},
+    'deepseek-v4-flash':    {'input': 1.00,  'input_cache': 0.02,  'output': 2.00},           # 非思考/思考模式均适用
+    'deepseek-v4-pro':      {'input': 3.00,  'input_cache': 0.025, 'output': 6.00, 'reasoning': 6.00},  # 默认思考模式
+    'deepseek-chat':        {'input': 0.27,  'input_cache': 0.07,  'output': 1.10},           # 将于 2026/07/24 弃用
+    'deepseek-reasoner':    {'input': 0.55,  'input_cache': 0.14,  'output': 2.19, 'reasoning': 2.19},  # 将于 2026/07/24 弃用
     # ---- OpenAI ----
     'gpt-5.2':              {'input': 2.50,  'input_cache': 1.25,  'output': 10.00},
     'gpt-5.3-codex':        {'input': 3.00,  'input_cache': 1.50,  'output': 12.00},

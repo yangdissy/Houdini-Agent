@@ -3,7 +3,13 @@ import sys
 import hou
 from houdini_agent.qt_compat import QtWidgets
 
-# 强制重新加载模块，避免缓存问题
+
+def _is_dev_reload_enabled():
+    """Return True when development hot-reload is explicitly enabled."""
+    value = os.getenv("HOUDINI_AGENT_DEV_RELOAD", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+# 开发模式下重新加载模块，避免缓存问题
 def _reload_modules():
     # ---- 清理旧包名残留（HOUDINI_HIP_MANAGER → houdini_agent 迁移） ----
     old_mods = [k for k in sys.modules if k.startswith('HOUDINI_HIP_MANAGER')]
@@ -43,21 +49,21 @@ def _reload_modules():
                 pass
 
 from houdini_agent.core.main_window import MainWindow
+from houdini_agent.ui.login_dialog import LoginDialog
+from shared.user_paths import is_user_allowed
 
 _main_window = None
 
-def show_tool():
+def show_tool(username: str = None, force_login: bool = False):
     global _main_window, MainWindow
     
-    # 每次调用时强制重新加载模块
-    _reload_modules()
-    
-    # ★ 重载后刷新 MainWindow 引用，避免使用旧类
-    try:
-        from houdini_agent.core.main_window import MainWindow as _MW
-        MainWindow = _MW
-    except Exception:
-        pass
+    if _is_dev_reload_enabled():
+        _reload_modules()
+        try:
+            from houdini_agent.core.main_window import MainWindow as _MW
+            MainWindow = _MW
+        except Exception:
+            pass
     
     if not QtWidgets.QApplication.instance():
         app = QtWidgets.QApplication([])
@@ -80,7 +86,18 @@ def show_tool():
         _main_window = None
 
     try:
-        _main_window = MainWindow()
+        if force_login or not username:
+            dlg = LoginDialog(parent=None)
+            if dlg.exec_() != QtWidgets.QDialog.Accepted:
+                return None
+            username = dlg.get_username()
+        if not username:
+            return None
+        if not is_user_allowed(username):
+            QtWidgets.QMessageBox.information(None, "Houdini Agent", "当前用户未启用访问权限。", QtWidgets.QMessageBox.Ok)
+            return None
+
+        _main_window = MainWindow(username=username)
         _main_window.show()
         _main_window.raise_()
         _main_window.activateWindow()

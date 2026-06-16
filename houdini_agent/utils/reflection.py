@@ -22,6 +22,7 @@ from .memory_store import (
     get_memory_store,
 )
 from .reward_engine import RewardEngine, get_reward_engine
+from shared.user_paths import normalize_username
 
 # ============================================================
 # 反思配置
@@ -880,11 +881,20 @@ class ReflectionModule:
 # 全局单例
 # ============================================================
 
-_reflection_instance: Optional[ReflectionModule] = None
+_reflection_instances: Dict[str, ReflectionModule] = {}
 
-def get_reflection_module() -> ReflectionModule:
-    """获取全局 ReflectionModule 实例"""
-    global _reflection_instance
-    if _reflection_instance is None:
-        _reflection_instance = ReflectionModule()
-    return _reflection_instance
+def get_reflection_module(username: Optional[str] = None) -> ReflectionModule:
+    """获取 ReflectionModule 实例（按用户隔离）。"""
+    global _reflection_instances
+    if not username:
+        key = "default"
+        if key not in _reflection_instances:
+            _reflection_instances[key] = ReflectionModule()
+        return _reflection_instances[key]
+
+    uname = normalize_username(username)
+    if uname not in _reflection_instances:
+        store = get_memory_store(uname)
+        engine = get_reward_engine(uname)
+        _reflection_instances[uname] = ReflectionModule(store=store, reward_engine=engine)
+    return _reflection_instances[uname]

@@ -85,6 +85,9 @@ User request → AI plans → call tools → inspect results → call more tools
 | `set_node_parameter` | Set a single parameter value (with smart error hints, inline red/green diff preview, and one-click undo) |
 | `batch_set_parameters` | Set the same parameter across multiple nodes |
 | `set_display_flag` | Set display/render flags on a node |
+| `rename_node` | Rename a node (auto-sanitizes illegal characters, returns old→new path) |
+| `disconnect_nodes` | Disconnect a specific input or all inputs on a node |
+| `set_node_flags` | Set node flags: bypass (grey-out), template (orange), or lock |
 | `save_hip` | Save the current HIP file |
 | `undo_redo` | Undo or redo operations |
 
@@ -523,31 +526,166 @@ Created attribwrangle1 with random Cd attribute on all points.
 
 ## Troubleshooting
 
-### API Connection Issues
-- Use the "Test Connection" button to diagnose
-- Check that your API key is correct
-- Verify network access to the API endpoint
+### Launch Failures
 
-### Agent Not Calling Tools
-- Ensure the selected provider supports Function Calling
-- DeepSeek, GLM-4.7, OpenAI, and Duojie (Claude) all support tool calling
-- Ollama requires models with tool-calling support (e.g. `qwen2.5`)
+**Window does not appear / ImportError on startup**
 
-### Node Operations Fail
-- Confirm you are running inside Houdini (not standalone Python)
-- Check that node paths are absolute (e.g. `/obj/geo1/box1`)
-- Review the tool execution result for specific error messages
+1. Open the **Houdini Python Shell** (`Windows → Python Shell`) and paste:
+   ```python
+   import sys, traceback
+   sys.path.insert(0, r"C:\path\to\Houdini-Agent")
+   try:
+       import houdini_agent_launcher as l; l.show_tool()
+   except Exception:
+       traceback.print_exc()
+   ```
+   Read the traceback — it will tell you exactly which import failed.
 
-### UI Freezing
-- Non-Houdini tools (shell, web) should run in the background thread
-- If the UI freezes during shell commands, update to the latest version
+2. Common causes:
+   - **Wrong path** in `QUICK_SHELF_CODE.py` — update the `launcher_file` variable.
+   - **`lib/` not bundled** — run `git submodule update --init` or re-download the release ZIP.
+   - **PySide version mismatch** — Houdini ≤20.5 uses PySide2, Houdini 21+ uses PySide6. The `qt_compat.py` layer handles this automatically; if it fails, check your Houdini version.
+
+**Window opens then immediately closes**
+
+The window likely hit an exception during `__init__`. Check the Houdini Python Shell for a traceback. Temporarily set `HOUDINI_AGENT_DEV_RELOAD=1` to force a fresh module load:
+
+```python
+import os; os.environ["HOUDINI_AGENT_DEV_RELOAD"] = "1"
+```
+
+---
+
+### API Key & Connection
+
+**"Invalid API Key" / 401 errors**
+
+- Double-check the key with the provider dashboard.
+- In-app: click `···` → *Set API Key…* → re-enter the key, tick *Save to local config*.
+- Environment variable: restart Houdini after setting the variable so the new value is inherited.
+
+**400 Bad Request (temperature error)**
+
+Some relay endpoints (e.g. OF3D `gpt-5.5`) only accept `temperature=1`.  
+VS Code Copilot's `customendpoint` sends `temperature=0.1`, causing a 400.  
+Fix: run the bundled local proxy before using the model:
+
+```powershell
+python C:/Users/<you>/of3d_proxy.py   # forces temperature=1
+```
+Then point `chatLanguageModels.json` → `http://127.0.0.1:4891/v1/chat/completions`.
+
+**Timeout / connection drops**
+
+- Web search uses Brave → DuckDuckGo fallback; if both fail, disable web (`Web` checkbox off).
+- Increase shell command timeout in `execute_shell` parameters.
+- VPN / corporate proxy: set `HTTPS_PROXY` in the OS environment before launching Houdini.
+
+---
+
+### Mode Differences (Ask / Agent / Plan)
+
+| | Ask | Agent | Plan |
+|---|---|---|---|
+| Read nodes | ✓ | ✓ | ✓ |
+| Create / modify / delete | ✗ | ✓ | ✓ (after user confirms plan) |
+| Execute Python / Shell | ✗ | ✓ | ✓ |
+| Web search | ✓ | ✓ | ✓ |
+| Best for | Diagnosis, Q&A | Autonomous tasks | Complex multi-step builds |
+
+Switch modes with the `Agent / Ask / Plan` dropdown in the input toolbar.  
+**If you just want to analyze a scene without risk, use Ask mode.**
+
+---
+
+### Tool Blocked or Rejected
+
+**"Ask mode blocked tool: execute_python"**
+
+You are in Ask mode, which only allows read-only tools.  
+→ Switch to Agent mode or Plan mode.
+
+**"Missing required node_path for tool: get_node_parameters"**
+
+The AI did not pass a `node_path` argument. Tell the AI explicitly:  
+*"Get parameters for `/obj/geo1/box1`"* instead of *"get that node's params"*.
+
+**Confirm mode keeps interrupting**
+
+Every mutating tool requires your approval when *Confirm* is checked.  
+Uncheck the `Confirm` checkbox in the toolbar to skip confirmations (use with care in Agent mode).
+
+**"Tool already disabled" / tool missing from the list**
+
+Open `···` → *Plugin Manager* → *Tools* tab — find the tool and toggle it on.
+
+---
+
+### Agent Gets Stuck / Stops Early
+
+1. Press the **Stop** button — it signals the running loop to exit cleanly.
+2. Check the **Policy** button count: if it shows a red number, there are policy failures. Click it → *Policy Timeline* to see which tool was blocked and why.
+3. Export a full diagnostics snapshot for inspection:
+   - Click **Policy** → **Export Diagnostics JSON**, or type `/diagnostics` in the input box.
+   - The JSON is saved to `cache/diagnostics/` and contains the policy timeline, Harness trace, call records, and session state — no conversation content.
+4. If the agent loop terminates mid-task in Plan mode, the auto-resume mechanism should restart it. If it doesn't, switch to Agent mode and continue manually.
+
+---
+
+### Unit Tests (for developers)
+
+Run without Houdini — uses stubs for `hou`, `PySide`, and third-party libs:
+
+```powershell
+# From the repo root, using Houdini's bundled Python:
+& "C:/Program Files/Side Effects Software/Houdini 18.5.759/python37/python.exe" `
+    -m unittest discover -s tests -v
+```
+
+Or with any Python 3.7+ interpreter if you have PySide installed:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Expected output: `Ran 77 tests … OK`.
+
+To run a specific suite:
+```bash
+python -m unittest tests.test_harness_policy   # policy engine tests
+python -m unittest tests.test_tool_contracts   # tool schema contract tests
+python -m unittest tests.test_diagnostics_export  # diagnostics payload tests
+```
+
+---
+
+### Hot-reload for Development
+
+By default the launcher uses a stable import path (no module purging).  
+To force a full hot-reload on every launch (useful during active development):
+
+```python
+# In QUICK_SHELF_CODE.py — change "0" to "1":
+HOUDINI_AGENT_DEV_RELOAD = "1"
+```
+
+Or set the environment variable before launching Houdini:
+
+```powershell
+$env:HOUDINI_AGENT_DEV_RELOAD = "1"
+```
+
+Set to `"0"` (or leave unset) for the default stable launch.
+
+---
 
 ### Updating
-- Click the **Update** button in the toolbar to check for new versions
-- The plugin checks GitHub on startup (silently) and shows an **update notification banner** above the input area if a new version is available
-- One-click "Update Now" from the banner or toolbar button
-- Updates preserve your `config/`, `cache/`, `trainData/`, `plugins/`, and `rules/` directories
-- After updating, the plugin restarts automatically
+
+- Click the **Update** button in the toolbar to check for new versions.
+- The plugin checks GitHub on startup (silently) and shows an **update notification banner** above the input area when a new version is available.
+- One-click "Update Now" from the banner or toolbar button.
+- Updates preserve `config/`, `cache/`, `trainData/`, `plugins/`, and `rules/`.
+- After updating, the plugin restarts automatically.
 
 ## Version History
 

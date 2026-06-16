@@ -46,7 +46,7 @@ def _skill_info_to_openai_schema(info: dict, skill_name: str) -> dict:
     return {
         "type": "function",
         "function": {
-            "name": f"skill:{skill_name}",
+            "name": f"skill_{skill_name}",
             "description": f"[Skill] {info.get('description', skill_name)}",
             "parameters": {
                 "type": "object",
@@ -154,7 +154,7 @@ def _register_skills_to_registry():
                 return handler
 
             reg.register(
-                name=f"skill:{name}",
+                name=f"skill_{name}",
                 schema=schema,
                 handler=_make_handler(mod),
                 source="skill",

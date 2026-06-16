@@ -10,10 +10,11 @@
 """
 
 import os
+import re
 import hashlib
 import numpy as np
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 # ============================================================
 # 常量
@@ -74,10 +75,10 @@ class LocalEmbedder:
         except Exception as e:
             print(f"[Embedding] sentence-transformers 加载失败: {e}")
 
-        # 2. Fallback: 基于字符 n-gram 的伪向量
+        # 2. Fallback: 双语 Unicode 分词伪向量
         self._backend = "fallback"
         self.dim = EMBEDDING_DIM
-        print(f"[Embedding] 使用 fallback 模式 (n-gram hash, dim={self.dim})")
+        print(f"[Embedding] 使用 fallback 模式 (bilingual unicode, dim={self.dim})")
 
     @property
     def is_semantic(self) -> bool:
@@ -161,35 +162,84 @@ class LocalEmbedder:
         return np.array(vecs, dtype=np.float32)
 
     # ==========================================================
-    # Fallback: 基于字符 n-gram 的伪向量
+    # Fallback: 双语 Unicode 分词向量
     # ==========================================================
 
-    def _encode_fallback(self, text: str) -> np.ndarray:
-        """基于字符 3-gram 的哈希向量
+    # CJK Unicode 区段（涵盖常用汉字、日文、韩文）
+    _CJK_RE = re.compile(
+        r'[\u4e00-\u9fff'      # CJK 统一表意文字
+        r'\u3400-\u4dbf'       # CJK 扩展 A
+        r'\uf900-\ufaff'       # CJK 兼容表意文字
+        r'\u3040-\u309f'       # 平假名
+        r'\u30a0-\u30ff'       # 片假名
+        r'\uac00-\ud7af]+'     # 韩文音节
+    )
+    _EN_WORD_RE = re.compile(r'[a-z0-9][a-z0-9_\-]*')
 
-        不是真正的语义向量，但能捕捉词汇重叠。
-        对于关键词匹配场景效果可接受。
+    def _tokenize_bilingual(self, text: str) -> List[Tuple[str, float]]:
+        """双语分词：CJK 按字/双字/三字切分，英文按词+前后缀子词切分。
+
+        Returns:
+            List of (token, weight) tuples
+        """
+        tokens: List[Tuple[str, float]] = []
+        text_lower = text.lower()
+
+        # 按 CJK 区段切分为交替的 [非CJK, CJK, 非CJK, ...] 段
+        segments = self._CJK_RE.split(text_lower)
+        cjk_parts = self._CJK_RE.findall(text_lower)
+
+        # 重建交错列表：[seg0, cjk0, seg1, cjk1, ...]
+        interleaved: List[Tuple[str, bool]] = []
+        for i, seg in enumerate(segments):
+            if seg:
+                interleaved.append((seg, False))
+            if i < len(cjk_parts):
+                interleaved.append((cjk_parts[i], True))
+
+        for seg, is_cjk in interleaved:
+            if is_cjk:
+                # CJK 段：unigram + bigram + trigram
+                for ch in seg:
+                    tokens.append((ch, 2.0))
+                for i in range(len(seg) - 1):
+                    tokens.append((seg[i:i+2], 3.0))
+                for i in range(len(seg) - 2):
+                    tokens.append((seg[i:i+3], 1.5))
+            else:
+                # 非 CJK 段：完整英文词 + 前后缀子词 + 字符 bigram
+                for m in self._EN_WORD_RE.finditer(seg):
+                    w = m.group()
+                    if len(w) < 2:
+                        continue
+                    tokens.append((w, 3.0))
+                    if len(w) >= 4:
+                        tokens.append((w[:3], 1.0))   # prefix
+                        tokens.append((w[-3:], 1.0))  # suffix
+                    for i in range(len(w) - 1):
+                        tokens.append((w[i:i+2], 0.5))
+
+        return tokens
+
+    def _encode_fallback(self, text: str) -> np.ndarray:
+        """双语 Unicode 分词哈希向量。
+
+        使用 double hashing（MD5 + SHA1）减少碰撞，
+        CJK 字符 bigram/trigram 加权，英文完整词加权。
         """
         vec = np.zeros(self.dim, dtype=np.float32)
-        text_lower = text.lower().strip()
-        if not text_lower:
+        text_clean = text.strip()
+        if not text_clean:
             return vec
 
-        # 字符 3-gram
-        for i in range(len(text_lower) - 2):
-            ngram = text_lower[i:i+3]
-            # 确定性哈希 → 向量位置
-            h = int(hashlib.md5(ngram.encode()).hexdigest(), 16)
-            idx = h % self.dim
-            vec[idx] += 1.0
-
-        # 词级 unigram（加权更高）
-        words = text_lower.split()
-        for w in words:
-            if len(w) >= 2:
-                h = int(hashlib.md5(w.encode()).hexdigest(), 16)
-                idx = h % self.dim
-                vec[idx] += 2.0
+        for token, weight in self._tokenize_bilingual(text_clean):
+            encoded = token.encode('utf-8')
+            # 主哈希位置
+            h1 = int(hashlib.md5(encoded).hexdigest(), 16) % self.dim
+            vec[h1] += weight
+            # 副哈希位置（减少碰撞，权重减半）
+            h2 = int(hashlib.sha1(encoded).hexdigest(), 16) % self.dim
+            vec[h2] += weight * 0.5
 
         return vec
 

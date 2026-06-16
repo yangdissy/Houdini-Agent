@@ -163,13 +163,14 @@ class MemoryMgrSheet(QtWidgets.QDialog):
 class MemoryManagerDialog(QtWidgets.QDialog):
     """记忆库 — 独立顶层窗口 + 自绘 chrome + 双栏卡片。"""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, username: Optional[str] = None):
         # parent 仅用于 API 兼容，实际不参与窗口层级，避免挂到 Houdini QWidget。
         super().__init__(None)
         self.setObjectName("memoryManagerDlg")
         self._caller_parent = parent
         self._qss = _render_memory_qss()
-        self._store = get_memory_store()
+        self._username = username or getattr(parent, "_username", None)
+        self._store = get_memory_store(self._username)
         self._creating_semantic = False
         self._creating_procedural = False
 
@@ -328,7 +329,7 @@ class MemoryManagerDialog(QtWidgets.QDialog):
     @staticmethod
     def exec_centered(reference: Optional[QtWidgets.QWidget] = None) -> None:
         """打开模态记忆库；reference 仅用于几何对齐，不作为 Qt parent。"""
-        dlg = MemoryManagerDialog(reference)
+        dlg = MemoryManagerDialog(reference, username=getattr(reference, "_username", None))
         dlg.exec_()
 
     def _position_near(self, reference: Optional[QtWidgets.QWidget]):

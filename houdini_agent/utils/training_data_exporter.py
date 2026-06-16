@@ -6,6 +6,7 @@
 
 import json
 import uuid
+import getpass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional
@@ -83,7 +84,8 @@ class ChatTrainingExporter:
         
         # 生成文件名
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"chat_train_{timestamp}_{len(samples)}samples.jsonl"
+        username = getpass.getuser()
+        filename = f"chat_train_{username}_{timestamp}_{len(samples)}samples.jsonl"
         filepath = self.output_dir / filename
         
         # 写入 JSONL 文件

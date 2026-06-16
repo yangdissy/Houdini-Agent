@@ -81,9 +81,66 @@ def connect_nodes(output_path: str, input_path: str, input_index: int = 0) -> Tu
         return False, f"输入端口索引 {input_index} 无效 (有效范围 0~{max_inputs - 1})"
     try:
         input_node.setInput(input_index, output_node, 0)
+        try:
+            related_paths = _collect_related_layout_paths([output_node, input_node])
+            if related_paths:
+                layout_nodes(
+                    parent_path=input_node.parent().path(),
+                    node_paths=related_paths,
+                    method="tidy",
+                    spacing=1.0,
+                )
+        except Exception:
+            pass
         return True, f"已连接 {output_path} -> {input_path}[{input_index}]"
     except Exception as e:
         return False, f"连接失败: {e}"
+
+
+def _collect_related_layout_paths(seed_nodes: List[Any], max_nodes: int = 48) -> List[str]:
+    """Collect a bounded same-parent connected component for local tidy layout."""
+    if not seed_nodes:
+        return []
+    parent = None
+    for node in seed_nodes:
+        if node is not None:
+            parent = node.parent()
+            break
+    if parent is None:
+        return []
+
+    queue = [node for node in seed_nodes if node is not None and node.parent() == parent]
+    seen: set = set()
+    paths: List[str] = []
+
+    while queue and len(paths) < max_nodes:
+        node = queue.pop(0)
+        try:
+            path = node.path()
+        except Exception:
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        paths.append(path)
+
+        neighbors = []
+        try:
+            neighbors.extend([inp for inp in (node.inputs() or []) if inp is not None])
+        except Exception:
+            pass
+        try:
+            neighbors.extend([out for out in (node.outputs() or []) if out is not None])
+        except Exception:
+            pass
+        for neighbor in neighbors:
+            try:
+                if neighbor.parent() == parent and neighbor.path() not in seen:
+                    queue.append(neighbor)
+            except Exception:
+                continue
+
+    return paths
 
 
 def set_parameter(node_path: str, param_name: str, value: Any) -> Tuple[bool, str]:
@@ -125,6 +182,83 @@ def get_node_info(node_path: str) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         "outputs": [o.path() for o in node.outputs() if o],
     }
     return True, "查询成功", info
+
+
+def disconnect_nodes(node_path: str, input_index: Optional[int] = None) -> Tuple[bool, str]:
+    """断开节点的一个或全部输入连接
+
+    Args:
+        node_path:   目标节点完整路径
+        input_index: 要断开的输入端口索引；None 表示断开所有输入
+
+    Returns:
+        (success, message)
+    """
+    if hou is None:
+        return False, "Houdini 环境不可用"
+    node = hou.node(node_path)
+    if not node:
+        return False, f"节点 '{node_path}' 不存在"
+    try:
+        max_inputs = node.type().maxNumInputs()
+        if input_index is not None:
+            if input_index < 0 or input_index >= max_inputs:
+                return False, f"输入端口索引 {input_index} 无效 (有效范围 0~{max_inputs - 1})"
+            node.setInput(input_index, None)
+            return True, f"已断开 {node_path}[{input_index}] 的输入连接"
+        else:
+            disconnected = []
+            for i in range(max_inputs):
+                if node.input(i) is not None:
+                    node.setInput(i, None)
+                    disconnected.append(i)
+            if disconnected:
+                return True, f"已断开 {node_path} 的全部输入连接（端口: {disconnected}）"
+            return True, f"节点 {node_path} 无活跃输入连接，无需操作"
+    except Exception as e:
+        return False, f"断开连接失败: {e}"
+
+
+def set_node_flags(
+    node_path: str,
+    bypass: Optional[bool] = None,
+    template: Optional[bool] = None,
+    lock: Optional[bool] = None,
+) -> Tuple[bool, str]:
+    """设置节点的 bypass / template / lock 标志
+
+    Args:
+        node_path: 节点完整路径
+        bypass:    True=绕过节点（节点变灰，数据透传），False=取消绕过
+        template:  True=设为模板节点（橙色），False=取消模板
+        lock:      True=锁定节点（防止修改），False=解锁
+
+    Returns:
+        (success, message)
+    """
+    if hou is None:
+        return False, "Houdini 环境不可用"
+    node = hou.node(node_path)
+    if not node:
+        return False, f"节点 '{node_path}' 不存在"
+    if bypass is None and template is None and lock is None:
+        return False, "至少需要指定一个标志（bypass / template / lock）"
+    try:
+        applied = []
+        if bypass is not None and hasattr(node, 'bypass'):
+            node.bypass(bypass)
+            applied.append(f"bypass={'on' if bypass else 'off'}")
+        if template is not None and hasattr(node, 'setTemplateFlag'):
+            node.setTemplateFlag(template)
+            applied.append(f"template={'on' if template else 'off'}")
+        if lock is not None and hasattr(node, 'setHardLocked'):
+            node.setHardLocked(lock)
+            applied.append(f"lock={'on' if lock else 'off'}")
+        if applied:
+            return True, f"已设置 {node_path}: {', '.join(applied)}"
+        return False, f"节点类型 {node.type().name()} 不支持请求的标志"
+    except Exception as e:
+        return False, f"设置标志失败: {e}"
 
 
 def set_display_flag(node_path: str) -> Tuple[bool, str]:
@@ -192,7 +326,7 @@ def layout_nodes(
     Args:
         parent_path: 父网络路径，留空使用当前活跃网络
         node_paths: 要布局的节点路径列表；为空时布局整个网络
-        method: 布局方法 auto / grid / columns
+        method: 布局方法 auto / tidy / grid / columns
         spacing: 间距倍率（默认 1.0）
 
     Returns:
@@ -209,7 +343,7 @@ def layout_nodes(
     if parent is None:
         # 尝试当前网络编辑器的 pwd
         try:
-            editor = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
+            editor = hou.ui.curDesktop().paneTabOfType(hou.paneTabType.NetworkEditor)
             if editor:
                 parent = editor.pwd()
         except Exception:
@@ -238,22 +372,8 @@ def layout_nodes(
 
         if method == "auto":
             if node_paths:
-                # 有指定节点 → 优先用 NetworkEditor.layoutNodes
-                try:
-                    editor = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
-                    if editor and hasattr(editor, "layoutNodes"):
-                        editor.layoutNodes(nodes)
-                        layout_method_used = "NetworkEditor.layoutNodes"
-                    else:
-                        raise AttributeError("layoutNodes 不可用")
-                except Exception:
-                    # 降级：逐个 moveToGoodPosition
-                    for n in nodes:
-                        try:
-                            n.moveToGoodPosition()
-                        except Exception:
-                            pass
-                    layout_method_used = "moveToGoodPosition"
+                _layout_columns(nodes, spacing)
+                layout_method_used = "tidy(auto)"
             else:
                 # 全网络 → layoutChildren（支持间距）
                 h_sp = 2.0 * spacing
@@ -269,13 +389,13 @@ def layout_nodes(
                     parent.layoutChildren()
                     layout_method_used = "layoutChildren(no-spacing)"
 
+        elif method in ("tidy", "columns"):
+            _layout_columns(nodes, spacing)
+            layout_method_used = "tidy" if method == "tidy" else "columns(tidy)"
+
         elif method == "grid":
             _layout_grid(nodes, spacing)
             layout_method_used = "grid"
-
-        elif method == "columns":
-            _layout_columns(nodes, spacing)
-            layout_method_used = "columns"
 
         else:
             return False, f"未知布局方法: {method}", []
@@ -316,43 +436,189 @@ def _layout_grid(nodes: list, spacing: float = 1.0) -> None:
 
 
 def _layout_columns(nodes: list, spacing: float = 1.0) -> None:
-    """按拓扑深度分列布局：根节点在最上方，逐层向下排列"""
+    """按拓扑关系整理节点：主链垂直，分支左右展开。"""
     if not nodes:
         return
-    node_set = set(id(n) for n in nodes)
+    node_ids = [n.path() for n in nodes]
+    node_set = set(node_ids)
+    edges: List[Tuple[str, str, int]] = []
+    original_positions: Dict[str, Tuple[float, float]] = {}
 
-    # 计算每个节点的深度（输入链长度）
-    depth_map: Dict[int, int] = {}
+    for node in nodes:
+        node_id = node.path()
+        try:
+            pos = node.position()
+            original_positions[node_id] = (float(pos[0]), float(pos[1]))
+        except Exception:
+            original_positions[node_id] = (0.0, 0.0)
+        try:
+            for input_index, input_node in enumerate(node.inputs() or []):
+                if input_node is not None and input_node.path() in node_set:
+                    edges.append((input_node.path(), node_id, input_index))
+        except Exception:
+            continue
 
-    def _depth(n) -> int:
-        nid = id(n)
-        if nid in depth_map:
-            return depth_map[nid]
-        inputs = [inp for inp in (n.inputs() or []) if inp and id(inp) in node_set]
-        if not inputs:
-            depth_map[nid] = 0
-            return 0
-        d = max(_depth(inp) for inp in inputs) + 1
-        depth_map[nid] = d
-        return d
+    positions = _compute_tidy_layout(
+        node_ids,
+        edges,
+        spacing=spacing,
+        original_positions=original_positions,
+    )
+    for node in nodes:
+        x, y = positions.get(node.path(), (0.0, 0.0))
+        node.setPosition(hou.Vector2(x, y))
 
-    for n in nodes:
-        _depth(n)
 
-    # 按深度分组
-    layers: Dict[int, list] = {}
-    for n in nodes:
-        d = depth_map.get(id(n), 0)
-        layers.setdefault(d, []).append(n)
+def _compute_tidy_layout(
+    node_ids: List[str],
+    edges: List[Tuple[str, str, int]],
+    spacing: float = 1.0,
+    original_positions: Optional[Dict[str, Tuple[float, float]]] = None,
+) -> Dict[str, Tuple[float, float]]:
+    """Compute readable DAG positions without depending on Houdini APIs.
 
-    h_sp = 3.5 * spacing
-    v_sp = 2.0 * spacing
-    for depth in sorted(layers.keys()):
-        layer_nodes = layers[depth]
-        for idx, node in enumerate(layer_nodes):
-            x = (idx - len(layer_nodes) / 2.0 + 0.5) * h_sp
-            y = -depth * v_sp
-            node.setPosition(hou.Vector2(x, y))
+    Upstream nodes are placed above downstream nodes. Multi-input parents are
+    nudged left/right according to input index, so V-shaped joins are easier to
+    read than Houdini's generic auto-layout for generated networks.
+    """
+    if not node_ids:
+        return {}
+
+    spacing = max(float(spacing or 1.0), 0.2)
+    h_sp = 3.6 * spacing
+    v_sp = 1.7 * spacing
+    order = {node_id: idx for idx, node_id in enumerate(node_ids)}
+    node_set = set(node_ids)
+    filtered_edges = [
+        (src, dst, int(input_index or 0))
+        for src, dst, input_index in edges
+        if src in node_set and dst in node_set and src != dst
+    ]
+
+    parents: Dict[str, List[Tuple[str, int]]] = {node_id: [] for node_id in node_ids}
+    children: Dict[str, List[Tuple[str, int]]] = {node_id: [] for node_id in node_ids}
+    in_degree: Dict[str, int] = {node_id: 0 for node_id in node_ids}
+    for src, dst, input_index in filtered_edges:
+        parents[dst].append((src, input_index))
+        children[src].append((dst, input_index))
+        in_degree[dst] += 1
+
+    from collections import deque
+    depth: Dict[str, int] = {}
+    queue = deque(sorted(
+        (node_id for node_id in node_ids if in_degree[node_id] == 0),
+        key=lambda node_id: order[node_id],
+    ))
+    for node_id in queue:
+        depth[node_id] = 0
+
+    remaining_degree = dict(in_degree)
+    while queue:
+        current = queue.popleft()
+        current_depth = depth.get(current, 0)
+        for child_id, _ in children[current]:
+            depth[child_id] = max(depth.get(child_id, 0), current_depth + 1)
+            remaining_degree[child_id] -= 1
+            if remaining_degree[child_id] == 0:
+                queue.append(child_id)
+
+    for node_id in node_ids:
+        if node_id not in depth:
+            upstream_depths = [depth[p] for p, _ in parents[node_id] if p in depth]
+            depth[node_id] = (max(upstream_depths) + 1) if upstream_depths else 0
+
+    connected = {src for src, _, _ in filtered_edges} | {dst for _, dst, _ in filtered_edges}
+    layers: Dict[int, List[str]] = {}
+    isolated: List[str] = []
+    for node_id in node_ids:
+        if node_id not in connected:
+            isolated.append(node_id)
+        else:
+            layers.setdefault(depth.get(node_id, 0), []).append(node_id)
+
+    def original_x(node_id: str) -> float:
+        if original_positions and node_id in original_positions:
+            return original_positions[node_id][0]
+        return float(order[node_id])
+
+    for layer_nodes in layers.values():
+        layer_nodes.sort(key=lambda node_id: (original_x(node_id), order[node_id]))
+    isolated.sort(key=lambda node_id: (original_x(node_id), order[node_id]))
+
+    x_pos: Dict[str, float] = {}
+    for layer_index in sorted(layers):
+        layer_nodes = layers[layer_index]
+        for idx, node_id in enumerate(layer_nodes):
+            x_pos[node_id] = (idx - (len(layer_nodes) - 1) / 2.0) * h_sp
+
+    def input_count(child_id: str) -> int:
+        input_indexes = [input_index for _, input_index in parents[child_id]]
+        return max(input_indexes) + 1 if input_indexes else 1
+
+    def pack_by_targets(items: List[Tuple[str, float]]) -> None:
+        if not items:
+            return
+        items = sorted(items, key=lambda item: (item[1], order[item[0]]))
+        packed: List[Tuple[str, float, float]] = []
+        right_edge = None
+        for node_id, target in items:
+            x_value = target if right_edge is None else max(target, right_edge + h_sp)
+            packed.append((node_id, target, x_value))
+            right_edge = x_value
+        shift = sum(target - x_value for _, target, x_value in packed) / float(len(packed))
+        for node_id, _, x_value in packed:
+            x_pos[node_id] = x_value + shift
+
+    sorted_layers = sorted(layers)
+    for _ in range(3):
+        for layer_index in sorted_layers:
+            targets = []
+            for node_id in layers[layer_index]:
+                if not parents[node_id]:
+                    targets.append((node_id, x_pos.get(node_id, 0.0)))
+                    continue
+                parent_targets = [x_pos.get(parent_id, 0.0) for parent_id, _ in parents[node_id]]
+                targets.append((node_id, sum(parent_targets) / float(len(parent_targets))))
+            pack_by_targets(targets)
+
+        for layer_index in reversed(sorted_layers):
+            targets = []
+            for node_id in layers[layer_index]:
+                if not children[node_id]:
+                    targets.append((node_id, x_pos.get(node_id, 0.0)))
+                    continue
+                child_targets = []
+                for child_id, input_index in children[node_id]:
+                    count = max(input_count(child_id), 1)
+                    offset = (input_index - (count - 1) / 2.0) * min(h_sp * 0.9, h_sp)
+                    child_targets.append(x_pos.get(child_id, 0.0) + offset)
+                targets.append((node_id, sum(child_targets) / float(len(child_targets))))
+            pack_by_targets(targets)
+
+    positions: Dict[str, Tuple[float, float]] = {}
+    for node_id in node_ids:
+        if node_id in connected:
+            positions[node_id] = (x_pos.get(node_id, 0.0), -depth.get(node_id, 0) * v_sp)
+
+    if isolated:
+        main_max_x = max([pos[0] for pos in positions.values()] or [0.0])
+        iso_x = main_max_x + h_sp * 1.6
+        for idx, node_id in enumerate(isolated):
+            positions[node_id] = (iso_x, -idx * v_sp)
+
+    if original_positions:
+        selected_positions = [original_positions.get(node_id, (0.0, 0.0)) for node_id in node_ids]
+        anchor_x = sum(pos[0] for pos in selected_positions) / float(len(selected_positions))
+        anchor_y = sum(pos[1] for pos in selected_positions) / float(len(selected_positions))
+        new_positions = [positions[node_id] for node_id in node_ids]
+        center_x = sum(pos[0] for pos in new_positions) / float(len(new_positions))
+        center_y = sum(pos[1] for pos in new_positions) / float(len(new_positions))
+        positions = {
+            node_id: (x - center_x + anchor_x, y - center_y + anchor_y)
+            for node_id, (x, y) in positions.items()
+        }
+
+    return positions
 
 
 def get_node_positions(
@@ -384,7 +650,7 @@ def get_node_positions(
         parent = hou.node(parent_path) if parent_path else None
         if parent is None:
             try:
-                editor = hou.ui.paneTabOfType(hou.paneTabType.NetworkEditor)
+                editor = hou.ui.curDesktop().paneTabOfType(hou.paneTabType.NetworkEditor)
                 if editor:
                     parent = editor.pwd()
             except Exception:

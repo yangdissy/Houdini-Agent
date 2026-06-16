@@ -72,7 +72,7 @@ class AuroraBar(QtWidgets.QWidget):
 
     _NUM_STOPS = 10  # 渐变采样点数量，越多越平滑
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, username: Optional[str] = None):
         super().__init__(parent)
         self.setFixedWidth(3)
         self._phase = 0.0
@@ -1298,6 +1298,7 @@ class AIResponse(QtWidgets.QWidget):
                 lbl.setOpenExternalLinks(False)
                 lbl.setTextInteractionFlags(
                     QtCore.Qt.TextSelectableByMouse
+                    | QtCore.Qt.TextSelectableByKeyboard
                     | QtCore.Qt.LinksAccessibleByMouse
                 )
                 lbl.setText(seg[1])
@@ -5508,6 +5509,7 @@ SLASH_COMMANDS = [
     ("skills",    "⚡",  "技能列表",     "List Skills",      "列出所有可用 Skill",         "List all available skills",    "scene"),
     # ── 工具 ──
     ("status",    "📊",  "系统状态",     "System Status",    "查看记忆/成长/上下文统计",   "View memory/growth/context stats", "tool"),
+    ("diagnostics", "🧪", "导出诊断",     "Diagnostics",      "导出策略/trace诊断 JSON",    "Export policy/trace diagnostics JSON", "tool"),
     ("export",    "💾",  "导出训练",     "Export Training",  "导出对话为训练数据",         "Export conversation as training data", "tool"),
     ("image",     "🖼",  "附加图片",     "Attach Image",     "从文件选择图片附加到消息",   "Select image to attach",       "tool"),
     ("help",      "❓",  "帮助",         "Help",             "显示所有可用斜杠命令",       "Show all available commands",   "tool"),
@@ -5578,13 +5580,28 @@ class SlashCommandPopup(QtWidgets.QListWidget):
             self.setVisible(False)
             return
 
-        # 定位到光标下方
-        global_pos = anchor_widget.mapToGlobal(cursor_rect.bottomLeft())
-        self.move(global_pos.x(), global_pos.y() + 4)
         # 动态调整高度
         row_h = 24
         total_h = min(320, (self.count()) * row_h + 12)
-        self.setFixedHeight(max(80, total_h))
+        popup_h = max(80, total_h)
+        self.setFixedHeight(popup_h)
+
+        # 智能定位：优先朝上展开（输入框通常在底部），空间不足时才朝下
+        anchor_top = anchor_widget.mapToGlobal(cursor_rect.topLeft())
+        anchor_bottom = anchor_widget.mapToGlobal(cursor_rect.bottomLeft())
+        screen = QtWidgets.QApplication.screenAt(anchor_bottom) or QtWidgets.QApplication.primaryScreen()
+        screen_rect = screen.availableGeometry() if screen else QtCore.QRect(0, 0, 1920, 1080)
+
+        space_above = anchor_top.y() - screen_rect.top() - 4
+        space_below = screen_rect.bottom() - anchor_bottom.y() - 4
+
+        if space_above >= popup_h:
+            # 朝上展开（输入框在底部的常见情况）
+            self.move(anchor_top.x(), anchor_top.y() - popup_h - 4)
+        else:
+            # 空间不足则朝下
+            self.move(anchor_bottom.x(), anchor_bottom.y() + 4)
+
         self.setVisible(True)
         # 选中第一个非标题项
         for i in range(self.count()):
@@ -6446,12 +6463,13 @@ class TokenAnalyticsPanel(QtWidgets.QDialog):
         "Output", "Think", "Total", "延迟", "费用", "",
     ]
 
-    def __init__(self, call_records: list, token_stats: dict, parent=None):
+    def __init__(self, call_records: list, token_stats: dict, harness_records: list = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Token 使用分析")
         self.setMinimumSize(920, 560)
         self.resize(1020, 640)
         self.setObjectName("tokenPanel")
+        self._harness_records = harness_records or []
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(16, 12, 16, 12)
@@ -6459,6 +6477,11 @@ class TokenAnalyticsPanel(QtWidgets.QDialog):
 
         # ---- 摘要卡片 ----
         root.addWidget(self._build_summary(call_records, token_stats))
+
+        # ---- Harness 概览（第五批：调度可观测性）----
+        if self._harness_records:
+            root.addWidget(self._build_harness_summary(self._harness_records))
+            root.addWidget(self._build_harness_table(self._harness_records), 1)
 
         # ---- 调用明细表 ----
         root.addWidget(self._build_table(call_records), 1)
@@ -6604,6 +6627,103 @@ class TokenAnalyticsPanel(QtWidgets.QDialog):
         scroll.setWidget(table_widget)
         vbox.addWidget(scroll, 1)
 
+        return container
+
+    # -------- Harness 概览 --------
+    def _build_harness_summary(self, records) -> QtWidgets.QWidget:
+        card = QtWidgets.QFrame()
+        card.setObjectName("tokenSummaryCard")
+        grid = QtWidgets.QGridLayout(card)
+        grid.setContentsMargins(16, 10, 16, 10)
+        grid.setHorizontalSpacing(24)
+        grid.setVerticalSpacing(6)
+
+        iters = len(records)
+        total_tools = sum(int(r.get('tool_count', 0) or 0) for r in records)
+        dedup_hits = sum(int(r.get('dedup_hits', 0) or 0) for r in records)
+        early_skips = sum(int(r.get('early_skips', 0) or 0) for r in records)
+        failed_tools = sum(int(r.get('failed_tools', 0) or 0) for r in records)
+        async_tools = sum(int(r.get('async_tools', 0) or 0) for r in records)
+        houdini_tools = sum(int(r.get('houdini_tools', 0) or 0) for r in records)
+
+        dedup_rate = (dedup_hits / total_tools * 100.0) if total_tools > 0 else 0.0
+        fail_rate = (failed_tools / total_tools * 100.0) if total_tools > 0 else 0.0
+
+        metrics = [
+            ("Harness Iter", f"{iters}", CursorTheme.TEXT_SECONDARY),
+            ("Tool Calls", self._fmt_k(total_tools), CursorTheme.ACCENT_BLUE),
+            ("Dedup Hits", self._fmt_k(dedup_hits), "#10b981"),
+            ("Dedup Rate", f"{dedup_rate:.1f}%", "#10b981"),
+            ("Early Skip", self._fmt_k(early_skips), CursorTheme.ACCENT_ORANGE),
+            ("Failed", self._fmt_k(failed_tools), CursorTheme.ACCENT_RED),
+            ("Fail Rate", f"{fail_rate:.1f}%", CursorTheme.ACCENT_RED),
+            ("Async/Houdini", f"{async_tools}/{houdini_tools}", CursorTheme.ACCENT_PURPLE),
+        ]
+
+        for col, (label, value, color) in enumerate(metrics):
+            lbl = QtWidgets.QLabel(label)
+            lbl.setObjectName("tokenMetricLabel")
+            lbl.setAlignment(QtCore.Qt.AlignCenter)
+            grid.addWidget(lbl, 0, col)
+
+            val = QtWidgets.QLabel(value)
+            val.setObjectName("tokenMetricValue")
+            val.setStyleSheet(f"color:{color};")
+            val.setAlignment(QtCore.Qt.AlignCenter)
+            grid.addWidget(val, 1, col)
+
+        return card
+
+    def _build_harness_table(self, records) -> QtWidgets.QWidget:
+        container = QtWidgets.QFrame()
+        container.setObjectName("tokenTableCard")
+        vbox = QtWidgets.QVBoxLayout(container)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
+
+        title_lbl = QtWidgets.QLabel(f"  Harness 调度明细 ({len(records)} rows)")
+        title_lbl.setObjectName("tokenTableTitle")
+        vbox.addWidget(title_lbl)
+
+        table = QtWidgets.QTableWidget()
+        table.setObjectName("tokenTable")
+        table.setColumnCount(8)
+        table.setHorizontalHeaderLabels([
+            "时间", "模型", "迭代", "Tools", "Dedup", "Skip", "Failed", "Async/Hou"
+        ])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        table.setAlternatingRowColors(True)
+        table.setSortingEnabled(False)
+        table.setRowCount(len(records))
+
+        h = table.horizontalHeader()
+        h.setStretchLastSection(True)
+        h.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeToContents)
+
+        for row_idx, rec in enumerate(records):
+            time_s = str(rec.get('time', '-'))
+            model = str(rec.get('model', '-'))
+            iteration = str(rec.get('iteration', '-'))
+            tools = str(rec.get('tool_count', 0))
+            dedup = str(rec.get('dedup_hits', 0))
+            skip = str(rec.get('early_skips', 0))
+            failed = str(rec.get('failed_tools', 0))
+            async_hou = f"{rec.get('async_tools', 0)}/{rec.get('houdini_tools', 0)}"
+
+            values = [time_s, model, iteration, tools, dedup, skip, failed, async_hou]
+            for col_idx, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                table.setItem(row_idx, col_idx, item)
+
+        vbox.addWidget(table, 1)
         return container
 
     # 列宽定义
@@ -7455,7 +7575,7 @@ class PluginManagerDialog(QtWidgets.QDialog):
         h.addLayout(left, 1)
 
         # Skill 启用/禁用开关
-        tool_name = f"skill:{name}"
+        tool_name = f"skill_{name}"
         enabled = True
         try:
             from ..utils.tool_registry import get_tool_registry
@@ -7660,6 +7780,7 @@ class RulesEditorDialog(QtWidgets.QDialog):
         self._current_rule_id: Optional[str] = None
         self._rules: list = []
         self._dirty = False
+        self._username = getattr(parent, '_username', 'default') if parent else 'default'
 
         self._build_ui()
         self._load_rules()
@@ -7823,7 +7944,7 @@ class RulesEditorDialog(QtWidgets.QDialog):
         """从 rules_manager 加载所有规则"""
         try:
             from ..utils.rules_manager import get_all_rules
-            self._rules = get_all_rules(force_reload=True)
+            self._rules = get_all_rules(username=self._username, force_reload=True)
         except Exception as e:
             print(f"[RulesEditor] Failed to load rules: {e}")
             self._rules = []
@@ -7960,7 +8081,7 @@ class RulesEditorDialog(QtWidgets.QDialog):
         try:
             from ..utils.rules_manager import save_all_ui_rules
             ui_rules = [r for r in self._rules if r.get("source", "ui") == "ui"]
-            save_all_ui_rules(ui_rules)
+            save_all_ui_rules(ui_rules, username=self._username)
             self._dirty = False
         except Exception as e:
             print(f"[RulesEditor] Auto-save failed: {e}")
@@ -7969,7 +8090,7 @@ class RulesEditorDialog(QtWidgets.QDialog):
         """新增一条 UI 规则"""
         try:
             from ..utils.rules_manager import add_rule
-            rule = add_rule(title=tr('rules.untitled'), content="")
+            rule = add_rule(title=tr('rules.untitled'), content="", username=self._username)
             rule["source"] = "ui"
             self._rules.append(rule)
             self._current_rule_id = rule["id"]
@@ -8007,7 +8128,7 @@ class RulesEditorDialog(QtWidgets.QDialog):
 
         try:
             from ..utils.rules_manager import delete_rule
-            delete_rule(self._current_rule_id)
+            delete_rule(self._current_rule_id, username=self._username)
             self._rules = [r for r in self._rules if r.get("id") != self._current_rule_id]
             self._current_rule_id = None
             self._refresh_list()

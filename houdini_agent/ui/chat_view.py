@@ -39,7 +39,7 @@ class ChatViewMixin:
             img_row.addStretch()
             msg.layout().addLayout(img_row)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, msg)
-        self._scroll_to_bottom()
+        self._scroll_to_bottom(force=True)  # 用户发消息，强制滚到底部
 
     def _add_ai_response(self) -> AIResponse:
         """添加 AI 回复块"""
@@ -61,17 +61,18 @@ class ChatViewMixin:
         """滚动到底部，但尊重用户的查看位置（带节流防止事件循环过载）
         
         Args:
-            force: 强制滚动（用于新消息）
+            force: 强制滚动（用于新消息）；可抢占正在等待的定时器
         """
-        if force or not self._is_user_scrolled_up():
-            # 节流：如果已有待执行的滚动定时器，跳过本次
-            if not hasattr(self, '_scroll_timer'):
-                self._scroll_timer = QtCore.QTimer(self)
-                self._scroll_timer.setSingleShot(True)
-                self._scroll_timer.setInterval(60)
-                self._scroll_timer.timeout.connect(self._do_scroll)
-            if not self._scroll_timer.isActive():
-                self._scroll_timer.start()
+        if not force and self._is_user_scrolled_up():
+            return
+        if not hasattr(self, '_scroll_timer'):
+            self._scroll_timer = QtCore.QTimer(self)
+            self._scroll_timer.setSingleShot(True)
+            self._scroll_timer.setInterval(60)
+            self._scroll_timer.timeout.connect(self._do_scroll)
+        # force 可抢占已有定时器（restart），普通请求不重复触发
+        if force or not self._scroll_timer.isActive():
+            self._scroll_timer.start()
     
     def _do_scroll(self):
         """实际执行滚动"""

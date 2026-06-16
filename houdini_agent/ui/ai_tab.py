@@ -11,6 +11,8 @@ Agent loop, multi-turn tool calling, streaming UI
   core/session_manager.py — SessionManagerMixin: 多会话管理和缓存
 """
 
+import atexit
+import copy
 import json
 import math
 import os
@@ -61,8 +63,18 @@ import re
 from .header import HeaderMixin
 from .input_area import InputAreaMixin
 from .chat_view import ChatViewMixin
+from .image_mixin import ImageMixin
 from ..core.agent_runner import AgentRunnerMixin
+from ..core.memory_mixin import MemoryMixin
+from ..core.plan_mixin import PlanMixin
 from ..core.session_manager import SessionManagerMixin
+from ..core.streaming_parser import StreamingParserMixin
+from ..core.harness_engine import (
+    HarnessRuntimeState,
+    HarnessToolPolicyEngine,
+    build_tool_retry_key,
+    is_harness_v2_enabled,
+)
 
 # ★ 大脑启发式长期记忆系统
 from ..utils.memory_store import get_memory_store
@@ -72,12 +84,54 @@ from ..utils.growth_tracker import get_growth_tracker, TaskMetric
 
 # ★ Plan 模式
 from ..utils.plan_manager import get_plan_manager, PLAN_TOOL_CREATE, PLAN_TOOL_UPDATE_STEP, PLAN_TOOL_ASK_QUESTION
+from shared.user_paths import UserPaths
+
+# ── 系统提示词模板加载器 ──────────────────────────────────────────────────────
+_PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
+_PROMPT_TEMPLATE_CACHE: dict = {}
+
+# 核心规则子集（内嵌兜底，当 system_prompt_rules_core.txt 文件不存在时使用）
+# 只保留每轮续接都可能触发的高频规则，完整规则见 system_prompt_rules.txt
+_CORE_RULES_FALLBACK = """
+Node Path Output Rules: Always use full absolute paths (e.g. /obj/geo1/box1), never bare names.
+
+Fake Tool Call Prevention (highest priority): NEVER write "[ok] tool:" or "[Tool Result]" in replies. Call tools via function calling only.
+
+Tool Call Parameter Rules: Verify all required parameters before calling. node_path must be absolute. Fix parameter errors and retry — don't call check_errors for tool failures.
+
+Safe Operation: Before setting parameters, call get_node_parameters. No duplicate queries per round. After creating a node, use the returned path.
+
+Node Creation Failure: If create_node fails, call search_node_types to find the correct type name and retry.
+
+Wrangle Run Over: addpoint()/addprim() code MUST use Detail mode (class=0), not Points — would create duplicates per input point.
+
+VEX Writing: New wrangle → create_wrangle_node; existing wrangle → set_node_parameter(parm_name="snippet"). Never use execute_python for VEX. After writing, call check_errors.
+
+Mandatory Verification: Call verify_and_summarize before completing any task. Fix issues and repeat until passed.
+
+Todo: Use add_todo for complex tasks. Call update_todo immediately after each step completes.
+"""
+
+
+def _load_prompt_template(name: str) -> str:
+    """从 prompts/ 目录按文件名加载模板，结果缓存到进程级 dict。"""
+    if name not in _PROMPT_TEMPLATE_CACHE:
+        try:
+            _PROMPT_TEMPLATE_CACHE[name] = (_PROMPTS_DIR / name).read_text(encoding='utf-8')
+        except FileNotFoundError:
+            print(f"[Prompts] 模板文件缺失: {name}")
+            _PROMPT_TEMPLATE_CACHE[name] = ""
+    return _PROMPT_TEMPLATE_CACHE[name]
 
 
 class AITab(
     HeaderMixin,
     InputAreaMixin,
     ChatViewMixin,
+    ImageMixin,
+    StreamingParserMixin,
+    MemoryMixin,
+    PlanMixin,
     AgentRunnerMixin,
     SessionManagerMixin,
     QtWidgets.QWidget,
@@ -114,11 +168,21 @@ class AITab(
     _updatePlanStep = QtCore.Signal(str, str, str)   # Plan 模式：更新步骤状态 (step_id, status, result_summary)
     _askQuestionRequest = QtCore.Signal()             # Plan 模式：ask_question 请求（参数通过属性传递）
     
-    def __init__(self, parent=None, workspace_dir: Optional[Path] = None):
+    def __init__(self, parent=None, workspace_dir: Optional[Path] = None, username: Optional[str] = None):
         super().__init__(parent)
-        
-        self.client = AIClient()
+
+        self._username = (username or "").strip().lower() or "default"
+        user_paths = UserPaths(self._username)
+        user_paths.ensure_dirs()
+
+        try:
+            self.client = AIClient(username=self._username)
+        except TypeError:
+            # Backward-compatible fallback for older AIClient versions
+            self.client = AIClient()
         self.mcp = HoudiniMCP()
+        if hasattr(self.mcp, "set_user"):
+            self.mcp.set_user(self._username)
         self.mcp.set_stop_event(self.client._stop_event)  # 共享停止事件，使 shell/python 命令可被中断
         self.client.set_tool_executor(self._execute_tool_with_todo)
         self.client.set_batch_tool_executor(self._execute_tools_batch_in_main_thread)
@@ -145,7 +209,7 @@ class AITab(
         
         # 缓存管理
         self._session_id = str(uuid.uuid4())[:8]  # 当前会话 ID
-        self._cache_dir = Path(__file__).parent.parent.parent / "cache" / "conversations"
+        self._cache_dir = user_paths.conversations_dir()
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._auto_save_cache = True  # 自动保存缓存
         self._workspace_dir = workspace_dir  # 工作区目录
@@ -182,6 +246,9 @@ class AITab(
         # ★ 睡眠机制计数器
         self._sleep_msg_counter = 0       # 当前 session 累计用户消息数
         self._sleep_in_progress = False   # 防止并发睡眠
+
+        # 用户切换请求（在停止后执行）
+        self._pending_user_switch: Optional[str] = None
         
         self._init_memory_system()
         
@@ -204,22 +271,23 @@ class AITab(
         self._session_node_map: dict[str, set[str]] = {}
         
         # Token 使用统计（累积值，每轮对话叠加）—— 对齐 Cursor
-        self._token_stats = {
-            'input_tokens': 0,      # 输入 token 总数
-            'output_tokens': 0,     # 输出 token 总数
-            'reasoning_tokens': 0,  # 推理 token（输出的子集）
-            'cache_read': 0,        # Cache 读取（命中）token
-            'cache_write': 0,       # Cache 写入（未命中）token
-            'total_tokens': 0,      # 总 token 数
-            'requests': 0,          # 请求次数
-            'estimated_cost': 0.0,  # 预估费用（USD）
-        }
+        self._token_stats = self._empty_token_stats()
         self._call_records: list = []  # 每次 API 调用的详细记录（对齐 Cursor）
+        self._harness_trace_records: list = []  # Harness 调度追踪记录（V2）
+        self._policy_timeline_records: list = []  # 最近策略决策时间线
+        self._policy_failure_count: int = 0
         
         # 工具执行线程安全机制（使用队列和锁避免竞争）
         self._tool_result_queue: queue.Queue = queue.Queue()
         self._tool_lock = threading.Lock()  # 确保一次只有一个工具调用
         self._main_thread_busy = False  # ★ 主线程忙标记（防止超时后堆积信号死锁）
+        self._harness_v2_enabled = is_harness_v2_enabled(default=True)
+        self._harness_state = HarnessRuntimeState(session_id=self._session_id)
+        self._tool_policy_engine = HarnessToolPolicyEngine()
+        try:
+            self._policy_retry_limit = max(1, int(os.getenv("HOUDINI_AGENT_POLICY_MAX_RETRIES", "2")))
+        except Exception:
+            self._policy_retry_limit = 2
         
         # 连接信号
         self._appendContent.connect(self._on_append_content)
@@ -255,7 +323,7 @@ class AITab(
         self._streaming_preview_tool = ""       # 正在流式预览的工具名
         self._streaming_last_code = ""          # 上次解析出的完整代码（用于增量 diff）
         
-        # 构建并缓存系统提示词（两个版本：有思考 / 无思考）
+        # 构建并缓存系统提示词（完整版：首轮；核心版：续接轮）
         self._system_prompt_think = self._build_system_prompt(with_thinking=True)
         self._system_prompt_no_think = self._build_system_prompt(with_thinking=False)
         self._cached_prompt_think = self.token_optimizer.optimize_system_prompt(
@@ -263,6 +331,13 @@ class AITab(
         )
         self._cached_prompt_no_think = self.token_optimizer.optimize_system_prompt(
             self._system_prompt_no_think, max_length=1500
+        )
+        # 核心规则子集版（续接轮使用，节省 ~2000 tokens/轮）
+        self._cached_prompt_core_think = self.token_optimizer.optimize_system_prompt(
+            self._build_system_prompt(with_thinking=True, full_rules=False), max_length=1200
+        )
+        self._cached_prompt_core_no_think = self.token_optimizer.optimize_system_prompt(
+            self._build_system_prompt(with_thinking=False, full_rules=False), max_length=1000
         )
         # 兼容旧引用
         self._system_prompt = self._system_prompt_think
@@ -272,6 +347,7 @@ class AITab(
         self._load_model_preference(restore_provider=True)  # 恢复上次使用的提供商和模型
         self._update_key_status()
         self._update_context_stats()
+        self._refresh_mode_guard_ui()
         
         # ★ 启动时自动恢复上次的会话（从 sessions_manifest.json）
         self._restore_all_sessions()
@@ -282,7 +358,6 @@ class AITab(
         self._auto_save_timer.start(60_000)  # 60 秒
         
         # 注册 atexit 回调和 QApplication.aboutToQuit 信号
-        import atexit
         atexit.register(self._atexit_save)
         app = QtWidgets.QApplication.instance()
         if app:
@@ -309,6 +384,13 @@ class AITab(
         self._cached_prompt_no_think = self.token_optimizer.optimize_system_prompt(
             self._system_prompt_no_think, max_length=1800
         )
+        # 核心规则子集版同步重建
+        self._cached_prompt_core_think = self.token_optimizer.optimize_system_prompt(
+            self._build_system_prompt(with_thinking=True, full_rules=False), max_length=1200
+        )
+        self._cached_prompt_core_no_think = self.token_optimizer.optimize_system_prompt(
+            self._build_system_prompt(with_thinking=False, full_rules=False), max_length=1000
+        )
         self._system_prompt = self._system_prompt_think
         self._cached_optimized_system_prompt = self._cached_prompt_think
         print(f"[i18n] System prompts rebuilt for language: {_lang or get_language()}")
@@ -326,23 +408,7 @@ class AITab(
     # ==========================================================
     # ★ 大脑启发式长期记忆系统
     # ==========================================================
-
-    def _init_memory_system(self):
-        """初始化长期记忆系统（后台线程，不阻塞 UI）"""
-        def _init():
-            try:
-                self._memory_store = get_memory_store()
-                self._reward_engine = get_reward_engine()
-                self._reflection_module = get_reflection_module()
-                self._growth_tracker = get_growth_tracker()
-                self._memory_initialized = True
-                print(f"[Memory] 长期记忆系统已初始化: {self._memory_store.get_stats()}")
-            except Exception as e:
-                print(f"[Memory] 初始化失败 (非致命): {e}")
-                self._memory_initialized = False
-
-        thread = threading.Thread(target=_init, daemon=True)
-        thread.start()
+    # 已迁移到 core/memory_mixin.py (MemoryMixin)
 
     # ==========================================================
     # ★ 插件系统 (Hook / Plugin System)
@@ -384,488 +450,50 @@ class AITab(
         except Exception:
             pass
 
-    def _activate_long_term_memory(self, user_message: str, scene_context: dict = None) -> str:
-        """动态记忆激活 — 分层 chunk 检索
+    def _build_system_prompt(self, with_thinking: bool = True, full_rules: bool = True) -> str:
+        """构建系统提示（从 houdini_agent/prompts/ 加载模板）。
 
-        6 层抽象层级体系：
-        - L0 (核心身份): 已在 sys_prompt 中加载，此处跳过
-        - L1 (核心偏好): embedding 检索, top_k=3, threshold=0.15
-        - L2 (经验规则): embedding 检索, top_k=3, threshold=0.25
-        - L3 (工作流模式): embedding 检索, top_k=2, threshold=0.35
-        - L4-L5: 不自动注入，仅通过 search_memory 工具检索
-
-        每层独立取 TopK chunk，互不挤占。
-        每条 chunk 附带置信度标注，明确标注"仅供参考"。
-
-        ★ 注意: fallback embedding (n-gram hash) 的 cosine similarity 值域约 0~0.4，
-        远低于 sentence-transformers 的 0~1.0。threshold 会在 search_by_level 内部
-        自动缩放以适配不同后端。Episodic / Procedural 的 score 阈值也需同样处理。
-        """
-        if not self._memory_initialized or not self._memory_store:
-            return ""
-
-        try:
-            store = self._memory_store
-
-            # 构建查询（用户消息 + 场景关键词）
-            query = user_message
-            if scene_context:
-                selected_types = scene_context.get('selected_types', [])
-                if selected_types:
-                    query += ' ' + ' '.join(selected_types)
-
-            # ★ fallback 模式下 cosine similarity 值域很低，缩放 score 阈值
-            _is_semantic = store.embedder.is_semantic
-            _ep_threshold = 0.3 if _is_semantic else 0.05
-            _proc_threshold = 0.25 if _is_semantic else 0.04
-
-            parts = []
-
-            # ── L1: 核心偏好 (top_k=3, threshold=0.15) ──
-            l1_results = store.search_by_level(query, level=1, top_k=3, threshold=0.15)
-            for rec, score in l1_results:
-                parts.append(f"[L1 Preference] (conf={rec.confidence:.2f}) {rec.rule[:120]}")
-                store.increment_semantic_activation(rec.id)
-
-            # ── L2: 经验规则 (top_k=3, threshold=0.25) ──
-            l2_results = store.search_by_level(query, level=2, top_k=3, threshold=0.25)
-            for rec, score in l2_results:
-                parts.append(f"[L2 Rule] (conf={rec.confidence:.2f}) {rec.rule[:120]}")
-                store.increment_semantic_activation(rec.id)
-
-            # ── L3: 工作流模式 (top_k=2, threshold=0.35) ──
-            l3_results = store.search_by_level(query, level=3, top_k=2, threshold=0.35)
-            for rec, score in l3_results:
-                parts.append(f"[L3 Workflow] (conf={rec.confidence:.2f}) {rec.rule[:120]}")
-                store.increment_semantic_activation(rec.id)
-
-            # ── Episodic: 相关经历 (top_k=2) ──
-            episodes = store.search_episodic(query, top_k=2, min_importance=0.3)
-            for ep, score in episodes:
-                if score > _ep_threshold:
-                    status = "✅" if ep.success else "❌"
-                    parts.append(
-                        f"[Past Experience] {status} {ep.task_description[:80]} "
-                        f"→ {ep.result_summary[:60]}"
-                    )
-                    try:
-                        new_imp = min(5.0, ep.importance * 1.05)
-                        store.update_episodic_importance(ep.id, new_imp)
-                    except Exception:
-                        pass
-
-            # ── Procedural: 适用策略 (top_k=2) ──
-            strategies = store.search_procedural(query, top_k=2)
-            for strat, score in strategies:
-                if score > _proc_threshold:
-                    parts.append(f"[Strategy] {strat.description[:80]}")
-
-            if not parts:
-                return ""
-
-            header = "[Long-Term Memory — 历史经验仅供参考，请结合当前上下文判断]"
-            result = header + "\n" + "\n".join(parts)
-            return result
-
-        except Exception as e:
-            print(f"[Memory] 记忆激活失败: {e}")
-            return ""
-
-    @staticmethod
-    def _collect_recent_rounds(history: list, n_rounds: int) -> list:
-        """从对话历史中收集最近 N 轮（以 user 消息为分界）的消息
+        动态部分（lang_rule、labs_catalog）在运行时注入；
+        静态规则文本存放在模板文件中，修改规则无需改动代码。
 
         Args:
-            history: 完整对话历史
-            n_rounds: 要收集的轮数
-
-        Returns:
-            最近 N 轮的消息副本列表
+            with_thinking: 是否包含 <think> 框架块。
+            full_rules: True=完整规则（首轮/首次请求）；
+                        False=核心规则子集（续接轮，节省 ~2000 tokens）。
+                        核心规则文件：system_prompt_rules_core.txt
         """
-        if not history:
-            return []
-
-        # 按 user 消息划分轮次
-        rounds = []
-        current_round = []
-        for m in history:
-            if m.get('role') == 'user' and current_round:
-                rounds.append(current_round)
-                current_round = []
-            current_round.append(m)
-        if current_round:
-            rounds.append(current_round)
-
-        # 取最近 n_rounds 轮
-        recent = rounds[-n_rounds:] if len(rounds) >= n_rounds else rounds
-        # 展平为消息列表（深拷贝避免修改原始数据）
-        import copy
-        return [copy.copy(m) for rnd in recent for m in rnd]
-
-    def _reflect_after_task(self, result: dict, agent_params: dict):
-        """任务完成后的反思钩子 — 在后台线程执行
-
-        从 agent result 中提取信号，创建 episodic 记忆，
-        计算 reward，触发规则/LLM 反思。
-        """
-        if not self._memory_initialized or not self._reflection_module:
-            return
-
-        try:
-            # 提取任务信息
-            tool_calls_history = result.get('tool_calls_history', [])
-            final_content = result.get('final_content', '') or result.get('content', '')
-            new_messages = result.get('new_messages', [])
-
-            # 构建工具调用序列
-            tool_calls = []
-            error_count = 0
-            retry_count = 0
-            for tc in tool_calls_history:
-                tc_result = tc.get('result', {})
-                success = bool(tc_result.get('success', True))
-                has_error = bool(tc_result.get('error', ''))
-                tool_calls.append({
-                    "name": tc.get('tool_name', ''),
-                    "success": success and not has_error,
-                    "error": tc_result.get('error', ''),
-                })
-                if has_error or not success:
-                    error_count += 1
-
-            # 检测重试（连续相同工具调用）
-            for i in range(1, len(tool_calls)):
-                if (tool_calls[i]["name"] == tool_calls[i-1]["name"]
-                        and not tool_calls[i-1]["success"]):
-                    retry_count += 1
-
-            # 提取用户请求
-            history = self._agent_history if self._agent_history is not None else self._conversation_history
-            task_description = ""
-            for msg in reversed(history):
-                if msg.get('role') == 'user':
-                    content = msg.get('content', '')
-                    if isinstance(content, list):
-                        task_description = ' '.join(
-                            p.get('text', '') for p in content if p.get('type') == 'text'
-                        )
-                    else:
-                        task_description = content
-                    task_description = task_description[:200]
-                    break
-
-            # 判断成功 / 失败
-            success = result.get('ok', True) and error_count < len(tool_calls) * 0.5
-
-            # 结果摘要
-            result_summary = ""
-            if final_content:
-                # 去除 think 标签
-                import re as _re
-                clean = _re.sub(r'<think>[\s\S]*?</think>', '', final_content).strip()
-                result_summary = clean[:150]
-
-            session_id = self._agent_session_id or self._session_id
-
-            # 执行反思
-            reflect_result = self._reflection_module.reflect_on_task(
-                session_id=session_id,
-                task_description=task_description,
-                result_summary=result_summary,
-                success=success,
-                error_count=error_count,
-                retry_count=retry_count,
-                tool_calls=tool_calls,
-                ai_client=self.client,
-                model=agent_params.get('model', 'deepseek-chat'),
-                provider=agent_params.get('provider', 'deepseek'),
-            )
-
-            # 更新 Growth Tracker
-            if self._growth_tracker:
-                metric = TaskMetric(
-                    success=success,
-                    error_count=error_count,
-                    retry_count=retry_count,
-                    tool_call_count=len(tool_calls),
-                    reward=reflect_result.get('reward', 0.0),
-                    tags=reflect_result.get('tags', []),
-                )
-                self._growth_tracker.record_task(metric)
-
-                # 如果 LLM 反思返回了技能置信度更新
-                if reflect_result.get('deep_reflected') and 'skill_confidence' in reflect_result:
-                    self._growth_tracker.update_skill_confidence_batch(
-                        reflect_result.get('skill_confidence', {})
-                    )
-
-            if reflect_result.get('reward', 0) > 0:
-                print(f"[Memory] 反思完成: reward={reflect_result['reward']:.2f}, "
-                      f"tags={reflect_result.get('tags', [])}, "
-                      f"deep_reflected={reflect_result.get('deep_reflected', False)}")
-
-        except Exception as e:
-            import traceback
-            print(f"[Memory] 反思钩子异常: {e}")
-            traceback.print_exc()
-
-    def _get_personality_injection(self) -> str:
-        """获取个性注入文本（附加到 system prompt 末尾）"""
-        if not self._memory_initialized or not self._growth_tracker:
-            return ""
-        try:
-            return self._growth_tracker.get_personality_description()
-        except Exception:
-            return ""
-
-    def _get_user_rules_injection(self) -> str:
-        """获取用户自定义规则文本（附加到 system prompt 末尾）"""
-        try:
-            from ..utils.rules_manager import get_rules_for_prompt
-            return get_rules_for_prompt()
-        except Exception:
-            return ""
-
-    def _build_system_prompt(self, with_thinking: bool = True) -> str:
-        """构建系统提示
-        
-        Args:
-            with_thinking: 是否包含 <think> 标签思考指令
-        """
-        # Language enforcement based on UI setting
         if get_language() == 'en':
             lang_rule = "CRITICAL: You MUST reply in English for ALL user-facing text. No exceptions. Even if the user writes in another language, your reply MUST be in English."
         else:
             lang_rule = "CRITICAL: You MUST reply in the SAME language the user uses. If the user writes in Chinese, reply in Chinese. If in English, reply in English. Match the user's language exactly."
-        
-        base_prompt = f"""You are a Houdini assistant, expert at solving problems with nodes and VEX.
-{lang_rule}
-Never use emoji or icon symbols in replies unless the user explicitly requests them. Use plain text only.
-"""
+
+        base_prompt = (
+            "You are a Houdini assistant, expert at solving problems with nodes and VEX.\n"
+            f"{lang_rule}\n"
+            "Never use emoji or icon symbols in replies unless the user explicitly requests them. Use plain text only.\n"
+        )
         if with_thinking:
-            base_prompt += f"""
-Output Format (highest priority rule — violation = failure):
-Every single reply (regardless of round number or whether tools were called) MUST begin with a <think>...</think> block. No exceptions.
-Even brief confirmations or status updates must start with <think> before the main text.
-Omitting the <think> tag is a format violation and is unacceptable.
-
-Deep Thinking Framework (MUST follow inside <think> tags, no steps may be skipped):
-1.[Understand] What does the user truly want? Are there implicit needs beyond the literal request? Don't stop at the surface.
-2.[Status] What is the current scene state? What did the last tool return? Does the result match expectations? Any anomalies or gaps?
-3.[Options] List at least 2 viable approaches and compare pros/cons. If only one exists, explain why there are no alternatives.
-4.[Decision] Choose the optimal approach and explicitly state the reasoning.
-5.[Plan] List concrete execution steps, tools to call, and their order.
-6.[Risk] What could go wrong? How to handle it if it does?
-
-Thinking Principles:
--Do NOT rush to act. First fully understand the existing network structure before deciding how to modify it.
--If unsure about node types, parameter names, or connections, you MUST query with tools first. Never guess.
--After each tool result, evaluate quality: Did it succeed? Is the return value reasonable? If unexpected, analyze why and adjust the plan.
--Better to query one extra time than to redo work due to wrong assumptions.
--After finding the first viable approach, pause and think whether there is a better one.
-
-Collaboration Rules When Encountering Obstacles (critical — never abandon the plan):
--When a step cannot be completed via tools (e.g., user must manually operate the UI, provide files/paths/passwords, install plugins, configure environments, select objects in viewport), you MUST NOT abandon or skip the current plan.
--Correct behavior: Pause execution. Clearly tell the user: current progress, the specific obstacle, and exactly what the user needs to do. Then wait.
--Be specific: Give concrete step-by-step instructions (e.g., "Please install SideFX Labs in Houdini: Shelf area -> Right-click -> Shelves -> SideFX Labs"), not vague "please configure the environment".
--If a step is easier for the user via UI interaction (drag files, click buttons, select objects in viewport), prefer asking the user rather than simulating it with code.
--Before pausing, summarize what you have completed and explain what the user needs to do, so you can resume seamlessly afterward.
-
-Content outside think tags is the formal reply shown to the user — keep it concise, direct, action-oriented. {lang_rule}
-
-Example (deep thinking + plain text reply):
-<think>
-[Understand] User wants to scatter points on a ground plane and copy small spheres. Implicit need: uniform distribution, appropriate sphere size.
-[Status] /obj/geo1 is currently empty, need to build from scratch.
-[Options]
-A: box -> scatter -> sphere + copytopoints — classic workflow, scatter directly controls count and distribution.
-B: grid -> wrangle(VEX rand to manually generate points) + copytopoints — more flexible but more complex, unnecessary for this case.
-[Decision] Choose A. Standard workflow, scatter parameters are controllable, no over-engineering needed.
-[Plan] 1. create_node box as scatter base 2. create_node scatter connected to box 3. create_node sphere as copy template 4. create_node copytopoints connecting scatter(input1) and sphere(input0) 5. verify_and_summarize
-[Risk] copytopoints input order is easy to mix up (0=template, 1=target points). Must verify connections carefully.
-</think>
-Created box->scatter->copytopoints pipeline, 500 points, sphere radius 0.05.
-
-Example (follow-up reply after tool execution, MUST still have think tag):
-<think>
-[Status] Previous step created grid node, returned path /obj/geo1/grid1, status normal.
-[Plan] Next, add a wrangle node for terrain noise displacement. Code needs @P.y += noise(@P * freq) structure, run_over = Points (operating on point attribute @P).
-[Risk] Noise frequency and amplitude need reasonable values. Start with freq=2, amp=0.5 as defaults, user can adjust later.
-</think>
-"""
+            base_prompt += _load_prompt_template("system_prompt_thinking_block.txt").format(lang_rule=lang_rule)
         else:
-            base_prompt += """
-Output format: Concise, direct, action-oriented. MUST reply in the same language the user uses.
-"""
+            base_prompt += "\nOutput format: Concise, direct, action-oriented. MUST reply in the same language the user uses.\n"
 
-        base_prompt += """
-Node Path Output Rules (MUST follow when mentioning nodes in replies):
--When mentioning any Houdini node in reply text, you MUST use the full absolute path, e.g. /obj/geo1/box1, NOT just the node name box1
--Path format must start with root category: /obj/..., /out/..., /ch/..., /shop/..., /stage/..., /mat/..., /tasks/...
--Correct: "Created node /obj/geo1/scatter1 and connected to /obj/geo1/box1"
--Wrong: "Created node scatter1 and connected to box1" (missing full path, user cannot click to navigate)
--When listing multiple nodes, each must have full path: "/obj/geo1/box1, /obj/geo1/transform1, /obj/geo1/merge1"
--Node paths are automatically converted to clickable links. Users can click to jump to the corresponding node. Path accuracy is critical.
+        # full_rules=True 加载完整规则（~400 行），False 加载核心子集（~60 行，续接轮用）
+        rules_file = "system_prompt_rules.txt" if full_rules else "system_prompt_rules_core.txt"
+        rules_text = _load_prompt_template(rules_file)
+        # 核心规则文件不存在时使用内嵌兜底常量（安全兜底，避免续接轮无规则）
+        if not rules_text and not full_rules:
+            rules_text = _CORE_RULES_FALLBACK
+        base_prompt += rules_text
 
-Fake Tool Call Prevention (highest priority — violation = failure):
--You MUST NEVER write text that looks like tool execution results in your reply
--NEVER include "[ok] web_search:", "[ok] fetch_webpage:", "[Tool Result]" or similar in replies
--If you need to search for information, you MUST actually call the web_search tool via function calling
--If unsure about information, you MUST call a tool to query, never fabricate answers disguised as search results
--Your reply may only contain: think tags, natural language text, code blocks — no simulated tool call formats
-
-Tool Call Parameter Rules (highest priority — MUST check before every tool call):
--Before calling a tool, MUST verify all required parameters are filled. Missing required params will cause failure
--Parameter values must use correct data types (string/number/boolean/array). Don't write numbers as strings, don't omit quotes around paths
--node_path parameter must be a full absolute path (e.g., "/obj/geo1/box1"), never just the node name (e.g., "box1")
--Don't guess parameter names or values from memory. First use query tools (get_node_parameters, get_node_inputs, search_node_types) to confirm
--If a tool call returns "missing parameter" or "parameter error", it means YOUR call parameters were wrong. Fix and retry, don't call check_errors
--When calling the same tool multiple times, always fill all required parameters each time. Don't assume the system remembers previous parameters
-
-Safe Operation Rules:
--When first needing to understand a network, call get_network_structure or list_children, but do NOT re-query a network already queried in this round (system auto-caches within the same round)
--Before setting parameters, MUST call get_node_parameters to see what parameters exist, their names, current values and defaults. Never guess parameter names
--If modifying multiple parameters, first query all with get_node_parameters, then set them one by one with set_node_parameter
--In execute_python, always check for None: node=hou.node(path); if node: ...
--After creating a node, use the returned path. Never guess paths
--Before connecting nodes, confirm both endpoints exist
--No duplicate queries: A network_path only needs one query per round. Results remain valid within the round. If you've already inspected a network's structure, reuse the previous result
-
-Node Creation Failure Recovery (MUST follow strictly):
--If create_node returns an error (e.g., "unrecognized node type"), do NOT retry blindly or give up
--MUST immediately call search_node_types to find the correct node type name
--If search results are unclear, continue with search_local_doc or get_houdini_node_doc for detailed documentation
--Recreate the node using the correct type name found
--If multiple searches still fail, use execute_python to query directly: hou.nodeType(hou.sopNodeTypeCategory(), 'xxx')
-
-Understanding Existing Networks:
--When get_network_structure returns results with [Contains VEX Code] or [Contains Python Code] annotations, you MUST carefully read the embedded code
--Reading wrangle node VEX code reveals the node's specific logic (attribute calculations, conditional filtering, etc.) — this is key to understanding existing network implementations
--To modify an existing wrangle node's code, first use get_node_parameters to read the full snippet parameter, then use set_node_parameter to set new code
-
-Wrangle Node Run Over Mode (critical — MUST consider every time a wrangle is created):
--When creating a wrangle node, you MUST select the correct run_over mode based on what the VEX code actually operates on. Never always use the default Points
--run_over determines VEX execution context: Points (per-point), Primitives (per-primitive), Vertices (per-vertex), Detail (once globally)
--Wrong run_over will cause VEX code to completely malfunction or produce incorrect results
--Selection rules:
-  If code operates on @P, @N, @pscale, @Cd etc. point attributes, or uses @ptnum, @numpt -> use Points
-  If code operates on @primnum, @numprim, prim() functions, or processes per-primitive -> use Primitives
-  If code only needs to run once for global attributes (e.g., @Frame, detail()), or uses addpoint/addprim to manually create geometry -> use Detail
-  If code operates on vertex attributes (e.g., UV) or uses @vtxnum -> use Vertices
--Common mistake: Using Points mode with addpoint()/addprim() causes creation to run per input point, producing massive duplicate geometry. Such code MUST use Detail mode
--When unsure which mode to use, prioritize judging by the attributes and functions accessed in VEX code
--Wrangle class parameter value mapping: 0=Detail (only once), 1=Primitives, 2=Points, 3=Vertices, 4=Numbers
-  Use set_node_parameter to set class parameter with the corresponding integer (e.g., Detail=0, Points=2)
-
-Mandatory Verification Before Task Completion (MUST execute, cannot skip):
-1. Call verify_and_summarize for automatic checks (orphan nodes, error nodes, connection integrity, display flags), passing your expected node list and expected outcome
-2. If verify_and_summarize reports issues, fix them and call again until passed
-3. Note: No need to call get_network_structure before verify_and_summarize — it has built-in network checks
-4. check_errors is only for checking node cooking errors. Tool call failure messages are already in the return result, no need to call check_errors
-5. After completing geometry or visual operations, if the model supports vision, call capture_viewport to take a viewport screenshot and visually verify the result looks correct (e.g., geometry shape, scale, distribution, material appearance). This is especially useful for scatter, copy-to-points, terrain, and other visual-dependent workflows
-
-Tool Priority: create_wrangle_node (VEX preferred) > create_nodes_batch > create_node
-Node Inputs: 0=primary input, 1=second input | from_path=upstream, to_path=downstream
-
-System Shell Tool (execute_shell):
--For executing system commands (pip, git, dir, ffmpeg, hython, scp, ssh, etc.), not limited to Houdini Python environment
--Use cases: Install Python packages, browse filesystem, run external toolchains, check env vars, remote file transfer (scp/sftp)
--execute_python is for Houdini scene operations (hou module), execute_shell is for system-level operations
--Commands have timeout limits (default 30s, max 120s). Dangerous commands will be intercepted
--Shell command rules (MUST follow):
-  1.Must generate complete commands ready to run immediately. No placeholders (e.g., <your_path>)
-  2.For commands requiring user interaction/confirmation, must pass non-interactive flags (e.g., pip install --yes, apt -y, echo y |)
-  3.Prefer single commands. For multi-step operations, chain with && (Linux) or semicolons ; (PowerShell)
-  4.Command output may be long. Prefer precise commands to reduce output (e.g., find -maxdepth 2, dir /b, ls -la specific_path)
-  5.Remote operations (ssh/scp/sftp) require pre-configured key-based auth. Cannot rely on interactive password input
-  6.For large file transfers or long-running commands, set appropriate timeout parameter (max 120s)
-  7.Paths with spaces must be quoted. Windows paths use backslashes or quoted forward slashes
-  8.Don't blindly guess file paths. First use dir/ls/find to confirm path exists before operating
-  9.When installing packages, specify version (pip install package==version) to avoid incompatibilities
-  10.If a command fails, first analyze stderr error output, fix specifically, then retry. Don't blindly re-execute
-
-Skill System (MUST use for geometry analysis):
--Skills are predefined advanced analysis scripts, more reliable and efficient than hand-written code
--For geometry info (point count, face count, attributes, bounding box, connectivity, etc.), MUST prefer run_skill over execute_python
--Common skills: analyze_geometry_attribs (attribute stats), get_bounding_info (bounding box), analyze_connectivity (connectivity), compare_attributes (attribute comparison), find_dead_nodes (dead nodes), trace_node_dependencies (dependency tracing), find_attribute_references (attribute reference search), analyze_normals (normal quality check)
--If unsure which skills exist, first call list_skills
--Example: run_skill(skill_name="analyze_geometry_attribs", params={"node_path": "/obj/geo1/box1"}) lists all attributes
--Example: run_skill(skill_name="get_bounding_info", params={"node_path": "/obj/geo1/box1"}) gets bounding box
--Example: run_skill(skill_name="analyze_normals", params={"node_path": "/obj/geo1/box1"}) checks normal quality
-
-Performance Analysis & Optimization (use when user mentions performance/speed/lag/optimization):
--Quick diagnosis: First use run_skill(skill_name="analyze_cook_performance", params={"network_path": "/obj/geo1"}) for network-wide cook time ranking and bottleneck identification
--Detailed analysis: For more precise time breakdown and memory stats, use perf_start_profile to start profiling (can force cook simultaneously), then perf_stop_and_report for detailed report
--After analysis, use existing tools to implement optimizations based on bottleneck nodes and suggestions, then re-run analysis to verify
--Common optimization techniques:
-  1.Add Cache/File Cache nodes before/after expensive nodes to avoid redundant cooking
-  2.Reduce unnecessary cooking (check time-dependent expressions)
-  3.Replace Python SOP with VEX (create_wrangle_node) — 10-100x performance improvement
-  4.Reduce scatter/copy point counts, reduce polygon subdivision
-  5.Use Packed Primitives to reduce memory and cook overhead
-  6.Check for-each loop iteration counts for excess
-
-Web Search Strategy (MUST follow before using web_search):
--Convert user questions to precise search keywords. Don't use raw questions as search terms
--For Houdini-related questions, prefer "SideFX Houdini" prefix
--If first search results are poor for Chinese questions, try English keywords (max 2 retries)
--If search results contain useful links, use fetch_webpage for detailed content before answering
--When using info from search results, MUST cite source at end of relevant paragraph, format: [Source: Title](URL)
--Don't copy search results verbatim. Synthesize in your own words
--Never search with the same keywords twice (cache returns identical results)
-
-Todo Management Rules (MUST follow strictly):
--For complex tasks, first use add_todo to create a task checklist broken into concrete steps
--After completing each step, IMMEDIATELY call update_todo to mark it done
--After each tool execution round, review the Todo list to confirm what's done and what's pending
--After all steps complete, ensure every todo is marked done before final verification
-
-Node Layout Rules (MUST execute after verification passes, before creating NetworkBox):
--After verify_and_summarize passes, MUST call layout_nodes to auto-arrange all nodes before creating any NetworkBox
--Default: layout_nodes() with no parameters — auto-layouts all nodes in the current network
--If only specific nodes need layout (e.g., newly created ones), pass their paths in node_paths
--Layout MUST happen before create_network_box, because NetworkBox.fitAroundContents() depends on node positions
--If layout result looks wrong, use get_node_positions to check, and try method="grid" or method="columns" as fallback
--Execution order: create nodes → connect → verify_and_summarize → layout_nodes → create_network_box
-
-NetworkBox Grouping Rules (MUST follow when building node networks):
--After completing a logical phase of node creation and connection, MUST use create_network_box to package that phase's nodes into a NetworkBox
--NetworkBox comment should clearly describe the group's function (e.g., "Base Geometry Input", "Noise Deformation", "Output Merge")
--Choose color preset by phase semantics: input (blue/data input), processing (green/geometry processing), deform (orange/deformation animation), output (red/output rendering), simulation (purple/physics simulation), utility (gray/helper tools)
--Grouping granularity: Only create a NetworkBox when there are 6+ functionally related nodes in a phase. If fewer than 6 nodes, do NOT create a box — leave them ungrouped. Small groups of nodes are fine without boxes
--Typical grouping examples:
-  Input phase (input): file_read, null (as input marker)
-  Processing phase (processing): scatter, copy_to_points, transform
-  Deformation phase (deform): mountain, bend, wrangle (VEX deformation)
-  Output phase (output): merge, null (as output marker), rop_geometry
--To add nodes to an existing group later, use add_nodes_to_box instead of creating a new box
-
-NetworkBox Hierarchical Navigation (large network query strategy, MUST follow):
--When calling get_network_structure, if NetworkBoxes exist, results auto-collapse to box overview (name + comment + node count + main types) without expanding each node — greatly reduces context usage
--To see detailed nodes and connections inside a box, call get_network_structure(box_name="box_name") to drill in
--Do NOT expand all boxes at once. Only expand the box needed for the current task. Expand others as needed later
--Ungrouped nodes appear with full details in the overview. No extra action needed
--Cross-group connections are listed separately in the overview to help understand data flow between boxes"""
-
-        # Inject Labs node catalog (so AI knows Labs tools exist)
-        try:
-            from ..utils.doc_rag import get_doc_index
-            labs_catalog = get_doc_index().get_labs_catalog()
-            if labs_catalog:
-                base_prompt += f"""
-
-SideFX Labs Node Usage Rules (MUST follow strictly):
--Below is the SideFX Labs toolkit node catalog. Labs provides extensive advanced tools for game development, texture baking, terrain, procedural generation, etc.
--When user requests involve game asset optimization, LOD generation, texture baking, flowmaps, photogrammetry, tree generation, UV processing, etc., PREFER Labs nodes over building from scratch.
--Before using ANY Labs node, you MUST first call search_local_doc("Labs node_name") to query its detailed documentation. Understand parameters and usage before creating the node. Using Labs nodes by guessing is FORBIDDEN.
--Labs node_type format is typically "labs::" prefix + node name (e.g., "labs::lod_create"). If creation fails, use search_node_types to find the correct type name.
--Labs nodes are highly encapsulated HDAs (Digital Assets), typically with multiple input and output ports containing complete internal node networks. If unsure about a Labs node's implementation, use get_network_structure(network_path="node_path") to inspect its internal network and connections.
--When connecting Labs nodes, check the input_label in connection data to ensure correct data is connected to the correct input port.
-
-{labs_catalog}
-"""
-        except Exception:
-            pass
+        # Labs catalog 仅在完整规则版本中注入（续接轮不需要重复注入）
+        if full_rules:
+            try:
+                from ..utils.doc_rag import get_doc_index
+                labs_catalog = get_doc_index().get_labs_catalog()
+                if labs_catalog:
+                    base_prompt += _load_prompt_template("system_prompt_labs_section.txt").format(labs_catalog=labs_catalog)
+            except Exception:
+                pass
 
         # 使用极致优化器压缩（已缓存）
         return UltraOptimizer.compress_system_prompt(base_prompt)
@@ -877,9 +505,9 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         self._theme.load_template(Path(__file__).parent / "style_template.qss")
         self._theme.load_preference()
         self.setStyleSheet(self._theme.render())
-        
+
         self.setMinimumWidth(320)
-        
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -1008,9 +636,8 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         """计算当前上下文的总 token 数（含工具定义）"""
         # 缓存工具定义 token 数（只算一次，因为工具定义不变）
         if not hasattr(self, '_tools_token_cache'):
-            import json as _json
             from houdini_agent.utils.ai_client import HOUDINI_TOOLS
-            tools_json = _json.dumps(HOUDINI_TOOLS, ensure_ascii=False)
+            tools_json = json.dumps(HOUDINI_TOOLS, ensure_ascii=False)
             self._tools_token_cache = self.token_optimizer.estimate_tokens(tools_json)
         
         total = self._tools_token_cache
@@ -1134,22 +761,18 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
             else:
                 optimize_indicator = ""  # 已优化/正常
         
-        # 根据使用比例设置颜色
+        # 根据使用比例设置颜色和状态
         if percent < 50:
             color = CursorTheme.TEXT_MUTED
-        elif percent < 80:
-            color = CursorTheme.ACCENT_ORANGE
-        else:
-            color = CursorTheme.ACCENT_RED
-        
-        self.context_label.setText(f"{percent:.1f}% {used_str}/{limit_str}{optimize_indicator}")
-        # 动态状态 → QSS 选择器 QLabel#contextLabel[state="..."]
-        if percent < 50:
             ctx_state = ""
         elif percent < 80:
+            color = CursorTheme.ACCENT_ORANGE
             ctx_state = "warning"
         else:
+            color = CursorTheme.ACCENT_RED
             ctx_state = "critical"
+
+        self.context_label.setText(f"{percent:.1f}% {used_str}/{limit_str}{optimize_indicator}")
         self.context_label.setProperty("state", ctx_state)
         self.context_label.style().unpolish(self.context_label)
         self.context_label.style().polish(self.context_label)
@@ -1212,14 +835,266 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         """显示详细 Token 统计对话框（对齐 Cursor：使用 TokenAnalyticsPanel）"""
         from houdini_agent.ui.cursor_widgets import TokenAnalyticsPanel
         records = getattr(self, '_call_records', []) or []
-        dialog = TokenAnalyticsPanel(records, self._token_stats, parent=self)
+        harness_records = getattr(self, '_harness_trace_records', []) or []
+        dialog = TokenAnalyticsPanel(records, self._token_stats, harness_records, parent=self)
         dialog.exec_()
         if dialog.should_reset_stats:
             self._reset_token_stats()
+
+    def _refresh_mode_guard_ui(self):
+        """刷新输入区模式风险提示与策略时间线入口。"""
+        mode = 'PLAN' if self._plan_mode else ('AGENT' if self._agent_mode else 'ASK')
+        if mode == 'ASK':
+            guard = 'RO'
+            color = '#10b981'
+        elif self._confirm_mode:
+            guard = 'CONFIRM'
+            color = '#f59e0b'
+        else:
+            guard = 'HIGH-RISK'
+            color = '#ef4444'
+
+        hint = f"{mode} | {guard}"
+        if hasattr(self, 'mode_guard_label') and self.mode_guard_label:
+            self.mode_guard_label.setText(hint)
+            self.mode_guard_label.setStyleSheet(f"color:{color}; font-weight:600;")
+
+            lines = [
+                f"当前模式: {mode}",
+                f"确认开关: {'ON' if self._confirm_mode else 'OFF'}",
+                f"策略失败次数: {self._policy_failure_count}",
+            ]
+            for item in self._policy_timeline_records[-5:]:
+                lines.append(
+                    f"{item.get('time', '')} {item.get('tool', '')} -> {item.get('action', '')}"
+                )
+            self.mode_guard_label.setToolTip("\n".join(lines))
+
+        if hasattr(self, 'policy_timeline_btn') and self.policy_timeline_btn:
+            n = len(self._policy_timeline_records)
+            self.policy_timeline_btn.setText(f"Policy {n}")
+            if self._policy_failure_count > 0:
+                self.policy_timeline_btn.setStyleSheet("color:#ef4444;")
+            else:
+                self.policy_timeline_btn.setStyleSheet("")
+
+    def _append_policy_timeline(self, tool_name: str, action: str, reason: str = ""):
+        item = {
+            'time': datetime.now().strftime('%H:%M:%S'),
+            'tool': tool_name,
+            'action': action,
+            'reason': (reason or '').strip(),
+        }
+        self._policy_timeline_records.append(item)
+        if len(self._policy_timeline_records) > 200:
+            self._policy_timeline_records = self._policy_timeline_records[-200:]
+        if action in {'deny', 'ask_cancel', 'retry_limit', 'exec_fail'}:
+            self._policy_failure_count += 1
+        try:
+            mode = 'plan' if self._plan_mode else ('agent' if self._agent_mode else 'ask')
+            self._append_session_diagnostics_records([
+                {
+                    'event_type': 'policy_decision',
+                    'tool': tool_name,
+                    'action': action,
+                    'reason': (reason or '').strip(),
+                    'mode': mode,
+                    'plan_phase': getattr(self, '_plan_phase', 'idle'),
+                    'confirm_mode': bool(getattr(self, '_confirm_mode', False)),
+                    'failure_count': int(getattr(self, '_policy_failure_count', 0) or 0),
+                }
+            ])
+        except Exception:
+            pass
+        self._refresh_mode_guard_ui()
+
+    def _get_session_diagnostics_jsonl_path(self, session_id: Optional[str] = None) -> Path:
+        sid = (session_id or self._session_id or "unknown").strip() or "unknown"
+        cache_dir = getattr(self, '_cache_dir', None)
+        if not isinstance(cache_dir, Path):
+            cache_dir = Path('.')
+        diag_dir = cache_dir / "diagnostics"
+        diag_dir.mkdir(parents=True, exist_ok=True)
+        return diag_dir / f"session_{sid}.jsonl"
+
+    def _append_session_diagnostics_records(self, records: list, session_id: Optional[str] = None):
+        """Append-only session diagnostics records (JSONL)."""
+        if not records:
+            return
+        sid = (session_id or self._session_id or "unknown").strip() or "unknown"
+        try:
+            path = self._get_session_diagnostics_jsonl_path(sid)
+            now_iso = datetime.now().isoformat()
+            with open(path, 'a', encoding='utf-8') as f:
+                for rec in records:
+                    row = dict(rec or {})
+                    row.setdefault('schema_version', 1)
+                    row.setdefault('session_id', sid)
+                    row.setdefault('recorded_at', now_iso)
+                    row.setdefault('event_type', 'unknown')
+                    f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        except Exception as e:
+            print(f"[Diagnostics] 写入 session jsonl 失败: {e}")
+
+    def _show_policy_menu(self):
+        """显示策略/诊断菜单。"""
+        menu = QtWidgets.QMenu(self)
+        menu.addAction("Policy Timeline", self._show_policy_timeline_dialog)
+        menu.addAction("Export Diagnostics JSON", self._export_diagnostics_json)
+        menu.exec_(self.policy_timeline_btn.mapToGlobal(
+            QtCore.QPoint(0, self.policy_timeline_btn.height())
+        ))
+
+    def _show_policy_timeline_dialog(self):
+        """显示最近策略决策时间线，并提供快速恢复动作。"""
+        lines = ["最近策略时间线（最新在下）：", ""]
+        records = self._policy_timeline_records[-30:]
+        if not records:
+            lines.append("暂无策略记录。")
+        else:
+            for rec in records:
+                reason = rec.get('reason', '')
+                if reason:
+                    lines.append(
+                        f"{rec.get('time', '')} | {rec.get('tool', '')} | {rec.get('action', '')} | {reason}"
+                    )
+                else:
+                    lines.append(
+                        f"{rec.get('time', '')} | {rec.get('tool', '')} | {rec.get('action', '')}"
+                    )
+
+        lines.append("")
+        lines.append("快速恢复：")
+        lines.append("1) 切换到 Plan 模式（更稳）")
+        lines.append("2) 切换到 Ask 模式（只读排查）")
+
+        msg_box = QtWidgets.QMessageBox(self)
+        msg_box.setWindowTitle("Policy Timeline")
+        msg_box.setText("\n".join(lines))
+        btn_plan = msg_box.addButton("切到 Plan", QtWidgets.QMessageBox.ActionRole)
+        btn_ask = msg_box.addButton("切到 Ask", QtWidgets.QMessageBox.ActionRole)
+        btn_close = msg_box.addButton("关闭", QtWidgets.QMessageBox.RejectRole)
+        msg_box.exec_()
+        clicked = msg_box.clickedButton()
+        if clicked == btn_plan and hasattr(self, 'mode_combo'):
+            self.mode_combo.setCurrentIndex(2)
+        elif clicked == btn_ask and hasattr(self, 'mode_combo'):
+            self.mode_combo.setCurrentIndex(1)
+        elif clicked == btn_close:
+            return
+
+    def _append_harness_trace_records(self, records: list, session_id: Optional[str] = None):
+        """追加写入 Harness trace（jsonl），用于回放与诊断。"""
+        if not records:
+            return
+        sid = (session_id or self._session_id or "unknown").strip() or "unknown"
+        try:
+            trace_dir = self._cache_dir / "harness_trace"
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            trace_file = trace_dir / f"session_{sid}.jsonl"
+            now_iso = datetime.now().isoformat()
+            with open(trace_file, 'a', encoding='utf-8') as f:
+                for rec in records:
+                    row = dict(rec or {})
+                    row.setdefault('session_id', sid)
+                    row.setdefault('recorded_at', now_iso)
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"[Harness Trace] 写入失败: {e}")
+
+    def _build_diagnostics_payload(self) -> dict:
+        """Build a compact diagnostics payload without conversation message content."""
+        session_id = self._session_id or "unknown"
+        provider = self._current_provider() if hasattr(self, '_current_provider') else ""
+        model = self.model_combo.currentText() if hasattr(self, 'model_combo') else ""
+        mode = 'plan' if self._plan_mode else ('agent' if self._agent_mode else 'ask')
+        session_audit_jsonl = None
+        session_audit_exists = False
+        try:
+            session_audit_path = self._get_session_diagnostics_jsonl_path(session_id)
+            session_audit_jsonl = str(session_audit_path)
+            session_audit_exists = session_audit_path.exists()
+        except Exception:
+            pass
+
+        return {
+            'schema_version': 1,
+            'exported_at': datetime.now().isoformat(),
+            'session': {
+                'id': session_id,
+                'username': getattr(self, '_username', 'default'),
+                'mode': mode,
+                'plan_phase': getattr(self, '_plan_phase', 'idle'),
+                'confirm_mode': bool(getattr(self, '_confirm_mode', False)),
+                'auto_read_mode': getattr(self, '_auto_read_mode', ''),
+                'conversation_messages': len(getattr(self, '_conversation_history', []) or []),
+                'session_audit_jsonl': session_audit_jsonl,
+                'session_audit_exists': session_audit_exists,
+            },
+            'runtime': {
+                'provider': provider,
+                'model': model,
+                'is_running': bool(getattr(self, '_is_running', False)),
+                'harness_v2_enabled': bool(getattr(self, '_harness_v2_enabled', False)),
+                'policy_retry_limit': getattr(self, '_policy_retry_limit', None),
+                'pending_user_switch': getattr(self, '_pending_user_switch', None),
+            },
+            'token_stats': dict(getattr(self, '_token_stats', {}) or {}),
+            'policy': {
+                'failure_count': int(getattr(self, '_policy_failure_count', 0) or 0),
+                'timeline': list(getattr(self, '_policy_timeline_records', []) or [])[-200:],
+                'retry_counts': dict(getattr(getattr(self, '_harness_state', None), 'policy_retry_counts', {}) or {}),
+            },
+            'harness': {
+                'runtime_trace': list(getattr(getattr(self, '_harness_state', None), 'trace', []) or [])[-300:],
+                'executor_trace': list(getattr(self, '_harness_trace_records', []) or [])[-500:],
+            },
+            'calls': list(getattr(self, '_call_records', []) or [])[-100:],
+        }
+
+    def _export_diagnostics_json(self) -> Optional[str]:
+        """Export policy/timing diagnostics to a JSON file."""
+        try:
+            diag_dir = self._cache_dir / "diagnostics"
+            diag_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            session_id = (self._session_id or "unknown").strip() or "unknown"
+            path = diag_dir / f"diagnostics_{session_id}_{stamp}.json"
+            payload = self._build_diagnostics_payload()
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Diagnostics Export Failed", str(e))
+            return None
+
+        response = self._add_ai_response()
+        response.add_status("Diagnostics exported")
+        response.set_content(
+            "诊断信息已导出。\n\n"
+            f"文件: {path}\n"
+            f"Policy 记录: {len(payload['policy']['timeline'])}\n"
+            f"Harness trace: {len(payload['harness']['executor_trace'])}\n"
+            f"Call records: {len(payload['calls'])}"
+        )
+        response.finalize()
+        return str(path)
     
     def _reset_token_stats(self):
         """重置 Token 统计"""
-        self._token_stats = {
+        self._token_stats = self._empty_token_stats()
+        self._call_records = []
+        self._harness_trace_records = []
+        self._update_token_stats_display()
+        
+        # 显示提示
+        if self._current_response:
+            self._current_response.add_status(tr('status.stats_reset'))
+
+    # ===== UI 辅助 =====
+
+    @staticmethod
+    def _empty_token_stats() -> dict:
+        return {
             'input_tokens': 0,
             'output_tokens': 0,
             'reasoning_tokens': 0,
@@ -1229,15 +1104,7 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
             'requests': 0,
             'estimated_cost': 0.0,
         }
-        self._call_records = []
-        self._update_token_stats_display()
-        
-        # 显示提示
-        if self._current_response:
-            self._current_response.add_status(tr('status.stats_reset'))
 
-    # ===== UI 辅助 =====
-    
     def _current_provider(self) -> str:
         return self.provider_combo.currentData() or 'deepseek'
 
@@ -1436,323 +1303,8 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
                 self.session_tabs.setTabText(i, label[len(self._TAB_RUNNING_PREFIX):])
 
     # ===== 信号处理 =====
-    
-    def _on_append_content(self, text: str):
-        """处理内容追加（主线程槽函数）
-        
-        注意：内容已经在 _on_content_with_limit → _drain_tag_buffer → 
-        _emit_normal_content 中经过了 <think> 标签过滤和伪造检测。
-        这里只负责将文本交给 UI 控件显示，不做额外过滤。
-        """
-        resp = self._agent_response or self._current_response
-        if not text or not resp:
-            return
-        # ★ 修复：不丢弃包含换行符的 chunk
-        # 纯换行符（\n\n）是 Markdown 段落分隔的关键信号，
-        # 丢弃它们会导致多段内容粘连在一起
-        if not text.strip() and '\n' not in text:
-            return
-        try:
-            # ★ 内容开始流入 → 隐藏 "Generating..." 状态（如果正在显示）
-            if hasattr(self, 'thinking_bar') and getattr(self.thinking_bar, '_mode', None) == 'generating':
-                self.thinking_bar.stop()
-            resp.append_content(text)
-            self._scroll_agent_to_bottom(force=False)
-        except RuntimeError:
-            pass  # widget 已被 clear 销毁
-
-    def _on_content_with_limit(self, text: str):
-        """处理内容追加，解析 <think> 标签，分离思考和正式内容"""
-        if not text:
-            return
-
-        # 初始化输出缓冲
-        if not hasattr(self, '_output_buffer'):
-            self._output_buffer = ""
-            self._last_flush_time = time.time()
-            self._adaptive_buf_size = 80
-            self._adaptive_interval = 0.15
-            self._last_render_duration = 0.0
-            self._flush_count = 0
-            self._is_first_content_chunk = True
-
-        # 追加到标签解析缓冲区
-        self._tag_parse_buf += text
-        self._drain_tag_buffer()
-
-    # ------------------------------------------------------------------
-    # <think> 标签流式解析
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _partial_tag_at_end(text: str, tag: str) -> int:
-        """检测 text 末尾是否有 tag 的不完整前缀，返回匹配长度 (0 = 无)"""
-        for i in range(min(len(tag) - 1, len(text)), 0, -1):
-            if tag[:i] == text[-i:]:
-                return i
-        return 0
-
-    def _drain_tag_buffer(self):
-        """处理 _tag_parse_buf，将内容分发到正式输出或思考面板"""
-        buf = self._tag_parse_buf
-        while buf:
-            if not self._in_think_block:
-                # ── 正常模式：寻找 <think> ──
-                pos = buf.find('<think>')
-                if pos >= 0:
-                    if pos > 0:
-                        self._emit_normal_content(buf[:pos])
-                    buf = buf[pos + 7:]          # 跳过 <think>
-                    self._in_think_block = True
-                    # ★ Think 开关打开时才显示思考面板；关闭时静默丢弃 <think> 内容
-                    if self._think_enabled:
-                        self._thinking_needs_finalize = True  # 进入思考，标记需要 finalize
-                        # 如果思考已 finalize，恢复为活跃状态并重启计时
-                        self._resume_thinking()
-                    continue
-                # 检查末尾是否有不完整的 <think>
-                hold = self._partial_tag_at_end(buf, '<think>')
-                if hold:
-                    self._emit_normal_content(buf[:-hold])
-                    self._tag_parse_buf = buf[-hold:]
-                    return
-                # 全部是正常内容
-                self._emit_normal_content(buf)
-                self._tag_parse_buf = ""
-                return
-            else:
-                # ── 思考模式：寻找 </think> ──
-                pos = buf.find('</think>')
-                if pos >= 0:
-                    if self._think_enabled and pos > 0:
-                        self._addThinking.emit(buf[:pos])
-                    buf = buf[pos + 8:]          # 跳过 </think>
-                    self._in_think_block = False
-                    # 思考结束：立即 finalize 思考区块并停止计时器
-                    if self._think_enabled:
-                        self._finalize_thinking()
-                    continue
-                # 检查末尾是否有不完整的 </think>
-                hold = self._partial_tag_at_end(buf, '</think>')
-                if hold:
-                    if self._think_enabled:
-                        safe = buf[:-hold]
-                        if safe:
-                            self._addThinking.emit(safe)
-                    self._tag_parse_buf = buf[-hold:]
-                    return
-                # 全部是思考内容
-                if self._think_enabled:
-                    self._addThinking.emit(buf)
-                # ★ Think 关闭时：静默丢弃 <think> 块内的内容
-                self._tag_parse_buf = ""
-                return
-        self._tag_parse_buf = ""
-
-    def _finalize_thinking(self):
-        """思考阶段结束（线程安全：自动分派到主线程）"""
-        self._finalizeThinkingSignal.emit()
-
-    def _resume_thinking(self):
-        """新一轮 <think> 开始（线程安全：自动分派到主线程）"""
-        self._resumeThinkingSignal.emit()
-
-    @QtCore.Slot()
-    def _finalize_thinking_main_thread(self):
-        """[主线程] 实际执行 finalize 思考区块并停止计时器"""
-        try:
-            resp = self._agent_response or self._current_response
-            if resp and resp._has_thinking:
-                if not resp.thinking_section._finalized:
-                    resp.thinking_section.finalize()
-        except RuntimeError:
-            pass  # widget 已被 clear 销毁
-        if self._thinking_timer:
-            self._thinking_timer.stop()
-            self._thinking_timer = None
-        # ★ 停止输入框上方的思考指示条
-        try:
-            self.thinking_bar.stop()
-        except (RuntimeError, AttributeError):
-            pass
-    
-    @QtCore.Slot()
-    def _resume_thinking_main_thread(self):
-        """[主线程] 实际执行恢复思考区块并重启计时器"""
-        if not getattr(self, '_is_running', False):
-            return  # Agent 已停止，忽略延迟到达的信号
-        try:
-            resp = self._agent_response or self._current_response
-            if resp and resp._has_thinking:
-                ts = resp.thinking_section
-                if ts._finalized:
-                    ts.resume()
-        except RuntimeError:
-            pass  # widget 已被 clear 销毁
-        # 重启计时器（如果已停止）
-        if not self._thinking_timer:
-            self._thinking_timer = QtCore.QTimer(self)
-            self._thinking_timer.timeout.connect(lambda: self._updateThinkingTime.emit())
-            self._thinking_timer.start(1000)
-        # ★ 重新启动输入框上方的思考指示条
-        try:
-            self.thinking_bar.start()
-        except (RuntimeError, AttributeError):
-            pass
-
-    def _emit_normal_content(self, text: str):
-        """发送正式内容（带 token 限制 + 自适应缓冲刷新）
-        
-        ★ 自适应策略（借鉴 markstream-vue 的时间预算机制）：
-        - 首个 chunk 立即刷新，消除首字延迟
-        - 后续根据上一次渲染耗时动态调整缓冲大小：
-          渲染快 → 小缓冲、多刷新（流畅感）
-          渲染慢 → 大缓冲、少刷新（避免卡顿）
-        - 换行始终立即刷新（段落边界及时显示）
-        """
-        if not text:
-            return
-        # 首次正式内容到达时，确保思考区块已 finalize（适配 DeepSeek 原生 reasoning_content）
-        # 使用标志位避免从后台线程访问 Qt 控件属性
-        if self._in_think_block is False and getattr(self, '_thinking_needs_finalize', True):
-            self._finalize_thinking()  # 通过信号分派到主线程
-            self._thinking_needs_finalize = False
-
-        # Token 限制仅对正式内容计数
-        if not self._check_output_token_limit(text):
-            if self._output_buffer:
-                self._appendContent.emit(self._output_buffer)
-                self._output_buffer = ""
-            self._appendContent.emit(tr('ai.token_limit'))
-            self._addStatus.emit(tr('ai.token_limit_status'))
-            self.client.request_stop()
-            return
-
-        self._output_buffer += text
-
-        # ★ 自适应缓冲刷新策略
-        should_flush = False
-        current_time = time.time()
-
-        # 初始化自适应状态（首次调用）
-        if not hasattr(self, '_adaptive_buf_size'):
-            self._adaptive_buf_size = 80       # 初始缓冲大小（字符）
-            self._adaptive_interval = 0.15     # 初始兜底间隔（秒）
-            self._last_render_duration = 0.0   # 上次渲染耗时
-            self._flush_count = 0              # flush 计数（性能追踪）
-            self._is_first_content_chunk = True  # 首个 chunk 标志
-
-        # 规则 1: 首个 chunk 立即刷新（消除首字延迟）
-        if self._is_first_content_chunk:
-            should_flush = True
-            self._is_first_content_chunk = False
-        # 规则 2: 缓冲区达到自适应阈值
-        elif len(self._output_buffer) >= self._adaptive_buf_size:
-            should_flush = True
-        # 规则 3: 换行时立即刷新（段落边界及时显示）
-        elif '\n' in text:
-            should_flush = True
-        # 规则 4: 自适应兜底间隔
-        elif current_time - self._last_flush_time > self._adaptive_interval:
-            should_flush = True
-
-        if should_flush and self._output_buffer:
-            flush_start = time.time()
-
-            # 实时过滤伪造的工具调用行
-            buf = self._output_buffer
-            if '[ok]' in buf or '[err]' in buf or '[工具执行结果]' in buf or '[Tool Result]' in buf:
-                lines = buf.split('\n')
-                filtered = []
-                has_fake = False
-                for ln in lines:
-                    s = ln.strip()
-                    if s == '[工具执行结果]' or s == '[Tool Result]' or self._FAKE_TOOL_PATTERNS.match(s):
-                        has_fake = True
-                        continue
-                    filtered.append(ln)
-                buf = '\n'.join(filtered)
-                if has_fake and not getattr(self, '_fake_warned', False):
-                    self._addStatus.emit(tr('ai.fake_tool'))
-                    self._fake_warned = True
-            if buf.strip():
-                self._appendContent.emit(buf)
-            self._output_buffer = ""
-            self._last_flush_time = current_time
-            self._flush_count += 1
-
-            # ★ 自适应调整：根据上次渲染耗时动态调整缓冲参数
-            render_dur = time.time() - flush_start
-            self._last_render_duration = render_dur
-            if render_dur < 0.004:
-                # 渲染很快 → 减小缓冲，更频繁刷新（流畅感）
-                self._adaptive_buf_size = max(40, self._adaptive_buf_size - 20)
-                self._adaptive_interval = max(0.08, self._adaptive_interval - 0.02)
-            elif render_dur > 0.012:
-                # 渲染较慢 → 增大缓冲，减少刷新（避免卡顿）
-                self._adaptive_buf_size = min(500, self._adaptive_buf_size + 40)
-                self._adaptive_interval = min(0.40, self._adaptive_interval + 0.05)
-
-    def _check_output_token_limit(self, text: str) -> bool:
-        """检查正式输出 token 是否超过限制（思考内容不计入）"""
-        if not text:
-            return True
-        new_tokens = self.token_optimizer.estimate_tokens(text)
-        self._current_output_tokens += new_tokens
-        if self._current_output_tokens >= self._max_output_tokens:
-            return False
-        if (self._current_output_tokens >= self._output_token_warning
-                and self._current_output_tokens < self._max_output_tokens):
-            remaining = self._max_output_tokens - self._current_output_tokens
-            if remaining < 400:
-                self._addStatus.emit(
-                    tr('ai.approaching_limit', self._current_output_tokens, self._max_output_tokens))
-        return True
-
-    def _on_thinking_chunk(self, text: str):
-        """处理原生 reasoning_content（DeepSeek R1 等模型）
-        
-        ★ 受 Think 开关控制：关闭时静默丢弃
-        """
-        if text and self._think_enabled:
-            self._addThinking.emit(text)
-    
-    @QtCore.Slot(str)
-    def _on_add_thinking(self, text: str):
-        """在主线程更新思考内容（槽函数）"""
-        if not getattr(self, '_is_running', False):
-            return  # Agent 已停止，忽略延迟到达的信号
-        try:
-            resp = self._agent_response or self._current_response
-            if resp:
-                resp.add_thinking(text)
-                # ★ 首次思考内容 → 启动输入框上方思考指示条
-                if hasattr(self, 'thinking_bar') and not self.thinking_bar.isVisible():
-                    self.thinking_bar.start()
-            self._scroll_agent_to_bottom(force=False)
-        except RuntimeError:
-            pass  # widget 已被 clear 销毁
-
-    def _on_add_status(self, text: str):
-        try:
-            resp = self._agent_response or self._current_response
-            if resp:
-                resp.add_status(text)
-                self._scroll_agent_to_bottom(force=False)
-        except RuntimeError:
-            pass  # widget 已被 clear 销毁
-
-    def _on_update_thinking(self):
-        try:
-            resp = self._agent_response or self._current_response
-            if resp:
-                resp.update_thinking_time()
-                # ★ 同步更新输入框上方思考指示条的时间
-                if hasattr(self, 'thinking_bar') and self.thinking_bar.isVisible():
-                    if resp._has_thinking:
-                        self.thinking_bar.set_elapsed(resp.thinking_section._total_elapsed())
-        except RuntimeError:
-            pass  # 控件可能已销毁
+    # _on_append_content / _on_content_with_limit / _drain_tag_buffer 等流式解析方法
+    # 已迁移到 core/streaming_parser.py (StreamingParserMixin)
 
     def _cook_displayed_nodes_if_manual(self):
         """★ 在 Manual 保护模式下，对当前工作区的 display 节点做针对性 cook
@@ -1967,6 +1519,28 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
             if not hasattr(self, '_call_records'):
                 self._call_records = []
             self._call_records.extend(new_call_records)
+            call_rows = []
+            for rec in new_call_records:
+                if not isinstance(rec, dict):
+                    continue
+                call_rows.append({
+                    'event_type': 'api_call_record',
+                    'model': rec.get('model'),
+                    'iteration': rec.get('iteration'),
+                    'latency': rec.get('latency'),
+                    'input_tokens': rec.get('input_tokens'),
+                    'output_tokens': rec.get('output_tokens'),
+                    'reasoning_tokens': rec.get('reasoning_tokens'),
+                    'cache_hit': rec.get('cache_hit'),
+                    'cache_miss': rec.get('cache_miss'),
+                    'total_tokens': rec.get('total_tokens'),
+                    'estimated_cost': rec.get('estimated_cost'),
+                    'has_tool_calls': bool(rec.get('has_tool_calls')),
+                })
+            self._append_session_diagnostics_records(
+                call_rows,
+                session_id=self._agent_session_id or self._session_id,
+            )
         
         # 如果当前显示的就是 agent session，更新 UI
         if usage:
@@ -1976,10 +1550,62 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
             cache_hit = usage.get('cache_hit_tokens', 0)
             cache_miss = usage.get('cache_miss_tokens', 0)
             cache_rate = usage.get('cache_hit_rate', 0)
+            harness_trace = usage.get('harness_trace', [])
             
             if cache_hit > 0 or cache_miss > 0:
                 rate_percent = cache_rate * 100
                 self._addStatus.emit(f"Cache: {cache_hit}/{cache_hit+cache_miss} ({rate_percent:.0f}%)")
+
+            if harness_trace:
+                if not hasattr(self, '_harness_trace_records'):
+                    self._harness_trace_records = []
+                now_ts = datetime.now().strftime('%H:%M:%S')
+                model_name = self.model_combo.currentText()
+                persisted_rows = []
+                for rec in harness_trace:
+                    item = dict(rec or {})
+                    item.setdefault('time', now_ts)
+                    item.setdefault('model', model_name)
+                    self._harness_trace_records.append(item)
+                    persisted_rows.append(item)
+                if len(self._harness_trace_records) > 2000:
+                    self._harness_trace_records = self._harness_trace_records[-2000:]
+
+                self._append_harness_trace_records(
+                    persisted_rows,
+                    session_id=self._agent_session_id or self._session_id,
+                )
+                session_rows = []
+                for item in persisted_rows:
+                    compress_stats = {
+                        'compressed_messages': item.get('compressed_messages'),
+                        'removed_messages': item.get('removed_messages'),
+                        'compression_ratio': item.get('compression_ratio'),
+                    }
+                    compress_stats = {k: v for k, v in compress_stats.items() if v is not None}
+                    session_rows.append({
+                        'event_type': 'harness_round',
+                        'source': 'ai_client',
+                        'iteration': item.get('iteration'),
+                        'tool_count': item.get('tool_count'),
+                        'dedup_hits': item.get('dedup_hits'),
+                        'early_skips': item.get('early_skips'),
+                        'failed_tools': item.get('failed_tools'),
+                        'retry_count': item.get('retries'),
+                        'compress_stats': compress_stats or None,
+                    })
+                self._append_session_diagnostics_records(
+                    session_rows,
+                    session_id=self._agent_session_id or self._session_id,
+                )
+
+                total_tools = sum(int(t.get('tool_count', 0) or 0) for t in harness_trace)
+                dedup_hits = sum(int(t.get('dedup_hits', 0) or 0) for t in harness_trace)
+                early_skips = sum(int(t.get('early_skips', 0) or 0) for t in harness_trace)
+                failed_tools = sum(int(t.get('failed_tools', 0) or 0) for t in harness_trace)
+                self._addStatus.emit(
+                    f"Harness: tools={total_tools}, dedup={dedup_hits}, skip={early_skips}, failed={failed_tools}"
+                )
         
         # ★ 反思钩子：任务完成后触发长期记忆反思（后台线程，不阻塞 UI）
         if self._memory_initialized and tool_calls_history:
@@ -2024,6 +1650,16 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
             self.thinking_bar.stop()
         except (RuntimeError, AttributeError):
             pass
+        # 刷新标签解析缓冲区残余内容（防止 <think> 块未正常关闭）
+        if self._tag_parse_buf:
+            if self._in_think_block and self._think_enabled:
+                self._addThinking.emit(self._tag_parse_buf)
+            elif not self._in_think_block:
+                self._emit_normal_content(self._tag_parse_buf)
+            self._tag_parse_buf = ""
+        if self._in_think_block:
+            self._in_think_block = False
+            self._finalizeThinkingSignal.emit()
         # 刷新输出缓冲区
         if hasattr(self, '_output_buffer') and self._output_buffer:
             self._on_append_content(self._output_buffer)
@@ -2051,6 +1687,16 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
             self.thinking_bar.stop()
         except (RuntimeError, AttributeError):
             pass
+        # 刷新标签解析缓冲区残余内容（防止 <think> 块未正常关闭）
+        if self._tag_parse_buf:
+            if self._in_think_block and self._think_enabled:
+                self._addThinking.emit(self._tag_parse_buf)
+            elif not self._in_think_block:
+                self._emit_normal_content(self._tag_parse_buf)
+            self._tag_parse_buf = ""
+        if self._in_think_block:
+            self._in_think_block = False
+            self._finalizeThinkingSignal.emit()
         # 刷新输出缓冲区
         if hasattr(self, '_output_buffer') and self._output_buffer:
             self._on_append_content(self._output_buffer)
@@ -2069,6 +1715,12 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         
         self._set_running(False)
         self._hideToolStatus.emit()
+
+        # 如果有等待中的用户切换请求，停止后执行
+        if self._pending_user_switch:
+            target_user = self._pending_user_switch
+            self._pending_user_switch = None
+            self._perform_user_switch(target_user)
     
     def _ensure_history_ends_with_assistant(self, fallback_content: str):
         """确保 conversation_history 以 assistant 消息结尾
@@ -2103,12 +1755,178 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         else:
             todo.update_todo(todo_id, status)
 
+    def _execute_tool_with_policy(self, tool_name: str, kwargs: dict) -> dict:
+        """Harness V2 policy gate for tool execution.
+
+        This wrapper is intentionally thin and delegates real execution to the
+        existing implementation so behavior can be migrated incrementally.
+        """
+        mode = 'plan' if self._plan_mode else ('agent' if self._agent_mode else 'ask')
+        context = {
+            'mode': mode,
+            'plan_phase': self._plan_phase,
+            'confirm_mode': bool(getattr(self, '_confirm_mode', False)),
+        }
+        decision = self._tool_policy_engine.decide(tool_name, kwargs, context)
+        self._append_policy_timeline(tool_name, decision.action, decision.reason)
+
+        if self._harness_state:
+            self._harness_state.add_trace(
+                'tool_policy',
+                tool=tool_name,
+                action=decision.action,
+                reason=decision.reason,
+            )
+
+        if decision.action == 'deny':
+            self._addStatus.emit(f"恢复建议: {tool_name} 被策略拒绝，可切到 Plan 或启用 Confirm")
+            return {
+                'success': False,
+                'error': decision.reason or f'Tool blocked by policy: {tool_name}',
+            }
+
+        exec_kwargs = decision.patched_args if decision.patched_args is not None else kwargs
+
+        if decision.action == 'ask':
+            confirmed = self._request_tool_confirmation(tool_name, exec_kwargs)
+            if self._harness_state:
+                self._harness_state.add_trace(
+                    'tool_policy_ask',
+                    tool=tool_name,
+                    confirmed=bool(confirmed),
+                )
+            if not confirmed:
+                self._append_policy_timeline(tool_name, 'ask_cancel', decision.reason)
+                return {
+                    'success': False,
+                    'error': decision.reason or tr('ask.user_cancel', tool_name),
+                }
+
+            self._append_session_diagnostics_records([
+                {
+                    'event_type': 'tool_call',
+                    'phase': 'start',
+                    'tool': tool_name,
+                    'action': decision.action,
+                    'mode': mode,
+                    'args_keys': sorted(list(exec_kwargs.keys())),
+                }
+            ])
+            started_at = time.time()
+            result = self._execute_tool_with_todo(
+                tool_name,
+                _harness_policy_checked=True,
+                _harness_skip_confirm=True,
+                **exec_kwargs,
+            )
+            self._append_session_diagnostics_records([
+                {
+                    'event_type': 'tool_call',
+                    'phase': 'result',
+                    'tool': tool_name,
+                    'action': decision.action,
+                    'mode': mode,
+                    'success': bool(result.get('success')),
+                    'error': str(result.get('error', '')) if not result.get('success') else '',
+                    'duration_ms': int(max(0.0, time.time() - started_at) * 1000),
+                }
+            ])
+            return result
+
+        if decision.action == 'retry':
+            retry_key = decision.retry_key or build_tool_retry_key(tool_name, exec_kwargs)
+            current_retry = self._harness_state.policy_retry_counts.get(retry_key, 0) if self._harness_state else 0
+            if current_retry >= self._policy_retry_limit:
+                self._append_policy_timeline(tool_name, 'retry_limit', f"limit={self._policy_retry_limit}")
+                self._append_session_diagnostics_records([
+                    {
+                        'event_type': 'policy_retry',
+                        'tool': tool_name,
+                        'action': 'retry_limit',
+                        'retry_key': retry_key,
+                        'retry_count': current_retry,
+                        'retry_limit': self._policy_retry_limit,
+                    }
+                ])
+                self._addStatus.emit(f"恢复建议: {tool_name} 达到重试上限，建议切 Ask 排查参数")
+                return {
+                    'success': False,
+                    'error': (
+                        f"Tool retry limit reached for {tool_name} "
+                        f"({self._policy_retry_limit}/{self._policy_retry_limit})."
+                    ),
+                }
+            if self._harness_state:
+                self._harness_state.policy_retry_counts[retry_key] = current_retry + 1
+                self._harness_state.retries += 1
+            self._append_session_diagnostics_records([
+                {
+                    'event_type': 'policy_retry',
+                    'tool': tool_name,
+                    'action': 'retry',
+                    'retry_key': retry_key,
+                    'retry_count': current_retry + 1,
+                    'retry_limit': self._policy_retry_limit,
+                    'mode': mode,
+                }
+            ])
+
+        if decision.action not in {'allow', 'retry'}:
+            return {
+                'success': False,
+                'error': f"Unsupported policy action: {decision.action}",
+            }
+
+        started_at = time.time()
+        self._append_session_diagnostics_records([
+            {
+                'event_type': 'tool_call',
+                'phase': 'start',
+                'tool': tool_name,
+                'action': decision.action,
+                'mode': mode,
+                'args_keys': sorted(list(exec_kwargs.keys())),
+            }
+        ])
+        result = self._execute_tool_with_todo(
+            tool_name,
+            _harness_policy_checked=True,
+            **exec_kwargs,
+        )
+        self._append_session_diagnostics_records([
+            {
+                'event_type': 'tool_call',
+                'phase': 'result',
+                'tool': tool_name,
+                'action': decision.action,
+                'mode': mode,
+                'success': bool(result.get('success')),
+                'error': str(result.get('error', '')) if not result.get('success') else '',
+                'duration_ms': int(max(0.0, time.time() - started_at) * 1000),
+            }
+        ])
+
+        if decision.action == 'retry' and self._harness_state and result.get('success'):
+            retry_key = decision.retry_key or build_tool_retry_key(tool_name, exec_kwargs)
+            self._harness_state.policy_retry_counts.pop(retry_key, None)
+
+        if not result.get('success'):
+            self._append_policy_timeline(tool_name, 'exec_fail', str(result.get('error', '')))
+            self._addStatus.emit(f"恢复建议: {tool_name} 失败，可打开 Policy 时间线查看并切换 Plan/Ask")
+
+        return result
+
     def _execute_tool_with_todo(self, tool_name: str, **kwargs) -> dict:
         """执行工具，包含 Todo 相关的工具
         
         注意：此方法在后台线程调用，Houdini 操作必须通过信号调度到主线程执行。
         不依赖 hou 模块的工具（execute_shell 等）直接在后台线程执行，避免阻塞 UI。
         """
+        _policy_checked = bool(kwargs.pop('_harness_policy_checked', False))
+        _skip_builtin_confirm = bool(kwargs.pop('_harness_skip_confirm', False))
+        if self._harness_v2_enabled and not _policy_checked:
+            return self._execute_tool_with_policy(tool_name, kwargs)
+
         # ★ Stop 检测：用户请求停止时立即返回，不再排队新工具
         if self.client.is_stop_requested():
             return {"success": False, "error": "用户已请求停止"}
@@ -2160,7 +1978,7 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
                     }
         
         # ★ 确认模式：对关键节点操作弹出预览确认
-        if self._confirm_mode and tool_name in self._CONFIRM_TOOLS:
+        if (not _skip_builtin_confirm) and self._confirm_mode and tool_name in self._CONFIRM_TOOLS:
             confirmed = self._request_tool_confirmation(tool_name, kwargs)
             if not confirmed:
                 return {
@@ -2323,295 +2141,7 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
     # ------------------------------------------------------------------
     # Plan 模式工具处理
     # ------------------------------------------------------------------
-
-    def _handle_create_plan(self, kwargs: dict) -> dict:
-        """处理 create_plan 工具调用（后台线程）"""
-        try:
-            if self._plan_manager is None:
-                self._plan_manager = get_plan_manager()
-            plan_data = self._plan_manager.create_plan(self._session_id, kwargs)
-            self._plan_phase = 'awaiting_confirmation'
-            # 切换状态：Planning → Generating（Plan 已完成构建）
-            self._showGenerating.emit()
-            # 通过信号在主线程渲染 PlanViewer 卡片
-            self._renderPlanViewer.emit(plan_data)
-            return {
-                "success": True,
-                "result": f"Plan '{plan_data.get('title', '')}' created with {len(plan_data.get('steps', []))} steps. Waiting for user confirmation."
-            }
-        except Exception as e:
-            return {"success": False, "error": f"Failed to create plan: {e}"}
-
-    def _handle_update_plan_step(self, kwargs: dict) -> dict:
-        """处理 update_plan_step 工具调用（后台线程）"""
-        try:
-            if self._plan_manager is None:
-                self._plan_manager = get_plan_manager()
-            step_id = kwargs.get('step_id', '')
-            status = kwargs.get('status', 'done')
-            result_summary = kwargs.get('result_summary', '')
-            plan = self._plan_manager.update_step(
-                self._session_id, step_id, status, result_summary
-            )
-            if not plan:
-                return {"success": False, "error": f"No active plan found for session {self._session_id}"}
-            # 通过信号在主线程更新 PlanViewer 步骤状态
-            self._updatePlanStep.emit(step_id, status, result_summary or '')
-            # 检查是否全部完成
-            all_steps = plan.get('steps', [])
-            done_count = sum(1 for s in all_steps if s.get('status') == 'done')
-            error_count = sum(1 for s in all_steps if s.get('status') == 'error')
-            total = len(all_steps)
-            
-            if plan.get('status') == 'completed':
-                self._plan_phase = 'completed'
-                return {
-                    "success": True,
-                    "result": f"Step {step_id} updated to '{status}'. Plan complete! ({done_count}/{total} done, {error_count} errors)"
-                }
-            
-            # 返回进度信息，让 AI 知道还有多少步骤要做
-            pending_steps = [s for s in all_steps if s.get('status') == 'pending']
-            next_step_info = ""
-            if pending_steps:
-                ns = pending_steps[0]
-                next_step_info = f" Next: {ns['id']} \"{ns.get('title', ns.get('description', ns['id']))}\""
-            
-            return {
-                "success": True,
-                "result": f"Step {step_id} updated to '{status}'. Progress: {done_count}/{total} done.{next_step_info}"
-            }
-        except Exception as e:
-            return {"success": False, "error": f"Failed to update plan step: {e}"}
-
-    def _handle_ask_question(self, kwargs: dict) -> dict:
-        """处理 ask_question 工具调用（后台线程）
-        
-        复用 _request_tool_confirmation 的阻塞模式：
-        1. 设置 pending 属性 → 发射信号 → 主线程渲染 AskQuestionCard
-        2. 后台线程在 queue 上阻塞等待用户回答
-        3. 用户提交后 queue.put(answers) → 后台线程继续
-        """
-        questions = kwargs.get('questions', [])
-        if not questions:
-            return {"success": False, "error": "No questions provided"}
-
-        self._ask_question_result_queue = queue.Queue()
-        self._pending_ask_questions = questions
-        self._askQuestionRequest.emit()
-
-        try:
-            result = self._ask_question_result_queue.get(timeout=300.0)  # 5 分钟超时
-            if result is None:
-                return {"success": True, "result": "User skipped the questions."}
-            # 格式化答案为可读文本
-            answer_lines = []
-            for q_id, selections in result.items():
-                readable = []
-                for sel in selections:
-                    if sel.startswith("__free_text__:"):
-                        readable.append(sel.replace("__free_text__:", ""))
-                    else:
-                        readable.append(sel)
-                answer_lines.append(f"{q_id}: {', '.join(readable)}")
-            return {
-                "success": True,
-                "result": f"User answered:\n" + "\n".join(answer_lines)
-            }
-        except queue.Empty:
-            return {"success": True, "result": "User did not answer within the time limit."}
-
-    @QtCore.Slot()
-    def _on_render_ask_question(self):
-        """主线程：在聊天流中插入 AskQuestionCard"""
-        q = getattr(self, '_ask_question_result_queue', None)
-        questions = getattr(self, '_pending_ask_questions', [])
-
-        if not q:
-            print("[AskQuestion] ⚠ _ask_question_result_queue 不存在")
-            return
-
-        try:
-            card = AskQuestionCard(questions, parent=self.chat_container)
-        except Exception as e:
-            print(f"[AskQuestion] ✖ AskQuestionCard 创建失败: {e}")
-            q.put(None)
-            return
-
-        def _on_answered(answers: dict):
-            q.put(answers)
-
-        def _on_cancelled():
-            q.put(None)
-
-        card.answered.connect(_on_answered)
-        card.cancelled.connect(_on_cancelled)
-
-        # 插入到对话流
-        try:
-            self.chat_layout.insertWidget(self.chat_layout.count() - 1, card)
-        except Exception as e:
-            print(f"[AskQuestion] ⚠ 插入失败: {e}")
-            q.put(None)
-            return
-
-        card.setVisible(True)
-        try:
-            self._scroll_to_bottom(force=True)
-        except Exception:
-            pass
-
-    @QtCore.Slot(dict)
-    def _show_plan_generation_progress(self, accumulated: str):
-        """从 create_plan 的流式参数中提取进度信息并显示 Planning... 状态"""
-        import re as _re
-        # 统计已出现的 step id
-        step_ids = _re.findall(r'"id"\s*:\s*"(step-\d+)"', accumulated)
-        # 尝试提取 title
-        title_match = _re.search(r'"title"\s*:\s*"([^"]{1,30})', accumulated)
-        title_part = title_match.group(1) if title_match else ""
-
-        # 检查是否已进入 architecture 部分
-        has_arch = '"architecture"' in accumulated
-        arch_nodes = _re.findall(r'"id"\s*:\s*"(?!step-)([^"]+)"', accumulated)
-
-        if has_arch and arch_nodes:
-            progress = f"architecture ({len(arch_nodes)} nodes)"
-        elif step_ids:
-            progress = f"step {len(step_ids)}"
-            if title_part:
-                progress = f"「{title_part}」 {progress}"
-        elif title_part:
-            progress = f"「{title_part}」"
-        else:
-            progress = ""
-
-        self._showPlanning.emit(progress)
-
-    @QtCore.Slot()
-    def _on_create_streaming_plan(self):
-        """主线程：创建流式 Plan 预览卡片并插入聊天流"""
-        try:
-            # 如果已有旧的流式卡片则先移除
-            if self._streaming_plan_card is not None:
-                self._streaming_plan_card.setParent(None)
-                self._streaming_plan_card.deleteLater()
-
-            card = StreamingPlanCard(parent=self.chat_container)
-            self._streaming_plan_card = card
-            self.chat_layout.insertWidget(self.chat_layout.count() - 1, card)
-            self._scroll_to_bottom(force=True)
-        except Exception as e:
-            print(f"[Plan] Create streaming card error: {e}")
-
-    @QtCore.Slot(str)
-    def _on_update_streaming_plan(self, accumulated: str):
-        """主线程：将流式 JSON 碎片增量渲染到流式 Plan 卡片
-
-        使用简单的节流策略：缓存最新数据，通过 singleShot 延迟处理，
-        避免每个 token 都触发正则解析和 UI 更新。
-        """
-        self._streaming_plan_acc = accumulated
-        if not getattr(self, '_streaming_plan_timer_active', False):
-            self._streaming_plan_timer_active = True
-            QtCore.QTimer.singleShot(150, self._flush_streaming_plan)
-
-    def _flush_streaming_plan(self):
-        """实际执行流式 Plan 卡片更新"""
-        self._streaming_plan_timer_active = False
-        if self._streaming_plan_card is None:
-            return
-        acc = getattr(self, '_streaming_plan_acc', '')
-        if not acc:
-            return
-        try:
-            old_count = self._streaming_plan_card._rendered_step_count
-            self._streaming_plan_card.update_from_accumulated(acc)
-            new_count = self._streaming_plan_card._rendered_step_count
-            if new_count > old_count:
-                self._scroll_to_bottom()
-        except Exception as e:
-            print(f"[Plan] Update streaming card error: {e}")
-
-    def _on_render_plan_viewer(self, plan_data: dict):
-        """主线程：将流式 Plan 卡片原地升级为完整交互卡片。
-
-        如果流式卡片已存在 → finalize_with_data 原地补充完整数据。
-        如果不存在（边缘情况）→ 创建新卡片。
-        """
-        try:
-            if self._streaming_plan_card is not None:
-                # ★ 原地升级：在流式骨架上补充 DAG + 按钮
-                card = self._streaming_plan_card
-                card.finalize_with_data(plan_data)
-                card.planConfirmed.connect(self._on_plan_confirmed)
-                card.planRejected.connect(self._on_plan_rejected)
-                self._active_plan_viewer = card
-                self._streaming_plan_card = None  # 不再追踪为流式卡片
-            else:
-                # 边缘情况：没有流式卡片时直接创建 PlanViewer
-                viewer = PlanViewer(plan_data, parent=self.chat_container)
-                viewer.planConfirmed.connect(self._on_plan_confirmed)
-                viewer.planRejected.connect(self._on_plan_rejected)
-                self._active_plan_viewer = viewer
-                self.chat_layout.insertWidget(self.chat_layout.count() - 1, viewer)
-            self._scroll_to_bottom(force=True)
-        except Exception as e:
-            print(f"[Plan] Render PlanViewer error: {e}")
-
-    @QtCore.Slot(str, str, str)
-    def _on_update_plan_step(self, step_id: str, status: str, result_summary: str):
-        """主线程：更新 PlanViewer 卡片中的步骤状态"""
-        if self._active_plan_viewer:
-            try:
-                self._active_plan_viewer.update_step_status(step_id, status, result_summary)
-            except Exception as e:
-                print(f"[Plan] Update step UI error: {e}")
-
-    def _on_plan_confirmed(self, plan_data: dict):
-        """用户点击 Confirm 按钮 → 启动执行阶段"""
-        self._plan_phase = 'executing'
-        # 禁用 PlanViewer 按钮（防止重复点击）
-        if self._active_plan_viewer:
-            self._active_plan_viewer.set_confirmed()
-        
-        # 构造执行提示消息
-        exec_msg = tr('ai.plan_confirmed_msg', plan_data.get('title', 'Plan'))
-        self._conversation_history.append({
-            'role': 'user', 'content': exec_msg
-        })
-        
-        # 创建新的 AI 回复块
-        self._set_running(True)
-        self._add_ai_response()
-        self._agent_response = self._current_response
-        self._start_active_aurora()
-        
-        # 构造 agent_params（复用上次的 provider/model 设置）
-        agent_params = getattr(self, '_last_agent_params', {}).copy()
-        agent_params['use_agent'] = True          # 执行阶段用完整工具
-        agent_params['plan_mode'] = True
-        agent_params['plan_executing'] = True     # 标记为 Plan 执行阶段
-        agent_params['plan_data'] = plan_data
-        
-        # 后台线程执行
-        thread = threading.Thread(
-            target=self._run_agent, args=(agent_params,), daemon=True
-        )
-        thread.start()
-
-    def _on_plan_rejected(self):
-        """用户点击 Reject 按钮 → 丢弃 Plan"""
-        self._plan_phase = 'idle'
-        try:
-            if self._plan_manager is None:
-                self._plan_manager = get_plan_manager()
-            self._plan_manager.delete_plan(self._session_id)
-        except Exception:
-            pass
-        if self._active_plan_viewer:
-            self._active_plan_viewer.set_rejected()
-        self._active_plan_viewer = None
+    # 已迁移到 core/plan_mixin.py (PlanMixin)
 
     # 已自带 checkpoint 追踪的工具（在 _on_add_node_operation 中有专用分支）
     _SELF_TRACKING_TOOLS = frozenset({
@@ -2737,8 +2267,9 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
 
     # ★ 会触发 Houdini cook 的工具集合
     # 这些工具执行时可能导致耗时的场景计算，需要特殊保护
+    # 注意：create_node/create_nodes_batch/create_wrangle_node 已使用 run_init_scripts=False
+    # 不会在节点创建时触发 cook，因此不需要 Manual 模式保护
     _COOK_TRIGGERING_TOOLS = frozenset({
-        'create_node', 'create_nodes_batch', 'create_wrangle_node',
         'connect_nodes', 'set_display_flag', 'set_node_parameter',
         'batch_set_parameters', 'execute_python', 'run_skill',
     })
@@ -2781,7 +2312,7 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         # 判断是否为修改操作（需要 undo group）
         _MUTATING_TOOLS = {
             "create_node", "create_nodes_batch", "create_wrangle_node",
-            "delete_node", "set_node_parameter", "connect_nodes",
+            "delete_node", "rename_node", "set_node_parameter", "connect_nodes",
             "copy_node", "batch_set_parameters", "set_display_flag",
             "execute_python", "save_hip", "run_skill",
         }
@@ -3183,6 +2714,17 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
             if reason and ('警告' in reason or 'warning' in reason.lower()):
                 self._addStatus.emit(f"Note: {reason}")
             return
+
+        self._append_session_diagnostics_records([
+            {
+                'event_type': 'context_compress',
+                'phase': 'start',
+                'reason': reason,
+                'mode': 'plan' if self._plan_mode else ('agent' if self._agent_mode else 'ask'),
+                'current_tokens': int(current_tokens),
+                'context_limit': int(context_limit),
+            }
+        ])
         
         # ★ 深度睡眠：_manage_context 压缩前整理全部上下文为长期记忆
         if self._memory_initialized and self._reflection_module and not self._sleep_in_progress:
@@ -3195,7 +2737,7 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
                         session_id=self._session_id,
                         all_messages=list(history),
                         ai_client=self.client,
-                        model=_params.get('model', 'deepseek-chat'),
+                        model=_params.get('model', 'deepseek-v4-flash'),
                         provider=_params.get('provider', 'deepseek'),
                     )
                     if deep_result.get("success"):
@@ -3247,6 +2789,17 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
             if saved > 0:
                 pct = saved / old_tokens * 100 if old_tokens else 0
                 self._addStatus.emit(tr('opt.auto_status', saved))
+                self._append_session_diagnostics_records([
+                    {
+                        'event_type': 'context_compress',
+                        'phase': 'result',
+                        'strategy': 'tool_summary_only',
+                        'saved_tokens': int(saved),
+                        'saved_percent': round(pct, 2),
+                        'old_tokens': int(old_tokens),
+                        'new_tokens': int(new_tokens),
+                    }
+                ])
             return
         
         # --- 第二遍：删除最早的完整轮次，直到低于阈值 ---
@@ -3272,8 +2825,31 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         saved = old_tokens - self.token_optimizer.calculate_message_tokens(history)
         if saved > 0:
             self._addStatus.emit(tr('opt.auto_status', saved))
-            self._render_conversation_history()
+            # 只在聊天区顶部插一条提示，不全量重渲染（避免 UI 闪烁/重绘）
+            self._insert_compression_notice(n_rounds - len(rounds))
+            pct = saved / old_tokens * 100 if old_tokens else 0
+            self._append_session_diagnostics_records([
+                {
+                    'event_type': 'context_compress',
+                    'phase': 'result',
+                    'strategy': 'round_prune_with_summary',
+                    'saved_tokens': int(saved),
+                    'saved_percent': round(pct, 2),
+                    'old_tokens': int(old_tokens),
+                    'new_tokens': int(self.token_optimizer.calculate_message_tokens(history)),
+                    'removed_rounds': int(n_rounds - len(rounds)),
+                }
+            ])
     
+    def _insert_compression_notice(self, removed_rounds: int):
+        """在聊天区顶部（第0位）插入一条上下文压缩提示，不重建整个对话区。"""
+        from .cursor_widgets import StatusLine
+        text = f"🗜 已自动压缩 {removed_rounds} 轮旧对话以节省 Token"
+        notice = StatusLine(text)
+        notice.setStyleSheet("background:#1e293b; color:#64748b; font-size:11px; padding:4px 12px; border-radius:4px;")
+        # 插到 stretch 之前的第 0 位（最顶部）
+        self.chat_layout.insertWidget(0, notice)
+
     def _compress_context(self):
         """压缩上下文 — 智能摘要，保留关键信息
 
@@ -3538,6 +3114,25 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         thread = threading.Thread(target=self._run_agent, args=(agent_params,), daemon=True)
         thread.start()
 
+    def _select_agent_tools_for_message(self, user_message: str, use_web: bool = True) -> List[dict]:
+        """Select a minimal Agent-mode tool set using ToolRegistry intent groups."""
+        try:
+            from ..utils.tool_registry import get_tool_registry
+            reg = get_tool_registry()
+            intents = reg.classify_intent(user_message or "")
+            selected = reg.get_tools_for_intent(intents, mode='agent')
+        except Exception as e:
+            print(f"[Tool Selection] intent selection failed, falling back to core tools: {e}")
+            selected = list(HOUDINI_TOOLS)
+
+        if not use_web:
+            selected = [
+                t for t in selected
+                if t.get('function', {}).get('name') not in ('web_search', 'fetch_webpage')
+            ]
+
+        return UltraOptimizer.optimize_tool_definitions(selected)
+
     def _run_agent(self, agent_params: dict):
         """后台运行 Agent
         
@@ -3561,6 +3156,8 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         supports_vision = agent_params.get('supports_vision', True)
         plan_mode = agent_params.get('plan_mode', False)
         plan_executing = agent_params.get('plan_executing', False)
+        if self._harness_v2_enabled:
+            self._harness_state = HarnessRuntimeState(session_id=self._session_id)
         
         # ★ 保存 agent_params 供反思钩子使用
         self._last_agent_params = agent_params
@@ -3575,9 +3172,21 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
             # 消息结构：[系统提示] + [历史消息] + [上下文提醒+当前请求]
             # 前缀（系统提示+历史消息）保持稳定，提升 cache 命中率
             
-            # 1. 系统提示词（根据思考模式选择版本）
-            sys_prompt = self._cached_prompt_think if use_think else self._cached_prompt_no_think
-            
+            # 1. 系统提示词（根据思考模式和轮次选择版本）
+            # 对话已有历史（续接轮）→ 用核心规则子集，节省 ~2000 tokens/轮，提升 cache 命中率
+            # 首轮（无历史或全是 system 消息）→ 用完整规则，确保 AI 掌握所有约束
+            _has_prior_history = bool(
+                self._conversation_history
+                and any(m.get('role') != 'system' for m in self._conversation_history)
+            )
+            if _has_prior_history:
+                sys_prompt = (
+                    self._cached_prompt_core_think
+                    if use_think else self._cached_prompt_core_no_think
+                )
+            else:
+                sys_prompt = self._cached_prompt_think if use_think else self._cached_prompt_no_think
+
             # ★ Ask 模式：追加只读约束
             if not use_agent and not plan_mode:
                 sys_prompt = sys_prompt + tr('ai.ask_mode_prompt')
@@ -3956,18 +3565,8 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
                                     if t['function']['name'] not in ('web_search', 'fetch_webpage')]
                 tools = UltraOptimizer.optimize_tool_definitions(ask_filtered)
             else:
-                # ★ Agent 模式：使用全量工具
-                # 注意：不做意图过滤。Agent 需要多轮迭代，可能先查询再创建再验证，
-                # 意图过滤会导致后续迭代缺少必要工具（如 capture_viewport、create_node 等）。
-                if use_web:
-                    if self._cached_optimized_tools is None:
-                        self._cached_optimized_tools = UltraOptimizer.optimize_tool_definitions(HOUDINI_TOOLS)
-                    tools = self._cached_optimized_tools
-                else:
-                    if self._cached_optimized_tools_no_web is None:
-                        filtered = [t for t in HOUDINI_TOOLS if t['function']['name'] not in ('web_search', 'fetch_webpage')]
-                        self._cached_optimized_tools_no_web = UltraOptimizer.optimize_tool_definitions(filtered)
-                    tools = self._cached_optimized_tools_no_web
+                # ★ Agent 模式：按本轮用户意图选择最小工具集，避免每轮暴露全量工具。
+                tools = self._select_agent_tools_for_message(user_last_msg, use_web=use_web)
             
             # ★ 合并外部工具（HookManager 插件工具 + ToolRegistry Skill 工具）
             try:
@@ -3995,7 +3594,6 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
                 _degraded_tools = []
                 for _t in tools:
                     if _t.get('function', {}).get('name') == 'capture_viewport':
-                        import copy
                         _t_copy = copy.deepcopy(_t)
                         _t_copy['function']['description'] = (
                             "截取当前 Houdini 3D 视口快照并保存到文件。"
@@ -4012,84 +3610,20 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
             
             # ★ 通用回调：每轮 API 迭代开始时显示 "Generating..." 状态
             # 第1轮也显示，填补 Send → 首字之间的空白
-            _on_iter = lambda i: self._showGenerating.emit()
+            def _on_iter(i: int) -> None:
+                self._showGenerating.emit()
+                if self._harness_state:
+                    self._harness_state.iteration = i
             
             if plan_mode:
                 # ★ Plan 模式：使用 agent loop（规划或执行阶段均走此分支）
                 _max_iter = 999 if plan_executing else 20
                 
-                # ★ Plan 续接回调：检测 AI 提前终止但 Plan 未完成的情况
+                # ★ Plan 续接回调：逻辑和状态统一由 PlanMixin._check_plan_resume 管理
                 _plan_resume_callback = None
-                _plan_resume_count = 0       # 防止无限续接
-                _MAX_PLAN_RESUMES = 5        # 最多续接 5 次
-                _last_resume_done_count = [-1]  # 上次续接时的 done 数（列表用于闭包可变）
                 if plan_executing:
-                    def _check_plan_incomplete():
-                        nonlocal _plan_resume_count
-                        if _plan_resume_count >= _MAX_PLAN_RESUMES:
-                            print(f"[AI Client] Plan 续接次数已达上限 ({_MAX_PLAN_RESUMES})，停止续接")
-                            return None
-                        try:
-                            if self._plan_manager is None:
-                                from ..utils.plan_manager import get_plan_manager
-                                self._plan_manager = get_plan_manager()
-                            plan = self._plan_manager.load_plan(self._session_id)
-                            if not plan:
-                                return None
-                            steps = plan.get('steps', [])
-                            if not steps:
-                                return None
-
-                            # ★ 治本：将仍处于 running 状态的步骤自动推进为 done
-                            # AI 已执行完毕但忘记调用 update_plan_step，此处代劳
-                            running_steps = [s for s in steps if s.get('status') == 'running']
-                            if running_steps:
-                                for s in running_steps:
-                                    print(f"[Plan] 自动标记 running 步骤为 done: {s['id']}")
-                                    self._plan_manager.update_step(
-                                        self._session_id, s['id'], 'done',
-                                        '(auto-completed: AI finished but did not call update_plan_step)'
-                                    )
-                                # 重新加载最新 plan
-                                plan = self._plan_manager.load_plan(self._session_id)
-                                steps = plan.get('steps', [])
-
-                            done_count = sum(1 for s in steps if s.get('status') == 'done')
-                            total = len(steps)
-                            if done_count >= total:
-                                return None  # 全部完成，正常结束
-
-                            # ★ 治本：如果 done 数没有增长，说明 AI 卡死，停止续接
-                            if done_count == _last_resume_done_count[0]:
-                                print(f"[Plan] done_count 没有增长 ({done_count}/{total})，停止续接防止死循环")
-                                return None
-                            _last_resume_done_count[0] = done_count
-
-                            # 找到未完成的步骤
-                            pending_steps = [s for s in steps if s.get('status') in ('pending', 'running')]
-                            if not pending_steps:
-                                return None
-
-                            _plan_resume_count += 1
-                            # 构造提醒消息
-                            pending_names = ', '.join(
-                                f'"{s.get("title", s.get("description", s["id"]))}"'
-                                for s in pending_steps[:5]
-                            )
-                            # 获取最新的 Plan 上下文
-                            plan_ctx = self._plan_manager.get_plan_for_context(self._session_id)
-                            resume_msg = (
-                                f"[Plan Incomplete] 计划尚未完成！已完成 {done_count}/{total} 步。\n"
-                                f"未完成步骤: {pending_names}\n"
-                                f"请立即继续执行下一个未完成的步骤。不要停止，不要总结，继续调用工具执行。\n"
-                            )
-                            if plan_ctx:
-                                resume_msg += f"\n{plan_ctx}"
-                            return resume_msg
-                        except Exception as e:
-                            print(f"[Plan] Incomplete check error: {e}")
-                            return None
-                    _plan_resume_callback = _check_plan_incomplete
+                    self._init_plan_resume_state()
+                    _plan_resume_callback = self._check_plan_resume
                 
                 result = self.client.agent_loop_auto(
                     messages=messages,
@@ -4299,6 +3833,10 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         # 添加到执行流程（CollapsibleSection 风格，点击展开查看完整结果）
         if self._agent_response or self._current_response:
             prefix = "[err]" if not success else "[ok]"
+            if not success:
+                self._addStatus.emit(
+                    f"恢复建议: {name} 执行失败，可点 Policy 按钮查看时间线并切换 Plan/Ask。"
+                )
             invoke_on_main(self, "_add_tool_result_ui", name, f"{prefix} {result_text}")
     
     @QtCore.Slot(str, str)
@@ -5029,13 +4567,63 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
     def _on_stop(self):
         self.client.request_stop()
 
+    def _request_user_switch(self):
+        """触发用户切换（需要先停止当前请求）。"""
+        try:
+            from .login_dialog import LoginDialog
+            dlg = LoginDialog(parent=self)
+            if dlg.exec_() != QtWidgets.QDialog.Accepted:
+                return
+            new_user = dlg.get_username()
+            if not new_user:
+                return
+            from shared.user_paths import is_user_allowed
+            if not is_user_allowed(new_user):
+                QtWidgets.QMessageBox.information(self, "切换用户", "当前用户未启用访问权限。")
+                return
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "切换用户", f"无法打开登录窗口: {e}")
+            return
+
+        # 若正在运行，先停止
+        if self._agent_session_id is not None:
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "切换用户",
+                "当前有任务正在运行。是否先停止并切换用户？",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+            self._pending_user_switch = new_user
+            self._on_stop()
+            return
+
+        self._perform_user_switch(new_user)
+
+    def _perform_user_switch(self, new_user: str):
+        """保存当前状态并让主窗口切换用户。"""
+        try:
+            self._save_all_sessions()
+        except Exception:
+            pass
+
+        win = self.window()
+        if hasattr(win, "switch_user"):
+            win.switch_user(new_user)
+
     def _on_set_key(self):
         provider = self._current_provider()
         # Custom provider 使用专用配置对话框
         if provider == 'custom':
             self._open_custom_provider_dialog()
             return
-        names = {'openai': 'OpenAI', 'deepseek': 'DeepSeek', 'glm': 'GLM（智谱AI）', 'ollama': 'Ollama', 'openrouter': 'OpenRouter'}
+        # OF3D 内置统一 key，不允许手动修改
+        if provider == 'of3d':
+            QtWidgets.QMessageBox.information(self, "OF3D", "OF3D 使用公司统一 API Key，已内置配置，无需手动输入。")
+            return
+        names = {'openai': 'OpenAI', 'deepseek': 'DeepSeek', 'glm': 'GLM（智谱AI）', 'ollama': 'Ollama', 'openrouter': 'OpenRouter', 'siliconflow': 'SiliconFlow', 'kimi_coding': 'Kimi Coding'}
         
         key, ok = QtWidgets.QInputDialog.getText(
             self, f"Set {names.get(provider, provider)} API Key",
@@ -5137,7 +4725,7 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         """/memory — 显示记忆系统状态"""
         from ..utils.memory_store import get_memory_store, ABSTRACTION_LEVELS, MEMORY_CATEGORIES
         try:
-            store = get_memory_store()
+            store = get_memory_store(self._username)
             stats = store.get_stats()
             core_mems = store.get_core_memories(max_count=10)
 
@@ -5190,7 +4778,7 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
             return
 
         try:
-            store = get_memory_store()
+            store = get_memory_store(self._username)
             record = SemanticRecord(
                 rule=text.strip(),
                 confidence=1.0,
@@ -5219,7 +4807,7 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
             return
 
         try:
-            store = get_memory_store()
+            store = get_memory_store(self._username)
             results = store.search_all_levels(
                 query=keyword.strip(), top_k=5, min_confidence=0.0
             )
@@ -5268,7 +4856,7 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
             return
 
         try:
-            store = get_memory_store()
+            store = get_memory_store(self._username)
             results = store.search_all_levels(
                 query=keyword.strip(), top_k=10, min_confidence=0.0
             )
@@ -5300,7 +4888,7 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         try:
             from .memory_manager_dialog import MemoryManagerDialog
             # 直接 exec_，避免依赖 staticmethod exec_centered（旧版模块或热加载缺该方法时会报错）
-            MemoryManagerDialog(self).exec_()
+            MemoryManagerDialog(self, username=self._username).exec_()
         except Exception as e:
             # 不在此处二次 import MemoryMgrSheet：模块未加载全或热加载残留时会再触发 ImportError
             QtWidgets.QMessageBox.critical(
@@ -5375,6 +4963,11 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         """/export — 导出训练数据"""
         self._on_export_training_data()
 
+    def _slash_diagnostics(self):
+        """/diagnostics — 导出策略与 Harness trace 诊断 JSON"""
+        self._add_user_message("[/diagnostics]")
+        self._export_diagnostics_json()
+
     def _slash_image(self):
         """/image — 附加图片"""
         self._on_attach_image()
@@ -5415,236 +5008,8 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
     # ============================================================
     # 图片输入支持
     # ============================================================
-    
-    def _current_model_supports_vision(self) -> bool:
-        """检查当前选中的模型是否支持图片输入"""
-        model = self.model_combo.currentText()
-        features = self._model_features.get(model, {})
-        return features.get('supports_vision', False)
-    
-    def _on_attach_image(self):
-        """打开文件对话框选择图片"""
-        if not self._current_model_supports_vision():
-            model = self.model_combo.currentText()
-            QtWidgets.QMessageBox.information(
-                self, "不支持图片",
-                f"当前模型 {model} 不支持图片输入。\n请切换到支持视觉的模型（如 Claude、GPT-5.2 等）。"
-            )
-            return
-        
-        file_paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self, "选择图片", "",
-            "Images (*.png *.jpg *.jpeg *.gif *.webp *.bmp);;All Files (*)"
-        )
-        for fp in file_paths:
-            self._add_image_from_path(fp)
-    
-    def _add_image_from_path(self, file_path: str):
-        """从文件路径加载图片并添加到待发送列表（自动缩放过大图片）"""
-        import base64
-        try:
-            # ★ 通过 QImage 加载，统一走缩放逻辑
-            qimg = QtGui.QImage(file_path)
-            if qimg.isNull():
-                print(f"[AI Tab] 无法加载图片: {file_path}")
-                return
-            qimg = self._resize_image_if_needed(qimg, self._MAX_IMAGE_DIMENSION)
-            
-            ext = os.path.splitext(file_path)[1].lower()
-            # 优先保持原始格式；BMP/GIF 等不适合直接发 API，统一转 PNG
-            if ext in ('.jpg', '.jpeg'):
-                fmt, media_type = 'JPEG', 'image/jpeg'
-            elif ext == '.webp':
-                fmt, media_type = 'WEBP', 'image/webp'
-            else:
-                fmt, media_type = 'PNG', 'image/png'
-            
-            buf = QtCore.QBuffer()
-            buf.open(QtCore.QIODevice.WriteOnly)
-            quality = 90 if fmt == 'JPEG' else -1
-            qimg.save(buf, fmt, quality)
-            raw_bytes = buf.data().data()
-            buf.close()
-            
-            # ★ 过大时降级为 JPEG 压缩
-            if len(raw_bytes) > self._MAX_IMAGE_BYTES and fmt != 'JPEG':
-                buf2 = QtCore.QBuffer()
-                buf2.open(QtCore.QIODevice.WriteOnly)
-                qimg.save(buf2, 'JPEG', 85)
-                raw_bytes = buf2.data().data()
-                buf2.close()
-                media_type = 'image/jpeg'
-                print(f"[AI Tab] 图片过大，已转为 JPEG ({len(raw_bytes)//1024}KB)")
-            
-            b64 = base64.b64encode(raw_bytes).decode('utf-8')
-            self._add_pending_image(b64, media_type)
-        except Exception as e:
-            print(f"[AI Tab] 加载图片失败: {e}")
-    
-    # ★ 图片尺寸限制：超过此分辨率的图片自动缩放（防止 base64 过大导致 API 400 错误）
-    _MAX_IMAGE_DIMENSION = 2048  # 最长边不超过 2048px
-    _MAX_IMAGE_BYTES = 5 * 1024 * 1024  # base64 前的原始字节数上限 ~5MB（编码后约 6.7MB）
+    # 已迁移到 ui/image_mixin.py (ImageMixin)
 
-    @staticmethod
-    def _resize_image_if_needed(image: 'QtGui.QImage', max_dim: int = 2048) -> 'QtGui.QImage':
-        """如果图片超过 max_dim，等比缩放。返回缩放后的 QImage。"""
-        w, h = image.width(), image.height()
-        if w <= max_dim and h <= max_dim:
-            return image
-        if w > h:
-            new_w = max_dim
-            new_h = int(h * max_dim / w)
-        else:
-            new_h = max_dim
-            new_w = int(w * max_dim / h)
-        print(f"[AI Tab] 图片过大 ({w}x{h})，自动缩放至 {new_w}x{new_h}")
-        return image.scaled(new_w, new_h, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
-
-    def _on_image_dropped(self, image: 'QtGui.QImage'):
-        """ChatInput 拖拽或粘贴图片的回调"""
-        if not self._current_model_supports_vision():
-            return
-        import base64
-        # ★ 自动缩放过大图片
-        image = self._resize_image_if_needed(image, self._MAX_IMAGE_DIMENSION)
-        buf = QtCore.QBuffer()
-        buf.open(QtCore.QIODevice.WriteOnly)
-        image.save(buf, "PNG")
-        raw_bytes = buf.data().data()
-        buf.close()
-        # ★ 如果 PNG 仍然过大，改用 JPEG 压缩
-        if len(raw_bytes) > self._MAX_IMAGE_BYTES:
-            buf2 = QtCore.QBuffer()
-            buf2.open(QtCore.QIODevice.WriteOnly)
-            image.save(buf2, "JPEG", 85)
-            raw_bytes = buf2.data().data()
-            buf2.close()
-            media_type = 'image/jpeg'
-            print(f"[AI Tab] PNG 过大，已转为 JPEG (quality=85, {len(raw_bytes)//1024}KB)")
-        else:
-            media_type = 'image/png'
-        b64 = base64.b64encode(raw_bytes).decode('utf-8')
-        self._add_pending_image(b64, media_type)
-    
-    def _add_pending_image(self, b64_data: str, media_type: str):
-        """添加图片到待发送列表并在预览区显示缩略图（点击可放大）"""
-        # 创建缩略图和完整 pixmap
-        img_bytes = __import__('base64').b64decode(b64_data)
-        full_pixmap = QtGui.QPixmap()
-        full_pixmap.loadFromData(img_bytes)
-        thumb = full_pixmap.scaled(60, 60, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
-        
-        # 存储
-        idx = len(self._pending_images)
-        self._pending_images.append((b64_data, media_type, thumb))
-        
-        # 创建预览 widget
-        img_widget = QtWidgets.QWidget()
-        img_layout = QtWidgets.QVBoxLayout(img_widget)
-        img_layout.setContentsMargins(2, 2, 2, 2)
-        img_layout.setSpacing(1)
-        
-        lbl = ClickableImageLabel(thumb, full_pixmap)
-        lbl.setObjectName("imgThumb")
-        img_layout.addWidget(lbl)
-        
-        # 删除按钮
-        rm_btn = QtWidgets.QPushButton("x")
-        rm_btn.setFixedSize(16, 16)
-        rm_btn.setObjectName("imgRemoveBtn")
-        rm_btn.clicked.connect(lambda checked=False, i=idx: self._remove_pending_image(i))
-        img_layout.addWidget(rm_btn, alignment=QtCore.Qt.AlignCenter)
-        
-        # 插入到 stretch 之前
-        count = self.image_preview_layout.count()
-        self.image_preview_layout.insertWidget(count - 1, img_widget)
-        self.image_preview_container.setVisible(True)
-    
-    def _remove_pending_image(self, index: int):
-        """移除待发送图片"""
-        if 0 <= index < len(self._pending_images):
-            self._pending_images[index] = None  # 标记为已删除
-            self._rebuild_image_preview()  # 过滤 None 后重建整个预览区
-    
-    def _rebuild_image_preview(self):
-        """重新构建图片预览区"""
-        # 清除所有 widget（保留 stretch）
-        while self.image_preview_layout.count() > 1:
-            item = self.image_preview_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        
-        # 重新过滤并添加
-        new_images = [(b64, mt, th) for entry in self._pending_images 
-                      if entry is not None for b64, mt, th in [entry]]
-        self._pending_images = list(new_images)
-        
-        if not self._pending_images:
-            self.image_preview_container.setVisible(False)
-            return
-        
-        for i, (b64, mt, thumb) in enumerate(self._pending_images):
-            img_widget = QtWidgets.QWidget()
-            img_layout = QtWidgets.QVBoxLayout(img_widget)
-            img_layout.setContentsMargins(2, 2, 2, 2)
-            img_layout.setSpacing(1)
-            
-            # 从 base64 还原完整 pixmap 用于放大预览
-            full_pixmap = QtGui.QPixmap()
-            full_pixmap.loadFromData(__import__('base64').b64decode(b64))
-            lbl = ClickableImageLabel(thumb, full_pixmap)
-            lbl.setObjectName("imgThumb")
-            img_layout.addWidget(lbl)
-            
-            rm_btn = QtWidgets.QPushButton("x")
-            rm_btn.setFixedSize(16, 16)
-            rm_btn.setObjectName("imgRemoveBtn")
-            rm_btn.clicked.connect(lambda checked=False, idx=i: self._remove_pending_image(idx))
-            img_layout.addWidget(rm_btn, alignment=QtCore.Qt.AlignCenter)
-            
-            count = self.image_preview_layout.count()
-            self.image_preview_layout.insertWidget(count - 1, img_widget)
-    
-    def _clear_pending_images(self):
-        """清空所有待发送图片"""
-        self._pending_images.clear()
-        while self.image_preview_layout.count() > 1:
-            item = self.image_preview_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self.image_preview_container.setVisible(False)
-    
-    def _build_multimodal_content(self, text: str, images: list) -> list:
-        """构建包含文字和图片的多模态消息内容（OpenAI Vision API 格式）
-        
-        Args:
-            text: 用户文字消息
-            images: List of (base64_data, media_type, thumbnail) tuples
-            
-        Returns:
-            list: content 数组，包含 text 和 image_url 项
-        """
-        # ★ API 支持的 media type 白名单（BMP 等需要先转换）
-        _SUPPORTED_MEDIA = {'image/png', 'image/jpeg', 'image/gif', 'image/webp'}
-        
-        content_parts = []
-        # ★ 始终添加 text 部分（即使为空也提供占位符，某些 API 要求至少一个 text block）
-        content_parts.append({"type": "text", "text": text or " "})
-        # 添加图片
-        for b64_data, media_type, _thumb in images:
-            if not b64_data:
-                continue  # 跳过空数据
-            # ★ 不支持的 media type 降级为 image/png
-            if media_type not in _SUPPORTED_MEDIA:
-                media_type = 'image/png'
-            content_parts.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{media_type};base64,{b64_data}"
-                }
-            })
-        return content_parts
-    
     def _on_read_selection(self):
         ok, text = self.mcp.describe_selection()
         if ok:
@@ -5861,8 +5226,8 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         auto_save_action.setChecked(self._auto_save_cache)
         auto_save_action.triggered.connect(lambda: setattr(self, '_auto_save_cache', not self._auto_save_cache))
         
-        # 显示菜单
-        menu.exec_(self.btn_cache.mapToGlobal(QtCore.QPoint(0, self.btn_cache.height())))
+        # 显示菜单（btn_cache 是隐藏控件，用鼠标位置避免弹到屏幕最左边）
+        menu.exec_(QtGui.QCursor.pos())
     
     @staticmethod
     def _strip_images_for_cache(history: list) -> list:
@@ -5870,7 +5235,6 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
         用占位文本替代，大幅减小缓存文件体积。
         返回一份深拷贝，不修改原始 history。
         """
-        import copy
         stripped = []
         for msg in history:
             content = msg.get('content')
@@ -7364,8 +6728,8 @@ SideFX Labs Node Usage Rules (MUST follow strictly):
             action.setChecked(self._optimization_strategy == strat)
             action.triggered.connect(lambda _, s=strat: setattr(self, '_optimization_strategy', s))
         
-        # 显示菜单
-        menu.exec_(self.btn_optimize.mapToGlobal(QtCore.QPoint(0, self.btn_optimize.height())))
+        # 显示菜单（btn_optimize 是隐藏控件，用鼠标位置避免弹到屏幕最左边）
+        menu.exec_(QtGui.QCursor.pos())
     
     def _optimize_now(self):
         """立即优化当前对话"""

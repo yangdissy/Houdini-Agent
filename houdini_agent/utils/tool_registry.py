@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 from dataclasses import dataclass, field
 
+from ..core.harness_policy_config import HIGH_RISK_TOOLS
+
 
 # ─────────────────────────────────────────────
 # 数据模型
@@ -32,6 +34,8 @@ class ToolMeta:
     tags: Set[str] = field(default_factory=set)  # {"readonly", "geometry", "network", "system", ...}
     modes: Set[str] = field(default_factory=set) # {"agent", "ask", "plan_planning", "plan_executing"}
     enabled: bool = True                         # 是否启用
+    concurrency_safe: bool = False               # 是否允许与其他工具并发执行
+    risk_level: str = "normal"                  # "low" | "normal" | "high"
 
 
 # ─────────────────────────────────────────────
@@ -47,6 +51,7 @@ _ASK_TOOLS = frozenset({
     'search_local_doc', 'get_houdini_node_doc', 'list_skills',
     'add_todo', 'update_todo', 'get_node_positions',
     'list_network_boxes', 'perf_start_profile', 'perf_stop_and_report',
+    'search_memory', 'capture_viewport',
 })
 
 # Plan 规划阶段白名单
@@ -58,6 +63,7 @@ _PLAN_PLANNING_TOOLS = frozenset({
     'search_local_doc', 'get_houdini_node_doc', 'list_skills',
     'add_todo', 'update_todo', 'get_node_positions',
     'list_network_boxes', 'perf_start_profile', 'perf_stop_and_report',
+    'search_memory', 'capture_viewport',
     'create_plan', 'ask_question',
 })
 
@@ -70,7 +76,23 @@ _READONLY_TOOLS = frozenset({
     'search_local_doc', 'get_houdini_node_doc', 'list_skills',
     'get_node_positions', 'list_network_boxes',
     'perf_start_profile', 'perf_stop_and_report',
-    'capture_viewport',
+    'capture_viewport', 'search_memory',
+})
+
+_HIGH_RISK_TOOLS = HIGH_RISK_TOOLS
+
+_CONCURRENCY_SAFE_TOOLS = frozenset({
+    'web_search',
+    'fetch_webpage',
+    'search_local_doc',
+    'list_skills',
+    'search_memory',
+})
+
+_ASYNC_PREFERRED_TOOLS = frozenset({
+    'web_search',
+    'fetch_webpage',
+    'execute_shell',
 })
 
 
@@ -103,13 +125,30 @@ def _infer_tags(name: str) -> Set[str]:
     # 搜索/文档
     if name in ('web_search', 'fetch_webpage', 'search_local_doc', 'get_houdini_node_doc'):
         tags.add("docs")
+    # 异步优先（不依赖 Houdini 主线程）
+    if name in _ASYNC_PREFERRED_TOOLS:
+        tags.add("async")
     # Skill
-    if name.startswith("skill:") or name in ('run_skill', 'list_skills'):
+    if name.startswith("skill_") or name in ('run_skill', 'list_skills'):
         tags.add("skill")
     # 任务管理
     if name in ('add_todo', 'update_todo'):
         tags.add("task")
     return tags
+
+
+def _infer_concurrency_safe(name: str) -> bool:
+    """Infer if a tool can be safely run concurrently."""
+    return name in _READONLY_TOOLS or name in _CONCURRENCY_SAFE_TOOLS
+
+
+def _infer_risk_level(name: str) -> str:
+    """Infer risk level for policy and UI display."""
+    if name in _HIGH_RISK_TOOLS:
+        return "high"
+    if name in _READONLY_TOOLS:
+        return "low"
+    return "normal"
 
 
 # ─────────────────────────────────────────────
@@ -142,7 +181,9 @@ class ToolRegistry:
                  plugin_name: str = "",
                  tags: Optional[Set[str]] = None,
                  modes: Optional[Set[str]] = None,
-                 enabled: bool = True):
+                 enabled: bool = True,
+                 concurrency_safe: bool = False,
+                 risk_level: str = "normal"):
         """注册工具"""
         with self._lock:
             meta = ToolMeta(
@@ -154,6 +195,8 @@ class ToolRegistry:
                 tags=tags or set(),
                 modes=modes or set(),
                 enabled=enabled and (name not in self._disabled_tools),
+                concurrency_safe=concurrency_safe,
+                risk_level=risk_level,
             )
             self._tools[name] = meta
 
@@ -217,9 +260,58 @@ class ToolRegistry:
                     "tags": sorted(meta.tags),
                     "modes": sorted(meta.modes),
                     "enabled": meta.enabled,
+                    "concurrency_safe": meta.concurrency_safe,
+                    "risk_level": meta.risk_level,
                     "description": meta.schema.get("function", {}).get("description", "")[:120],
                 })
             return sorted(result, key=lambda x: (x["source"], x["name"]))
+
+    def build_streaming_executor_profile(self) -> Dict[str, Set[str]]:
+        """Build runtime classification for StreamingToolExecutor.
+
+        Returns enabled tool-name sets used by executor dispatch and cache policy.
+        """
+        with self._lock:
+            dedup_tools: Set[str] = set()
+            async_tools: Set[str] = set()
+            batch_readonly_tools: Set[str] = set()
+            network_mutating_tools: Set[str] = set()
+            cache_invalidate_tools: Set[str] = set()
+
+            for meta in self._tools.values():
+                if not meta.enabled:
+                    continue
+
+                tags = meta.tags or set()
+                readonly = "readonly" in tags
+                is_async = "async" in tags
+                is_network = "network" in tags
+
+                if is_async:
+                    async_tools.add(meta.name)
+
+                # 只读工具默认可去重；异步工具不参与当前轮去重缓存。
+                if readonly and not is_async:
+                    dedup_tools.add(meta.name)
+                    batch_readonly_tools.add(meta.name)
+                    if is_network:
+                        cache_invalidate_tools.add(meta.name)
+
+                # 网络写操作会导致结构缓存失效。
+                if is_network and not readonly:
+                    network_mutating_tools.add(meta.name)
+
+            # 兼容旧行为：部分只读工具并非 network 标签，但应参与失效清理。
+            if "check_errors" in dedup_tools:
+                cache_invalidate_tools.add("check_errors")
+
+            return {
+                "dedup_tools": dedup_tools,
+                "async_tools": async_tools,
+                "batch_readonly_tools": batch_readonly_tools,
+                "network_mutating_tools": network_mutating_tools,
+                "cache_invalidate_tools": cache_invalidate_tools,
+            }
 
     # ---------- 执行 ----------
 
@@ -297,6 +389,8 @@ class ToolRegistry:
                 source="core",
                 tags=_infer_tags(name),
                 modes=_infer_modes(name),
+                concurrency_safe=_infer_concurrency_safe(name),
+                risk_level=_infer_risk_level(name),
             )
         self._initialized = True
 

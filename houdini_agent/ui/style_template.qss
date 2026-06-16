@@ -110,9 +110,9 @@ QComboBox#modelCombo {
     color: #d4c5b0;
     border: 1px solid rgba(180,160,130,18);
     border-radius: 6px;
-    padding: 2px 8px;
-    font-size: {FS_XS}px;
-    min-height: 22px;
+    padding: 3px 8px;
+    font-size: {FS_SM}px;
+    min-height: 26px;
 }
 QComboBox#providerCombo::drop-down,
 QComboBox#modelCombo::drop-down {
@@ -140,10 +140,10 @@ QComboBox#modelCombo QAbstractItemView {
 QCheckBox#chkWeb,
 QCheckBox#chkThink {
     color: #8a7e6e;
-    font-size: {FS_MICRO}px;
+    font-size: {FS_XS}px;
     spacing: 0px;
-    padding: 2px 8px;
-    border-radius: 9px;
+    padding: 3px 10px;
+    border-radius: 10px;
     border: 1px solid rgba(180,160,130,10);
     background: transparent;
 }
@@ -209,7 +209,7 @@ QCheckBox#chkConfirm::indicator:checked {
 /* --- Key Status (compact, truncated) --- */
 QLabel#keyStatus {
     color: #8a7e6e;
-    font-size: {FS_MICRO}px;
+    font-size: {FS_XS}px;
     padding: 0 2px;
 }
 QLabel#keyStatus[state="ok"] {

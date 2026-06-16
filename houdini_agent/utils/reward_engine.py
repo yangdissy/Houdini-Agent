@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from .memory_store import MemoryStore, EpisodicRecord, get_memory_store
+from shared.user_paths import normalize_username
 
 # ============================================================
 # 奖励权重配置
@@ -215,11 +216,17 @@ class RewardEngine:
         if total % 10 == 0:
             self.apply_time_decay()
 
+        maintenance = None
+        # 定期执行语义/策略记忆维护（每 20 个任务执行一次）
+        if total % 20 == 0:
+            maintenance = self.store.maintain_long_term_memory()
+
         return {
             "reward": reward,
             "importance": new_importance,
             "had_error_correction": had_error_correction,
             "total_episodes": total,
+            "memory_maintenance": maintenance,
         }
 
 
@@ -227,11 +234,18 @@ class RewardEngine:
 # 全局单例
 # ============================================================
 
-_engine_instance: Optional[RewardEngine] = None
+_engine_instances: Dict[str, RewardEngine] = {}
 
-def get_reward_engine() -> RewardEngine:
-    """获取全局 RewardEngine 实例"""
-    global _engine_instance
-    if _engine_instance is None:
-        _engine_instance = RewardEngine()
-    return _engine_instance
+def get_reward_engine(username: Optional[str] = None) -> RewardEngine:
+    """获取 RewardEngine 实例（按用户隔离）。"""
+    global _engine_instances
+    if not username:
+        key = "default"
+        if key not in _engine_instances:
+            _engine_instances[key] = RewardEngine()
+        return _engine_instances[key]
+
+    uname = normalize_username(username)
+    if uname not in _engine_instances:
+        _engine_instances[uname] = RewardEngine(store=get_memory_store(uname))
+    return _engine_instances[uname]
