@@ -4,7 +4,7 @@
 
 基于 AI 的 SideFX Houdini 智能助手，支持自主多轮工具调用、联网搜索、VEX/Python 代码执行、Plan 模式规划复杂任务、大脑启发式长期记忆系统、插件 Hook 系统支持社区扩展、用户自定义上下文规则，配备现代深色 UI 与双语支持。
 
-基于 **OpenAI Function Calling** 协议，Agent 可以读取节点网络、创建/修改/连接节点、编写 VEX Wrangle、执行系统命令、联网搜索、查询本地文档、创建结构化执行计划、从历史交互中持续学习、通过插件扩展能力 —— 全部在自主循环中迭代完成。统一的 **ToolRegistry** 集中管理核心工具、技能脚本和插件工具，支持基于模式的访问控制。
+基于 **OpenAI Function Calling** 协议，Agent 可以读取节点网络、创建/修改/连接节点、编写 VEX Wrangle、执行系统命令、联网搜索、查询本地文档、创建结构化执行计划、从历史交互中持续学习、通过插件扩展能力 —— 全部在自主循环中迭代完成。统一的 **ToolRegistry** 集中管理核心工具、技能脚本和插件工具，支持基于模式的访问控制；**Harness V2** 进一步提供 Registry 驱动调度、策略决策、高风险工具处理和可追踪诊断链路。
 
 ## 核心特性
 
@@ -29,6 +29,7 @@ AI 以自主 **Agent 循环** 运行：接收用户请求 → 规划步骤 → �
 - **长期记忆** — 大脑启发式三层记忆系统（事件记忆、抽象知识、策略记忆），基于奖励驱动的学习与自动反思
 - **插件系统** — 通过 `plugins/` 目录支持外部社区扩展，包含 Hook 事件、自定义工具、UI 按钮和设置
 - **用户规则** — 类似 Cursor Rules 的持久上下文规则，自动注入到每次 AI 请求中
+- **Harness V2 策略层** — 支持 allow/deny/ask/retry 决策、高风险工具分类、策略时间线 UI 和诊断导出，让工具执行可追踪、可解释
 
 ### 支持的 AI 提供商
 
@@ -158,6 +159,13 @@ AI 以自主 **Agent 循环** 运行：接收用户请求 → 规划步骤 → �
 | `add_todo` | 添加任务到 Todo 列表 |
 | `update_todo` | 更新任务状态（pending / in_progress / done / error） |
 
+### 记忆与诊断
+
+| 工具 / 命令 | 说明 |
+|-------------|------|
+| `search_memory` | 跨语义记忆、事件记忆、策略记忆三层搜索长期记忆，支持分类过滤和带置信度的结构化结果 |
+| `/diagnostics` | 导出精简诊断 JSON，包含策略时间线、Harness 执行轨迹、调用记录和会话状态；不包含对话正文 |
+
 ### Plan 模式
 
 | 工具 | 说明 |
@@ -229,7 +237,10 @@ Houdini-Agent/
     ├── core/
     │   ├── main_window.py          # 主窗口（工作区保存/恢复）
     │   ├── agent_runner.py         # AgentRunnerMixin — Agent 循环辅助、确认模式、工具调度
-    │   └── session_manager.py      # SessionManagerMixin — 多会话创建/切换/关闭
+    │   ├── session_manager.py      # SessionManagerMixin — 多会话创建/切换/关闭
+    │   ├── harness_engine.py       # Harness V2 运行态、策略决策、重试键
+    │   ├── harness_policy_config.py # 高风险工具策略配置来源
+    │   └── streaming_tool_executor.py # Registry 驱动的异步/串行/高风险工具调度
     ├── ui/
     │   ├── ai_tab.py              # AI Agent 标签页（Mixin 宿主、Agent 循环、上下文管理、流式 UI）
     │   ├── cursor_widgets.py      # UI 组件（主题、对话块、Todo、Shell、Token 分析、Plan 查看器、插件管理器、规则编辑器）
@@ -385,7 +396,14 @@ Plan 模式使 AI 能够通过结构化的三阶段工作流处理复杂任务�
 | `reflection.py` | 混合反思 — 每次任务后规则提取 + 定期 LLM 深度反思生成抽象规则和策略更新 |
 | `growth_tracker.py` | 滚动窗口指标（错误率、成功率、工具调用效率趋势）+ 个性特征形成（效率偏好、风险容忍度、回复详细度、主动性） |
 
-查询时自动激活记忆：通过余弦相似度检索相关的事件记忆、抽象规则和策略记忆，注入到系统提示词中。
+查询时自动激活记忆：通过余弦相似度检索相关的事件记忆、抽象规则和策略记忆，注入到系统提示词中。`search_memory` 工具也可显式执行三层联合检索，返回兼容字段 `memories`，并附带结构化的 semantic/episodic/procedural 分层结果。
+
+长期维护机制会持续保持记忆库健康：
+
+- fallback embedding 使用自适应相似度阈值缩放，减少重复或弱匹配
+- SQLite 访问加入重入锁、timeout/busy_timeout 和线程安全单例初始化
+- 语义记忆置信度和策略记忆优先级会随时间衰减
+- 低价值语义/策略记录可通过统一的 `maintain_long_term_memory` 维护入口清理
 
 ### 插件系统
 
@@ -404,6 +422,18 @@ Agent 通过插件架构支持外部社区扩展：
 - **插件管理器 UI** — 三标签页对话框（插件/工具/技能），支持启用/禁用插件、管理工具可见性、配置用户技能目录、编辑插件设置
 
 插件配置存储在 `config/plugins.json`。详细开发文档见 `plugins/PLUGIN_DEV_GUIDE.md`。
+
+### Harness V2 与策略治理
+
+Harness V2 位于模型生成的工具调用与 MCP/工具运行时之间，是受治理的执行层：
+
+- **策略决策** — 每个工具调用可根据统一高风险工具策略解析为 allow、deny、ask 或 retry
+- **Registry 驱动调度** — `ToolRegistry` 构建 runtime profile，Streaming Executor 每轮据此区分异步、串行和高风险工具
+- **重试隔离** — 重试预算以“工具名 + 参数指纹”为键，不同参数不会误消耗彼此的重试额度
+- **策略时间线** — 被拦截或高风险操作可在 Policy 菜单中查看原因、工具名和恢复建议
+- **追加式诊断** — 会话诊断和 Harness trace 以 JSON/JSONL 写入 `cache/diagnostics/` 和 `cache/harness_trace/`，不包含对话内容
+
+Legacy 执行路径仍保留为回退方案，降低迁移风险。
 
 ### ToolRegistry（统一工具注册中心）
 
@@ -430,6 +460,7 @@ Agent 通过插件架构支持外部社区扩展：
 - **文件规则** — 将 `.md` 和 `.txt` 文件放在 `rules/` 目录下即自动加载（以 `_` 开头的文件视为草稿，不加载）
 - **Prompt 注入** — 所有启用的规则合并后用 `<user_rules>` 标签包裹注入系统提示词
 - 规则编辑器采用暖卡其色调主题，与主 UI 风格一致，带列表/编辑器分栏布局和空状态引导
+- **安全过滤** — `config/user_rules.json` 被视为外部输入；疑似 Prompt 注入内容会被忽略，而不会直接执行
 
 ### 上下文管理
 
@@ -480,6 +511,24 @@ Agent 通过插件架构支持外部社区扩展：
 - **Doc/*.txt** — Houdini 编程知识库文章
 
 相关文档会根据用户的查询自动注入到系统提示词中。
+
+知识库检索链路现已加入更高质量的排序与注入控制：
+
+- 加权打分综合标题/正文匹配、查询覆盖率、来源权重和短片段惩罚
+- Query-type 重排区分 node、VEX、HOM 和 general knowledge 请求
+- 结果包含 `matched_terms`、`rank_reason`、`confidence_band`、`source` 和 snippet，方便工具侧判断依据
+- 自动检索按 node/VEX/HOM/knowledge 分桶配额注入，低证据场景会回退提示
+- 知识库缓存指纹升级为 mtime+size；无 `##` 标题文档使用滑动窗口分段兜底
+
+### 安全边界
+
+运行时安全规则记录在 `rules/security_boundaries.md`，并反映到 Agent 行为中：
+
+- API Key 和敏感配置值不得完整输出、写入日志、导出训练数据或写入记忆库
+- `delete_node`、`save_hip`、大范围批量编辑等破坏性 Houdini 操作必须明确影响范围并确认
+- 插件加载前必须声明名称与功能，继承同样的 Python/Shell 限制，且不得下载并执行远程代码
+- 网页内容和用户规则都视为不可信外部输入，需要识别并过滤 Prompt 注入模式
+- 记忆内容限定用于当前用户工作流，不得包含 API Key、私有路径或个人身份信息
 
 ## 使用示例
 
@@ -690,6 +739,8 @@ $env:HOUDINI_AGENT_DEV_RELOAD = "1"
 
 ## 版本历史
 
+- **2026-05-25** — **安全边界更新**：扩展 `rules/security_boundaries.md`，新增 API Key 与敏感配置保护、破坏性 Houdini 操作确认规则、插件加载限制、外部规则/配置 Prompt 注入防护，以及记忆库写入限制，避免保存密钥、私有路径和个人身份信息。
+- **2026-05-21** — **Harness、记忆、Doc RAG 与规则更新**：引入 Harness V2 运行态和策略决策链路，统一高风险工具策略，使用 Registry runtime profile 驱动 Streaming Tool Executor，新增策略时间线、诊断导出，以及基于“工具名 + 参数指纹”的重试键。`search_memory` 升级为语义/事件/策略三层联合检索，MemoryStore 加强并发安全、fallback embedding 阈值自适应、长期语义/策略衰减与清理。Doc RAG 升级为加权打分、query-type 重排、来源多样性约束、置信度元数据、结构化 `search_local_doc` 字段、分桶自动注入、mtime+size 缓存指纹和无标题文档窗口分段。主规则加入 Karpathy 风格实现准则。
 - **v1.3.4** — **ToolRegistry 与插件系统全面升级**：新增统一 `ToolRegistry` 单例，集中管理核心工具、技能和插件工具，支持基于模式的访问控制（`agent`/`ask`/`plan_planning`/`plan_executing`）和标签分类（`readonly`/`geometry`/`network`/`system`/`docs`/`skill`/`task`/`plugin`）。技能自动注册为 `skill:xxx` 工具。用户技能目录支持（可配置）。插件管理器重构为 3 标签页 UI（插件/工具/技能），支持单工具启用/禁用开关。装饰器 API（`@hook`/`@tool`/`@ui_button`）通过 `_apply_decorators` 正式生效。MCP Client 新增 ToolRegistry 降级分发。模式安全守卫迁移至 `ToolRegistry.is_tool_allowed_in_mode()`。macOS 线程安全修复：移除 `BlockingQueuedConnection` 槽中的 `processEvents()` 防止重入崩溃；新增主线程断言；工具超时增加到 60s。规则编辑器 UI 重新设计，使用 `QStackedWidget` 分离空状态/编辑器视图，暖卡其色主题。
 - **v1.3.3** — **插件与输入法修复**：修复插件管理器「打开插件文件夹」按钮失效（缺少 `import os`）。macOS PySide2 中文输入法全面修复 — 重写 `inputMethodQuery` 提供光标矩形/周边文本/光标位置给 macOS NSTextInputClient；设置 `StrongFocus` 焦点策略和 `ImhNone` 提示；增强 `focusInEvent` 强制输入法重新激活；`inputMethodEvent` 新增 `commitString` 降级插入。插件管理器和规则编辑器对话框统一为暖卡其色主题（之前为冷色调蓝灰）。新增 `PLUGIN_DEV_GUIDE.md` 插件开发文档。
 - **v1.3.2** — **用户规则系统**：类似 Cursor Rules 的自定义上下文规则 — 通过规则编辑器对话框管理 UI 规则（创建/编辑/删除/启用禁用，存储在 `config/user_rules.json`）+ `rules/` 目录下的文件规则（`.md`/`.txt` 自动加载）。所有启用规则合并后以 `<user_rules>` 标签注入系统提示词。规则集成到系统提示词构建流水线。

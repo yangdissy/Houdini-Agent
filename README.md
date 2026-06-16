@@ -4,7 +4,7 @@
 
 An AI-powered assistant for SideFX Houdini, featuring autonomous multi-turn tool calling, web search, VEX/Python code execution, Plan mode for complex tasks, a brain-inspired long-term memory system, a plugin hook system for community extensions, user-defined context rules, and a modern dark UI with bilingual support.
 
-Built on the **OpenAI Function Calling** protocol, the agent can read node networks, create/modify/connect nodes, run VEX wrangles, execute system shell commands, search the web, query local documentation, create structured execution plans, learn from past interactions, and be extended via plugins — all within an iterative agent loop. A centralized **ToolRegistry** unifies core tools, skills, and plugin tools with mode-based access control.
+Built on the **OpenAI Function Calling** protocol, the agent can read node networks, create/modify/connect nodes, run VEX wrangles, execute system shell commands, search the web, query local documentation, create structured execution plans, learn from past interactions, and be extended via plugins — all within an iterative agent loop. A centralized **ToolRegistry** unifies core tools, skills, and plugin tools with mode-based access control, while **Harness V2** adds registry-driven scheduling, policy decisions, high-risk tool handling, and diagnostics traceability.
 
 ## Core Features
 
@@ -29,6 +29,7 @@ User request → AI plans → call tools → inspect results → call more tools
 - **Long-term memory** — brain-inspired three-layer memory system (episodic, semantic, procedural) with reward-driven learning and automatic reflection
 - **Plugin system** — external community extensions via `plugins/` directory with hook events, custom tools, UI buttons, and settings
 - **User Rules** — Cursor-style persistent context rules that are automatically injected into every AI request
+- **Harness V2 policy layer** — allow/deny/ask/retry decisions, high-risk tool classification, policy timeline UI, and diagnostics export for traceable tool execution
 
 ### Supported AI Providers
 
@@ -158,6 +159,13 @@ User request → AI plans → call tools → inspect results → call more tools
 | `add_todo` | Add a task to the Todo list |
 | `update_todo` | Update task status (pending / in_progress / done / error) |
 
+### Memory & Diagnostics
+
+| Tool / Command | Description |
+|----------------|-------------|
+| `search_memory` | Search long-term memory across semantic, episodic, and procedural layers; supports category filtering and confidence-scored results |
+| `/diagnostics` | Export a compact diagnostics JSON with policy timeline, Harness trace, call records, and session state; conversation content is excluded |
+
 ### Plan Mode
 
 | Tool | Description |
@@ -227,9 +235,12 @@ Houdini-Agent/
     ├── qt_compat.py                # PySide2/PySide6 compatibility layer
     ├── QUICK_SHELF_CODE.py         # Quick shelf code snippet
     ├── core/
-    │   ├── main_window.py          # Main window (workspace save/restore)
-    │   ├── agent_runner.py         # AgentRunnerMixin — agent loop helpers, confirm mode, tool scheduling
-    │   └── session_manager.py      # SessionManagerMixin — multi-session create/switch/close
+   │   ├── main_window.py          # Main window (workspace save/restore)
+   │   ├── agent_runner.py         # AgentRunnerMixin — agent loop helpers, confirm mode, tool scheduling
+   │   ├── session_manager.py      # SessionManagerMixin — multi-session create/switch/close
+   │   ├── harness_engine.py       # Harness V2 runtime, policy decisions, retry keys
+   │   ├── harness_policy_config.py # High-risk tool policy configuration source
+   │   └── streaming_tool_executor.py # Registry-driven async/serial/high-risk tool scheduling
     ├── ui/
     │   ├── ai_tab.py              # AI Agent tab (Mixin host, agent loop, context management, streaming UI)
     │   ├── cursor_widgets.py      # UI widgets (theme, chat blocks, todo, shells, token analytics, plan viewer, plugin manager, rules editor)
@@ -385,7 +396,14 @@ A five-module system that enables the agent to learn and improve over time:
 | `reflection.py` | Hybrid reflection — rule-based extraction after every task + periodic LLM deep reflection to generate semantic rules and strategy updates |
 | `growth_tracker.py` | Rolling-window metrics (error rate, success rate, tool call efficiency) + personality trait formation (efficiency bias, risk tolerance, verbosity, proactivity) |
 
-Memory is activated at query time: relevant episodic memories, semantic rules, and procedural strategies are retrieved via cosine similarity and injected into the system prompt.
+Memory is activated at query time: relevant episodic memories, semantic rules, and procedural strategies are retrieved via cosine similarity and injected into the system prompt. The `search_memory` tool can also perform explicit three-layer retrieval and returns compatibility `memories` data plus structured semantic/episodic/procedural fields.
+
+Long-term maintenance keeps the memory store healthy over time:
+
+- Fallback embeddings use adaptive similarity threshold scaling to reduce duplicate or weak matches
+- SQLite access is guarded with reentrant locks, timeout/busy-timeout settings, and thread-safe singleton initialization
+- Semantic confidence and procedural priority decay over time
+- Low-value semantic/procedural records can be pruned through the unified `maintain_long_term_memory` maintenance path
 
 ### Plugin System
 
@@ -404,6 +422,18 @@ The agent supports external community extensions via a plugin architecture:
 - **Plugin Manager UI** — tabbed dialog (Plugins / Tools / Skills) for enabling/disabling plugins, managing tool visibility, configuring user skill directories, and editing plugin settings
 
 Plugins are managed via `config/plugins.json`. See `plugins/PLUGIN_DEV_GUIDE.md` for development documentation.
+
+### Harness V2 & Policy Governance
+
+Harness V2 is the governed execution layer between model-generated tool calls and the MCP/tool runtime:
+
+- **Policy decisions** — each tool call can resolve to allow, deny, ask, or retry using a shared high-risk tool policy source
+- **Registry-driven scheduling** — `ToolRegistry` builds the runtime profile used by the streaming executor to classify async, serial, and high-risk tools each round
+- **Retry isolation** — retry budgets are keyed by tool name plus argument fingerprint, so different argument sets do not accidentally consume each other's retry allowance
+- **Policy timeline** — blocked or risky actions are visible from the Policy menu with reason, tool name, and recovery hints
+- **Append-only diagnostics** — session diagnostics and Harness trace records are written as JSON/JSONL under `cache/diagnostics/` and `cache/harness_trace/` without conversation content
+
+Legacy execution paths remain available as fallbacks to reduce migration risk.
 
 ### ToolRegistry
 
@@ -430,6 +460,7 @@ Similar to Cursor Rules, users can define persistent context that is automatical
 - **File Rules** — `.md` and `.txt` files placed in the `rules/` directory are auto-loaded (files starting with `_` are treated as drafts and excluded)
 - **Prompt injection** — all enabled rules are merged and wrapped in `<user_rules>` tags, injected into the system prompt
 - Rules Editor features a warm khaki theme matching the main UI, with a list/editor split layout and empty state guidance
+- **Safety filtering** — `config/user_rules.json` is treated as external input; suspicious prompt-injection patterns are ignored instead of being executed
 
 ### Context Management
 
@@ -480,6 +511,24 @@ The `doc_rag.py` module provides O(1) lookup from bundled ZIP archives:
 - **Doc/*.txt** — Knowledge base articles on Houdini programming
 
 Relevant docs are automatically injected into the system prompt based on the user's query.
+
+The knowledge search pipeline now uses higher-quality ranking and injection controls:
+
+- Weighted scoring combines title/body matches, query coverage, source weights, and short-snippet penalties
+- Query-type reranking distinguishes node, VEX, HOM, and general knowledge requests
+- Results include `matched_terms`, `rank_reason`, `confidence_band`, `source`, and snippets for easier tool-side reasoning
+- Auto retrieval uses per-type quotas for node/VEX/HOM/knowledge content and falls back when evidence is weak
+- Knowledge cache fingerprints use mtime+size, and documents without `##` headings fall back to sliding-window chunking
+
+### Security Boundaries
+
+Runtime safety rules are documented in `rules/security_boundaries.md` and are reflected in agent behavior:
+
+- API keys and sensitive config values must not be printed in full, logged, exported to training data, or written into memory
+- Destructive Houdini actions such as `delete_node`, `save_hip`, and broad batch edits require clear scope and confirmation
+- Plugins must declare their name and function before loading, inherit the same Python/shell restrictions, and must not download and execute remote code
+- Web content and user rules are treated as untrusted external input and screened for prompt-injection patterns
+- Memory content is scoped to the current user's workflow and must not include API keys, private paths, or personal identity data
 
 ## Usage Examples
 
@@ -689,6 +738,8 @@ Set to `"0"` (or leave unset) for the default stable launch.
 
 ## Version History
 
+- **2026-05-25** — **Security boundary update**: Expanded `rules/security_boundaries.md` with API key and sensitive config protection, destructive Houdini operation confirmation rules, plugin loading restrictions, external rule/config prompt-injection handling, and memory-store write limits for secrets, private paths, and personal identity data.
+- **2026-05-21** — **Harness, memory, Doc RAG, and rules update**: Introduced Harness V2 runtime and policy decision flow, centralized high-risk tool policy, registry-driven streaming tool scheduling, policy timeline and diagnostics export, and retry keys based on tool name + argument fingerprint. Upgraded `search_memory` to semantic/episodic/procedural retrieval, hardened MemoryStore concurrency, added adaptive fallback-embedding thresholds, and added long-term semantic/procedural decay and pruning. Improved Doc RAG ranking with weighted scoring, query-type reranking, source diversity, confidence metadata, structured `search_local_doc` fields, per-type auto-injection quotas, mtime+size cache fingerprints, and window chunking for unheaded documents. Main rules now include Karpathy-style implementation guidelines.
 - **v1.3.4** — **ToolRegistry & plugin system overhaul**: New centralized `ToolRegistry` singleton unifying core tools, skills, and plugin tools with mode-based access control (`agent`/`ask`/`plan_planning`/`plan_executing`) and tag classification (`readonly`/`geometry`/`network`/`system`/`docs`/`skill`/`task`/`plugin`). Skills auto-registered as `skill:xxx` tools. User skill directory support (configurable in settings). Plugin Manager refactored to 3-tab UI (Plugins/Tools/Skills) with per-tool enable/disable toggles. Decorator API (`@hook`/`@tool`/`@ui_button`) now properly applied via `_apply_decorators`. MCP Client fallback dispatch to ToolRegistry for `skill:xxx` tools. Mode-based safety guards in `_execute_tool_with_todo` migrated to `ToolRegistry.is_tool_allowed_in_mode()`. macOS thread safety fix: removed `processEvents()` from `BlockingQueuedConnection` slot preventing reentrant crashes; added main-thread assertion; increased tool timeout to 60s. Rules Editor UI redesigned with `QStackedWidget` for empty/editor states, warm khaki theme, and polished layout.
 - **v1.3.3** — **Plugin & IME fixes**: Fixed Plugin Manager "Open Plugins Folder" button (`import os` missing). Comprehensive PySide2 IME fix for macOS Chinese input — overrode `inputMethodQuery` to provide cursor rectangle/surrounding text/position to macOS NSTextInputClient; set `StrongFocus` policy and `ImhNone` hints; enhanced `focusInEvent` to force IME reactivation; added `commitString` fallback in `inputMethodEvent`. Warm khaki theme applied to Plugin Manager and Rules Editor dialogs (previously cold blue/gray). Added `PLUGIN_DEV_GUIDE.md` plugin development documentation.
 - **v1.3.2** — **User Rules system**: Cursor-like custom context rules — UI rules via Rules Editor dialog (create/edit/delete/enable/disable, stored in `config/user_rules.json`) + file rules from `rules/` directory (`.md`/`.txt` auto-loaded). All enabled rules merged and injected as `<user_rules>` into system prompt. Rules integrated into system prompt construction pipeline.
