@@ -1,0 +1,241 @@
+# OF/SFX 流程文档 - 工作流程与规范
+# 来源: U:\CG_VFX\sfxLib\Tutorials\特效流程引导\SFX_List\index.html
+# 生成日期: 2026-06-23
+# 收录范围: 工作流程与规范，10 张卡片
+# 媒体策略: 仅保留文字内容、分类、卡片 ID 与来源锚点，不复制图片或视频
+
+## [工作流程与规范] ABC/格式的模型不要直接filecache出缓存
+
+分类: 工作流程与规范
+分类ID: workflow
+卡片ID: card-135960896
+Confluence PID: 135960896
+来源锚点: #card-135960896
+
+我们现在是双系统流程，有ubuntu有Win，电信农场基本都是Ubuntu.
+目前发现的问题是 当alembic文件不unpack，直接出bgeo类的缓存，会导致不同系统之间，读取不到模型！
+例如：
+[媒体: image-2025-5-21_14-55-1.png][媒体: image-2025-5-21_14-56-7.png]
+原因：
+ABC格式，本身内部就是路径引用，使用filecache之后，应该是又加了一层引用path，导致不同系统之间文件出错
+由于bgeo的格式没有开源，不知道内部的情况，只能大家使用的时候注意
+ABC文件不要直接Filecache！！！ABC文件不要直接Filecache！！！
+单独的ABC读写是没有问题的哈
+
+## [工作流程与规范] 创建文件的命名的时候，注意大小写!不要太简单
+
+分类: 工作流程与规范
+分类ID: workflow
+卡片ID: card-135963507
+Confluence PID: 135963507
+来源锚点: #card-135963507
+
+创建文件的命名的时候，一定要注意大小写！注意大小写！注意大小写！
+Win系统是不分大小写的，但是Ubuntu是分大小写的！ Bool 和 bool在win看来是一个文件夹（应该也创建不出来），ubantu认为是两个！
+你填写的路径是*/bool/*这样，Win可能会定位*/Bool/*的文件夹
+例如这个Cache_POP_1 和 Cache_pop_1 Win认为这个是同一个文件夹，但是Linux认为这两个不一样，报没有找到数据的警告
+[媒体: image-2025-5-28_14-11-36.png]
+
+## [工作流程与规范] 建议使用$JOB来指引路径，$OF_PROJ来引用其他的镜头或asset的内容
+
+分类: 工作流程与规范
+分类ID: workflow
+卡片ID: card-168723201
+Confluence PID: 168723201
+来源锚点: #card-168723201
+
+建议使用$JOB来指引路径，$OF_PROJ来引用其他的镜头或asset的内容
+一定一定不要有绝对路径！！！一定一定不要有绝对路径！！！
+一般情况下,个人学习和看教程的时候，大家都习惯了使用$HIP来指引自己的缓存和贴图
+但是公司在提交农场的时候，会备份一份文件，再使用这份文件去农场渲染，这会导致$HIP这个变量会改变其引导的位置
+遍历所有的路径信息，然后全部替换，这个工具会消耗大量的时间，导致提交农场会异常卡顿！！
+一下节点是会自动转换路径的节点
+NODE_TYPE = {
+"Sop/file": "file",
+"Sop/dopio": "file",
+"Sop/filemerge": "file",
+"Sop/filecache": "file, basedir",
+"Sop/export_vdb": "file",
+"Sop/tableimport": "file",
+"Sop/alembic": "fileName",
+"Sop/rop_alembic": "filename",
+"Sop/rop_fbx": "sopoutput",
+"Sop/rop_geometry": "sopoutput",
+"Sop/of_assexport": "file",
+"Sop/agent": "fbxfile",
+"Sop/fbx_archive_import": "sFBXFile",
+"Sop/fbxcharacterimport": "fbxfile, animfbxfile",
+"Sop/vellumio": "file",
+"Sop/uvquickshade": "texture",
+"Sop/attribfrommap": "texture_channel",
+"Lop/sopcache": "basedir",
+"Lop/usdcache": "lopoutput",
+"Lop/filecache": "lopoutput",
+"Lop/usdrender_rop": "outputimage",
+"Lop/sublayer": "allParm",
+"Lop/reference": "allParm",
+"Lop/of_arnoldrender": "file",
+"Object/alembicxform": "fileName",
+"Object/alembicarchive": "fileName",
+"Object/arnold_light": "ar_light_color_texture",
+"Driver/ifd": "vm_picture",
+"Driver/arnold": "ar_picture",
+"Driver/geometry": "sopoutput",
+"Object/envlight": "env_map",
+"Object/cam": "vm_background",
+"Object/fetch_camera_v001_": "vm_background",
+标题: "allParm" is not a parameter, it's just a special filter tag
+"Vop/image": "allParm",
+"Vop/classicshader": "allParm",
+"Vop/principledshader": "allParm",
+"Vop/materialbuilder": "allParm",
+}
+所有在这之外的节点请使用$JOB来指引路径，$OF_PROJ来引用其他的镜头或asset的内容。
+总的来说，就是贴图路径以及自己添加的路径，使用$JOB和$OF_PROJ
+两个变量的查看位置，如下图：
+[媒体: image-2026-1-22_14-1-20.png][媒体: image-2026-1-22_14-1-44.png]
+
+## [工作流程与规范] 提交农场的simulation与Sequences的区别
+
+分类: 工作流程与规范
+分类ID: workflow
+卡片ID: card-135963327
+Confluence PID: 135963327
+来源锚点: #card-135963327
+
+[媒体: image-2025-5-19_18-4-58.png]
+Simulation 是单个节点的计算，只分配给一个农场机器，用于处理解算任务的。
+Sequences 是将一个节点功能分成多个子任务，分配给多个农场同时完成，用于处理渲染任务的。
+Filecache一般用Simulation ，渲染一般用Sequences！！！！
+注意：
+- 只有一种情况，你的节点树上没有Solver节点，才能Filecache用Sequences！！！！ 没把握就不要用哈~
+- 底下有蓝条的是解算任务（一般节点树上有Solver），帧与帧之间有依赖关系，必须用Simulation单个机器跑任务！！！
+[媒体: image-2025-5-19_18-11-59.png]
+
+## [工作流程与规范] 渲染分层注意命名！
+
+分类: 工作流程与规范
+分类ID: workflow
+卡片ID: card-135963543
+Confluence PID: 135963543
+来源锚点: #card-135963543
+
+这里输出自己制作的层信息的时候，一定要注意一下的问题！！
+- 字母数量不得少于4个，不然输出的层可能失败，nuke读取不到，例如"aaa"，"bbb"这种。
+- 不能以数字打头，例如"1depth",或者"02ratio"这种。
+- 不要使用例如"aaaa""bbbb"这种没有意义的命名，最好用英文，可以用拼音，不要再出现无意义的名字了
+[媒体: image-2025-5-28_14-18-29.png]
+
+## [工作流程与规范] 缓存时不要使用filecache之外的节点
+
+分类: 工作流程与规范
+分类ID: workflow
+卡片ID: card-135959543
+Confluence PID: 135959543
+来源锚点: #card-135959543
+
+注意：我们缓存不要使用filecache之外的缓存节点
+我们自己的filecache长这个样子，请认准！！ 新版本颜色也改了，不要再混淆了啊
+[媒体: image-2025-4-8_16-30-51.png][媒体: image-2025-4-9_11-28-11.png]
+其他的filecache不是不能用，是目前流程不支持他们提交农场，路径检查等一系列的流程管控，出问题了我没法查看。
+以下是几个不同的filecache节点，尤其是第一个Labs::filecache几乎和我们自己的filecache一样，大家一定要小心（后期我会改个颜色以用来区分）。
+[媒体: image-2025-4-8_16-35-41.png]
+注意：有人想同时看碎块或者布料的约束，用这个方法.
+[媒体: image-2025-4-11_10-52-20.png]
+出小数帧的设置
+[媒体: image-2025-4-11_10-46-8.png]
+
+## [工作流程与规范] 缓存渲染不要自己再添加版本号
+
+分类: 工作流程与规范
+分类ID: workflow
+卡片ID: card-135959545
+Confluence PID: 135959545
+来源锚点: #card-135959545
+
+我们无论是缓存节点还是渲染节点都会为大家做好版本预设了（例子如下图），节点的名字上不要再添加新的v*的版本控制了，这样会导致pipeline解析路径出问题
+filecache：
+[媒体: image-2025-4-9_11-30-22.png]
+mantra：
+[媒体: image-2025-4-9_11-35-5.png]
+
+## [工作流程与规范] Nuke合成的daily和publish流程
+
+分类: 工作流程与规范
+分类ID: workflow
+卡片ID: card-25921494
+Confluence PID: 25921494
+来源锚点: #card-25921494
+
+鉴于再次出现了Publish后特效的素材丢失的情况,感觉有必要示例一下daily和Publish的流程(为了不背锅).
+一.由于daily的需求太过多样, 目前在Nuke中没有相应的节点.
+一般的流程是:
+1. nuke中输出mov影片.
+2. shotgun中右键找到Dailywork Submitter.
+3. 按要求上传mov和说明. 如下图:
+[媒体: img_50a998c8-50dc-4975-a258-4e8fc0ca2c0g.png]
+二.Publish时需要使用publishItem 节点进行Publish(重点)
+- ChooseTask当前的镜头号,升级版本另存.
+2.将该节点放在节点树的最后,删除没有用的节点,点击Publish按钮即可.
+[媒体: image2021-3-12_16-42-49.png]
+注: 该节点会自动在后台生成一个mov上传到shotgun上,这就可以成为一个证据,即如果mov是正确的,之后的素材丢失不是特效的失误.
+以唐洪波3月11号天龙项目中素材丢失为例, 他在3月4号Publish的文件,在11号时发现素材丢失,历史回溯只能到3月5号,如果没有使用该节点Publish,在shotgun/RV上留下mov, 则没法证明是不是特效的过失.所以希望竟可能的使用该节点,保留痕迹.
+PS: 如何取得目前来说比较好用的合成模板
+1. 中心化打开Nuke,ChooseTask后,在左下角可以找到[媒体: image2021-3-12_15-20-9.png],点击后选择ProjectTools->TOA-sfx_template,就可以得到一个基础的合成模板,如下图:
+[媒体: image2021-3-12_15-27-14.png]
+
+## [工作流程与规范] SFX_Checklist
+
+分类: 工作流程与规范
+分类ID: workflow
+卡片ID: card-10697848
+Confluence PID: 10697848
+来源锚点: #card-10697848
+
+制作前准备工作:
+1.特效制作之前需确定场景文件，动画文件以及摄像机是否为最终文件
+2.制作镜头前，要先看一下layout，注意本镜头以及前后镜头，保证制作的前后连贯性。
+提交工作:
+1.正确的渲染尺寸
+2.注意单个镜头的帧间距
+3.houdini文件夹自动创建，相应的文件夹用途
+4.前后预留handle帧
+5.视频统一命名-按镜头号来
+6.特效场景提交前除特效文件外确保不要包含其他文件（比如灯光，摄像机等）
+7.因为制作中要用到roto，所以序列一开始要Reformat为工程尺寸
+8.破碎导出ABC格式，液体导出bin格式，水面可以导ABC也可以导bin
+9.镜头通过在最终渲染时，要检查缓存、相机有没有更新
+10.注意检查序列的噪点问题，给合成的序列一定要没有明显的噪点
+11.提交前需单帧测试，确保能正确渲染运动模糊
+12.涉及光等特效，需要确认要不要提交渲染灯光影响的mesh，凡有破碎、液体和水面的，都要提交给渲染渲，除非经过商量由本环节渲染。
+13.特效制作时如果将缩小100倍制作，提交前需将放大100倍
+14.特效从场景导出模型时需确保带有UV信息，并且UV正确
+15.提交破碎场景前需检查破碎起始帧UV贴图是否有偏移或者其他错误，从而导致场景在从原始模型切换到破碎模型时的贴图位置不匹配问题
+16.提交的碎块内部面要赋予正确UV
+17.整理大纲并且合理命名
+18.不要有隐藏的layer显示层
+19.特效提交烟雾类场景时，需赋予相应渲染器的volume材质并调节好，渲染单帧测试，再渲染场景单帧，并且预合成，确保voluem密度没有问题后再提交
+20.提交给合成的序列须带有三色光，或者分开的灯光通道，并且遮罩正确（这个检查点有问题，如果volume由渲染来渲，特效则不需要提供任何的序列给到合成。如果是特效自己来渲染，三色光是根据合成要求来提供，至于灯光通道不需要提供）
+
+## [工作流程与规范] SFX_vdb提交说明
+
+分类: 工作流程与规范
+分类ID: workflow
+卡片ID: card-1347473
+Confluence PID: 1347473
+来源锚点: #card-1347473
+
+1.首先我们确认了maya与houdini的场景尺寸比例，houdini的VDB缓存导入maya后需要扩大100倍。（因为maya默认的单位为厘米，而houdini的单位是米）
+[媒体: 图片1.png]
+2.显示方式上我们选择使用Bounding Box and Point，这样可以更好地显示流体的大小和位置。
+[媒体: 图片2.png]
+3.我们导入到maya中使用的是如下的方式：
+[媒体: 图片3.png]
+4.我们会对VDB的材质进行一下编辑，在Channel上面填写density
+[媒体: 图片4.png]
+5.由于场景中的VDB扩大了100倍，所以她的density同样扩大了100倍，我们需要将它缩回来，所以要将下面的数值填写为0.01
+[媒体: 图片5.png]
+6.通过maya的redshift渲染我们得到了VDB的形态（并没有看到有阶梯状的烟雾）
+[媒体: 图片6.png]
+7.通过houdini的mantra渲染得到如下结果（并没有看到有阶梯状的烟雾）
+[媒体: 图片7.png]

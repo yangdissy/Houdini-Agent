@@ -43,7 +43,10 @@ class ChatViewMixin:
 
     def _add_ai_response(self) -> AIResponse:
         """添加 AI 回复块"""
-        response = AIResponse(self.chat_container)
+        response = AIResponse(
+            self.chat_container,
+            session_node_map=getattr(self, '_session_node_map', {}),
+        )
         response.createWrangleRequested.connect(self._on_create_wrangle)
         response.nodePathClicked.connect(self._navigate_to_node)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, response)

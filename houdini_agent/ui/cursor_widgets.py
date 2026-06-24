@@ -14,6 +14,7 @@ import re
 import time
 
 from .i18n import tr
+from .node_links import _linkify_node_paths, _linkify_node_paths_plain
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -22,40 +23,6 @@ def _fmt_duration(seconds: float) -> str:
     if s < 60:
         return f"{s}s"
     return f"{s // 60}m{s % 60:02d}s"
-
-
-# ============================================================
-# 节点路径 → 可点击链接
-# ============================================================
-
-# 匹配 Houdini 节点路径: /obj/..., /out/..., /ch/..., /shop/..., /stage/..., /mat/..., /tasks/...
-_NODE_PATH_RE = re.compile(
-    r'(?<!["\w/])'                          # 不在引号、字母或 / 之后
-    r'(/(?:obj|out|ch|shop|stage|mat|tasks)(?:/[\w.]+)+)'   # 路径本体
-    r'(?!["\w/])'                           # 不在引号、字母或 / 之前
-)
-
-_NODE_LINK_STYLE = "color:#10b981;text-decoration:none;font-family:Consolas,Monaco,monospace;"
-
-
-def _linkify_node_paths(text: str) -> str:
-    """将文本中的 Houdini 节点路径转换为可点击的 <a> 标签
-    
-    使用 houdini:// 协议，点击后由 Qt 的 linkActivated 信号处理跳转。
-    """
-    return _NODE_PATH_RE.sub(
-        lambda m: f'<a href="houdini://{m.group(1)}" style="{_NODE_LINK_STYLE}">{m.group(1)}</a>',
-        text,
-    )
-
-
-def _linkify_node_paths_plain(text: str) -> str:
-    """将纯文本中的节点路径转换为富文本 HTML（含可点击链接）
-    
-    先 html.escape 再 linkify，保证安全。
-    """
-    escaped = html.escape(text)
-    return _linkify_node_paths(escaped).replace('\n', '<br>')
 
 
 # ============================================================
@@ -969,8 +936,9 @@ class AIResponse(QtWidgets.QWidget):
     createWrangleRequested = QtCore.Signal(str)  # vex_code
     nodePathClicked = QtCore.Signal(str)         # 节点路径被点击
     
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, session_node_map: dict = None):
         super().__init__(parent)
+        self._session_node_map = session_node_map if session_node_map is not None else {}
         self._start_time = time.time()
         self._content = ""
         self._has_thinking = False
@@ -1301,7 +1269,7 @@ class AIResponse(QtWidgets.QWidget):
                     | QtCore.Qt.TextSelectableByKeyboard
                     | QtCore.Qt.LinksAccessibleByMouse
                 )
-                lbl.setText(seg[1])
+                lbl.setText(_linkify_node_paths(seg[1], self._session_node_map))
                 lbl.setObjectName("richText")
                 lbl.linkActivated.connect(self._on_link_activated)
                 self._frozen_layout.addWidget(lbl)
@@ -4847,14 +4815,17 @@ class CodeBlockWidget(QtWidgets.QFrame):
         self._code_edit.setHtml(
             f'<pre style="margin:0;white-space:pre;">{code_html}</pre>'
         )
-        # auto-height (capped)
         doc = self._code_edit.document()
         doc.setDocumentMargin(4)
-        self._full_h = int(doc.size().height()) + 20
 
-        # 计算折叠高度（COLLAPSE_THRESHOLD 行）
+        # ★ 用行高×行数估算高度 — doc.size() 在 widget 未 show() 时是懒布局值，
+        #   不可靠，导致 setFixedHeight 过小，手动跨行选中时内容被截断。
+        #   showEvent 里会用真实文档高度校正一次（兜底）。
         fm = self._code_edit.fontMetrics()
         line_h = fm.lineSpacing() if fm.lineSpacing() > 0 else 17
+        self._full_h = line_h * self._line_count + 24 + int(doc.documentMargin()) * 2
+
+        # 计算折叠高度（COLLAPSE_THRESHOLD 行）
         self._collapsed_h = self._COLLAPSE_THRESHOLD * line_h + 20
 
         if self._collapsed:
@@ -4864,6 +4835,15 @@ class CodeBlockWidget(QtWidgets.QFrame):
             self._code_edit.setFixedHeight(min(self._full_h, self._MAX_HEIGHT))
 
         layout.addWidget(self._code_edit)
+
+    def showEvent(self, event):
+        """首次显示后用真实文档高度校正 — 消除懒布局估算偏差"""
+        super().showEvent(event)
+        if not self._collapsed:
+            real_h = int(self._code_edit.document().size().height()) + 20
+            if real_h != self._full_h:
+                self._full_h = real_h
+                self._code_edit.setFixedHeight(min(real_h, self._MAX_HEIGHT))
 
     def _add_line_numbers(self, highlighted_code: str) -> str:
         """为高亮代码添加行号（使用 HTML table 布局）"""

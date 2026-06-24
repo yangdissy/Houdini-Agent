@@ -4,7 +4,7 @@ Plan Manager — Plan 模式的数据模型与文件管理
 
 职责：
 - Plan 数据的 CRUD（创建、读取、更新、删除）
-- Plan 文件持久化到 cache/plans/plan_{session_id}.json
+- Plan 文件持久化到当前用户 cache root 下的 plans/plan_{session_id}.json
 - 精简版 Plan 上下文生成（用于注入 LLM，最小化 token 消耗）
 - 一个 session 只有一个 active plan，重复创建时自动归档旧 plan
 """
@@ -21,7 +21,7 @@ class PlanManager:
     """Plan 文件管理器
 
     文件存储路径:
-        cache/plans/plan_{session_id}.json
+        <cache_root>/plans/plan_{session_id}.json
 
     Plan JSON Schema (增强版):
         {
@@ -616,12 +616,12 @@ PLAN_TOOL_ASK_QUESTION = {
 # 单例
 # ======================================================================
 
-_instance: Optional[PlanManager] = None
+_instances: Dict[str, PlanManager] = {}
 
 
 def get_plan_manager(cache_dir: Optional[Path] = None) -> PlanManager:
-    """获取 PlanManager 单例"""
-    global _instance
-    if _instance is None:
-        _instance = PlanManager(cache_dir)
-    return _instance
+    """获取指定 cache root 对应的 PlanManager。"""
+    key = str(Path(cache_dir).resolve()) if cache_dir is not None else "__default__"
+    if key not in _instances:
+        _instances[key] = PlanManager(cache_dir)
+    return _instances[key]

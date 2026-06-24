@@ -111,6 +111,7 @@ class UserPaths:
         for p in (
             self.user_root,
             self.conversations_dir(),
+            self.plans_dir(),
             self.memory_dir(),
             self.embeddings_dir(),
             self.workspace_dir(),
@@ -119,6 +120,9 @@ class UserPaths:
 
     def conversations_dir(self) -> Path:
         return self.user_root / "conversations"
+
+    def plans_dir(self) -> Path:
+        return self.user_root / "plans"
 
     def memory_dir(self) -> Path:
         return self.user_root / "memory"

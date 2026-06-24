@@ -93,11 +93,11 @@ _PROMPT_TEMPLATE_CACHE: dict = {}
 # 核心规则子集（内嵌兜底，当 system_prompt_rules_core.txt 文件不存在时使用）
 # 只保留每轮续接都可能触发的高频规则，完整规则见 system_prompt_rules.txt
 _CORE_RULES_FALLBACK = """
-Node Path Output Rules: Always use full absolute paths (e.g. /obj/geo1/box1), never bare names.
+Node Path Output Rules: In user-facing replies, prefer relative or short node references (e.g. box1, geo1/box1, or ../geo1/box1) when the current network is clear. Use full /obj/... paths only when needed to avoid ambiguity, preserve clickable navigation, or quote actual tool output.
 
 Fake Tool Call Prevention (highest priority): NEVER write "[ok] tool:" or "[Tool Result]" in replies. Call tools via function calling only.
 
-Tool Call Parameter Rules: Verify all required parameters before calling. node_path must be absolute. Fix parameter errors and retry — don't call check_errors for tool failures.
+Tool Call Parameter Rules: Verify all required parameters before calling. Tool node_path parameters must use full Houdini paths, because tools need exact lookup paths. Fix parameter errors and retry — don't call check_errors for tool failures.
 
 Safe Operation: Before setting parameters, call get_node_parameters. No duplicate queries per round. After creating a node, use the returned path.
 
@@ -173,6 +173,7 @@ class AITab(
 
         self._username = (username or "").strip().lower() or "default"
         user_paths = UserPaths(self._username)
+        self._user_paths = user_paths
         user_paths.ensure_dirs()
 
         try:
@@ -267,7 +268,7 @@ class AITab(
         self._thinking_needs_finalize = False  # 标记是否需要 finalize 思考区块
         self._think_enabled = True  # 当前会话是否启用思考显示（由 Think 开关控制）
         
-        # 会话级节点路径映射：name → set[path]，用于后处理裸节点名 → 完整路径
+        # 会话级节点路径映射：name → set[path]，用于节点引用去歧义
         self._session_node_map: dict[str, set[str]] = {}
         
         # Token 使用统计（累积值，每轮对话叠加）—— 对齐 Cursor
@@ -1395,9 +1396,6 @@ class AITab(
         
         try:
             if resp:
-                # ★ 后处理：将裸节点名自动解析为完整路径（防止长上下文中 AI 遗忘路径规范）
-                if resp._content:
-                    resp._content = self._resolve_bare_node_names(resp._content)
                 resp.finalize()
         except RuntimeError:
             resp = None  # widget 已被 clear 销毁，跳过 UI 操作
@@ -2177,7 +2175,7 @@ class AITab(
             return {}
 
     # ------------------------------------------------------------------
-    #  后处理：自动将 AI 回复中的裸节点名解析为完整路径
+    #  节点路径收集：记录工具涉及的节点，用于后续去歧义
     # ------------------------------------------------------------------
 
     _NODE_PATH_RE = re.compile(r'/(?:obj|out|shop|stage|tasks|ch|mat|img)/[\w/]+')
@@ -2211,48 +2209,13 @@ class AITab(
                 self._session_node_map.setdefault(name, set()).add(p)
 
     def _resolve_bare_node_names(self, text: str) -> str:
-        """将 AI 回复中的裸节点名（如 box1）自动替换为完整路径（如 /obj/geo1/box1）。
+        """保留 AI 回复中的相对/短节点引用。
 
         数据来源：当前会话中 AI 工具调用涉及的节点路径（_session_node_map）。
-        安全规则:
-        - 只替换名称在会话中只对应 **唯一一个** 路径的节点（避免跨 subnet 歧义）。
-        - 只处理以数字结尾的名称（box1, scatter2），避免误匹配普通英文单词。
-        - 跳过代码块（```...``` 和 `...`）中的内容。
-        - 跳过已经是完整路径一部分的名称（前面有 /）。
-        - 长名称优先替换，避免子串冲突。
+        旧版本会把裸节点名自动扩写成 /obj/... 完整路径；现在用户可见回复
+        优先保留相对路径/短名称，工具参数仍使用完整路径。
         """
-        if not text or not self._session_node_map:
-            return text
-
-        import re
-
-        # 构建 name → path 映射（仅以数字结尾 + 唯一路径的名称）
-        name_to_path: dict[str, str] = {}
-        for name, path_set in self._session_node_map.items():
-            if len(path_set) == 1 and name and name[-1].isdigit():
-                name_to_path[name] = next(iter(path_set))
-        if not name_to_path:
-            return text
-
-        # 按名称长度降序排列（长名优先，避免 "box1" 误匹配 "networkbox1" 的子串）
-        sorted_names = sorted(name_to_path.keys(), key=len, reverse=True)
-
-        # 将文本拆分为 代码块 / 非代码块
-        code_pattern = re.compile(r'(```[\s\S]*?```|`[^`\n]+`)')
-        parts = code_pattern.split(text)
-
-        for i, part in enumerate(parts):
-            # 跳过代码块片段
-            if part.startswith('`'):
-                continue
-            for name in sorted_names:
-                full_path = name_to_path[name]
-                # 负向后视：前面不能是 / 或 \w（已在路径中或更长名称的一部分）
-                # 负向前瞻：后面不能是 \w（更长名称的一部分）
-                pat = r'(?<![/\w])' + re.escape(name) + r'(?!\w)'
-                parts[i] = re.sub(pat, full_path, parts[i])
-
-        return ''.join(parts)
+        return text
 
     @staticmethod
     def _diff_network_children(before: dict, after: dict):
@@ -3353,9 +3316,7 @@ class AITab(
             # 5. ★ Plan 上下文注入（仅在 Plan 执行阶段 + 当前 session 匹配时）
             if plan_mode and plan_executing:
                 try:
-                    if self._plan_manager is None:
-                        self._plan_manager = get_plan_manager()
-                    plan_ctx = self._plan_manager.get_plan_for_context(self._session_id)
+                    plan_ctx = self._get_plan_manager().get_plan_for_context(self._session_id)
                     if plan_ctx:
                         messages.append({'role': 'system', 'content': plan_ctx})
                 except Exception as e:

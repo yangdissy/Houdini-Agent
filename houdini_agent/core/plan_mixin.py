@@ -42,6 +42,13 @@ from ..ui.cursor_widgets import AskQuestionCard, PlanViewer, StreamingPlanCard
 class PlanMixin:
     """Plan 模式 Mixin：Plan 工具处理、交互卡片渲染与执行流程"""
 
+    def _get_plan_manager(self):
+        if self._plan_manager is None:
+            user_paths = getattr(self, '_user_paths', None)
+            cache_root = getattr(user_paths, 'user_root', None)
+            self._plan_manager = get_plan_manager(cache_root)
+        return self._plan_manager
+
     # ------------------------------------------------------------------
     # Plan 模式工具处理
     # ------------------------------------------------------------------
@@ -49,9 +56,7 @@ class PlanMixin:
     def _handle_create_plan(self, kwargs: dict) -> dict:
         """处理 create_plan 工具调用（后台线程）"""
         try:
-            if self._plan_manager is None:
-                self._plan_manager = get_plan_manager()
-            plan_data = self._plan_manager.create_plan(self._session_id, kwargs)
+            plan_data = self._get_plan_manager().create_plan(self._session_id, kwargs)
             self._plan_phase = 'awaiting_confirmation'
             # 切换状态：Planning → Generating（Plan 已完成构建）
             self._showGenerating.emit()
@@ -67,12 +72,10 @@ class PlanMixin:
     def _handle_update_plan_step(self, kwargs: dict) -> dict:
         """处理 update_plan_step 工具调用（后台线程）"""
         try:
-            if self._plan_manager is None:
-                self._plan_manager = get_plan_manager()
             step_id = kwargs.get('step_id', '')
             status = kwargs.get('status', 'done')
             result_summary = kwargs.get('result_summary', '')
-            plan = self._plan_manager.update_step(
+            plan = self._get_plan_manager().update_step(
                 self._session_id, step_id, status, result_summary
             )
             if not plan:
@@ -326,9 +329,7 @@ class PlanMixin:
         """用户点击 Reject 按钮 → 丢弃 Plan"""
         self._plan_phase = 'idle'
         try:
-            if self._plan_manager is None:
-                self._plan_manager = get_plan_manager()
-            self._plan_manager.delete_plan(self._session_id)
+            self._get_plan_manager().delete_plan(self._session_id)
         except Exception:
             pass
         if self._active_plan_viewer:
@@ -368,9 +369,8 @@ class PlanMixin:
             print(f"[Plan] 续接次数已达上限 ({self._MAX_PLAN_RESUMES})，停止续接")
             return None
         try:
-            if self._plan_manager is None:
-                self._plan_manager = get_plan_manager()
-            plan = self._plan_manager.load_plan(self._session_id)
+            plan_manager = self._get_plan_manager()
+            plan = plan_manager.load_plan(self._session_id)
             if not plan:
                 return None
             steps = plan.get('steps', [])
@@ -382,11 +382,11 @@ class PlanMixin:
             if running_steps:
                 for s in running_steps:
                     print(f"[Plan] 自动标记 running 步骤为 done: {s['id']}")
-                    self._plan_manager.update_step(
+                    plan_manager.update_step(
                         self._session_id, s['id'], 'done',
                         '(auto-completed: AI finished but did not call update_plan_step)'
                     )
-                plan = self._plan_manager.load_plan(self._session_id)
+                plan = plan_manager.load_plan(self._session_id)
                 steps = plan.get('steps', [])
 
             done_count = sum(1 for s in steps if s.get('status') == 'done')
@@ -410,7 +410,7 @@ class PlanMixin:
                 f'"{s.get("title", s.get("description", s["id"]))}"'
                 for s in pending_steps[:5]
             )
-            plan_ctx = self._plan_manager.get_plan_for_context(self._session_id)
+            plan_ctx = plan_manager.get_plan_for_context(self._session_id)
             resume_msg = (
                 f"[Plan Incomplete] 计划尚未完成！已完成 {done_count}/{total} 步。\n"
                 f"未完成步骤: {pending_names}\n"

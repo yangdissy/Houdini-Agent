@@ -1,0 +1,20 @@
+# OF/SFX 流程文档索引
+# 来源: U:\CG_VFX\sfxLib\Tutorials\特效流程引导\SFX_List\index.html
+# 生成日期: 2026-06-23
+# 收录范围: 整页 238 张卡片 + 新人培训模式 5 个阶段
+# 媒体策略: 仅保留文字内容、分类、卡片 ID 与来源锚点，不复制图片或视频
+
+## OF/SFX 流程文档索引
+
+本目录由 SFX 流程文档中心生成，共收录 238 张卡片和 5 个新人培训阶段。
+
+分类文件:
+- quickstart.txt: 快速入门
+- workflow.txt: 工作流程与规范
+- tools.txt: 工具指南
+- knowledgebase.txt: 技术问题库
+- outsource.txt: 外包管理
+- team.txt: 团队制度
+- collaboration.txt: 上下游协作
+- checklist.txt: 艺术家自查清单
+- training.txt: 新人培训模式
