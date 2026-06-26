@@ -1296,6 +1296,17 @@ class AIResponse(QtWidgets.QWidget):
         if not self._frozen_container.isVisible():
             self._frozen_container.setVisible(True)
         self._frozen_segments.append(text)
+
+    def _clear_rendered_content(self):
+        """清空已经冻结的正文 widget，用于 finalize 后完整重渲染。"""
+        while self._frozen_layout.count():
+            item = self._frozen_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.setParent(None)
+                widget.deleteLater()
+        self._frozen_segments.clear()
+        self._frozen_container.setVisible(False)
     
     def set_content(self, text: str):
         """设置内容（一次性，非流式场景，如历史恢复）
@@ -1398,7 +1409,7 @@ class AIResponse(QtWidgets.QWidget):
         if self._clean_content(self._content):
             self._copy_btn.setVisible(True)
         
-        # ★ 增量渲染 finalize: 处理最后残余的 pending_text
+        # ★ finalize 后用完整正文重渲染一次，避免流式半截 Markdown 影响最终 UI
         content = self._clean_content(self._content)
         
         if not content:
@@ -1409,18 +1420,9 @@ class AIResponse(QtWidgets.QWidget):
             self.content_label.setProperty("state", "empty")
             self.content_label.style().unpolish(self.content_label)
             self.content_label.style().polish(self.content_label)
-        elif self._frozen_segments:
-            # 增量模式：已有冻结段落，只需处理 pending 尾部
-            remaining = self._clean_content(self._pending_text)
-            if remaining:
-                # ★ 始终将残余文本冻结为富文本，避免 finalize 时的跳变
-                self._freeze_text(remaining)
-                self.content_label.setVisible(False)
-            else:
-                # 没有残余文本，隐藏 QPlainTextEdit
-                self.content_label.setVisible(False)
         else:
-            # 传统模式（无冻结段落）—— 始终渲染为富文本以保持一致性
+            self._clear_rendered_content()
+            self._pending_text = ""
             self.content_label.setVisible(False)
             self._freeze_text(content)
     
@@ -3533,7 +3535,10 @@ class SimpleMarkdown:
     - 围栏代码块（交给 CodeBlockWidget）
     """
 
-    _CODE_BLOCK_RE = re.compile(r'```(\w*)\n(.*?)```', re.DOTALL)
+    _CODE_BLOCK_RE = re.compile(
+        r'^[ \t]*```[ \t]*([^\n`]*)\n(.*?)^[ \t]*```[ \t]*$',
+        re.DOTALL | re.MULTILINE,
+    )
     _TABLE_SEP_RE = re.compile(r'^\|?\s*[-:]+[-| :]*$')  # 表头分割行
     # 自动检测裸 URL
     _AUTO_URL_RE = re.compile(
@@ -3562,7 +3567,14 @@ class SimpleMarkdown:
             before = text[last:m.start()]
             if before.strip():
                 cls._parse_text_with_images(before, segments)
-            segments.append(('code', m.group(1) or '', m.group(2).rstrip()))
+            lang = (m.group(1) or '').strip()
+            code = m.group(2).rstrip()
+            if not lang:
+                code_lines = code.split('\n')
+                if code_lines and re.fullmatch(r'[A-Za-z][\w.+#-]{0,31}', code_lines[0].strip()):
+                    lang = code_lines[0].strip()
+                    code = '\n'.join(code_lines[1:]).rstrip()
+            segments.append(('code', lang, code))
             last = m.end()
         after = text[last:]
         if after.strip():
@@ -4742,7 +4754,7 @@ class CodeBlockWidget(QtWidgets.QFrame):
     def __init__(self, code: str, language: str = "", parent=None):
         super().__init__(parent)
         self._code = code
-        self._lang = language.lower()
+        self._lang = self._normalize_language(language)
         self._line_count = code.count('\n') + 1
         self._collapsed = self._line_count > self._COLLAPSE_THRESHOLD
         self._show_line_numbers = self._line_count > self._LINE_NUM_THRESHOLD
@@ -4879,6 +4891,14 @@ class CodeBlockWidget(QtWidgets.QFrame):
             self._toggle_btn.setText("收起")
 
     # --- helpers ---
+    def _normalize_language(self, language: str) -> str:
+        lang = (language or '').strip().lower()
+        if lang in ('text', 'txt', 'plain', 'plaintext', 'none'):
+            return 'text'
+        if lang in ('c', 'cpp', 'c++', 'cxx', 'h', 'hpp') and self._is_vex():
+            return 'vex'
+        return lang
+
     def _is_vex(self) -> bool:
         return any(ind in self._code for ind in self._VEX_INDICATORS)
 
@@ -4913,6 +4933,8 @@ class CodeBlockWidget(QtWidgets.QFrame):
             return SyntaxHighlighter.highlight_glsl(self._code)
         # XML / HTML — use plain escaped (simple approach)
         if lang in ('xml', 'html', 'svg'):
+            return html.escape(self._code)
+        if lang == 'text':
             return html.escape(self._code)
         # Fallback: no highlighting
         return html.escape(self._code)

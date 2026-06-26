@@ -2715,7 +2715,15 @@ class AIClient:
     def requires_temperature_one(model: str) -> bool:
         """判断模型是否只支持 temperature=1（不允许自定义值）"""
         m = model.lower()
-        return 'k2' in m  # kimi-k2 系列
+        return 'k2' in m or m.startswith('gpt-5')
+
+    @classmethod
+    def _payload_temperature(cls, model: str, temperature: Optional[float]) -> Optional[float]:
+        if cls.requires_temperature_one(model):
+            return 1
+        if temperature is None:
+            return None
+        return min(max(temperature, 0.0), 1.0)
     
     # Duojie 思考模式说明：
     # 经测试 thinking/reasoningEffort API 参数对 Duojie 均无效（reasoning_tokens 始终 0）
@@ -3405,11 +3413,13 @@ class AIClient:
         payload = {
             'model': model,
             'messages': messages,
-            'temperature': temperature,
             'stream': True,
             # 必须加 stream_options 才能在流式响应中获取 usage 统计
             'stream_options': {'include_usage': True},
         }
+        payload_temperature = self._payload_temperature(model, temperature)
+        if payload_temperature is not None:
+            payload['temperature'] = payload_temperature
         if max_tokens:
             payload['max_tokens'] = max_tokens
         
@@ -3806,8 +3816,10 @@ class AIClient:
         payload = {
             'model': model,
             'messages': messages,
-            'temperature': temperature,
         }
+        payload_temperature = self._payload_temperature(model, temperature)
+        if payload_temperature is not None:
+            payload['temperature'] = payload_temperature
         if max_tokens:
             payload['max_tokens'] = max_tokens
         

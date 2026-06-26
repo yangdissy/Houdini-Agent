@@ -9,6 +9,7 @@ Session Manager — 多会话管理和缓存
 """
 
 import uuid
+from datetime import datetime
 from houdini_agent.qt_compat import QtWidgets, QtCore
 
 from ..ui.i18n import tr
@@ -117,6 +118,7 @@ class SessionManagerMixin:
             'chat_layout': chat_layout,
             'todo_list': todo,
             'conversation_history': self._conversation_history,
+            'created_at': self._session_created_at,
             'context_summary': self._context_summary,
             'current_response': self._current_response,
             'token_stats': self._token_stats,
@@ -159,6 +161,7 @@ class SessionManagerMixin:
         # 创建新会话
         self._session_counter += 1
         new_id = str(uuid.uuid4())[:8]
+        new_created_at = datetime.now().isoformat()
         label = f"Chat {self._session_counter}"
         
         scroll_area, chat_container, chat_layout = self._create_session_widgets()
@@ -182,6 +185,7 @@ class SessionManagerMixin:
             'chat_layout': chat_layout,
             'todo_list': todo,
             'conversation_history': [],
+            'created_at': new_created_at,
             'context_summary': '',
             'current_response': None,
             'token_stats': new_token_stats,
@@ -189,6 +193,7 @@ class SessionManagerMixin:
         
         # 切换到新会话
         self._session_id = new_id
+        self._session_created_at = new_created_at
         self._conversation_history = []
         self._context_summary = ''
         self._current_response = None
@@ -211,6 +216,10 @@ class SessionManagerMixin:
         self.session_stack.setCurrentWidget(scroll_area)
         
         self._sync_tabs_backup()
+        try:
+            self._update_manifest()
+        except Exception:
+            pass
         self._update_context_stats()
     
     def _switch_session(self, tab_index: int):
@@ -275,6 +284,10 @@ class SessionManagerMixin:
             pass
         
         self._sync_tabs_backup()
+        try:
+            self._update_manifest()
+        except Exception:
+            pass
         self._update_context_stats()
     
     def _save_current_session_state(self):
@@ -283,6 +296,7 @@ class SessionManagerMixin:
             return
         s = self._sessions[self._session_id]
         s['conversation_history'] = self._conversation_history
+        s['created_at'] = self._session_created_at
         s['context_summary'] = self._context_summary
         s['current_response'] = self._current_response
         s['token_stats'] = self._token_stats
@@ -307,6 +321,7 @@ class SessionManagerMixin:
             return
         
         self._session_id = session_id
+        self._session_created_at = sdata.get('created_at') or datetime.now().isoformat()
         self._conversation_history = sdata.get('conversation_history', [])
         self._context_summary = sdata.get('context_summary', '')
         self._current_response = sdata.get('current_response')

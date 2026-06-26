@@ -304,6 +304,10 @@ class MainWindow(QtWidgets.QMainWindow):
             print(f"[Workspace] Exit save failed: {e}")
     
     def closeEvent(self, event):
-        self._save_workspace()
+        # ★ 使用 _save_workspace_once() 而不是 _save_workspace()：
+        #   当 show_tool() 替换旧窗口时会预先设 _already_saved=True，
+        #   防止旧窗口 closeEvent 用旧数据覆盖新窗口刚写好的 manifest。
+        #   普通关闭（用户点 X）时 _already_saved=False，行为与之前完全一致。
+        self._save_workspace_once()
         event.accept()
         super().closeEvent(event)

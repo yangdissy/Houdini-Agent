@@ -40,27 +40,27 @@ Split the 7073-line `houdini_agent/ui/ai_tab.py` into focused mixins while prese
 
 ## Implementation Checklist
 
-### [ ] Phase 1: Preserve AITab Entry Point And Extract Low-Risk Helpers
+### [x] Phase 1: Preserve AITab Entry Point And Extract Low-Risk Helpers
 
-- [ ] Task 1.1: Keep AITab as the public composition root
+- [x] Task 1.1: Keep AITab as the public composition root
 
   - Details: .copilot-tracking/details/20260624-ai-tab-refactor-details.md (Lines 11-25)
 
-- [ ] Task 1.2: Extract prompt utilities
+- [x] Task 1.2: Extract prompt utilities
   - Details: .copilot-tracking/details/20260624-ai-tab-refactor-details.md (Lines 27-42)
 
-- [ ] Task 1.3: Extract preferences and diagnostics mixins
+- [x] Task 1.3: Extract preferences and diagnostics mixins
   - Details: .copilot-tracking/details/20260624-ai-tab-refactor-details.md (Lines 44-62)
 
-### [ ] Phase 2: Extract Runtime And UI Action Domains
+### [x] Phase 2: Extract Runtime And UI Action Domains
 
-- [ ] Task 2.1: Extract runtime state lifecycle mixin
+- [x] Task 2.1: Extract runtime state lifecycle mixin
   - Details: .copilot-tracking/details/20260624-ai-tab-refactor-details.md (Lines 66-83)
 
-- [ ] Task 2.2: Extract tool result UI mixin
+- [x] Task 2.2: Extract tool result UI mixin
   - Details: .copilot-tracking/details/20260624-ai-tab-refactor-details.md (Lines 85-102)
 
-- [ ] Task 2.3: Extract action command mixin
+- [x] Task 2.3: Extract action command mixin
   - Details: .copilot-tracking/details/20260624-ai-tab-refactor-details.md (Lines 104-120)
 
 ### [ ] Phase 3: Extract Context And Cache Domains

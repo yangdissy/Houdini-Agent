@@ -47,14 +47,12 @@ from .cursor_widgets import (
     SendButton,
     StopButton,
     TodoList,
-    NodeOperationLabel,
     NodeContextBar,
     PythonShellWidget,
     SystemShellWidget,
     ClickableImageLabel,
     ToolStatusBar,
     NodeCompleterPopup,
-    StreamingCodePreview,
     UpdateNotificationBanner,
 )
 import re
@@ -64,11 +62,17 @@ from .header import HeaderMixin
 from .input_area import InputAreaMixin
 from .chat_view import ChatViewMixin
 from .image_mixin import ImageMixin
+from .preferences_mixin import PreferencesMixin
+from .tool_result_mixin import ToolResultMixin
+from .action_commands_mixin import ActionCommandsMixin
 from ..core.agent_runner import AgentRunnerMixin
 from ..core.memory_mixin import MemoryMixin
 from ..core.plan_mixin import PlanMixin
 from ..core.session_manager import SessionManagerMixin
 from ..core.streaming_parser import StreamingParserMixin
+from ..core.prompt_manager import build_system_prompt
+from ..core.diagnostics_mixin import DiagnosticsMixin
+from ..core.runtime_state_mixin import RuntimeStateMixin
 from ..core.harness_engine import (
     HarnessRuntimeState,
     HarnessToolPolicyEngine,
@@ -86,49 +90,16 @@ from ..utils.growth_tracker import get_growth_tracker, TaskMetric
 from ..utils.plan_manager import get_plan_manager, PLAN_TOOL_CREATE, PLAN_TOOL_UPDATE_STEP, PLAN_TOOL_ASK_QUESTION
 from shared.user_paths import UserPaths
 
-# ── 系统提示词模板加载器 ──────────────────────────────────────────────────────
-_PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
-_PROMPT_TEMPLATE_CACHE: dict = {}
-
-# 核心规则子集（内嵌兜底，当 system_prompt_rules_core.txt 文件不存在时使用）
-# 只保留每轮续接都可能触发的高频规则，完整规则见 system_prompt_rules.txt
-_CORE_RULES_FALLBACK = """
-Node Path Output Rules: In user-facing replies, prefer relative or short node references (e.g. box1, geo1/box1, or ../geo1/box1) when the current network is clear. Use full /obj/... paths only when needed to avoid ambiguity, preserve clickable navigation, or quote actual tool output.
-
-Fake Tool Call Prevention (highest priority): NEVER write "[ok] tool:" or "[Tool Result]" in replies. Call tools via function calling only.
-
-Tool Call Parameter Rules: Verify all required parameters before calling. Tool node_path parameters must use full Houdini paths, because tools need exact lookup paths. Fix parameter errors and retry — don't call check_errors for tool failures.
-
-Safe Operation: Before setting parameters, call get_node_parameters. No duplicate queries per round. After creating a node, use the returned path.
-
-Node Creation Failure: If create_node fails, call search_node_types to find the correct type name and retry.
-
-Wrangle Run Over: addpoint()/addprim() code MUST use Detail mode (class=0), not Points — would create duplicates per input point.
-
-VEX Writing: New wrangle → create_wrangle_node; existing wrangle → set_node_parameter(parm_name="snippet"). Never use execute_python for VEX. After writing, call check_errors.
-
-Mandatory Verification: Call verify_and_summarize before completing any task. Fix issues and repeat until passed.
-
-Todo: Use add_todo for complex tasks. Call update_todo immediately after each step completes.
-"""
-
-
-def _load_prompt_template(name: str) -> str:
-    """从 prompts/ 目录按文件名加载模板，结果缓存到进程级 dict。"""
-    if name not in _PROMPT_TEMPLATE_CACHE:
-        try:
-            _PROMPT_TEMPLATE_CACHE[name] = (_PROMPTS_DIR / name).read_text(encoding='utf-8')
-        except FileNotFoundError:
-            print(f"[Prompts] 模板文件缺失: {name}")
-            _PROMPT_TEMPLATE_CACHE[name] = ""
-    return _PROMPT_TEMPLATE_CACHE[name]
-
-
 class AITab(
     HeaderMixin,
     InputAreaMixin,
     ChatViewMixin,
     ImageMixin,
+    PreferencesMixin,
+    DiagnosticsMixin,
+    RuntimeStateMixin,
+    ToolResultMixin,
+    ActionCommandsMixin,
     StreamingParserMixin,
     MemoryMixin,
     PlanMixin,
@@ -210,6 +181,7 @@ class AITab(
         
         # 缓存管理
         self._session_id = str(uuid.uuid4())[:8]  # 当前会话 ID
+        self._session_created_at = datetime.now().isoformat()
         self._cache_dir = user_paths.conversations_dir()
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._auto_save_cache = True  # 自动保存缓存
@@ -452,52 +424,7 @@ class AITab(
             pass
 
     def _build_system_prompt(self, with_thinking: bool = True, full_rules: bool = True) -> str:
-        """构建系统提示（从 houdini_agent/prompts/ 加载模板）。
-
-        动态部分（lang_rule、labs_catalog）在运行时注入；
-        静态规则文本存放在模板文件中，修改规则无需改动代码。
-
-        Args:
-            with_thinking: 是否包含 <think> 框架块。
-            full_rules: True=完整规则（首轮/首次请求）；
-                        False=核心规则子集（续接轮，节省 ~2000 tokens）。
-                        核心规则文件：system_prompt_rules_core.txt
-        """
-        if get_language() == 'en':
-            lang_rule = "CRITICAL: You MUST reply in English for ALL user-facing text. No exceptions. Even if the user writes in another language, your reply MUST be in English."
-        else:
-            lang_rule = "CRITICAL: You MUST reply in the SAME language the user uses. If the user writes in Chinese, reply in Chinese. If in English, reply in English. Match the user's language exactly."
-
-        base_prompt = (
-            "You are a Houdini assistant, expert at solving problems with nodes and VEX.\n"
-            f"{lang_rule}\n"
-            "Never use emoji or icon symbols in replies unless the user explicitly requests them. Use plain text only.\n"
-        )
-        if with_thinking:
-            base_prompt += _load_prompt_template("system_prompt_thinking_block.txt").format(lang_rule=lang_rule)
-        else:
-            base_prompt += "\nOutput format: Concise, direct, action-oriented. MUST reply in the same language the user uses.\n"
-
-        # full_rules=True 加载完整规则（~400 行），False 加载核心子集（~60 行，续接轮用）
-        rules_file = "system_prompt_rules.txt" if full_rules else "system_prompt_rules_core.txt"
-        rules_text = _load_prompt_template(rules_file)
-        # 核心规则文件不存在时使用内嵌兜底常量（安全兜底，避免续接轮无规则）
-        if not rules_text and not full_rules:
-            rules_text = _CORE_RULES_FALLBACK
-        base_prompt += rules_text
-
-        # Labs catalog 仅在完整规则版本中注入（续接轮不需要重复注入）
-        if full_rules:
-            try:
-                from ..utils.doc_rag import get_doc_index
-                labs_catalog = get_doc_index().get_labs_catalog()
-                if labs_catalog:
-                    base_prompt += _load_prompt_template("system_prompt_labs_section.txt").format(labs_catalog=labs_catalog)
-            except Exception:
-                pass
-
-        # 使用极致优化器压缩（已缓存）
-        return UltraOptimizer.compress_system_prompt(base_prompt)
+        return build_system_prompt(with_thinking=with_thinking, full_rules=full_rules)
 
     def _build_ui(self):
         # ---- 全局 QSS（由 ThemeEngine 从模板渲染） ----
@@ -583,254 +510,10 @@ class AITab(
 
     # ===== 字号缩放 =====
 
-    def _apply_font_scale(self):
-        """重新渲染 QSS 并应用到界面"""
-        self.setStyleSheet(self._theme.render())
-        self._theme.save_preference()
-
-    def _zoom_in(self):
-        self._theme.zoom_in()
-        self._apply_font_scale()
-
-    def _zoom_out(self):
-        self._theme.zoom_out()
-        self._apply_font_scale()
-
-    def _zoom_reset(self):
-        self._theme.zoom_reset()
-        self._apply_font_scale()
-
-    def _on_font_settings(self):
-        """打开字号设置面板"""
-        dlg = FontSettingsDialog(current_scale=self._theme.scale, parent=self)
-        dlg.scaleChanged.connect(self._on_font_scale_preview)
-        dlg.exec_()
-        # 对话框关闭后保存最终结果
-        self._theme.set_scale(dlg.scale)
-        self._apply_font_scale()
-
-    def _on_font_scale_preview(self, scale: float):
-        """实时预览字号缩放"""
-        self._theme.set_scale(scale)
-        self.setStyleSheet(self._theme.render())
-
-    # ===== 上下文统计 =====
-    
-    def _estimate_tokens(self, text: str) -> int:
-        """估算文本的 token 数量（粗略估算）
-        
-        中文约 1.5 字符/token，英文约 4 字符/token
-        这里使用简单的混合估算
-        """
-        if not text:
-            return 0
-        
-        # 统计中文字符
-        chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
-        other_chars = len(text) - chinese_chars
-        
-        # 中文约 1.5 字符/token，其他约 4 字符/token
-        tokens = chinese_chars / 1.5 + other_chars / 4
-        return int(tokens)
-    
-    def _calculate_context_tokens(self) -> int:
-        """计算当前上下文的总 token 数（含工具定义）"""
-        # 缓存工具定义 token 数（只算一次，因为工具定义不变）
-        if not hasattr(self, '_tools_token_cache'):
-            from houdini_agent.utils.ai_client import HOUDINI_TOOLS
-            tools_json = json.dumps(HOUDINI_TOOLS, ensure_ascii=False)
-            self._tools_token_cache = self.token_optimizer.estimate_tokens(tools_json)
-        
-        total = self._tools_token_cache
-        
-        # 系统提示词
-        total += self.token_optimizer.estimate_tokens(self._system_prompt)
-        
-        # 上下文摘要
-        if self._context_summary:
-            total += self.token_optimizer.estimate_tokens(self._context_summary)
-        
-        # 对话历史
-        total += self.token_optimizer.calculate_message_tokens(self._conversation_history)
-        
-        return total
-    
-    def _save_model_preference(self):
-        """保存模型选择偏好"""
-        settings = QSettings("HoudiniAI", "Assistant")
-        provider = self._current_provider()
-        model = self.model_combo.currentText()
-        settings.setValue("last_provider", provider)
-        settings.setValue("last_model", model)
-        settings.setValue("use_think", self.think_check.isChecked())
-        settings.setValue("last_mode_index", self.mode_combo.currentIndex())
-        settings.setValue("last_read_mode_index", self.read_combo.currentIndex())
-    
-    def _load_model_preference(self, restore_provider: bool = False):
-        """加载模型选择偏好
-        
-        Args:
-            restore_provider: 是否同时恢复提供商选择（仅在初始化时为 True）
-        """
-        settings = QSettings("HoudiniAI", "Assistant")
-        last_provider = settings.value("last_provider", "")
-        last_model = settings.value("last_model", "")
-        
-        # 恢复 Think 开关
-        use_think = settings.value("use_think", True)
-        # QSettings 可能返回字符串 "true"/"false"
-        if isinstance(use_think, str):
-            use_think = use_think.lower() == 'true'
-        self.think_check.setChecked(bool(use_think))
-
-        # 恢复模式选择（默认 Ask = index 1）
-        mode_index = settings.value("last_mode_index", 1)
-        try:
-            mode_index = int(mode_index)
-        except (TypeError, ValueError):
-            mode_index = 1
-        mode_index = max(0, min(mode_index, self.mode_combo.count() - 1))
-        self.mode_combo.blockSignals(True)
-        self.mode_combo.setCurrentIndex(mode_index)
-        self.mode_combo.blockSignals(False)
-        self._on_mode_changed(mode_index)
-
-        # 恢复自动读取模式（默认 Rd:Sel = index 1）
-        read_index = settings.value("last_read_mode_index", 1)
-        try:
-            read_index = int(read_index)
-        except (TypeError, ValueError):
-            read_index = 1
-        read_index = max(0, min(read_index, self.read_combo.count() - 1))
-        self.read_combo.blockSignals(True)
-        self.read_combo.setCurrentIndex(read_index)
-        self.read_combo.blockSignals(False)
-        self._on_auto_read_changed(read_index)
-        
-        if not last_provider:
-            return
-        
-        # 恢复提供商（仅在启动时调用一次）
-        if restore_provider and last_provider != self._current_provider():
-            for i in range(self.provider_combo.count()):
-                if self.provider_combo.itemData(i) == last_provider:
-                    # 暂时阻断信号，避免触发 _on_provider_changed 递归
-                    self.provider_combo.blockSignals(True)
-                    self.provider_combo.setCurrentIndex(i)
-                    self.provider_combo.blockSignals(False)
-                    # 手动刷新模型列表和状态
-                    self._refresh_models(last_provider)
-                    self._update_key_status()
-                    break
-        
-        # 恢复模型
-        current_provider = self._current_provider()
-        if last_provider == current_provider and last_model:
-            available_models = [self.model_combo.itemText(i) for i in range(self.model_combo.count())]
-            if last_model in available_models:
-                index = self.model_combo.findText(last_model)
-                if index >= 0:
-                    self.model_combo.setCurrentIndex(index)
-    
     def _get_current_context_limit(self) -> int:
         """获取当前模型的上下文限制"""
         model = self.model_combo.currentText()
         return self._model_context_limits.get(model, 64000)
-    
-    def _update_context_stats(self):
-        """更新上下文统计显示（包含优化状态）"""
-        used = self._calculate_context_tokens()
-        limit = self._get_current_context_limit()
-        
-        # 格式化显示
-        if used >= 1000:
-            used_str = f"{used / 1000:.1f}K"
-        else:
-            used_str = str(used)
-        
-        limit_str = f"{limit // 1000}K"
-        
-        # 计算百分比
-        percent = (used / limit) * 100 if limit > 0 else 0
-        
-        # 优化状态指示
-        optimize_indicator = ""
-        if self._auto_optimize:
-            should_compress, _ = self.token_optimizer.should_compress(used, limit)
-            if should_compress:
-                optimize_indicator = " *"  # 需要优化
-            else:
-                optimize_indicator = ""  # 已优化/正常
-        
-        # 根据使用比例设置颜色和状态
-        if percent < 50:
-            color = CursorTheme.TEXT_MUTED
-            ctx_state = ""
-        elif percent < 80:
-            color = CursorTheme.ACCENT_ORANGE
-            ctx_state = "warning"
-        else:
-            color = CursorTheme.ACCENT_RED
-            ctx_state = "critical"
-
-        self.context_label.setText(f"{percent:.1f}% {used_str}/{limit_str}{optimize_indicator}")
-        self.context_label.setProperty("state", ctx_state)
-        self.context_label.style().unpolish(self.context_label)
-        self.context_label.style().polish(self.context_label)
-        
-        # 更新优化按钮状态（如果超过阈值，高亮显示）
-        opt_state = "warning" if percent >= 80 else ""
-        self.btn_optimize.setProperty("state", opt_state)
-        self.btn_optimize.style().unpolish(self.btn_optimize)
-        self.btn_optimize.style().polish(self.btn_optimize)
-
-    def _update_token_stats_display(self):
-        """更新 Token 统计按钮显示（对齐 Cursor：显示费用）"""
-        total = self._token_stats['total_tokens']
-        cost = self._token_stats.get('estimated_cost', 0.0)
-        
-        # 格式化 token 显示
-        if total >= 1000000:
-            tok_display = f"{total / 1000000:.1f}M"
-        elif total >= 1000:
-            tok_display = f"{total / 1000:.1f}K"
-        else:
-            tok_display = str(total)
-        
-        # 格式化费用显示（Cursor 风格：$0.12）
-        if cost >= 1.0:
-            cost_display = f"${cost:.2f}"
-        elif cost >= 0.01:
-            cost_display = f"${cost:.2f}"
-        elif cost > 0:
-            cost_display = f"${cost:.4f}"
-        else:
-            cost_display = ""
-        
-        # 按钮文本：token数 | $费用
-        if cost_display:
-            self.token_stats_btn.setText(f"{tok_display} | {cost_display}")
-        else:
-            self.token_stats_btn.setText(tok_display)
-        
-        # 计算 cache 命中率
-        cache_read = self._token_stats['cache_read']
-        cache_write = self._token_stats['cache_write']
-        cache_total = cache_read + cache_write
-        hit_rate_display = f"{(cache_read / cache_total * 100):.1f}%" if cache_total > 0 else "N/A"
-        
-        reasoning = self._token_stats.get('reasoning_tokens', 0)
-        reasoning_line = tr('token.reasoning_line', reasoning) if reasoning > 0 else ""
-        
-        self.token_stats_btn.setToolTip(
-            tr('token.summary',
-               self._token_stats['requests'],
-               self._token_stats['input_tokens'],
-               self._token_stats['output_tokens'],
-               reasoning_line,
-               cache_read, cache_write, hit_rate_display,
-               total, cost_display or '$0.00')
-        )
     
     def _show_token_stats_dialog(self):
         """显示详细 Token 统计对话框（对齐 Cursor：使用 TokenAnalyticsPanel）"""
@@ -879,434 +562,6 @@ class AITab(
             else:
                 self.policy_timeline_btn.setStyleSheet("")
 
-    def _append_policy_timeline(self, tool_name: str, action: str, reason: str = ""):
-        item = {
-            'time': datetime.now().strftime('%H:%M:%S'),
-            'tool': tool_name,
-            'action': action,
-            'reason': (reason or '').strip(),
-        }
-        self._policy_timeline_records.append(item)
-        if len(self._policy_timeline_records) > 200:
-            self._policy_timeline_records = self._policy_timeline_records[-200:]
-        if action in {'deny', 'ask_cancel', 'retry_limit', 'exec_fail'}:
-            self._policy_failure_count += 1
-        try:
-            mode = 'plan' if self._plan_mode else ('agent' if self._agent_mode else 'ask')
-            self._append_session_diagnostics_records([
-                {
-                    'event_type': 'policy_decision',
-                    'tool': tool_name,
-                    'action': action,
-                    'reason': (reason or '').strip(),
-                    'mode': mode,
-                    'plan_phase': getattr(self, '_plan_phase', 'idle'),
-                    'confirm_mode': bool(getattr(self, '_confirm_mode', False)),
-                    'failure_count': int(getattr(self, '_policy_failure_count', 0) or 0),
-                }
-            ])
-        except Exception:
-            pass
-        self._refresh_mode_guard_ui()
-
-    def _get_session_diagnostics_jsonl_path(self, session_id: Optional[str] = None) -> Path:
-        sid = (session_id or self._session_id or "unknown").strip() or "unknown"
-        cache_dir = getattr(self, '_cache_dir', None)
-        if not isinstance(cache_dir, Path):
-            cache_dir = Path('.')
-        diag_dir = cache_dir / "diagnostics"
-        diag_dir.mkdir(parents=True, exist_ok=True)
-        return diag_dir / f"session_{sid}.jsonl"
-
-    def _append_session_diagnostics_records(self, records: list, session_id: Optional[str] = None):
-        """Append-only session diagnostics records (JSONL)."""
-        if not records:
-            return
-        sid = (session_id or self._session_id or "unknown").strip() or "unknown"
-        try:
-            path = self._get_session_diagnostics_jsonl_path(sid)
-            now_iso = datetime.now().isoformat()
-            with open(path, 'a', encoding='utf-8') as f:
-                for rec in records:
-                    row = dict(rec or {})
-                    row.setdefault('schema_version', 1)
-                    row.setdefault('session_id', sid)
-                    row.setdefault('recorded_at', now_iso)
-                    row.setdefault('event_type', 'unknown')
-                    f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-        except Exception as e:
-            print(f"[Diagnostics] 写入 session jsonl 失败: {e}")
-
-    def _show_policy_menu(self):
-        """显示策略/诊断菜单。"""
-        menu = QtWidgets.QMenu(self)
-        menu.addAction("Policy Timeline", self._show_policy_timeline_dialog)
-        menu.addAction("Export Diagnostics JSON", self._export_diagnostics_json)
-        menu.exec_(self.policy_timeline_btn.mapToGlobal(
-            QtCore.QPoint(0, self.policy_timeline_btn.height())
-        ))
-
-    def _show_policy_timeline_dialog(self):
-        """显示最近策略决策时间线，并提供快速恢复动作。"""
-        lines = ["最近策略时间线（最新在下）：", ""]
-        records = self._policy_timeline_records[-30:]
-        if not records:
-            lines.append("暂无策略记录。")
-        else:
-            for rec in records:
-                reason = rec.get('reason', '')
-                if reason:
-                    lines.append(
-                        f"{rec.get('time', '')} | {rec.get('tool', '')} | {rec.get('action', '')} | {reason}"
-                    )
-                else:
-                    lines.append(
-                        f"{rec.get('time', '')} | {rec.get('tool', '')} | {rec.get('action', '')}"
-                    )
-
-        lines.append("")
-        lines.append("快速恢复：")
-        lines.append("1) 切换到 Plan 模式（更稳）")
-        lines.append("2) 切换到 Ask 模式（只读排查）")
-
-        msg_box = QtWidgets.QMessageBox(self)
-        msg_box.setWindowTitle("Policy Timeline")
-        msg_box.setText("\n".join(lines))
-        btn_plan = msg_box.addButton("切到 Plan", QtWidgets.QMessageBox.ActionRole)
-        btn_ask = msg_box.addButton("切到 Ask", QtWidgets.QMessageBox.ActionRole)
-        btn_close = msg_box.addButton("关闭", QtWidgets.QMessageBox.RejectRole)
-        msg_box.exec_()
-        clicked = msg_box.clickedButton()
-        if clicked == btn_plan and hasattr(self, 'mode_combo'):
-            self.mode_combo.setCurrentIndex(2)
-        elif clicked == btn_ask and hasattr(self, 'mode_combo'):
-            self.mode_combo.setCurrentIndex(1)
-        elif clicked == btn_close:
-            return
-
-    def _append_harness_trace_records(self, records: list, session_id: Optional[str] = None):
-        """追加写入 Harness trace（jsonl），用于回放与诊断。"""
-        if not records:
-            return
-        sid = (session_id or self._session_id or "unknown").strip() or "unknown"
-        try:
-            trace_dir = self._cache_dir / "harness_trace"
-            trace_dir.mkdir(parents=True, exist_ok=True)
-            trace_file = trace_dir / f"session_{sid}.jsonl"
-            now_iso = datetime.now().isoformat()
-            with open(trace_file, 'a', encoding='utf-8') as f:
-                for rec in records:
-                    row = dict(rec or {})
-                    row.setdefault('session_id', sid)
-                    row.setdefault('recorded_at', now_iso)
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        except Exception as e:
-            print(f"[Harness Trace] 写入失败: {e}")
-
-    def _build_diagnostics_payload(self) -> dict:
-        """Build a compact diagnostics payload without conversation message content."""
-        session_id = self._session_id or "unknown"
-        provider = self._current_provider() if hasattr(self, '_current_provider') else ""
-        model = self.model_combo.currentText() if hasattr(self, 'model_combo') else ""
-        mode = 'plan' if self._plan_mode else ('agent' if self._agent_mode else 'ask')
-        session_audit_jsonl = None
-        session_audit_exists = False
-        try:
-            session_audit_path = self._get_session_diagnostics_jsonl_path(session_id)
-            session_audit_jsonl = str(session_audit_path)
-            session_audit_exists = session_audit_path.exists()
-        except Exception:
-            pass
-
-        return {
-            'schema_version': 1,
-            'exported_at': datetime.now().isoformat(),
-            'session': {
-                'id': session_id,
-                'username': getattr(self, '_username', 'default'),
-                'mode': mode,
-                'plan_phase': getattr(self, '_plan_phase', 'idle'),
-                'confirm_mode': bool(getattr(self, '_confirm_mode', False)),
-                'auto_read_mode': getattr(self, '_auto_read_mode', ''),
-                'conversation_messages': len(getattr(self, '_conversation_history', []) or []),
-                'session_audit_jsonl': session_audit_jsonl,
-                'session_audit_exists': session_audit_exists,
-            },
-            'runtime': {
-                'provider': provider,
-                'model': model,
-                'is_running': bool(getattr(self, '_is_running', False)),
-                'harness_v2_enabled': bool(getattr(self, '_harness_v2_enabled', False)),
-                'policy_retry_limit': getattr(self, '_policy_retry_limit', None),
-                'pending_user_switch': getattr(self, '_pending_user_switch', None),
-            },
-            'token_stats': dict(getattr(self, '_token_stats', {}) or {}),
-            'policy': {
-                'failure_count': int(getattr(self, '_policy_failure_count', 0) or 0),
-                'timeline': list(getattr(self, '_policy_timeline_records', []) or [])[-200:],
-                'retry_counts': dict(getattr(getattr(self, '_harness_state', None), 'policy_retry_counts', {}) or {}),
-            },
-            'harness': {
-                'runtime_trace': list(getattr(getattr(self, '_harness_state', None), 'trace', []) or [])[-300:],
-                'executor_trace': list(getattr(self, '_harness_trace_records', []) or [])[-500:],
-            },
-            'calls': list(getattr(self, '_call_records', []) or [])[-100:],
-        }
-
-    def _export_diagnostics_json(self) -> Optional[str]:
-        """Export policy/timing diagnostics to a JSON file."""
-        try:
-            diag_dir = self._cache_dir / "diagnostics"
-            diag_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            session_id = (self._session_id or "unknown").strip() or "unknown"
-            path = diag_dir / f"diagnostics_{session_id}_{stamp}.json"
-            payload = self._build_diagnostics_payload()
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Diagnostics Export Failed", str(e))
-            return None
-
-        response = self._add_ai_response()
-        response.add_status("Diagnostics exported")
-        response.set_content(
-            "诊断信息已导出。\n\n"
-            f"文件: {path}\n"
-            f"Policy 记录: {len(payload['policy']['timeline'])}\n"
-            f"Harness trace: {len(payload['harness']['executor_trace'])}\n"
-            f"Call records: {len(payload['calls'])}"
-        )
-        response.finalize()
-        return str(path)
-    
-    def _reset_token_stats(self):
-        """重置 Token 统计"""
-        self._token_stats = self._empty_token_stats()
-        self._call_records = []
-        self._harness_trace_records = []
-        self._update_token_stats_display()
-        
-        # 显示提示
-        if self._current_response:
-            self._current_response.add_status(tr('status.stats_reset'))
-
-    # ===== UI 辅助 =====
-
-    @staticmethod
-    def _empty_token_stats() -> dict:
-        return {
-            'input_tokens': 0,
-            'output_tokens': 0,
-            'reasoning_tokens': 0,
-            'cache_read': 0,
-            'cache_write': 0,
-            'total_tokens': 0,
-            'requests': 0,
-            'estimated_cost': 0.0,
-        }
-
-    def _current_provider(self) -> str:
-        return self.provider_combo.currentData() or 'deepseek'
-
-    def _refresh_models(self, provider: str):
-        self.model_combo.clear()
-        
-        if provider == 'ollama':
-            # 尝试动态获取 Ollama 模型列表
-            try:
-                models = self.client.get_ollama_models()
-                if models:
-                    self.model_combo.addItems(models)
-                    return
-            except Exception:
-                pass
-        
-        # 使用预设的模型列表
-        self.model_combo.addItems(self._model_map.get(provider, []))
-
-    def _update_key_status(self):
-        provider = self._current_provider()
-        
-        if provider == 'ollama':
-            # 测试 Ollama 连接
-            result = self.client.test_connection('ollama')
-            if result.get('ok'):
-                self.key_status.setText("Local")
-                self.key_status.setProperty("state", "ok")
-            else:
-                self.key_status.setText("Offline")
-                self.key_status.setProperty("state", "error")
-        elif self.client.has_api_key(provider):
-            masked = self.client.get_masked_key(provider)
-            self.key_status.setText(masked)
-            self.key_status.setProperty("state", "ok")
-        else:
-            self.key_status.setText("No Key")
-            self.key_status.setProperty("state", "warning")
-        self.key_status.style().unpolish(self.key_status)
-        self.key_status.style().polish(self.key_status)
-
-    def _on_provider_changed(self):
-        provider = self._current_provider()
-        self._refresh_models(provider)
-        self._load_model_preference()  # 切换提供商时也尝试加载上次使用的模型
-        self._update_key_status()
-        self._on_provider_changed_custom_visibility()  # Custom ⚙ 按钮可见性
-
-    def _set_running(self, running: bool):
-        self._is_running = running
-        
-        if running:
-            # 锚定 agent 输出目标到当前 session
-            self._agent_session_id = self._session_id
-            self._agent_response = self._current_response
-            self._agent_scroll_area = self.scroll_area
-            self._agent_history = self._conversation_history
-            self._agent_token_stats = self._token_stats
-            self._agent_todo_list = self.todo_list
-            self._agent_chat_layout = self.chat_layout
-            
-            # 重置缓冲区
-            self._thinking_buffer = ""
-            self._content_buffer = ""
-            self._current_output_tokens = 0
-            self._in_think_block = False
-            self._tag_parse_buf = ""
-            self._fake_warned = False
-            # 重置自适应缓冲参数
-            self._output_buffer = ""
-            self._last_flush_time = time.time()
-            self._adaptive_buf_size = 80
-            self._adaptive_interval = 0.15
-            self._last_render_duration = 0.0
-            self._flush_count = 0
-            self._is_first_content_chunk = True
-            
-            self.client.reset_stop()
-            # 启动思考计时器
-            self._thinking_timer = QtCore.QTimer(self)
-            self._thinking_timer.timeout.connect(lambda: self._updateThinkingTime.emit())
-            self._thinking_timer.start(1000)
-            
-            # ★ 启动输入框呼吸光晕
-            self._start_input_glow()
-        else:
-            # ★ 先停止所有动效（此时 _agent_response 引用仍有效）
-            if self._thinking_timer:
-                self._thinking_timer.stop()
-                self._thinking_timer = None
-            self._stop_input_glow()
-            self._stop_active_aurora()
-            # ★ 强制停止 thinking_bar（防止延迟到达的 _showGenerating 信号重新启动）
-            try:
-                self.thinking_bar.stop()
-            except (RuntimeError, AttributeError):
-                pass
-            
-            # 将完成后的状态写回 session 字典
-            if self._agent_session_id and self._agent_session_id in self._sessions:
-                s = self._sessions[self._agent_session_id]
-                s['current_response'] = self._agent_response
-                if self._agent_history is not None:
-                    s['conversation_history'] = self._agent_history
-                if self._agent_token_stats is not None:
-                    s['token_stats'] = self._agent_token_stats
-                if self._agent_todo_list is not None:
-                    s['todo_list'] = self._agent_todo_list
-            
-            self._agent_session_id = None
-            self._agent_response = None
-            self._agent_scroll_area = None
-            self._agent_history = None
-            self._agent_token_stats = None
-            self._agent_todo_list = None
-            self._agent_chat_layout = None
-        
-        # 按当前显示的 session 更新按钮状态
-        self._update_run_buttons()
-    
-    # ===== 动效：输入框呼吸光晕 + AIResponse 流光边框 =====
-
-    def _start_input_glow(self):
-        """启动输入框边框呼吸光晕（AI 运行期间）"""
-        self._glow_phase = 0.0
-        if not hasattr(self, '_glow_timer') or self._glow_timer is None:
-            self._glow_timer = QtCore.QTimer(self)
-            self._glow_timer.setInterval(50)
-            self._glow_timer.timeout.connect(self._update_input_glow)
-        self._glow_timer.start()
-
-    def _stop_input_glow(self):
-        """停止输入框呼吸光晕，恢复默认边框"""
-        if hasattr(self, '_glow_timer') and self._glow_timer is not None:
-            self._glow_timer.stop()
-        try:
-            self.input_edit.setStyleSheet("")  # 清除覆盖，恢复全局 QSS
-        except RuntimeError:
-            pass
-
-    def _update_input_glow(self):
-        """定时器回调：正弦波驱动边框亮度在银灰/亮白之间柔和呼吸"""
-        self._glow_phase += 0.04
-        t = (math.sin(self._glow_phase) + 1.0) / 2.0  # 0~1
-        # 暗银 → 亮银白 插值（简洁单色系）
-        r = int(100 + (200 - 100) * t)
-        g = int(116 + (210 - 116) * t)
-        b = int(139 + (220 - 139) * t)
-        a = int(60 + 70 * t)
-        try:
-            self.input_edit.setStyleSheet(
-                f"QPlainTextEdit#chatInput {{ border: 1.5px solid rgba({r},{g},{b},{a}); }}"
-            )
-        except RuntimeError:
-            pass
-
-    def _start_active_aurora(self):
-        """启动当前活跃 AIResponse 的流光边框"""
-        try:
-            resp = self._agent_response or self._current_response
-            if resp and hasattr(resp, 'aurora_bar'):
-                resp.start_aurora()
-        except RuntimeError:
-            pass
-
-    def _stop_active_aurora(self):
-        """停止当前活跃 AIResponse 的流光边框"""
-        try:
-            resp = self._agent_response or self._current_response
-            if resp and hasattr(resp, 'aurora_bar'):
-                resp.stop_aurora()
-        except RuntimeError:
-            pass
-
-    _TAB_RUNNING_PREFIX = "\u25cf "  # ● 前缀表示正在运行
-    
-    def _update_run_buttons(self):
-        """根据当前显示的 session 是否正在运行，更新 send/stop 按钮和 tab 指示器"""
-        current_is_running = (self._agent_session_id is not None
-                              and self._agent_session_id == self._session_id)
-        any_running = self._agent_session_id is not None
-        # 当前 session 在跑 → 显示 stop；否则显示 send（但若其他 session 在跑则 disable）
-        self.btn_stop.setVisible(current_is_running)
-        self.btn_send.setVisible(not current_is_running)
-        self.btn_send.setEnabled(not any_running)
-        
-        # 更新所有 tab 的运行指示器
-        for i in range(self.session_tabs.count()):
-            sid = self.session_tabs.tabData(i)
-            label = self.session_tabs.tabText(i)
-            is_agent_tab = (sid == self._agent_session_id and self._agent_session_id is not None)
-            has_prefix = label.startswith(self._TAB_RUNNING_PREFIX)
-            if is_agent_tab and not has_prefix:
-                self.session_tabs.setTabText(i, self._TAB_RUNNING_PREFIX + label)
-            elif not is_agent_tab and has_prefix:
-                self.session_tabs.setTabText(i, label[len(self._TAB_RUNNING_PREFIX):])
-
-    # ===== 信号处理 =====
-    # _on_append_content / _on_content_with_limit / _drain_tag_buffer 等流式解析方法
-    # 已迁移到 core/streaming_parser.py (StreamingParserMixin)
-
     def _cook_displayed_nodes_if_manual(self):
         """★ 在 Manual 保护模式下，对当前工作区的 display 节点做针对性 cook
         
@@ -1341,396 +596,6 @@ class AITab(
                 print(f"[Cook Guard] Manual 模式下针对性 cook 了 {cooked} 个 display 节点")
         except Exception as e:
             print(f"[Cook Guard] 针对性 cook 失败: {e}")
-
-    def _restore_update_mode(self):
-        """★ 恢复 Houdini 更新模式（Agent 结束/错误/停止时调用）
-        
-        v1.4.3 Cook 保护策略：
-        Agent 运行期间，修改工具会将 Houdini 切换为 Manual 模式以防止
-        cook 阻塞主线程。Agent 结束后在此统一恢复用户原始的更新模式，
-        此时 Houdini 会自动触发一次 cook 展示最终结果。
-        """
-        _user_mode = getattr(self, '_pre_agent_update_mode', None)
-        if _user_mode is not None:
-            try:
-                import hou  # type: ignore
-                hou.setUpdateMode(_user_mode)
-            except Exception:
-                pass
-            self._pre_agent_update_mode = None
-    
-    def _on_agent_done(self, result: dict):
-        # ★ Hook: on_session_end
-        self._fire_session_hook('on_session_end', self._agent_session_id or self._session_id)
-        
-        # ★ 恢复 Houdini 更新模式 & 清除主线程忙标记
-        self._main_thread_busy = False
-        self._restore_update_mode()
-        
-        # ★ 停止思考指示条
-        try:
-            self.thinking_bar.stop()
-        except (RuntimeError, AttributeError):
-            pass
-
-        # 使用 agent 锚定的引用（可能已切走 session）
-        resp = self._agent_response or self._current_response
-        history = self._agent_history if self._agent_history is not None else self._conversation_history
-        stats = self._agent_token_stats or self._token_stats
-        
-        # 刷新标签解析缓冲区残余内容
-        if self._tag_parse_buf:
-            if self._in_think_block:
-                if self._think_enabled:
-                    self._addThinking.emit(self._tag_parse_buf)
-                # Think 关闭时静默丢弃残余思考内容
-            else:
-                self._emit_normal_content(self._tag_parse_buf)
-            self._tag_parse_buf = ""
-            self._in_think_block = False
-
-        # 刷新输出缓冲区（确保不丢失最后内容）
-        if hasattr(self, '_output_buffer') and self._output_buffer:
-            self._on_append_content(self._output_buffer)
-            self._output_buffer = ""
-        
-        try:
-            if resp:
-                resp.finalize()
-        except RuntimeError:
-            resp = None  # widget 已被 clear 销毁，跳过 UI 操作
-        
-        # ================================================================
-        # Cursor 风格：保存原生消息链到对话历史
-        # ================================================================
-        # 格式：assistant(tool_calls) → tool → ... → assistant(reply)
-        # 完整保留工具调用链和 AI 回复，不做任何压缩
-        # 只有系统级上下文管理（_manage_context / _progressive_trim）才在超限时压缩
-        
-        tool_calls_history = result.get('tool_calls_history', [])
-        new_messages = result.get('new_messages', [])
-        
-        # 1. 添加工具交互链（原生 OpenAI 格式）
-        # new_messages 包含：assistant(tool_calls) + tool(results) + ...
-        # ★ 只添加中间轮次（带 tool_calls 的 assistant 和 tool 回复），
-        #   最终的纯文本 assistant 回复由下面步骤 2 统一构建，避免重复
-        if new_messages:
-            for nm in new_messages:
-                clean = nm.copy()
-                clean.pop('reasoning_content', None)  # 推理模型专用，不需持久化
-                # 跳过最后一条纯文本 assistant 消息（没有 tool_calls 的），
-                # 它会在步骤 2 中作为 final_msg 添加
-                if nm is new_messages[-1] and nm.get('role') == 'assistant' and not nm.get('tool_calls'):
-                    continue
-                history.append(clean)
-        
-        # 2. 提取并添加最终 AI 回复
-        # 优先使用 final_content（最后一轮的纯文本），其次从 new_messages 提取
-        final_content = result.get('final_content', '')
-        if not final_content or not final_content.strip():
-            # final_content 为空 → 尝试从 new_messages 中提取最后一个有 content 的 assistant 消息
-            for nm in reversed(new_messages):
-                if nm.get('role') == 'assistant' and nm.get('content'):
-                    c = nm['content']
-                    # 去掉 think 标签后还有内容吗？
-                    stripped = re.sub(r'<think>[\s\S]*?</think>', '', c).strip()
-                    if stripped:
-                        final_content = c
-                        break
-            # 仍然为空 → 回退到 full_content
-            if not final_content or not final_content.strip():
-                final_content = result.get('content', '')
-        
-        thinking_text = ""
-        clean_content = ""
-        if final_content:
-            thinking_parts = re.findall(r'<think>([\s\S]*?)</think>', final_content)
-            thinking_text = '\n'.join(thinking_parts).strip() if thinking_parts else ''
-            clean_content = re.sub(r'<think>[\s\S]*?</think>', '', final_content).strip()
-            clean_content = self._strip_fake_tool_results(clean_content)
-        
-        # 确保历史以 assistant 消息结尾（维持 user→assistant 交替）
-        # 只要有内容或有工具交互，都需要一条最终 assistant 消息
-        need_final = bool(clean_content) or bool(new_messages) or not history or history[-1].get('role') != 'assistant'
-        if need_final:
-            final_msg = {'role': 'assistant', 'content': clean_content or tr('ai.no_content')}
-            if thinking_text:
-                final_msg['thinking'] = thinking_text
-            # 提取 shell 执行记录，供历史恢复时重建 Shell 折叠面板
-            py_shells = []
-            sys_shells = []
-            for tc in tool_calls_history:
-                tn = tc.get('tool_name', '')
-                ta = tc.get('arguments', {})
-                tc_result = tc.get('result', {})
-                if tn == 'execute_python' and ta.get('code'):
-                    py_shells.append({
-                        'code': ta['code'],
-                        'output': tc_result.get('result', ''),
-                        'error': tc_result.get('error', ''),
-                        'success': bool(tc_result.get('success')),
-                    })
-                elif tn == 'execute_shell' and ta.get('command'):
-                    sys_shells.append({
-                        'command': ta['command'],
-                        'output': tc_result.get('result', ''),
-                        'error': tc_result.get('error', ''),
-                        'success': bool(tc_result.get('success')),
-                        'cwd': ta.get('cwd', ''),
-                    })
-            if py_shells:
-                final_msg['python_shells'] = py_shells
-            if sys_shells:
-                final_msg['system_shells'] = sys_shells
-            history.append(final_msg)
-        
-        # 管理上下文
-        self._manage_context()
-        
-        # 更新 Token 统计（累积到 agent 所属 session 的 stats）—— 对齐 Cursor
-        usage = result.get('usage', {})
-        new_call_records = result.get('call_records', [])
-        if usage:
-            stats['input_tokens'] += usage.get('prompt_tokens', 0)
-            stats['output_tokens'] += usage.get('completion_tokens', 0)
-            stats['reasoning_tokens'] = stats.get('reasoning_tokens', 0) + usage.get('reasoning_tokens', 0)
-            stats['cache_read'] += usage.get('cache_hit_tokens', 0)
-            stats['cache_write'] += usage.get('cache_miss_tokens', 0)
-            stats['total_tokens'] += usage.get('total_tokens', 0)
-            stats['requests'] += 1
-            
-            # 计算本次费用并累积
-            from houdini_agent.utils.token_optimizer import calculate_cost
-            model_name = self.model_combo.currentText()
-            this_cost = calculate_cost(
-                model=model_name,
-                input_tokens=usage.get('prompt_tokens', 0),
-                output_tokens=usage.get('completion_tokens', 0),
-                cache_hit=usage.get('cache_hit_tokens', 0),
-                cache_miss=usage.get('cache_miss_tokens', 0),
-                reasoning_tokens=usage.get('reasoning_tokens', 0),
-            )
-            stats['estimated_cost'] = stats.get('estimated_cost', 0.0) + this_cost
-        
-        # 合并 call_records
-        if new_call_records:
-            if not hasattr(self, '_call_records'):
-                self._call_records = []
-            self._call_records.extend(new_call_records)
-            call_rows = []
-            for rec in new_call_records:
-                if not isinstance(rec, dict):
-                    continue
-                call_rows.append({
-                    'event_type': 'api_call_record',
-                    'model': rec.get('model'),
-                    'iteration': rec.get('iteration'),
-                    'latency': rec.get('latency'),
-                    'input_tokens': rec.get('input_tokens'),
-                    'output_tokens': rec.get('output_tokens'),
-                    'reasoning_tokens': rec.get('reasoning_tokens'),
-                    'cache_hit': rec.get('cache_hit'),
-                    'cache_miss': rec.get('cache_miss'),
-                    'total_tokens': rec.get('total_tokens'),
-                    'estimated_cost': rec.get('estimated_cost'),
-                    'has_tool_calls': bool(rec.get('has_tool_calls')),
-                })
-            self._append_session_diagnostics_records(
-                call_rows,
-                session_id=self._agent_session_id or self._session_id,
-            )
-        
-        # 如果当前显示的就是 agent session，更新 UI
-        if usage:
-            if not self._agent_session_id or self._agent_session_id == self._session_id:
-                self._update_token_stats_display()
-            
-            cache_hit = usage.get('cache_hit_tokens', 0)
-            cache_miss = usage.get('cache_miss_tokens', 0)
-            cache_rate = usage.get('cache_hit_rate', 0)
-            harness_trace = usage.get('harness_trace', [])
-            
-            if cache_hit > 0 or cache_miss > 0:
-                rate_percent = cache_rate * 100
-                self._addStatus.emit(f"Cache: {cache_hit}/{cache_hit+cache_miss} ({rate_percent:.0f}%)")
-
-            if harness_trace:
-                if not hasattr(self, '_harness_trace_records'):
-                    self._harness_trace_records = []
-                now_ts = datetime.now().strftime('%H:%M:%S')
-                model_name = self.model_combo.currentText()
-                persisted_rows = []
-                for rec in harness_trace:
-                    item = dict(rec or {})
-                    item.setdefault('time', now_ts)
-                    item.setdefault('model', model_name)
-                    self._harness_trace_records.append(item)
-                    persisted_rows.append(item)
-                if len(self._harness_trace_records) > 2000:
-                    self._harness_trace_records = self._harness_trace_records[-2000:]
-
-                self._append_harness_trace_records(
-                    persisted_rows,
-                    session_id=self._agent_session_id or self._session_id,
-                )
-                session_rows = []
-                for item in persisted_rows:
-                    compress_stats = {
-                        'compressed_messages': item.get('compressed_messages'),
-                        'removed_messages': item.get('removed_messages'),
-                        'compression_ratio': item.get('compression_ratio'),
-                    }
-                    compress_stats = {k: v for k, v in compress_stats.items() if v is not None}
-                    session_rows.append({
-                        'event_type': 'harness_round',
-                        'source': 'ai_client',
-                        'iteration': item.get('iteration'),
-                        'tool_count': item.get('tool_count'),
-                        'dedup_hits': item.get('dedup_hits'),
-                        'early_skips': item.get('early_skips'),
-                        'failed_tools': item.get('failed_tools'),
-                        'retry_count': item.get('retries'),
-                        'compress_stats': compress_stats or None,
-                    })
-                self._append_session_diagnostics_records(
-                    session_rows,
-                    session_id=self._agent_session_id or self._session_id,
-                )
-
-                total_tools = sum(int(t.get('tool_count', 0) or 0) for t in harness_trace)
-                dedup_hits = sum(int(t.get('dedup_hits', 0) or 0) for t in harness_trace)
-                early_skips = sum(int(t.get('early_skips', 0) or 0) for t in harness_trace)
-                failed_tools = sum(int(t.get('failed_tools', 0) or 0) for t in harness_trace)
-                self._addStatus.emit(
-                    f"Harness: tools={total_tools}, dedup={dedup_hits}, skip={early_skips}, failed={failed_tools}"
-                )
-        
-        # ★ 反思钩子：任务完成后触发长期记忆反思（后台线程，不阻塞 UI）
-        if self._memory_initialized and tool_calls_history:
-            # 获取 agent_params（从最近的 _run_agent 调用中保存）
-            _reflect_params = getattr(self, '_last_agent_params', {})
-            def _do_reflect():
-                self._reflect_after_task(result, _reflect_params)
-            reflect_thread = threading.Thread(target=_do_reflect, daemon=True)
-            reflect_thread.start()
-        
-        # 自动保存缓存（必须在 _set_running(False) 之前，因为此时 agent 引用还有效）
-        agent_sid = self._agent_session_id
-        if self._auto_save_cache and len(history) > 0 and agent_sid:
-            # 临时将 history 同步到 sessions 字典，再保存
-            if agent_sid in self._sessions:
-                self._sessions[agent_sid]['conversation_history'] = history
-                self._sessions[agent_sid]['token_stats'] = stats
-            # 如果当前显示的恰好就是 agent session，直接保存
-            if agent_sid == self._session_id:
-                self._save_cache()
-            else:
-                # 不在当前 session 上，写入 session 字典即可（下次切换回来时再保存）
-                pass
-        
-        self._set_running(False)
-        
-        # 隐藏工具状态
-        self._hideToolStatus.emit()
-        
-        # 更新上下文统计
-        self._update_context_stats()
-        
-        # ★ 异步生成会话标题（仅在首次 agent 完成时）
-        self._maybe_generate_title(agent_sid, history)
-
-    def _on_agent_error(self, error: str):
-        # ★ 恢复 Houdini 更新模式 & 清除主线程忙标记
-        self._main_thread_busy = False
-        self._restore_update_mode()
-        # 停止思考指示条
-        try:
-            self.thinking_bar.stop()
-        except (RuntimeError, AttributeError):
-            pass
-        # 刷新标签解析缓冲区残余内容（防止 <think> 块未正常关闭）
-        if self._tag_parse_buf:
-            if self._in_think_block and self._think_enabled:
-                self._addThinking.emit(self._tag_parse_buf)
-            elif not self._in_think_block:
-                self._emit_normal_content(self._tag_parse_buf)
-            self._tag_parse_buf = ""
-        if self._in_think_block:
-            self._in_think_block = False
-            self._finalizeThinkingSignal.emit()
-        # 刷新输出缓冲区
-        if hasattr(self, '_output_buffer') and self._output_buffer:
-            self._on_append_content(self._output_buffer)
-            self._output_buffer = ""
-        
-        resp = self._agent_response or self._current_response
-        try:
-            if resp:
-                resp.finalize()
-                resp.add_status(f"Error: {error}")
-        except RuntimeError:
-            pass  # widget 已被 clear 销毁
-        
-        # ★ 确保历史以 assistant 结尾（防止连续 user 消息破坏结构）
-        self._ensure_history_ends_with_assistant(f"[Error] {error}")
-        
-        self._set_running(False)
-
-    def _on_agent_stopped(self):
-        # ★ 恢复 Houdini 更新模式 & 清除主线程忙标记
-        self._main_thread_busy = False
-        self._restore_update_mode()
-        # 停止思考指示条
-        try:
-            self.thinking_bar.stop()
-        except (RuntimeError, AttributeError):
-            pass
-        # 刷新标签解析缓冲区残余内容（防止 <think> 块未正常关闭）
-        if self._tag_parse_buf:
-            if self._in_think_block and self._think_enabled:
-                self._addThinking.emit(self._tag_parse_buf)
-            elif not self._in_think_block:
-                self._emit_normal_content(self._tag_parse_buf)
-            self._tag_parse_buf = ""
-        if self._in_think_block:
-            self._in_think_block = False
-            self._finalizeThinkingSignal.emit()
-        # 刷新输出缓冲区
-        if hasattr(self, '_output_buffer') and self._output_buffer:
-            self._on_append_content(self._output_buffer)
-            self._output_buffer = ""
-        
-        resp = self._agent_response or self._current_response
-        try:
-            if resp:
-                resp.finalize()
-                resp.add_status("Stopped")
-        except RuntimeError:
-            pass  # widget 已被 clear 销毁
-        
-        # ★ 确保历史以 assistant 结尾（防止连续 user 消息破坏结构）
-        self._ensure_history_ends_with_assistant("[Stopped by user]")
-        
-        self._set_running(False)
-        self._hideToolStatus.emit()
-
-        # 如果有等待中的用户切换请求，停止后执行
-        if self._pending_user_switch:
-            target_user = self._pending_user_switch
-            self._pending_user_switch = None
-            self._perform_user_switch(target_user)
-    
-    def _ensure_history_ends_with_assistant(self, fallback_content: str):
-        """确保 conversation_history 以 assistant 消息结尾
-        
-        当 agent 出错或被中断时，用户消息已追加但没有对应的 assistant 回复，
-        这会破坏 user↔assistant 交替结构，导致下次 API 调用失败。
-        """
-        history = self._agent_history if self._agent_history is not None else self._conversation_history
-        if history and history[-1].get('role') == 'user':
-            history.append({'role': 'assistant', 'content': fallback_content})
-
-    # ---------- 工具执行状态 ----------
 
     def _on_update_todo(self, todo_id: str, text: str, status: str):
         """更新 Todo 列表（跟随对话流内联显示）
@@ -3722,1441 +2587,8 @@ class AITab(
                 print(f"[AI Tab Error] {traceback.format_exc()}")  # 控制台输出
                 self._agentError.emit(error_detail)
 
-    def _add_tool_result(self, name: str, result: dict, arguments: dict = None):
-        """添加工具结果到执行流程（自动压缩长结果）"""
-        result_text = str(result.get('result', result.get('error', '')))
-        success = result.get('success', True)
-        
-        # ★ 从工具结果和参数中提取节点路径，用于后处理裸节点名
-        self._collect_node_paths_from_tool(result, arguments)
-        
-        # 压缩工具结果以节省 token（如果结果很长）
-        if self._auto_optimize and len(result_text) > 300:
-            compressed_summary = self.token_optimizer.compress_tool_result(result, max_length=200)
-            # 在历史中使用压缩版本，但 UI 中显示完整版本
-            # 注意：这里只影响显示，实际保存到历史时会使用压缩版本
-        
-        # === execute_python 专用展示 ===
-        if name == 'execute_python' and arguments:
-            code = arguments.get('code', '')
-            if code:
-                shell_data = {
-                    'code': code,
-                    'output': result.get('result', ''),
-                    'error': result.get('error', ''),
-                    'success': success,
-                }
-                self._addPythonShell.emit(code, json.dumps(shell_data))
-                # 同时设置 ToolCallItem 结果
-                short = f"[ok] Python ({len(code.splitlines())} lines)" if success else f"[err] {result_text[:50]}"
-                invoke_on_main(self, "_add_tool_result_ui", name, short)
-                # ★ 如果 execute_python 导致了节点变更，额外生成 checkpoint
-                if result.get('_node_changes'):
-                    self._addNodeOperation.emit(name, result)
-                return
-        
-        # === execute_shell 专用展示 ===
-        if name == 'execute_shell' and arguments:
-            command = arguments.get('command', '')
-            if command:
-                shell_data = {
-                    'command': command,
-                    'output': result.get('result', ''),
-                    'error': result.get('error', ''),
-                    'success': success,
-                    'cwd': arguments.get('cwd', ''),
-                }
-                self._addSystemShell.emit(command, json.dumps(shell_data))
-                short = f"[ok] $ {command[:40]}" if success else f"[err] {result_text[:50]}"
-                invoke_on_main(self, "_add_tool_result_ui", name, short)
-                return
-        
-        # ★ 通用节点变更检测：任何工具如果通过 before/after 快照检测到节点变更，生成 checkpoint
-        if result.get('_node_changes') and result.get('success'):
-            self._addNodeOperation.emit(name, result)
-        
-        # 检查是否是节点操作，需要高亮显示
-        # 但如果是失败的操作，也要显示错误信息
-        if name in ('create_node', 'create_nodes_batch', 'create_wrangle_node', 'delete_node', 'set_node_parameter'):
-            if result.get('success'):
-                # 成功时使用节点操作标签（直接传 dict，避免 JSON 序列化开销）
-                self._addNodeOperation.emit(name, result)
-                # 同时设置 ToolCallItem 结果（折叠式，可展开查看完整内容）
-                invoke_on_main(self, "_add_tool_result_ui", name, f"[ok] {result_text}")
-                return
-            else:
-                # 失败时也结束流式预览
-                if name in self._VEX_TOOLS:
-                    self._finalize_streaming_preview()
-                # 失败时显示错误信息（继续下面的逻辑）
-                pass
-        
-        # 添加到执行流程（CollapsibleSection 风格，点击展开查看完整结果）
-        if self._agent_response or self._current_response:
-            prefix = "[err]" if not success else "[ok]"
-            if not success:
-                self._addStatus.emit(
-                    f"恢复建议: {name} 执行失败，可点 Policy 按钮查看时间线并切换 Plan/Ask。"
-                )
-            invoke_on_main(self, "_add_tool_result_ui", name, f"{prefix} {result_text}")
-    
-    @QtCore.Slot(str, str)
-    def _add_tool_result_ui(self, name: str, result: str):
-        """在 UI 线程中添加工具结果"""
-        try:
-            resp = self._agent_response or self._current_response
-            if resp:
-                resp.add_tool_result(name, result)
-        except RuntimeError:
-            pass  # widget 已被 clear 销毁
+    # ActionCommandsMixin provides stop, user switch, key, clear, slash, read, scene, wrangle, and export actions.
 
-    @QtCore.Slot(str, str)
-    def _add_collapsible_result(self, name: str, result: str):
-        resp = self._agent_response or self._current_response
-        if resp:
-            resp.add_collapsible(f"Result: {name}", result)
-
-    @staticmethod
-    def _extract_node_paths(text: str, tool_name: str = '') -> list:
-        """从工具返回的结果文本中提取 **实际操作** 的节点路径
-        
-        只提取真正被创建/删除的节点路径，忽略上下文信息
-        （父网络、输入/输出连接等附属路径）。
-        
-        各工具的返回格式:
-        - create_node:      "✓/obj/geo1/scatter1 (父网络: /obj/geo1, ...)"
-        - create_nodes_batch:"已创建 3 个节点: /obj/geo1/a, /obj/geo1/b, /obj/geo1/c"
-        - create_wrangle_node:"已创建 Wrangle 节点: /obj/geo1/attribwrangle1"
-        - delete_node:      "已删除节点: /obj/geo1/scatter1 (父网络: ...)"
-        """
-        import re
-        _PATH_RE = r'(/(?:obj|out|ch|shop|stage|mat|tasks)[/\w]*)'
-        
-        if tool_name == 'create_node':
-            # 格式: "✓/obj/geo1/scatter1 (父网络: /obj/geo1, ...)"
-            # 只取 ✓ 后面的第一个路径
-            m = re.match(r'[✓\s]*' + _PATH_RE, text)
-            return [m.group(1)] if m else []
-        
-        if tool_name == 'delete_node':
-            # 格式: "已删除节点: /obj/geo1/scatter1 (父网络: ...)"
-            # 只取 "已删除节点:" 后面的第一个路径
-            m = re.search(r'已删除节点:\s*' + _PATH_RE, text)
-            if m:
-                return [m.group(1)]
-            # fallback: 取文本中第一个路径
-            m = re.search(_PATH_RE, text)
-            return [m.group(1)] if m else []
-        
-        if tool_name == 'create_nodes_batch':
-            # 格式: "已创建 3 个节点: /obj/geo1/a, /obj/geo1/b, /obj/geo1/c\n注意: ..."
-            # 只解析 "个节点:" 后同一行内的逗号分隔路径
-            m = re.search(r'个节点:\s*(.*)', text)
-            if m:
-                first_line = m.group(1).split('\n')[0]
-                return re.findall(_PATH_RE, first_line)
-            # fallback: 提取所有路径（批量创建格式未匹配时）
-            return re.findall(_PATH_RE, text)
-        
-        if tool_name == 'create_wrangle_node':
-            # 格式: "已创建 Wrangle 节点: /obj/geo1/attribwrangle1"
-            m = re.search(r'节点:\s*' + _PATH_RE, text)
-            return [m.group(1)] if m else []
-        
-        # 未知工具 → 保守策略：只取第一个路径
-        m = re.search(_PATH_RE, text)
-        return [m.group(1)] if m else []
-    
-    # ── 流式 VEX 预览 ─────────────────────────────────────
-    # VEX 相关的工具名（只有这些才需要流式预览）
-    _VEX_TOOLS = frozenset({'create_wrangle_node', 'set_node_parameter'})
-
-    # 常见的 VEX/代码参数名（set_node_parameter 只有在设置这些参数时才做流式预览）
-    _VEX_PARAM_NAMES = frozenset({
-        'snippet', 'vex_code', 'code', 'script', 'python',
-        'sopoutput', 'command', 'expr', 'expression',
-    })
-
-    @QtCore.Slot(str, str, str)
-    def _on_tool_args_delta(self, tool_name: str, delta: str, accumulated: str):
-        """主线程 slot：处理 tool_call 参数增量，流式预览 VEX 代码 / Plan 生成进度"""
-        try:
-            # ★ Plan 模式：create_plan 参数流式 → 创建/更新流式卡片
-            if tool_name == 'create_plan':
-                # 首次收到 create_plan 参数 → 立即创建流式卡片
-                if self._streaming_plan_card is None:
-                    self._on_create_streaming_plan()
-                self._show_plan_generation_progress(accumulated)
-                self._updateStreamingPlan.emit(accumulated)
-                return
-
-            if tool_name not in self._VEX_TOOLS:
-                return
-
-            # set_node_parameter 只对 VEX/代码参数做流式预览
-            if tool_name == 'set_node_parameter':
-                # 尝试从已累积的 JSON 中提取 param_name
-                import re as _re
-                m = _re.search(r'"param_name"\s*:\s*"([^"]*)"', accumulated)
-                if m:
-                    param_name = m.group(1).lower()
-                    if param_name not in self._VEX_PARAM_NAMES:
-                        return
-                # 如果 param_name 还没出现，暂不创建预览（等到能确认是 VEX 参数再说）
-
-            # 从不完整的 JSON 中增量提取 VEX 代码
-            code = self._extract_vex_from_partial_json(tool_name, accumulated)
-            if not code:
-                return
-            
-            # 对于 set_node_parameter，只有代码超过一定长度才显示预览（避免为 "1.5" 这种值创建预览）
-            if tool_name == 'set_node_parameter' and len(code) < 10 and '\n' not in code:
-                return
-
-            # 如果还没有 StreamingCodePreview，则创建
-            if self._streaming_preview is None or self._streaming_preview_tool != tool_name:
-                resp = self._agent_response or self._current_response
-                if not resp:
-                    return
-                self._streaming_preview = StreamingCodePreview(tool_name, parent=resp)
-                self._streaming_preview_tool = tool_name
-                self._streaming_last_code = ""
-                resp.details_layout.addWidget(self._streaming_preview)
-                self._scroll_agent_to_bottom()
-
-            # 更新预览（StreamingCodePreview 内部做增量追加）
-            self._streaming_preview.update_code(code)
-            self._streaming_last_code = code
-        except RuntimeError:
-            pass  # widget 已被销毁
-
-    def _extract_vex_from_partial_json(self, tool_name: str, accumulated: str) -> str:
-        """从不完整的 JSON 字符串中增量提取 VEX 代码字段
-        
-        create_wrangle_node → 提取 "vex_code" 字段
-        set_node_parameter  → 提取 "value" 字段
-        """
-        import re as _re
-        # 确定要提取的字段名
-        if tool_name == 'create_wrangle_node':
-            field_pattern = r'"vex_code"\s*:\s*"'
-        else:
-            field_pattern = r'"value"\s*:\s*"'
-
-        m = _re.search(field_pattern, accumulated)
-        if not m:
-            return ""
-        start = m.end()
-
-        # 从 start 开始，解析 JSON 字符串内容（处理转义字符）
-        result_chars = []
-        i = start
-        while i < len(accumulated):
-            ch = accumulated[i]
-            if ch == '\\' and i + 1 < len(accumulated):
-                next_ch = accumulated[i + 1]
-                if next_ch == 'n':
-                    result_chars.append('\n')
-                elif next_ch == 't':
-                    result_chars.append('\t')
-                elif next_ch == '"':
-                    result_chars.append('"')
-                elif next_ch == '\\':
-                    result_chars.append('\\')
-                elif next_ch == '/':
-                    result_chars.append('/')
-                elif next_ch == 'r':
-                    result_chars.append('\r')
-                else:
-                    result_chars.append(next_ch)
-                i += 2
-            elif ch == '"':
-                break  # 字符串字面量结束
-            else:
-                result_chars.append(ch)
-                i += 1
-        return ''.join(result_chars)
-
-    def _finalize_streaming_preview(self):
-        """流式预览结束：移除预览 widget（ParamDiffWidget 会接替展示正式 diff）"""
-        if self._streaming_preview is not None:
-            try:
-                self._streaming_preview.setVisible(False)
-                self._streaming_preview.deleteLater()
-            except RuntimeError:
-                pass
-            self._streaming_preview = None
-            self._streaming_preview_tool = ""
-            self._streaming_last_code = ""
-
-    @QtCore.Slot(str, str)
-    def _on_add_node_operation(self, name: str, result: dict):
-        """处理节点操作高亮显示"""
-        try:
-            # ★ 工具执行完毕 → 结束流式预览
-            if name in self._VEX_TOOLS:
-                self._finalize_streaming_preview()
-            
-            resp = self._agent_response or self._current_response
-            if not resp:
-                return
-            
-            if not isinstance(result, dict):
-                result = {}
-            
-            label = None
-            result_text = str(result.get('result', ''))
-            undo_snapshot = result.get('_undo_snapshot')  # 仅 delete_node 时会有
-            
-            # ---- 收集路径 & 操作类型 ----
-            op_type = 'create'
-            paths: list = []
-            
-            if name == 'create_node':
-                paths = self._extract_node_paths(result_text, 'create_node') or ([result_text] if result_text else [])
-                label = NodeOperationLabel('create', 1, paths) if paths else None
-            
-            elif name in ('create_nodes_batch', 'create_wrangle_node'):
-                paths = self._extract_node_paths(result_text, name) or ([result_text] if result_text else [])
-                label = NodeOperationLabel('create', len(paths) or 1, paths) if paths else None
-            
-            elif name == 'delete_node':
-                op_type = 'delete'
-                paths = self._extract_node_paths(result_text, 'delete_node') or ([result_text] if result_text else [])
-                label = NodeOperationLabel('delete', 1, paths) if paths else None
-            
-            elif name == 'set_node_parameter':
-                op_type = 'modify'
-                # undo_snapshot 包含 node_path, param_name, old_value, new_value
-                # ★ 无 snapshot = 参数值未变化 → 不显示 checkpoint（避免用户困惑）
-                if undo_snapshot:
-                    node_path = undo_snapshot.get("node_path", "")
-                    param_name = undo_snapshot.get("param_name", "")
-                    old_val = undo_snapshot.get("old_value", "")
-                    new_val = undo_snapshot.get("new_value", "")
-                    paths = [node_path] if node_path else []
-                    # 传 param_diff 给 NodeOperationLabel，展示红绿 diff
-                    param_diff = {
-                        "param_name": param_name,
-                        "old_value": old_val,
-                        "new_value": new_val,
-                    }
-                    label = NodeOperationLabel('modify', 1, paths, param_diff=param_diff) if paths else None
-            
-            # ★ 通用变更检测（execute_python, run_skill, copy_node 等通过 before/after 快照检测到的变更）
-            node_changes = result.get('_node_changes')
-            if node_changes and label is None:
-                created = node_changes.get('created', [])
-                deleted = node_changes.get('deleted', [])
-                labels_to_add = []
-                
-                if created:
-                    c_paths = [n['path'] for n in created]
-                    op_type = 'create'
-                    paths = c_paths
-                    labels_to_add.append(
-                        ('create', len(created), c_paths, None)
-                    )
-                if deleted:
-                    d_paths = [n['path'] for n in deleted]
-                    if not created:
-                        op_type = 'delete'
-                        paths = d_paths
-                    labels_to_add.append(
-                        ('delete', len(deleted), d_paths, None)
-                    )
-                
-                # 为每种操作类型生成独立的 checkpoint label
-                for l_op, l_count, l_paths, _ in labels_to_add:
-                    l_label = NodeOperationLabel(l_op, l_count, l_paths)
-                    l_label.nodeClicked.connect(self._navigate_to_node)
-                    l_label.undoRequested.connect(
-                        lambda _op=l_op, _paths=list(l_paths), _snap=None:
-                            self._undo_node_operation(_op, _paths, _snap)
-                    )
-                    resp.details_layout.addWidget(l_label)
-                    entry = (l_label, l_op, list(l_paths), None)
-                    self._pending_ops.append(entry)
-                    l_label.decided.connect(self._update_batch_bar)
-                
-                if labels_to_add:
-                    self._update_batch_bar()
-                    self._scroll_agent_to_bottom()
-                    return  # 已处理，跳过下面的通用逻辑
-            
-            if label:
-                label.nodeClicked.connect(self._navigate_to_node)
-                # 用 lambda 捕获当前操作的上下文，使撤销精确到这一条操作
-                label.undoRequested.connect(
-                    lambda _op=op_type, _paths=list(paths), _snap=undo_snapshot:
-                        self._undo_node_operation(_op, _paths, _snap)
-                )
-                resp.details_layout.addWidget(label)
-                
-                # ★ 追踪未决操作 → Undo All / Keep All 按钮可见
-                entry = (label, op_type, list(paths), undo_snapshot)
-                self._pending_ops.append(entry)
-                label.decided.connect(self._update_batch_bar)
-                self._update_batch_bar()
-            
-            self._scroll_agent_to_bottom()
-        except RuntimeError:
-            pass  # widget 已被 clear 销毁
-    
-    def _navigate_to_node(self, node_path: str):
-        """点击节点标签时，跳转到该节点并选中"""
-        try:
-            import hou
-            node = hou.node(node_path)
-            if node is None:
-                self._show_toast(tr('toast.node_not_exist', node_path))
-                return
-            
-            # 选中节点
-            node.setSelected(True, clear_all_selected=True)
-            
-            # 在网络编辑器中跳转到该节点
-            try:
-                editor = hou.ui.curDesktop().paneTabOfType(hou.paneTabType.NetworkEditor)
-                if editor:
-                    # 先切换到节点的父网络
-                    parent = node.parent()
-                    if parent:
-                        editor.cd(parent.path())
-                    editor.homeToSelection()
-            except Exception:
-                pass
-            
-            # 更新节点上下文栏
-            self._refresh_node_context()
-            
-        except ImportError:
-            self._show_toast(tr('toast.houdini_unavailable'))
-        except Exception as e:
-            self._show_toast(tr('toast.jump_failed', e))
-    
-    # ----------------------------------------------------------------
-    # ★ 递归恢复节点树（用于 undo delete 操作）
-    # ----------------------------------------------------------------
-    def _restore_node_from_snapshot(self, hou, snapshot: dict, _parent_override=None):
-        """从快照递归重建节点及其整棵子节点树
-        
-        Args:
-            hou: Houdini 模块引用
-            snapshot: _snapshot_node 生成的快照字典
-            _parent_override: 若不为 None，则在此节点下创建（用于递归重建子节点）
-        
-        Returns:
-            新建的 hou.Node，或 None（失败时）
-        """
-        if not snapshot:
-            return None
-        
-        parent_path = snapshot.get("parent_path", "")
-        node_type = snapshot.get("node_type", "")
-        node_name = snapshot.get("node_name", "")
-        has_children_snapshot = bool(snapshot.get("children"))
-        
-        parent = _parent_override or hou.node(parent_path)
-        if parent is None:
-            return None
-        
-        # 1) 创建节点
-        # ★ 如果快照中有子节点数据，必须禁止自动创建默认子节点
-        #   否则 geo 等容器节点会自动生成 file1 等默认子节点，
-        #   与我们递归恢复的原始子节点冲突（名称冲突/多余节点）
-        try:
-            if has_children_snapshot:
-                new_node = parent.createNode(
-                    node_type, node_name,
-                    run_init_scripts=False,
-                    load_contents=False,
-                )
-            else:
-                new_node = parent.createNode(node_type, node_name)
-        except Exception:
-            return None
-        
-        # 2) 恢复位置
-        pos = snapshot.get("position")
-        if pos and len(pos) == 2:
-            try:
-                new_node.setPosition(hou.Vector2(pos[0], pos[1]))
-            except Exception:
-                pass
-        
-        # 3) 恢复参数
-        for parm_name, val in snapshot.get("params", {}).items():
-            try:
-                parm = new_node.parm(parm_name)
-                if parm is None:
-                    continue
-                if isinstance(val, dict) and "expr" in val:
-                    lang_str = val.get("lang", "Hscript")
-                    lang = (hou.exprLanguage.Python
-                            if "python" in lang_str.lower()
-                            else hou.exprLanguage.Hscript)
-                    parm.setExpression(val["expr"], lang)
-                else:
-                    parm.set(val)
-            except Exception:
-                continue
-        
-        # 4) ★ 清空可能残留的默认子节点（以防万一，确保干净恢复）
-        if has_children_snapshot:
-            try:
-                for default_child in list(new_node.children()):
-                    try:
-                        default_child.destroy()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        
-        # 5) ★ 递归重建子节点
-        children_map: dict = {}  # name → hou.Node  用于稍后恢复内部连接
-        for child_snap in snapshot.get("children", []):
-            child_node = self._restore_node_from_snapshot(hou, child_snap, _parent_override=new_node)
-            if child_node:
-                children_map[child_node.name()] = child_node
-        
-        # 6) ★ 恢复子节点间的内部连接
-        for iconn in snapshot.get("internal_connections", []):
-            try:
-                src_node = children_map.get(iconn["src_name"])
-                dest_node = children_map.get(iconn["dest_name"])
-                if src_node and dest_node:
-                    dest_node.setInput(iconn["dest_input"], src_node)
-            except Exception:
-                continue
-        
-        # 7) 恢复外部输入连接（仅顶层节点 — 子节点的外部连接由父级调用处理）
-        if _parent_override is None:
-            for conn in snapshot.get("input_connections", []):
-                try:
-                    src = hou.node(conn["source_path"])
-                    if src:
-                        new_node.setInput(conn["input_index"], src)
-                except Exception:
-                    continue
-        
-        # 8) 恢复外部输出连接（仅顶层节点）
-        if _parent_override is None:
-            for conn in snapshot.get("output_connections", []):
-                try:
-                    dest = hou.node(conn["dest_path"])
-                    if dest:
-                        dest.setInput(conn["dest_input_index"], new_node, conn.get("output_index", 0))
-                except Exception:
-                    continue
-        
-        # 9) 恢复标志位
-        try:
-            if snapshot.get("display_flag") and hasattr(new_node, 'setDisplayFlag'):
-                new_node.setDisplayFlag(True)
-            if snapshot.get("render_flag") and hasattr(new_node, 'setRenderFlag'):
-                new_node.setRenderFlag(True)
-        except Exception:
-            pass
-        
-        return new_node
-
-    def _undo_node_operation(self, op_type: str = 'create',
-                              node_paths: list = None,
-                              undo_snapshot: dict = None):
-        """精确撤销单次节点操作
-        
-        - create 操作 → 删除该节点（by path）
-        - delete 操作 → 从快照递归重建该节点及所有子节点
-        - modify 操作 → 恢复参数旧值
-        """
-        try:
-            import hou
-        except ImportError:
-            self._show_toast(tr('toast.houdini_unavailable'))
-            return
-        
-        try:
-            if op_type == 'modify' and undo_snapshot:
-                # ---- 撤销参数修改 = 恢复旧值 ----
-                node_path = undo_snapshot.get("node_path", "")
-                param_name = undo_snapshot.get("param_name", "")
-                old_value = undo_snapshot.get("old_value")
-                is_tuple = undo_snapshot.get("is_tuple", False)
-                
-                node = hou.node(node_path)
-                if node is None:
-                    self._show_toast(tr('toast.node_not_found', node_path))
-                    return
-                
-                if is_tuple:
-                    parm_tuple = node.parmTuple(param_name)
-                    if parm_tuple is None:
-                        self._show_toast(tr('toast.param_not_found', param_name))
-                        return
-                    parm_tuple.set(old_value)
-                else:
-                    parm = node.parm(param_name)
-                    if parm is None:
-                        self._show_toast(tr('toast.param_not_found', param_name))
-                        return
-                    if isinstance(old_value, dict) and "expr" in old_value:
-                        lang_str = old_value.get("lang", "Hscript")
-                        lang = (hou.exprLanguage.Python
-                                if "python" in lang_str.lower()
-                                else hou.exprLanguage.Hscript)
-                        parm.setExpression(old_value["expr"], lang)
-                    else:
-                        parm.set(old_value)
-                
-                self._show_toast(tr('toast.param_restored', param_name))
-            
-            elif op_type == 'create':
-                # ---- 撤销创建 = 删除节点 ----
-                if not node_paths:
-                    self._show_toast(tr('toast.missing_path'))
-                    return
-                deleted = 0
-                for p in node_paths:
-                    node = hou.node(p)
-                    if node is not None:
-                        node.destroy()
-                        deleted += 1
-                if deleted:
-                    self._show_toast(tr('toast.undo_create', deleted))
-                else:
-                    self._show_toast(tr('toast.node_gone'))
-            
-            elif op_type == 'delete' and undo_snapshot:
-                # ---- 撤销删除 = 从快照递归重建整棵节点树 ----
-                new_node = self._restore_node_from_snapshot(hou, undo_snapshot)
-                if new_node:
-                    self._show_toast(tr('toast.node_restored', new_node.path()))
-                else:
-                    self._show_toast(tr('toast.undo_failed', 'snapshot restore returned None'))
-            
-            else:
-                # 回退：使用 Houdini 原生 undo
-                hou.undos.performUndo()
-                self._show_toast(tr('toast.undone'))
-            
-            self._refresh_node_context()
-        
-        except Exception as e:
-            self._show_toast(tr('toast.undo_failed', e))
-
-    # ---------- Undo All / Keep All 批量操作 ----------
-
-    def _update_batch_bar(self):
-        """根据未决操作数量显示/隐藏批量操作栏"""
-        # 清理已决的条目（label._decided == True）
-        self._pending_ops = [
-            entry for entry in self._pending_ops
-            if entry[0] and not entry[0]._decided
-        ]
-        count = len(self._pending_ops)
-        if count > 0:
-            self._batch_count_label.setText(f"{count} 个操作待确认")
-            self._batch_bar.setVisible(True)
-        else:
-            self._batch_bar.setVisible(False)
-
-    def _undo_all_ops(self):
-        """撤销所有未决操作（倒序执行，后创建的先撤销）"""
-        # 清理已决条目
-        self._pending_ops = [
-            entry for entry in self._pending_ops
-            if entry[0] and not entry[0]._decided
-        ]
-        if not self._pending_ops:
-            self._batch_bar.setVisible(False)
-            return
-        
-        count = 0
-        # 倒序：后创建的先撤销（避免依赖冲突）
-        for label, op_type, paths, snapshot in reversed(self._pending_ops):
-            if label._decided:
-                continue
-            # ★ 直接执行撤销逻辑，不通过 label._on_undo() 的信号
-            #   因为 label._on_undo() 会 emit undoRequested 信号，
-            #   而该信号已连接了 _undo_node_operation，会导致双重执行。
-            #   这里只更新 label 的 UI 状态，然后手动执行一次撤销。
-            label._decided = True
-            label._undo_btn.setVisible(False)
-            label._keep_btn.setVisible(False)
-            label._status_label.setText(tr('status.undone'))
-            label._status_label.setProperty("state", "undone")
-            label._status_label.style().unpolish(label._status_label)
-            label._status_label.style().polish(label._status_label)
-            label._status_label.setVisible(True)
-            self._undo_node_operation(op_type, paths, snapshot)
-            count += 1
-        
-        self._pending_ops.clear()
-        self._batch_bar.setVisible(False)
-        if count:
-            self._show_toast(f"已撤销全部 {count} 个操作")
-
-    def _keep_all_ops(self):
-        """保留所有未决操作"""
-        self._pending_ops = [
-            entry for entry in self._pending_ops
-            if entry[0] and not entry[0]._decided
-        ]
-        if not self._pending_ops:
-            self._batch_bar.setVisible(False)
-            return
-        
-        count = 0
-        for label, op_type, paths, snapshot in self._pending_ops:
-            if label._decided:
-                continue
-            label._on_keep()
-            label.collapse_diff()  # ★ 自动折叠 diff 展示区
-            count += 1
-        
-        self._pending_ops.clear()
-        self._batch_bar.setVisible(False)
-        if count:
-            self._show_toast(f"已保留全部 {count} 个操作")
-
-    @QtCore.Slot(str, str)
-    def _on_add_python_shell(self, code: str, result_json: str):
-        """处理 execute_python 的专用 UI 展示"""
-        try:
-            resp = self._agent_response or self._current_response
-            if not resp:
-                return
-            
-            try:
-                data = json.loads(result_json)
-            except Exception:
-                data = {}
-            
-            raw_output = data.get('output', '')
-            error = data.get('error', '')
-            success = data.get('success', True)
-            
-            # 从格式化的输出中提取执行时间和清理内容
-            # 格式: "输出:\n...\n返回值: ...\n执行时间: 0.123s"
-            exec_time = 0.0
-            clean_parts = []
-            
-            for line in raw_output.split('\n'):
-                time_match = re.match(r'^执行时间:\s*([\d.]+)s$', line.strip())
-                if time_match:
-                    exec_time = float(time_match.group(1))
-                    continue
-                # 去掉 "输出:" 前缀
-                if line.strip() == '输出:':
-                    continue
-                clean_parts.append(line)
-            
-            clean_output = '\n'.join(clean_parts).strip()
-            
-            widget = PythonShellWidget(
-                code=code,
-                output=clean_output,
-                error=error,
-                exec_time=exec_time,
-                success=success,
-                parent=resp
-            )
-            # 放入 Python Shell 折叠区块（而非 details_layout）
-            resp.add_shell_widget(widget)
-            self._scroll_agent_to_bottom()
-        except RuntimeError:
-            pass  # widget 已被 clear 销毁
-
-    @QtCore.Slot(str, str)
-    def _on_add_system_shell(self, command: str, result_json: str):
-        """处理 execute_shell 的专用 UI 展示"""
-        try:
-            resp = self._agent_response or self._current_response
-            if not resp:
-                return
-
-            try:
-                data = json.loads(result_json)
-            except Exception:
-                data = {}
-
-            raw_output = data.get('output', '')
-            error = data.get('error', '')
-            success = data.get('success', True)
-            cwd = data.get('cwd', '')
-
-            # 从输出中提取执行时间和退出码
-            exec_time = 0.0
-            exit_code = 0
-            stdout_parts = []
-
-            for line in raw_output.split('\n'):
-                # 匹配 "退出码: 0, 耗时: 0.123s" 或 "⛔ 命令执行失败: 退出码: 1, 耗时: ..."
-                time_match = re.search(r'耗时:\s*([\d.]+)s', line)
-                code_match = re.search(r'退出码:\s*(\d+)', line)
-                if time_match:
-                    exec_time = float(time_match.group(1))
-                if code_match:
-                    exit_code = int(code_match.group(1))
-                if time_match or code_match:
-                    continue
-                # 分离 stdout / stderr
-                if line.strip() == '--- stdout ---':
-                    continue
-                if line.strip() == '--- stderr ---':
-                    continue
-                stdout_parts.append(line)
-
-            clean_output = '\n'.join(stdout_parts).strip()
-
-            widget = SystemShellWidget(
-                command=command,
-                output=clean_output,
-                error=error,
-                exit_code=exit_code,
-                exec_time=exec_time,
-                success=success,
-                cwd=cwd,
-                parent=resp
-            )
-            resp.add_sys_shell_widget(widget)
-            self._scroll_agent_to_bottom()
-        except RuntimeError:
-            pass  # widget 已被 clear 销毁
-
-    def _on_stop(self):
-        self.client.request_stop()
-
-    def _request_user_switch(self):
-        """触发用户切换（需要先停止当前请求）。"""
-        try:
-            from .login_dialog import LoginDialog
-            dlg = LoginDialog(parent=self)
-            if dlg.exec_() != QtWidgets.QDialog.Accepted:
-                return
-            new_user = dlg.get_username()
-            if not new_user:
-                return
-            from shared.user_paths import is_user_allowed
-            if not is_user_allowed(new_user):
-                QtWidgets.QMessageBox.information(self, "切换用户", "当前用户未启用访问权限。")
-                return
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "切换用户", f"无法打开登录窗口: {e}")
-            return
-
-        # 若正在运行，先停止
-        if self._agent_session_id is not None:
-            reply = QtWidgets.QMessageBox.question(
-                self,
-                "切换用户",
-                "当前有任务正在运行。是否先停止并切换用户？",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                QtWidgets.QMessageBox.No,
-            )
-            if reply != QtWidgets.QMessageBox.Yes:
-                return
-            self._pending_user_switch = new_user
-            self._on_stop()
-            return
-
-        self._perform_user_switch(new_user)
-
-    def _perform_user_switch(self, new_user: str):
-        """保存当前状态并让主窗口切换用户。"""
-        try:
-            self._save_all_sessions()
-        except Exception:
-            pass
-
-        win = self.window()
-        if hasattr(win, "switch_user"):
-            win.switch_user(new_user)
-
-    def _on_set_key(self):
-        provider = self._current_provider()
-        # Custom provider 使用专用配置对话框
-        if provider == 'custom':
-            self._open_custom_provider_dialog()
-            return
-        # OF3D 内置统一 key，不允许手动修改
-        if provider == 'of3d':
-            QtWidgets.QMessageBox.information(self, "OF3D", "OF3D 使用公司统一 API Key，已内置配置，无需手动输入。")
-            return
-        names = {'openai': 'OpenAI', 'deepseek': 'DeepSeek', 'glm': 'GLM（智谱AI）', 'ollama': 'Ollama', 'openrouter': 'OpenRouter', 'siliconflow': 'SiliconFlow', 'kimi_coding': 'Kimi Coding'}
-        
-        key, ok = QtWidgets.QInputDialog.getText(
-            self, f"Set {names.get(provider, provider)} API Key",
-            "Enter API Key:",
-            QtWidgets.QLineEdit.Password
-        )
-        
-        if ok and key.strip():
-            self.client.set_api_key(key.strip(), persist=True, provider=provider)
-            self._update_key_status()
-
-    def _on_clear(self):
-        # ── 如果当前 session 正在运行 agent，先停止 ──
-        if self._agent_session_id == self._session_id and self._agent_session_id is not None:
-            # 1) 请求后端线程停止
-            self.client.request_stop()
-            # 2) 断开 agent 对已删除 widget 的引用（防止回调访问已销毁控件）
-            self._agent_response = None
-            self._agent_todo_list = None
-            self._agent_chat_layout = None
-            self._agent_scroll_area = None
-            # 3) 重置运行状态和按钮
-            self._set_running(False)
-        
-        self._conversation_history.clear()
-        self._context_summary = ""
-        self._current_response = None
-        self._token_stats = {
-            'input_tokens': 0, 'output_tokens': 0,
-            'reasoning_tokens': 0,
-            'cache_read': 0, 'cache_write': 0,
-            'total_tokens': 0, 'requests': 0,
-            'estimated_cost': 0.0,
-        }
-        self._call_records = []
-        
-        # ── 清理待确认操作列表和批量操作栏 ──
-        self._pending_ops.clear()
-        self._batch_bar.setVisible(False)
-        self._session_node_map.clear()
-        
-        while self.chat_layout.count() > 1:
-            item = self.chat_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        
-        # 旧 todo_list 已被 deleteLater, 创建新的
-        self.todo_list = self._create_todo_list(self.chat_container)
-        if self._session_id in self._sessions:
-            self._sessions[self._session_id]['todo_list'] = self.todo_list
-        
-        # 同步到 sessions 字典
-        self._save_current_session_state()
-        
-        # ★ 清空后删除磁盘上的旧 session 文件（防止残留数据在重启后被恢复）
-        try:
-            old_session_file = self._cache_dir / f"session_{self._session_id}.json"
-            if old_session_file.exists():
-                old_session_file.unlink()
-        except Exception:
-            pass
-        # ★ 立即更新 manifest（移除已清空的会话条目）
-        try:
-            self._update_manifest()
-        except Exception:
-            pass
-        
-        # 重置标签名
-        for i in range(self.session_tabs.count()):
-            if self.session_tabs.tabData(i) == self._session_id:
-                self.session_tabs.setTabText(i, f"Chat {self._session_counter}")
-                break
-        
-        # 更新统计显示
-        self._update_token_stats_display()
-        self._update_context_stats()
-
-    # ============================================================
-    # ★ 斜杠命令执行
-    # ============================================================
-
-    def _execute_slash_command(self, command: str):
-        """执行斜杠命令 — 由 InputAreaMixin._on_slash_command_selected 调用"""
-        handler = getattr(self, f'_slash_{command}', None)
-        if handler:
-            handler()
-        else:
-            print(f"[SlashCommand] 未知命令: /{command}")
-
-    def _slash_clear(self):
-        """/ clear — 清空当前对话"""
-        self._on_clear()
-
-    def _slash_new(self):
-        """/new — 新建会话"""
-        self._new_session()
-
-    def _slash_memory(self):
-        """/memory — 显示记忆系统状态"""
-        from ..utils.memory_store import get_memory_store, ABSTRACTION_LEVELS, MEMORY_CATEGORIES
-        try:
-            store = get_memory_store(self._username)
-            stats = store.get_stats()
-            core_mems = store.get_core_memories(max_count=10)
-
-            lines = ["📊 **长期记忆系统状态**\n"]
-            lines.append(f"- 情景记忆 (Episodic): {stats.get('episodic_count', 0)} 条")
-            lines.append(f"- 语义记忆 (Semantic): {stats.get('semantic_count', 0)} 条")
-            lines.append(f"- 策略记忆 (Procedural): {stats.get('procedural_count', 0)} 条")
-            lines.append(f"- 嵌入后端: {stats.get('backend', 'unknown')}")
-            lines.append(f"- 向量维度: {stats.get('embedding_dim', 0)}")
-
-            if core_mems:
-                lines.append(f"\n🧠 **核心记忆 (L0)** — {len(core_mems)} 条:")
-                for i, mem in enumerate(core_mems, 1):
-                    conf = f"(conf={mem.confidence:.2f})" if hasattr(mem, 'confidence') else ""
-                    lines.append(f"  {i}. [{mem.category}] {mem.rule} {conf}")
-            else:
-                lines.append("\n🧠 核心记忆 (L0): 暂无")
-
-            # 显示成长指标
-            if self._memory_initialized and self._growth_tracker:
-                try:
-                    gm = self._growth_tracker.get_growth_metrics()
-                    lines.append(f"\n📈 **成长指标:**")
-                    lines.append(f"  - 成功率: {gm.get('success_rate', 0):.1%}")
-                    lines.append(f"  - 错误率: {gm.get('error_rate', 0):.1%}")
-                    lines.append(f"  - 成长分: {gm.get('growth_score', 0):.2f}")
-                    lines.append(f"  - 任务数: {gm.get('total_tasks', 0)}")
-                except Exception:
-                    pass
-
-            content = "\n".join(lines)
-            self._add_user_message("[/memory]")
-            resp = self._add_ai_response()
-            resp.set_content(content)
-            resp.finalize()
-        except Exception as e:
-            self._add_user_message("[/memory]")
-            resp = self._add_ai_response()
-            resp.set_content(f"❌ 记忆系统未就绪: {e}")
-            resp.finalize()
-
-    def _slash_remember(self):
-        """/remember — 弹出对话框让用户输入要记住的内容"""
-        from ..utils.memory_store import get_memory_store, SemanticRecord
-
-        text, ok = QtWidgets.QInputDialog.getText(
-            self, "📌 记住偏好", "输入要永久记住的内容（将存为 L0 核心记忆）:"
-        )
-        if not ok or not text.strip():
-            return
-
-        try:
-            store = get_memory_store(self._username)
-            record = SemanticRecord(
-                rule=text.strip(),
-                confidence=1.0,
-                category="preference",
-                abstraction_level=0,
-            )
-            rid = store.add_semantic(record)
-            self._add_user_message(f"[/remember] {text.strip()}")
-            resp = self._add_ai_response()
-            resp.set_content(f"✅ 已写入核心记忆 (L0): {text.strip()}\nID: `{rid}`")
-            resp.finalize()
-        except Exception as e:
-            self._add_user_message(f"[/remember]")
-            resp = self._add_ai_response()
-            resp.set_content(f"❌ 写入记忆失败: {e}")
-            resp.finalize()
-
-    def _slash_forget(self):
-        """/forget — 搜索并删除记忆"""
-        from ..utils.memory_store import get_memory_store
-
-        keyword, ok = QtWidgets.QInputDialog.getText(
-            self, "🧹 清除记忆", "输入关键词搜索要删除的记忆:"
-        )
-        if not ok or not keyword.strip():
-            return
-
-        try:
-            store = get_memory_store(self._username)
-            results = store.search_all_levels(
-                query=keyword.strip(), top_k=5, min_confidence=0.0
-            )
-            if not results:
-                self._add_user_message(f"[/forget] {keyword.strip()}")
-                resp = self._add_ai_response()
-                resp.set_content("未找到匹配的记忆。")
-                resp.finalize()
-                return
-
-            # 显示找到的记忆，让用户选择删除
-            items = []
-            for rec, score in results:
-                display = f"[L{rec.abstraction_level}][{rec.category}] {rec.rule[:60]} (conf={rec.confidence:.2f})"
-                items.append((rec.id, display))
-
-            choices = [d for _, d in items]
-            choice, ok2 = QtWidgets.QInputDialog.getItem(
-                self, "选择要删除的记忆", "找到以下匹配记忆:", choices, 0, False
-            )
-            if not ok2:
-                return
-
-            idx = choices.index(choice)
-            del_id = items[idx][0]
-            store.delete_semantic(del_id)
-
-            self._add_user_message(f"[/forget] {keyword.strip()}")
-            resp = self._add_ai_response()
-            resp.set_content(f"🗑 已删除记忆: {choice}")
-            resp.finalize()
-        except Exception as e:
-            self._add_user_message(f"[/forget]")
-            resp = self._add_ai_response()
-            resp.set_content(f"❌ 操作失败: {e}")
-            resp.finalize()
-
-    def _slash_search_mem(self):
-        """/search_mem — 搜索长期记忆"""
-        from ..utils.memory_store import get_memory_store, ABSTRACTION_LEVELS
-
-        keyword, ok = QtWidgets.QInputDialog.getText(
-            self, "🔍 搜索记忆", "输入搜索关键词:"
-        )
-        if not ok or not keyword.strip():
-            return
-
-        try:
-            store = get_memory_store(self._username)
-            results = store.search_all_levels(
-                query=keyword.strip(), top_k=10, min_confidence=0.0
-            )
-
-            self._add_user_message(f"[/search_mem] {keyword.strip()}")
-            resp = self._add_ai_response()
-
-            if not results:
-                resp.set_content("未找到相关记忆。")
-            else:
-                lines = [f"🔍 **搜索结果** — 关键词: `{keyword.strip()}`  ({len(results)} 条)\n"]
-                for i, (rec, score) in enumerate(results, 1):
-                    level_name = ABSTRACTION_LEVELS.get(rec.abstraction_level, "unknown")
-                    lines.append(
-                        f"{i}. **[L{rec.abstraction_level} {level_name}]** [{rec.category}] "
-                        f"conf={rec.confidence:.2f}  rel={score:.3f}\n"
-                        f"   {rec.rule}"
-                    )
-                resp.set_content("\n".join(lines))
-            resp.finalize()
-        except Exception as e:
-            self._add_user_message(f"[/search_mem]")
-            resp = self._add_ai_response()
-            resp.set_content(f"❌ 搜索失败: {e}")
-            resp.finalize()
-
-    def _slash_memories(self):
-        """/memories — 打开记忆库管理窗口（情景 / 语义 / 策略 增删改查）"""
-        try:
-            from .memory_manager_dialog import MemoryManagerDialog
-            # 直接 exec_，避免依赖 staticmethod exec_centered（旧版模块或热加载缺该方法时会报错）
-            MemoryManagerDialog(self, username=self._username).exec_()
-        except Exception as e:
-            # 不在此处二次 import MemoryMgrSheet：模块未加载全或热加载残留时会再触发 ImportError
-            QtWidgets.QMessageBox.critical(
-                None,
-                tr('memory_mgr.title'),
-                f"{tr('memory_mgr.err_load')}\n{e}",
-            )
-
-    def _slash_network(self):
-        """/network — 读取网络结构"""
-        self._on_read_network()
-
-    def _slash_selection(self):
-        """/selection — 读取选中节点"""
-        self._on_read_selection()
-
-    def _slash_skills(self):
-        """/skills — 列出所有技能"""
-        result = self.mcp._tool_list_skills({})
-        self._add_user_message("[/skills]")
-        resp = self._add_ai_response()
-        if result.get('success'):
-            resp.set_content(result.get('result', '无可用 Skill'))
-        else:
-            resp.set_content(f"❌ {result.get('error', '未知错误')}")
-        resp.finalize()
-
-    def _slash_status(self):
-        """/status — 显示系统综合状态"""
-        lines = ["📊 **系统状态概览**\n"]
-
-        # 上下文统计
-        token_stats = self._token_stats
-        lines.append("**Token 统计:**")
-        lines.append(f"  - 输入: {token_stats.get('input_tokens', 0):,}")
-        lines.append(f"  - 输出: {token_stats.get('output_tokens', 0):,}")
-        lines.append(f"  - 总计: {token_stats.get('total_tokens', 0):,}")
-        lines.append(f"  - 请求次数: {token_stats.get('requests', 0)}")
-        cost = token_stats.get('estimated_cost', 0.0)
-        if cost > 0:
-            lines.append(f"  - 预估费用: ${cost:.4f}")
-        lines.append(f"  - 对话轮数: {len(self._conversation_history)}")
-
-        # 记忆统计
-        if self._memory_initialized and self._memory_store:
-            try:
-                stats = self._memory_store.get_stats()
-                lines.append(f"\n**记忆系统:**")
-                lines.append(f"  - 情景: {stats.get('episodic_count', 0)}")
-                lines.append(f"  - 语义: {stats.get('semantic_count', 0)}")
-                lines.append(f"  - 策略: {stats.get('procedural_count', 0)}")
-            except Exception:
-                pass
-
-        # 成长指标
-        if self._memory_initialized and self._growth_tracker:
-            try:
-                gm = self._growth_tracker.get_growth_metrics()
-                lines.append(f"\n**成长指标:**")
-                lines.append(f"  - 成功率: {gm.get('success_rate', 0):.1%}")
-                lines.append(f"  - 成长分: {gm.get('growth_score', 0):.2f}")
-                lines.append(f"  - 累计任务: {gm.get('total_tasks', 0)}")
-            except Exception:
-                pass
-
-        self._add_user_message("[/status]")
-        resp = self._add_ai_response()
-        resp.set_content("\n".join(lines))
-        resp.finalize()
-
-    def _slash_export(self):
-        """/export — 导出训练数据"""
-        self._on_export_training_data()
-
-    def _slash_diagnostics(self):
-        """/diagnostics — 导出策略与 Harness trace 诊断 JSON"""
-        self._add_user_message("[/diagnostics]")
-        self._export_diagnostics_json()
-
-    def _slash_image(self):
-        """/image — 附加图片"""
-        self._on_attach_image()
-
-    def _slash_help(self):
-        """/help — 显示所有斜杠命令"""
-        from .cursor_widgets import SLASH_COMMANDS
-        from .i18n import get_language
-
-        is_zh = (get_language() == 'zh')
-        lines = ["❓ **可用斜杠命令**\n"]
-        for cmd, icon, lbl_zh, lbl_en, desc_zh, desc_en, cat in SLASH_COMMANDS:
-            label = lbl_zh if is_zh else lbl_en
-            desc = desc_zh if is_zh else desc_en
-            lines.append(f"  {icon} `/{cmd}` — {label}: {desc}")
-
-        self._add_user_message("[/help]")
-        resp = self._add_ai_response()
-        resp.set_content("\n".join(lines))
-        resp.finalize()
-
-    def _on_read_network(self):
-        ok, text = self.mcp.get_network_structure_text()
-        if ok:
-            # 添加到对话
-            self._add_user_message("[Read network structure]")
-            response = self._add_ai_response()
-            response.add_status("Read network")
-            response.add_collapsible("Network structure", text)
-            response.finalize()
-            self._conversation_history.append({'role': 'user', 'content': f"[Network structure]\n{text}"})
-            self._update_context_stats()
-            # 更新节点上下文栏
-            self._refresh_node_context()
-        else:
-            self._add_ai_response().set_content(f"Error: {text}")
-
-    # ============================================================
-    # 图片输入支持
-    # ============================================================
-    # 已迁移到 ui/image_mixin.py (ImageMixin)
-
-    def _on_read_selection(self):
-        ok, text = self.mcp.describe_selection()
-        if ok:
-            self._add_user_message("[Read selected nodes]")
-            response = self._add_ai_response()
-            response.add_status("Read selection")
-            response.add_collapsible("Node details", text)
-            response.finalize()
-            self._conversation_history.append({'role': 'user', 'content': f"[Selected nodes]\n{text}"})
-            self._update_context_stats()
-            # 更新节点上下文栏
-            self._refresh_node_context()
-        else:
-            self._add_ai_response().set_content(f"Error: {text}")
-
-    def _auto_inject_scene_read(self):
-        """[主线程] 根据 auto_read_mode 自动将场景信息静默注入对话历史。
-
-        每次 _on_send 时调用一次，不在聊天界面中显示额外卡片。
-        调用方式与手动 + 菜单中的 Read Selection / Read Network 保持一致。
-        """
-        mode = getattr(self, '_auto_read_mode', 'sel')
-        if mode == 'off':
-            return
-        try:
-            if mode == 'sel':
-                # 与 _on_read_selection 完全一致：读取所有选中节点，无数量限制
-                ok, text = self.mcp.describe_selection()
-                label = "Selected nodes"
-            else:  # net
-                # 与 _on_read_network 完全一致
-                ok, text = self.mcp.get_network_structure_text()
-                label = "Network structure"
-            if ok and text:
-                self._conversation_history.append({
-                    'role': 'user',
-                    'content': f"[Auto-read: {label}]\n{text}"
-                })
-        except Exception:
-            pass
-
-    def _refresh_node_context(self):
-        """刷新节点上下文栏（显示当前网络路径和选中节点）"""
-        try:
-            import hou
-            # 获取当前网络编辑器的工作路径
-            path = "/obj"
-            editors = [p for p in hou.ui.paneTabs()
-                       if p.type() == hou.paneTabType.NetworkEditor]
-            if editors:
-                pwd = editors[0].pwd()
-                if pwd:
-                    path = pwd.path()
-            # 获取选中节点
-            selected = [n.path() for n in hou.selectedNodes()]
-            self.node_context_bar.update_context(path, selected)
-        except Exception:
-            self.node_context_bar.update_context("/obj")
-
-    def _collect_scene_context(self) -> dict:
-        """[主线程] 收集 Houdini 场景上下文用于自动 RAG 增强
-        
-        返回场景上下文 dict，传给后台线程的 _auto_rag_retrieve 使用。
-        包含：当前网络路径、选中节点类型、选中节点名。
-        """
-        ctx = {'network_path': '', 'selected_types': [], 'selected_names': []}
-        try:
-            import hou  # type: ignore
-            # 当前网络路径
-            editors = [p for p in hou.ui.paneTabs()
-                       if p.type() == hou.paneTabType.NetworkEditor]
-            if editors:
-                pwd = editors[0].pwd()
-                if pwd:
-                    ctx['network_path'] = pwd.path()
-            # 选中节点的类型和名称
-            for n in hou.selectedNodes()[:5]:  # 最多 5 个，避免过多
-                ctx['selected_types'].append(n.type().name())
-                ctx['selected_names'].append(n.name())
-        except Exception:
-            pass
-        return ctx
-
-    def _on_create_wrangle(self, vex_code: str):
-        """从代码块一键创建 Wrangle 节点"""
-        result = self.mcp.execute_tool("create_wrangle_node", {"vex_code": vex_code})
-        if result.get("success"):
-            resp = self._add_ai_response()
-            resp.set_content(f"{result.get('result', '已创建 Wrangle 节点')}")
-            resp.finalize()
-            self._refresh_node_context()
-        else:
-            resp = self._add_ai_response()
-            resp.set_content(f"错误: {result.get('error', '创建 Wrangle 失败')}")
-            resp.finalize()
-
-    def _on_export_training_data(self):
-        """导出当前对话为训练数据"""
-        if not self._conversation_history:
-            QtWidgets.QMessageBox.warning(self, "导出失败", "当前没有对话记录可导出")
-            return
-        
-        # 统计对话信息
-        user_count = sum(1 for m in self._conversation_history if m.get('role') == 'user')
-        assistant_count = sum(1 for m in self._conversation_history if m.get('role') == 'assistant')
-        
-        if user_count == 0:
-            QtWidgets.QMessageBox.warning(self, "导出失败", "对话中没有用户消息")
-            return
-        
-        # 询问导出选项
-        msg_box = QtWidgets.QMessageBox(self)
-        msg_box.setWindowTitle("导出训练数据")
-        msg_box.setText(f"当前对话包含 {user_count} 条用户消息，{assistant_count} 条 AI 回复。\n\n选择导出方式：")
-        msg_box.setInformativeText(
-            "• 分割模式：每轮对话生成一个训练样本（推荐，样本更多）\n"
-            "• 完整模式：整个对话作为一个训练样本"
-        )
-        
-        split_btn = msg_box.addButton("分割模式", QtWidgets.QMessageBox.ActionRole)
-        full_btn = msg_box.addButton("完整模式", QtWidgets.QMessageBox.ActionRole)
-        cancel_btn = msg_box.addButton("取消", QtWidgets.QMessageBox.RejectRole)
-        
-        msg_box.exec_()
-        
-        clicked = msg_box.clickedButton()
-        if clicked == cancel_btn:
-            return
-        
-        split_by_user = (clicked == split_btn)
-        
-        # 导出
-        try:
-            from ..utils.training_data_exporter import ChatTrainingExporter
-            
-            exporter = ChatTrainingExporter()
-            filepath = exporter.export_conversation(
-                self._conversation_history,
-                system_prompt=self._system_prompt,
-                split_by_user=split_by_user
-            )
-            
-            # 显示成功消息
-            response = self._add_ai_response()
-            response.add_status("训练数据已导出")
-            
-            # 读取生成的样本数
-            sample_count = 0
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    sample_count = sum(1 for _ in f)
-            except:
-                pass
-            
-            response.set_content(
-                f"成功导出训练数据！\n\n"
-                f"文件: {filepath}\n"
-                f"训练样本数: {sample_count}\n"
-                f"对话轮数: {user_count}\n"
-                f"导出模式: {'分割模式' if split_by_user else '完整模式'}\n\n"
-                f"提示: 文件为 JSONL 格式，可直接用于 OpenAI/DeepSeek 微调"
-            )
-            response.finalize()
-            
-            # 询问是否打开文件夹
-            reply = QtWidgets.QMessageBox.question(
-                self, 
-                "导出成功",
-                f"已生成 {sample_count} 个训练样本\n\n是否打开所在文件夹？",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
-            )
-            
-            if reply == QtWidgets.QMessageBox.Yes:
-                import os
-                import subprocess
-                folder = os.path.dirname(filepath)
-                if os.name == 'nt':  # Windows
-                    os.startfile(folder)
-                else:  # macOS/Linux
-                    subprocess.run(['open' if 'darwin' in __import__('sys').platform else 'xdg-open', folder])
-        
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "导出错误", f"导出训练数据时发生错误：{str(e)}")
-
-    # ===== 缓存管理 =====
-    
     def _on_cache_menu(self):
         """显示缓存菜单"""
         menu = QtWidgets.QMenu(self)
@@ -5231,7 +2663,7 @@ class AITab(
         return {
             'version': '1.0',
             'session_id': self._session_id,
-            'created_at': datetime.now().isoformat(),
+            'created_at': self._session_created_at,
             'message_count': len(self._conversation_history),
             'estimated_tokens': self._calculate_context_tokens(),
             'conversation_history': self._conversation_history,
@@ -5265,12 +2697,27 @@ class AITab(
         - 使用 _tabs_backup（纯 Python 列表）代替遍历 QTabBar
         - 使用 try/except 包裹 todo_list 访问
         """
+        # ★ stale 保护：新窗口创建时旧实例被标记为 inactive，
+        #   此时不再写文件，避免覆盖新窗口已保存的正确数据
+        if not getattr(self, '_ai_tab_active', True):
+            return
         try:
             if not hasattr(self, '_sessions') or not self._sessions:
                 return
+            # ★ agent 仍在运行时，先把最新 history 刷回对应 session
+            try:
+                agent_sid = getattr(self, '_agent_session_id', None)
+                if agent_sid and agent_sid in self._sessions:
+                    if getattr(self, '_agent_history', None) is not None:
+                        self._sessions[agent_sid]['conversation_history'] = self._agent_history
+                    if getattr(self, '_agent_token_stats', None) is not None:
+                        self._sessions[agent_sid]['token_stats'] = self._agent_token_stats
+            except Exception:
+                pass
             # 尝试同步当前状态（Qt widget 可能已销毁）
             try:
-                self._save_current_session_state()
+                if getattr(self, '_agent_session_id', None) != getattr(self, '_session_id', None):
+                    self._save_current_session_state()
             except (RuntimeError, AttributeError):
                 pass
             
@@ -5299,6 +2746,7 @@ class AITab(
                 cache_data = {
                     'version': '1.0',
                     'session_id': sid,
+                    'created_at': sdata.get('created_at') or datetime.now().isoformat(),
                     'message_count': len(history),
                     'conversation_history': self._strip_images_for_cache(history),
                     'context_summary': sdata.get('context_summary', ''),
@@ -5313,15 +2761,7 @@ class AITab(
                     'tab_label': tab_label,
                     'file': f"session_{sid}.json",
                 })
-            if manifest_tabs:
-                manifest = {
-                    'version': '1.0',
-                    'active_session_id': self._session_id,
-                    'tabs': manifest_tabs,
-                }
-                manifest_file = self._cache_dir / "sessions_manifest.json"
-                with open(manifest_file, 'w', encoding='utf-8') as f:
-                    json.dump(manifest, f, ensure_ascii=False)
+            self._write_manifest(manifest_tabs, indent=None)
         except Exception:
             pass  # atexit 中不能抛出异常
 
@@ -5366,42 +2806,81 @@ class AITab(
                 if not sid:
                     continue
                 tab_label = self.session_tabs.tabText(i)
+                sdata = self._sessions.get(sid, {})
+                history = sdata.get('conversation_history', [])
+                if not history:
+                    try:
+                        session_file = self._cache_dir / f"session_{sid}.json"
+                        if session_file.exists():
+                            session_file.unlink()
+                    except Exception:
+                        pass
+                    continue
+
                 # 检查该 session 是否有对话文件存在
                 session_file = self._cache_dir / f"session_{sid}.json"
                 if not session_file.exists():
-                    # 检查 _sessions 字典中是否有对话
-                    sdata = self._sessions.get(sid, {})
-                    history = sdata.get('conversation_history', [])
-                    if not history:
-                        continue
+                    continue
                 manifest_tabs.append({
                     'session_id': sid,
                     'tab_label': tab_label,
                     'file': f"session_{sid}.json",
                 })
-            if manifest_tabs:
-                manifest = {
-                    'version': '1.0',
-                    'active_session_id': self._session_id,
-                    'tabs': manifest_tabs,
-                }
-                manifest_file = self._cache_dir / "sessions_manifest.json"
-                with open(manifest_file, 'w', encoding='utf-8') as f:
-                    json.dump(manifest, f, ensure_ascii=False, indent=2)
+            self._write_manifest(manifest_tabs)
         except Exception as e:
             print(f"[Cache] 更新 manifest 失败: {e}")
+
+    def _write_manifest(self, manifest_tabs: list, indent: int = 2):
+        manifest = {
+            'version': '1.0',
+            'active_session_id': self._manifest_active_session_id(manifest_tabs),
+            'tabs': manifest_tabs,
+        }
+        manifest_file = self._cache_dir / "sessions_manifest.json"
+        with open(manifest_file, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=indent)
+        clear_marker = self._cache_dir / "sessions_cleared.json"
+        if manifest_tabs:
+            try:
+                if clear_marker.exists():
+                    clear_marker.unlink()
+            except Exception:
+                pass
+        else:
+            try:
+                with open(clear_marker, 'w', encoding='utf-8') as f:
+                    json.dump({
+                        'version': '1.0',
+                        'cleared_at': datetime.now().isoformat(),
+                    }, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+    def _manifest_active_session_id(self, manifest_tabs: list) -> str:
+        """Return an active session that is actually present in the saved manifest."""
+        saved_sids = [tab.get('session_id') for tab in manifest_tabs if tab.get('session_id')]
+        session_id = getattr(self, '_session_id', '')
+        if session_id in saved_sids:
+            return session_id
+        return saved_sids[0] if saved_sids else ""
 
     def _save_all_sessions(self) -> bool:
         """保存所有打开的会话到磁盘（关闭软件时调用）"""
         try:
+            # ★ agent 仍在运行时，先把最新 history 刷回对应 session（防止关窗口时丢最后一轮）
+            agent_sid = getattr(self, '_agent_session_id', None)
+            if agent_sid and agent_sid in self._sessions:
+                if self._agent_history is not None:
+                    self._sessions[agent_sid]['conversation_history'] = self._agent_history
+                if self._agent_token_stats is not None:
+                    self._sessions[agent_sid]['token_stats'] = self._agent_token_stats
             # 先保存当前活跃会话的状态到 _sessions 字典
-            self._save_current_session_state()
+            if agent_sid != self._session_id:
+                self._save_current_session_state()
             # ★ 同步 tab 备份（确保 atexit 时也能用）
             self._sync_tabs_backup()
 
             manifest_tabs = []
-            active_session_id = self._session_id
-
             for i in range(self.session_tabs.count()):
                 sid = self.session_tabs.tabData(i)
                 tab_label = self.session_tabs.tabText(i)
@@ -5432,7 +2911,7 @@ class AITab(
                 cache_data = {
                     'version': '1.0',
                     'session_id': sid,
-                    'created_at': datetime.now().isoformat(),
+                    'created_at': sdata.get('created_at') or datetime.now().isoformat(),
                     'message_count': len(history),
                     'conversation_history': self._strip_images_for_cache(history),
                     'context_summary': sdata.get('context_summary', ''),
@@ -5449,42 +2928,95 @@ class AITab(
                     'file': f"session_{sid}.json",
                 })
 
-            if not manifest_tabs:
-                return False
-
             # 写 manifest 文件
-            manifest = {
-                'version': '1.0',
-                'active_session_id': active_session_id,
-                'tabs': manifest_tabs,
-            }
-            manifest_file = self._cache_dir / "sessions_manifest.json"
-            with open(manifest_file, 'w', encoding='utf-8') as f:
-                json.dump(manifest, f, ensure_ascii=False, indent=2)
+            self._write_manifest(manifest_tabs)
 
             # ★ 不再写 cache_latest.json — 恢复由 sessions_manifest + session_*.json 管理
             # print(f"[Cache] 已保存 {len(manifest_tabs)} 个会话到磁盘")
-            return True
+            return bool(manifest_tabs)
         except Exception as e:
             print(f"[Cache] 保存所有会话失败: {e}")
             import traceback; traceback.print_exc()
             return False
 
     def _restore_all_sessions(self) -> bool:
-        """从 sessions_manifest.json 恢复所有会话标签（启动时调用，幂等）"""
+        """从 sessions_manifest.json 恢复所有会话标签（启动时调用，幂等）
+
+        恢复策略（严格信任 manifest）：
+                - manifest 存在 → 仅按 manifest 列出的 tab 恢复。即使 tabs 为空，
+                    也表示用户上次关闭时是空工作区，不再扫描孤儿 session_*.json。
+                - manifest 不存在 → 兜底扫盘，把目录下所有 session_*.json
+                    作为孤儿恢复，避免误删 manifest 时丢失全部历史会话。
+
+        可通过实例属性 `_orphan_scan_on_restore` 强制改变行为：
+            True  → 即使 manifest 存在也扫盘补 tab（旧行为）
+            False → 即使 manifest 不存在也不扫盘
+            None / 未设置 → 按上面默认策略
+        """
         # ★ 幂等保护：防止 __init__ 和 main_window 延迟回调重复恢复
         if getattr(self, '_sessions_restored', False):
             return True
         try:
             manifest_file = self._cache_dir / "sessions_manifest.json"
-            if not manifest_file.exists():
-                return False
+            clear_marker = self._cache_dir / "sessions_cleared.json"
+            if clear_marker.exists():
+                self._write_manifest([])
+                self._sessions_restored = True
+                self._sync_tabs_backup()
+                self._update_context_stats()
+                return True
 
-            with open(manifest_file, 'r', encoding='utf-8') as f:
-                manifest = json.load(f)
+            manifest_exists = manifest_file.exists()
 
-            tabs_info = manifest.get('tabs', [])
+            manifest = {}
+            tabs_info = []
+            if manifest_exists:
+                with open(manifest_file, 'r', encoding='utf-8') as f:
+                    manifest = json.load(f)
+                tabs_info = manifest.get('tabs', []) or []
+
+            # 决定是否扫盘补孤儿 session 文件
+            scan_override = getattr(self, '_orphan_scan_on_restore', None)
+            if scan_override is None:
+                should_scan_orphans = not manifest_exists
+            else:
+                should_scan_orphans = bool(scan_override)
+
+            if should_scan_orphans:
+                known_sids = {tab.get('session_id') for tab in tabs_info if tab.get('session_id')}
+                for session_file in sorted(self._cache_dir.glob("session_*.json")):
+                    sid = session_file.stem.replace("session_", "", 1)
+                    if sid in known_sids:
+                        continue
+                    try:
+                        with open(session_file, 'r', encoding='utf-8') as f:
+                            cache_data = json.load(f)
+                    except Exception:
+                        continue
+                    history = cache_data.get('conversation_history', [])
+                    if not history:
+                        continue
+                    label = "Chat"
+                    for msg in history:
+                        if msg.get('role') == 'user' and msg.get('content'):
+                            label = str(msg['content'])[:18].replace('\n', ' ').strip() or label
+                            if len(str(msg['content'])) > 18:
+                                label += "..."
+                            break
+                    tabs_info.append({
+                        'session_id': sid,
+                        'tab_label': label,
+                        'file': session_file.name,
+                    })
+                    known_sids.add(sid)
+
+            # manifest 不存在且扫盘也没补到任何东西 → 没什么可恢复的
             if not tabs_info:
+                if manifest_exists:
+                    self._sessions_restored = True
+                    self._sync_tabs_backup()
+                    self._update_context_stats()
+                    return True
                 return False
 
             active_sid = manifest.get('active_session_id', '')
@@ -5507,6 +3039,7 @@ class AITab(
                     continue
 
                 context_summary = cache_data.get('context_summary', '')
+                created_at = cache_data.get('created_at') or datetime.now().isoformat()
                 todo_data = cache_data.get('todo_data', [])
                 # ★ 从缓存中恢复 token 使用统计
                 saved_token_stats = cache_data.get('token_stats', {
@@ -5523,6 +3056,7 @@ class AITab(
                     old_id = self._session_id
 
                     self._session_id = sid
+                    self._session_created_at = created_at
                     self._conversation_history = history
                     self._context_summary = context_summary
                     self._token_stats = saved_token_stats
@@ -5531,6 +3065,7 @@ class AITab(
                     if old_id in self._sessions:
                         sdata = self._sessions.pop(old_id)
                         sdata['conversation_history'] = history
+                        sdata['created_at'] = created_at
                         sdata['context_summary'] = context_summary
                         sdata['token_stats'] = saved_token_stats
                         self._sessions[sid] = sdata
@@ -5541,6 +3076,7 @@ class AITab(
                             'chat_layout': self.chat_layout,
                             'todo_list': self.todo_list,
                             'conversation_history': history,
+                            'created_at': created_at,
                             'context_summary': context_summary,
                             'current_response': None,
                             'token_stats': saved_token_stats,
@@ -5584,6 +3120,7 @@ class AITab(
                         'chat_layout': chat_layout,
                         'todo_list': todo,
                         'conversation_history': history,
+                        'created_at': created_at,
                         'context_summary': context_summary,
                         'current_response': None,
                         'token_stats': saved_token_stats,
@@ -5598,8 +3135,10 @@ class AITab(
                     old_summary = self._context_summary
                     old_stats = self._token_stats
                     old_sid = self._session_id
+                    old_created_at = self._session_created_at
 
                     self._session_id = sid
+                    self._session_created_at = created_at
                     self._conversation_history = history
                     self._context_summary = context_summary
                     self._token_stats = saved_token_stats
@@ -5612,6 +3151,7 @@ class AITab(
 
                     # 恢复
                     self._session_id = old_sid
+                    self._session_created_at = old_created_at
                     self._conversation_history = old_history
                     self._context_summary = old_summary
                     self._token_stats = old_stats
@@ -5638,6 +3178,7 @@ class AITab(
 
             # ★ 恢复完成后同步 tab 备份并更新 UI 显示
             self._sync_tabs_backup()
+            self._update_manifest()
             self._update_token_stats_display()
             self._update_context_stats()
             self._sessions_restored = True  # 标记已恢复，防止重复
@@ -5705,6 +3246,7 @@ class AITab(
             
             history = cache_data.get('conversation_history', [])
             context_summary = cache_data.get('context_summary', '')
+            created_at = cache_data.get('created_at') or datetime.now().isoformat()
             todo_data = cache_data.get('todo_data', [])
             cached_session_id = cache_data.get('session_id', str(uuid.uuid4())[:8])
             # ★ 恢复 token 使用统计
@@ -5721,6 +3263,7 @@ class AITab(
                 self._conversation_history = history
                 self._context_summary = context_summary
                 self._session_id = cached_session_id
+                self._session_created_at = created_at
                 self._token_stats = saved_token_stats
                 # 恢复 todo 数据
                 if todo_data and hasattr(self, 'todo_list') and self.todo_list:
@@ -5729,6 +3272,7 @@ class AITab(
                 # 更新 sessions 字典
                 if self._session_id in self._sessions:
                     self._sessions[self._session_id]['conversation_history'] = self._conversation_history
+                    self._sessions[self._session_id]['created_at'] = created_at
                     self._sessions[self._session_id]['context_summary'] = self._context_summary
                     self._sessions[self._session_id]['token_stats'] = saved_token_stats
                 elif self._sessions:
@@ -5736,6 +3280,7 @@ class AITab(
                     old_id = list(self._sessions.keys())[0]
                     sdata = self._sessions.pop(old_id)
                     sdata['conversation_history'] = self._conversation_history
+                    sdata['created_at'] = created_at
                     sdata['context_summary'] = self._context_summary
                     sdata['token_stats'] = saved_token_stats
                     self._sessions[self._session_id] = sdata
@@ -5788,6 +3333,7 @@ class AITab(
                 'chat_layout': chat_layout,
                 'todo_list': todo,
                 'conversation_history': history,
+                'created_at': created_at,
                 'context_summary': context_summary,
                 'current_response': None,
                 'token_stats': saved_token_stats,
@@ -5795,6 +3341,7 @@ class AITab(
             
             # 切换到新标签
             self._session_id = cached_session_id
+            self._session_created_at = created_at
             self._conversation_history = history
             self._context_summary = context_summary
             self._current_response = None
@@ -6658,86 +4205,6 @@ class AITab(
 
     # ===== Token 优化管理 =====
     
-    def _on_optimize_menu(self):
-        """显示 Token 优化菜单"""
-        menu = QtWidgets.QMenu(self)
-        
-        # 立即优化
-        optimize_now_action = menu.addAction("立即压缩对话")
-        optimize_now_action.triggered.connect(self._optimize_now)
-        
-        menu.addSeparator()
-        
-        # 自动优化开关
-        auto_label = "自动压缩 [on]" if self._auto_optimize else "自动压缩"
-        auto_opt_action = menu.addAction(auto_label)
-        auto_opt_action.setCheckable(True)
-        auto_opt_action.setChecked(self._auto_optimize)
-        auto_opt_action.triggered.connect(lambda: setattr(self, '_auto_optimize', not self._auto_optimize))
-        
-        menu.addSeparator()
-        
-        # 压缩策略
-        strategy_menu = menu.addMenu("压缩策略")
-        for label, strat in [
-            ("激进 (最大节省)", CompressionStrategy.AGGRESSIVE),
-            ("平衡 (推荐)", CompressionStrategy.BALANCED),
-            ("保守 (保留细节)", CompressionStrategy.CONSERVATIVE),
-        ]:
-            action = strategy_menu.addAction(label)
-            action.setCheckable(True)
-            action.setChecked(self._optimization_strategy == strat)
-            action.triggered.connect(lambda _, s=strat: setattr(self, '_optimization_strategy', s))
-        
-        # 显示菜单（btn_optimize 是隐藏控件，用鼠标位置避免弹到屏幕最左边）
-        menu.exec_(QtGui.QCursor.pos())
-    
-    def _optimize_now(self):
-        """立即优化当前对话"""
-        if len(self._conversation_history) <= 4:
-            QtWidgets.QMessageBox.information(self, "提示", "对话历史太短，无需优化")
-            return
-        
-        # 计算优化前
-        before_tokens = self._calculate_context_tokens()
-        
-        # 执行优化
-        compressed_messages, stats = self.token_optimizer.compress_messages(
-            self._conversation_history,
-            strategy=self._optimization_strategy
-        )
-        
-        if stats['saved_tokens'] > 0:
-            self._conversation_history = compressed_messages
-            self._context_summary = compressed_messages[0].get('content', '') if compressed_messages and compressed_messages[0].get('role') == 'system' else self._context_summary
-            
-            # 重新渲染
-            self._render_conversation_history()
-            
-            # 更新统计
-            self._update_context_stats()
-            
-            # 显示结果
-            saved_percent = stats.get('saved_percent', 0)
-            QtWidgets.QMessageBox.information(
-                self, "优化完成",
-                f"对话已优化！\n\n"
-                f"原始: ~{before_tokens:,} tokens\n"
-                f"优化后: ~{stats['compressed_tokens']:,} tokens\n"
-                f"节省: ~{stats['saved_tokens']:,} tokens ({saved_percent:.1f}%)\n\n"
-                f"压缩了 {stats['compressed']} 条消息，保留 {stats['kept']} 条"
-            )
-        else:
-            QtWidgets.QMessageBox.information(self, "提示", "无需优化，对话历史已经很精简")
-
-    # ============================================================
-    # 自动更新
-    # ============================================================
-
-    _updateCheckDone = QtCore.Signal(dict)   # 检查结果
-    _updateApplyDone = QtCore.Signal(dict)   # 应用结果
-    _updateProgress = QtCore.Signal(str, int)  # (stage, percent)
-
     def _silent_update_check(self):
         """启动时静默检查更新（不弹窗，只在有更新时高亮按钮）"""
         try:

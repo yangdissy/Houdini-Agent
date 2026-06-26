@@ -2,6 +2,11 @@
 """AIClient adaptive thinking hint tests."""
 
 import unittest
+import sys
+from unittest import mock
+
+if "requests" not in sys.modules:
+    sys.modules["requests"] = mock.MagicMock(name="requests")
 
 from houdini_agent.utils.ai_client import AIClient
 
@@ -11,6 +16,15 @@ def _call(tool_name, args=None):
 
 
 class AIClientThinkingHintTest(unittest.TestCase):
+    def test_gpt5_models_use_default_temperature(self):
+        self.assertTrue(AIClient.requires_temperature_one("gpt-5.5"))
+        self.assertTrue(AIClient.requires_temperature_one("gpt-5.3-codex"))
+        self.assertEqual(AIClient._payload_temperature("gpt-5.5", 0.17), 1)
+
+    def test_regular_models_keep_clamped_temperature(self):
+        self.assertFalse(AIClient.requires_temperature_one("chatgpt-4o-latest"))
+        self.assertEqual(AIClient._payload_temperature("chatgpt-4o-latest", 1.7), 1.0)
+
     def test_simple_create_node_success_does_not_force_think(self):
         hint = AIClient._thinking_followup_hint(
             True,

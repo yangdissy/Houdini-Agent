@@ -77,6 +77,18 @@ def show_tool(username: str = None, force_login: bool = False):
                 _main_window.activateWindow()
                 return _main_window
             else:
+                # ★ 旧窗口标记为 stale，防止其 atexit 回调在 Houdini 退出时
+                #   以旧数据覆盖新窗口写入的 manifest/session 文件
+                try:
+                    if hasattr(_main_window, 'ai_tab') and _main_window.ai_tab:
+                        _main_window.ai_tab._ai_tab_active = False
+                        try:
+                            _main_window.ai_tab._auto_save_timer.stop()
+                        except Exception:
+                            pass
+                    _main_window._already_saved = True  # 禁止旧 MainWindow atexit 再保存
+                except Exception:
+                    pass
                 _main_window.force_quit = True
                 _main_window.close()
                 _main_window.deleteLater()
