@@ -78,6 +78,7 @@ from ..core.harness_engine import (
     HarnessToolPolicyEngine,
     build_tool_retry_key,
     is_harness_v2_enabled,
+    sanitize_tool_result,
 )
 
 # ★ 大脑启发式长期记忆系统
@@ -676,12 +677,12 @@ class AITab(
                 }
             ])
             started_at = time.time()
-            result = self._execute_tool_with_todo(
+            result = self._execute_tool_impl(
                 tool_name,
-                _harness_policy_checked=True,
-                _harness_skip_confirm=True,
-                **exec_kwargs,
+                exec_kwargs,
+                skip_builtin_confirm=True,
             )
+            result = sanitize_tool_result(result)
             self._append_session_diagnostics_records([
                 {
                     'event_type': 'tool_call',
@@ -751,11 +752,8 @@ class AITab(
                 'args_keys': sorted(list(exec_kwargs.keys())),
             }
         ])
-        result = self._execute_tool_with_todo(
-            tool_name,
-            _harness_policy_checked=True,
-            **exec_kwargs,
-        )
+        result = self._execute_tool_impl(tool_name, exec_kwargs)
+        result = sanitize_tool_result(result)
         self._append_session_diagnostics_records([
             {
                 'event_type': 'tool_call',
@@ -785,10 +783,16 @@ class AITab(
         注意：此方法在后台线程调用，Houdini 操作必须通过信号调度到主线程执行。
         不依赖 hou 模块的工具（execute_shell 等）直接在后台线程执行，避免阻塞 UI。
         """
-        _policy_checked = bool(kwargs.pop('_harness_policy_checked', False))
-        _skip_builtin_confirm = bool(kwargs.pop('_harness_skip_confirm', False))
-        if self._harness_v2_enabled and not _policy_checked:
+        kwargs.pop('_harness_policy_checked', None)
+        kwargs.pop('_harness_skip_confirm', None)
+        if self._harness_v2_enabled:
             return self._execute_tool_with_policy(tool_name, kwargs)
+
+        return self._execute_tool_impl(tool_name, kwargs)
+
+    def _execute_tool_impl(self, tool_name: str, kwargs: dict, skip_builtin_confirm: bool = False) -> dict:
+        """Execute a tool after the public harness/policy boundary has run."""
+        kwargs = dict(kwargs or {})
 
         # ★ Stop 检测：用户请求停止时立即返回，不再排队新工具
         if self.client.is_stop_requested():
@@ -841,7 +845,7 @@ class AITab(
                     }
         
         # ★ 确认模式：对关键节点操作弹出预览确认
-        if (not _skip_builtin_confirm) and self._confirm_mode and tool_name in self._CONFIRM_TOOLS:
+        if (not skip_builtin_confirm) and self._confirm_mode and tool_name in self._CONFIRM_TOOLS:
             confirmed = self._request_tool_confirmation(tool_name, kwargs)
             if not confirmed:
                 return {
@@ -1300,14 +1304,15 @@ class AITab(
     # 所有注册的工具名称（用于检测伪造）
     _ALL_TOOL_NAMES = (
         'create_wrangle_node|get_network_structure'
-        '|get_node_parameters|set_node_parameter|create_node|create_nodes_batch'
-        '|connect_nodes|delete_node|search_node_types|semantic_search_nodes'
-        '|list_children|read_selection|set_display_flag'
+        '|get_node_parameters|get_parameter_schema|inspect_node|set_node_parameter|create_node|create_nodes_batch'
+        '|connect_nodes|cook_node|get_node_connections|suggest_connection|preview_node_operation'
+        '|create_named_null|validate_node_network|delete_node|search_node_types|semantic_search_nodes'
+        '|list_children|find_nodes|get_geometry_summary|get_scene_snapshot|read_selection|set_display_flag'
         '|copy_node|batch_set_parameters|find_nodes_by_param|save_hip|undo_redo'
         '|web_search|fetch_webpage|search_local_doc|get_houdini_node_doc'
         '|execute_python|execute_shell|check_errors|get_node_inputs|add_todo|update_todo'
         '|verify_and_summarize|run_skill|list_skills'
-        '|layout_nodes|get_node_positions'
+        '|layout_nodes|preview_layout_nodes|get_node_positions'
         '|perf_start_profile|perf_stop_and_report'
     )
     _FAKE_TOOL_PATTERNS = re.compile(
@@ -1947,8 +1952,7 @@ class AITab(
         try:
             from ..utils.tool_registry import get_tool_registry
             reg = get_tool_registry()
-            intents = reg.classify_intent(user_message or "")
-            selected = reg.get_tools_for_intent(intents, mode='agent')
+            selected = reg.select_tools_for_request(user_message or "", mode='agent')
         except Exception as e:
             print(f"[Tool Selection] intent selection failed, falling back to core tools: {e}")
             selected = list(HOUDINI_TOOLS)
@@ -2376,8 +2380,11 @@ class AITab(
                                      if t['function']['name'] not in ('web_search', 'fetch_webpage')]
                 tools = UltraOptimizer.optimize_tool_definitions(plan_filtered)
             elif plan_mode and plan_executing:
-                # ★ Plan 执行阶段：完整工具 + update_plan_step
-                exec_tools = list(HOUDINI_TOOLS) + [PLAN_TOOL_UPDATE_STEP]
+                # ★ Plan 执行阶段：按当前步骤意图暴露工具 + update_plan_step
+                exec_tools = self._select_agent_tools_for_message(user_last_msg, use_web=use_web)
+                exec_names = {t.get('function', {}).get('name') for t in exec_tools}
+                if PLAN_TOOL_UPDATE_STEP.get('function', {}).get('name') not in exec_names:
+                    exec_tools = list(exec_tools) + [PLAN_TOOL_UPDATE_STEP]
                 if not use_web:
                     exec_tools = [t for t in exec_tools
                                   if t['function']['name'] not in ('web_search', 'fetch_webpage')]

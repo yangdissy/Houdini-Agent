@@ -159,6 +159,12 @@ Skill 是运行在 Houdini 环境中的预构建 Python 分析脚本。常见几
 | `trace_node_dependencies` | 追踪上游依赖或下游影响范围 |
 | `find_attribute_references` | 搜索 VEX、表达式和字符串参数中的属性引用 |
 | `analyze_cook_performance` | 全网络 cook 时间排名和瓶颈分析 |
+| `inspect_scene_context` | 当前 hip、帧、take、选择、网络和 UI pane 上下文 |
+| `analyze_groups` | point、primitive、edge 组数量、空组和成员采样 |
+| `inspect_material_assignments` | 材质节点、赋值、丢失引用和未使用材质路径 |
+| `inspect_lop_stage` | USD stage 图层、prim 类型统计、相机、灯光、引用和 payload |
+| `validate_network_contract` | 检查 OUT/null、显示/渲染标志、缺失输入、错误和死节点 |
+| `cache_node_report` | 缓存/导出节点路径、帧范围、磁盘存在性和修改时间摘要 |
 
 内置 Skill 位于 [houdini_agent/skills](houdini_agent/skills)。用户 Skill 目录可在插件管理器中配置。
 

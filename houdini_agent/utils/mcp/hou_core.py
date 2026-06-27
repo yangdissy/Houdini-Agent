@@ -81,17 +81,6 @@ def connect_nodes(output_path: str, input_path: str, input_index: int = 0) -> Tu
         return False, f"输入端口索引 {input_index} 无效 (有效范围 0~{max_inputs - 1})"
     try:
         input_node.setInput(input_index, output_node, 0)
-        try:
-            related_paths = _collect_related_layout_paths([output_node, input_node])
-            if related_paths:
-                layout_nodes(
-                    parent_path=input_node.parent().path(),
-                    node_paths=related_paths,
-                    method="tidy",
-                    spacing=1.0,
-                )
-        except Exception:
-            pass
         return True, f"已连接 {output_path} -> {input_path}[{input_index}]"
     except Exception as e:
         return False, f"连接失败: {e}"
@@ -389,6 +378,25 @@ def layout_nodes(
                     parent.layoutChildren()
                     layout_method_used = "layoutChildren(no-spacing)"
 
+        elif method == "native":
+            # 使用 Houdini 原生布局（借鉴 moveToGoodPosition 思路）
+            # 对指定节点子集调用 layoutChildren(items=...) 或逐个 moveToGoodPosition
+            try:
+                parent.layoutChildren(
+                    items=nodes,
+                    horizontal_spacing=3.0 * spacing,
+                    vertical_spacing=1.5 * spacing,
+                )
+                layout_method_used = "native(layoutChildren-items)"
+            except TypeError:
+                # 旧版 Houdini：逐个 moveToGoodPosition（保留上游节点为锚点）
+                for n in nodes:
+                    try:
+                        n.moveToGoodPosition()
+                    except Exception:
+                        pass
+                layout_method_used = "native(moveToGoodPosition)"
+
         elif method in ("tidy", "columns"):
             _layout_columns(nodes, spacing)
             layout_method_used = "tidy" if method == "tidy" else "columns(tidy)"
@@ -427,8 +435,8 @@ def _layout_grid(nodes: list, spacing: float = 1.0) -> None:
         return
     import math
     cols = max(1, int(math.ceil(math.sqrt(len(nodes)))))
-    h_sp = 3.5 * spacing
-    v_sp = 1.5 * spacing
+    h_sp = 5.5 * spacing
+    v_sp = 2.0 * spacing
     for idx, node in enumerate(nodes):
         col = idx % cols
         row = idx // cols
@@ -485,8 +493,10 @@ def _compute_tidy_layout(
         return {}
 
     spacing = max(float(spacing or 1.0), 0.2)
-    h_sp = 3.6 * spacing
-    v_sp = 1.7 * spacing
+    # h_sp: Houdini 节点宽度约 70px (~3.2 hou units)，标签最多 ~20 chars (~2.4 hou units)。
+    # 5.5 units 保证最短标签不重叠；长标签通过后续 collision pass 继续推开。
+    h_sp = 5.5 * spacing
+    v_sp = 2.0 * spacing
     order = {node_id: idx for idx, node_id in enumerate(node_ids)}
     node_set = set(node_ids)
     filtered_edges = [
@@ -605,6 +615,27 @@ def _compute_tidy_layout(
         iso_x = main_max_x + h_sp * 1.6
         for idx, node_id in enumerate(isolated):
             positions[node_id] = (iso_x, -idx * v_sp)
+
+    # ── Label-aware collision pass ──────────────────────────────────────────
+    # 估算节点名宽度（每字符 ~0.12 hou units，最小节点宽 3.2 units）
+    def _estimate_width(node_id: str) -> float:
+        name = node_id.rsplit('/', 1)[-1]
+        return max(3.2, len(name) * 0.12 + 2.4)
+
+    # 按层扫一遍，检测并消除 x 轴重叠
+    for layer_index in sorted(layers):
+        layer_nodes_sorted = sorted(layers[layer_index], key=lambda nid: x_pos.get(nid, 0.0))
+        for i in range(1, len(layer_nodes_sorted)):
+            prev_id = layer_nodes_sorted[i - 1]
+            curr_id = layer_nodes_sorted[i]
+            prev_x = x_pos.get(prev_id, 0.0)
+            prev_w = _estimate_width(prev_id)
+            curr_x = x_pos.get(curr_id, 0.0)
+            min_x = prev_x + prev_w * 0.5 + _estimate_width(curr_id) * 0.5 + 0.3
+            if curr_x < min_x:
+                x_pos[curr_id] = min_x
+                layer_nodes_sorted[i] = curr_id  # keep sorted view consistent
+    # ────────────────────────────────────────────────────────────────────────
 
     if original_positions:
         selected_positions = [original_positions.get(node_id, (0.0, 0.0)) for node_id in node_ids]

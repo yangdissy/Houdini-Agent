@@ -46,6 +46,21 @@ class InferHelpersTest(unittest.TestCase):
         self.assertIn("readonly", tags)
         self.assertIn("network", tags)
 
+    def test_new_query_tools_are_readonly_network_tools(self):
+        for name in (
+            "get_parameter_schema", "inspect_node", "get_node_connections",
+            "suggest_connection", "preview_node_operation", "validate_node_network",
+            "find_nodes", "get_geometry_summary", "get_scene_snapshot",
+            "preview_layout_nodes",
+        ):
+            with self.subTest(tool=name):
+                self.assertIn("readonly", _infer_tags(name))
+                self.assertIn("network", _infer_tags(name))
+                self.assertEqual(
+                    _infer_modes(name),
+                    {"agent", "plan_executing", "ask", "plan_planning"},
+                )
+
     def test_tags_system(self):
         self.assertIn("system", _infer_tags("execute_shell"))
 
@@ -209,6 +224,81 @@ class IntentTest(unittest.TestCase):
         # 带 create 意图后应包含 create_node
         names2 = {s["function"]["name"] for s in self.reg.get_tools_for_intent({"create"}, "agent")}
         self.assertIn("create_node", names2)
+
+    def test_connection_request_selects_preview_and_connection_tools(self):
+        for name in (
+            "connect_nodes", "get_node_connections", "get_node_inputs",
+            "suggest_connection", "preview_node_operation",
+        ):
+            self.reg.register(name, _schema(name), modes={"agent"})
+
+        names = {
+            s["function"]["name"]
+            for s in self.reg.select_tools_for_request("把 box 接到 mountain 第一个输入", "agent")
+        }
+
+        self.assertIn("connect_nodes", names)
+        self.assertIn("get_node_connections", names)
+        self.assertIn("suggest_connection", names)
+        self.assertIn("preview_node_operation", names)
+
+    def test_parameter_request_selects_schema_before_mutation(self):
+        for name in ("set_node_parameter", "get_parameter_schema", "inspect_node", "connect_nodes"):
+            self.reg.register(name, _schema(name), modes={"agent"})
+
+        names = {
+            s["function"]["name"]
+            for s in self.reg.select_tools_for_request("设置这个节点参数 scale", "agent")
+        }
+
+        self.assertIn("set_node_parameter", names)
+        self.assertIn("get_parameter_schema", names)
+        self.assertIn("inspect_node", names)
+        self.assertNotIn("connect_nodes", names)
+
+    def test_named_null_request_gets_safe_helper_tools(self):
+        for name in (
+            "create_named_null", "get_node_connections", "suggest_connection",
+            "preview_node_operation", "validate_node_network",
+        ):
+            self.reg.register(name, _schema(name), modes={"agent"})
+
+        names = {
+            s["function"]["name"]
+            for s in self.reg.select_tools_for_request("创建一个 OUT_ 命名 null", "agent")
+        }
+
+        self.assertIn("create_named_null", names)
+        self.assertIn("preview_node_operation", names)
+        self.assertIn("validate_node_network", names)
+
+    def test_high_risk_tools_not_selected_without_explicit_code_or_file_intent(self):
+        for name in ("execute_shell", "execute_python", "save_hip", "get_network_structure"):
+            self.reg.register(name, _schema(name), modes={"agent"})
+
+        names = {
+            s["function"]["name"]
+            for s in self.reg.select_tools_for_request("看看当前网络结构", "agent")
+        }
+
+        self.assertIn("get_network_structure", names)
+        self.assertNotIn("execute_shell", names)
+        self.assertNotIn("execute_python", names)
+        self.assertNotIn("save_hip", names)
+
+    def test_ask_mode_filters_mutating_dependency_tools(self):
+        for name in ("connect_nodes", "get_node_connections", "preview_node_operation"):
+            modes = {"agent", "ask"} if name != "connect_nodes" else {"agent"}
+            self.reg.register(name, _schema(name), modes=modes)
+
+        names = {
+            s["function"]["name"]
+            for s in self.reg.select_tools_for_request("connect these nodes", "ask")
+        }
+
+        self.assertIn("get_node_connections", names)
+        self.assertIn("preview_node_operation", names)
+        self.assertNotIn("connect_nodes", names)
 
 
 class ModeAllowanceTest(unittest.TestCase):

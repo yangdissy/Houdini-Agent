@@ -56,6 +56,28 @@ class CoreToolContractTest(unittest.TestCase):
         }
         self.assertFalse(CONFIRM_TOOLS & ask_names)
 
+    def test_new_query_tools_are_registered_for_ask_mode(self):
+        ask_names = {
+            schema["function"]["name"]
+            for schema in self.registry.get_tools_for_mode("ask")
+        }
+        for name in (
+            "get_parameter_schema", "inspect_node", "get_node_connections",
+            "suggest_connection", "preview_node_operation", "validate_node_network",
+            "find_nodes", "get_geometry_summary", "get_scene_snapshot",
+        ):
+            with self.subTest(tool=name):
+                self.assertIn(name, ask_names)
+
+    def test_node_operation_tools_are_registered(self):
+        core_names = set(self.registry._tools)
+        for name in (
+            "connect_nodes", "disconnect_nodes", "set_node_flags", "layout_nodes",
+            "cook_node", "create_named_null",
+        ):
+            with self.subTest(tool=name):
+                self.assertIn(name, core_names)
+
 
 if __name__ == "__main__":
     unittest.main()

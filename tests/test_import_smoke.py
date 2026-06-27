@@ -32,7 +32,7 @@ def _install_thirdparty_stubs():
     在更低版本的测试解释器上可能无法导入。本冒烟测试只关心 houdini_agent
     自身的模块结构，因此用桩模块替代这些纯运行时依赖。
     """
-    for name in ("requests", "trafilatura"):
+    for name in ("requests", "trafilatura", "numpy"):
         if name not in sys.modules:
             sys.modules[name] = mock.MagicMock(name=name)
 

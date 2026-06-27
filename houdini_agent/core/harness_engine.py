@@ -9,11 +9,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .harness_policy_config import HIGH_RISK_TOOLS
+from .harness_policy_config import (
+    HIGH_RISK_TOOLS,
+    PYTHON_DANGEROUS_PATTERNS,
+    SECRET_REDACTION_PATTERNS,
+    SENSITIVE_ARG_KEYS,
+    SENSITIVE_VALUE_PATTERNS,
+    SHELL_DANGEROUS_PATTERNS,
+)
 
 
 def _parse_bool(value: str, default: bool = False) -> bool:
@@ -50,6 +58,56 @@ def build_tool_retry_key(tool_name: str, args: Optional[Dict[str, Any]]) -> str:
         payload = repr(payload_obj)
     digest = hashlib.sha1(payload.encode("utf-8", errors="ignore")).hexdigest()[:12]
     return f"{tool_name}:{digest}"
+
+
+def redact_secrets(value: Any) -> Any:
+    """Redact sensitive text from tool outputs before UI/LLM reuse."""
+    if isinstance(value, str):
+        text = value
+        for pattern, replacement in SECRET_REDACTION_PATTERNS:
+            text = re.sub(pattern, replacement, text, flags=re.DOTALL)
+        return text
+    if isinstance(value, dict):
+        redacted: Dict[str, Any] = {}
+        for key, child in value.items():
+            key_text = str(key).strip().lower()
+            if key_text in SENSITIVE_ARG_KEYS or key_text.endswith(("_api_key", "_token", "_password", "_secret")):
+                redacted[key] = "[REDACTED]"
+            else:
+                redacted[key] = redact_secrets(child)
+        return redacted
+    if isinstance(value, list):
+        return [redact_secrets(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_secrets(item) for item in value)
+    return value
+
+
+def sanitize_tool_result(result: Any) -> Dict[str, Any]:
+    """Normalize tool result shape and redact secrets.
+
+    The harness contract is always {success: bool, result/error: ...}. Extra
+    metadata is preserved after recursive redaction.
+    """
+    if not isinstance(result, dict):
+        return {"success": False, "error": f"Invalid tool result type: {type(result).__name__}"}
+
+    sanitized = redact_secrets(dict(result))
+    success = bool(sanitized.get("success", False))
+    sanitized["success"] = success
+    if success:
+        sanitized.setdefault("result", "")
+        if sanitized.get("error") is None:
+            sanitized.pop("error", None)
+    else:
+        error = sanitized.get("error")
+        if error is None or error == "":
+            if "result" in sanitized and sanitized.get("result") not in (None, ""):
+                error = sanitized.get("result")
+            else:
+                error = "Tool returned unsuccessful result without error details"
+        sanitized["error"] = str(error)
+    return sanitized
 
 
 @dataclass
@@ -97,14 +155,23 @@ class HarnessToolPolicyEngine:
     _DANGEROUS_TOOLS = HIGH_RISK_TOOLS
 
     _REQUIRED_ARG_KEYS = {
+        "execute_python": ("code",),
+        "execute_shell": ("command",),
         "get_node_parameters": ("node_path",),
+        "get_parameter_schema": ("node_path",),
+        "inspect_node": ("node_path",),
+        "get_geometry_summary": ("node_path",),
         "list_children": ("node_path",),
         "delete_node": ("node_path",),
         "rename_node": ("node_path",),
         "set_node_parameter": ("node_path",),
         "batch_set_parameters": ("node_path",),
         "connect_nodes": ("from_path", "to_path"),
+        "create_named_null": ("name",),
+        "cook_node": ("node_path",),
         "disconnect_nodes": ("node_path",),
+        "get_node_connections": ("node_path",),
+        "suggest_connection": ("from_path", "to_path"),
         "copy_node": ("source_path",),
         "set_display_flag": ("node_path",),
         "set_node_flags": ("node_path",),
@@ -123,10 +190,27 @@ class HarnessToolPolicyEngine:
         "from_path",
         "to_path",
         "path",
+        "root_path",
+    })
+
+    _HOUDINI_ROOTS = frozenset({
+        "/obj",
+        "/out",
+        "/shop",
+        "/stage",
+        "/tasks",
+        "/ch",
+        "/mat",
+        "/img",
+        "/cop",
     })
 
     def decide(self, tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> ToolPolicyDecision:
         safe_args = self._normalize_args(args)
+
+        input_violation = self._check_input_guardrails(tool_name, safe_args)
+        if input_violation:
+            return ToolPolicyDecision(action="deny", reason=input_violation)
 
         mode = context.get("mode", "agent")
         confirm_mode = bool(context.get("confirm_mode", False))
@@ -173,6 +257,99 @@ class HarnessToolPolicyEngine:
             )
 
         return ToolPolicyDecision(action="allow")
+
+    def _check_input_guardrails(self, tool_name: str, args: Dict[str, Any]) -> str:
+        sensitive_reason = self._check_sensitive_args(args)
+        if sensitive_reason:
+            return sensitive_reason
+
+        path_reason = self._check_path_args(args)
+        if path_reason:
+            return path_reason
+
+        if tool_name == "execute_python":
+            return self._match_patterns(
+                str(args.get("code") or ""),
+                PYTHON_DANGEROUS_PATTERNS,
+                "Tool input guardrail blocked dangerous Python",
+            )
+
+        if tool_name == "execute_shell":
+            return self._match_patterns(
+                str(args.get("command") or ""),
+                SHELL_DANGEROUS_PATTERNS,
+                "Tool input guardrail blocked dangerous shell command",
+                flags=re.IGNORECASE,
+            )
+
+        return ""
+
+    def _check_sensitive_args(self, args: Dict[str, Any]) -> str:
+        for key, value in self._walk_args(args):
+            key_text = str(key or "").strip().lower()
+            if key_text in SENSITIVE_ARG_KEYS or key_text.endswith(("_api_key", "_token", "_password", "_secret")):
+                return f"Tool input guardrail blocked sensitive argument: {key}"
+            if isinstance(value, str):
+                reason = self._match_patterns(
+                    value,
+                    SENSITIVE_VALUE_PATTERNS,
+                    "Tool input guardrail blocked sensitive value",
+                    flags=re.IGNORECASE,
+                )
+                if reason:
+                    return reason
+        return ""
+
+    def _check_path_args(self, args: Dict[str, Any]) -> str:
+        for key in self._NORMALIZE_KEYS:
+            value = args.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            reason = self._validate_path_arg(key, value.strip())
+            if reason:
+                return reason
+        return ""
+
+    def _validate_path_arg(self, key: str, path: str) -> str:
+        normalized = path.replace("\\", "/")
+        parts = [part for part in normalized.split("/") if part]
+        if ".." in parts:
+            return f"Tool input guardrail blocked path traversal in {key}"
+        if "\x00" in normalized:
+            return f"Tool input guardrail blocked invalid path in {key}"
+
+        if key == "output_path":
+            return ""
+
+        if normalized.startswith("/") and not any(
+            normalized == root or normalized.startswith(root + "/") for root in self._HOUDINI_ROOTS
+        ):
+            return f"Tool input guardrail blocked unsupported Houdini path root in {key}: {path}"
+
+        return ""
+
+    @staticmethod
+    def _match_patterns(
+        text: str,
+        patterns: Iterable[Tuple[str, str]],
+        prefix: str,
+        flags: int = 0,
+    ) -> str:
+        for pattern, rule_id in patterns:
+            if re.search(pattern, text or "", flags):
+                return f"{prefix}: {rule_id}"
+        return ""
+
+    @classmethod
+    def _walk_args(cls, value: Any, key: str = ""):
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                yield from cls._walk_args(child_value, str(child_key))
+        elif isinstance(value, list):
+            for child_value in value:
+                yield from cls._walk_args(child_value, key)
+        else:
+            yield key, value
 
     def _normalize_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
         out: Dict[str, Any] = {}

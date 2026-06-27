@@ -13,6 +13,7 @@ Skill 是预定义的 Python 代码片段，在 Houdini 环境中执行。
 
 import os
 import importlib
+import importlib.util
 import traceback
 from typing import Dict, Any, Optional, List
 from pathlib import Path

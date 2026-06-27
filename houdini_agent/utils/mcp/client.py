@@ -10,6 +10,9 @@ import sys
 import re
 import time
 import json
+import fnmatch
+import itertools
+import difflib
 from collections import OrderedDict
 from typing import Any, Optional, Dict, List, Tuple
 from pathlib import Path
@@ -684,13 +687,26 @@ class HoudiniMCP:
             # 输入输出连接（重要，必须读取）
             inputs = []
             for i, inp in enumerate(node.inputs()):
-                if inp is not None:
-                    inputs.append({"index": i, "node": inp.path()})
+                entry: Dict[str, Any] = {"index": i, "node": inp.path() if inp is not None else None}
+                try:
+                    entry["label"] = node.inputLabel(i)
+                except Exception:
+                    pass
+                inputs.append(entry)
             data["inputs"] = inputs
             
             outputs = []
-            for out in node.outputs():
-                outputs.append(out.path())
+            try:
+                for conn in node.outputConnections():
+                    out_node = conn.outputNode()
+                    outputs.append({
+                        "node": out_node.path() if out_node else None,
+                        "output_index": conn.outputIndex(),
+                        "input_index": conn.inputIndex(),
+                    })
+            except Exception:
+                for out in node.outputs():
+                    outputs.append({"node": out.path()})
             data["outputs"] = outputs
             
             # 只读取非默认参数（部分上下文）
@@ -728,6 +744,12 @@ class HoudiniMCP:
                     continue
             
             data["parameters"] = params
+            data["parameter_count"] = len(node.parms())
+            data["child_count"] = len(node.children()) if hasattr(node, "children") else 0
+            try:
+                data["position"] = [node.position()[0], node.position()[1]]
+            except Exception:
+                pass
             
             # 可选：添加ATS引用（用于参考，但不包含在主要数据中）
             # 如果需要完整ATS信息，可以通过 get_node_type_ats 单独获取
@@ -735,6 +757,49 @@ class HoudiniMCP:
             return True, data
         except Exception as e:
             return False, {"error": f"读取节点详情失败: {str(e)}"}
+
+    def inspect_node(self, node_path: str, include_params: bool = True,
+                     max_params: int = 40, include_errors: bool = True,
+                     include_connections: bool = True,
+                     compact: bool = False) -> Tuple[bool, Dict[str, Any]]:
+        """Return structured node state for quick AI inspection."""
+        ok, data = self.get_node_details(node_path)
+        if not ok:
+            return ok, data
+
+        max_params = max(0, min(int(max_params), 200))
+        if compact:
+            include_params = False
+            include_connections = False
+            include_errors = False
+
+        result: Dict[str, Any] = {
+            "name": data.get("name"),
+            "path": data.get("path"),
+            "type": data.get("type"),
+            "type_label": data.get("type_label"),
+            "comment": data.get("comment"),
+            "flags": data.get("flags", {}),
+            "position": data.get("position"),
+            "child_count": data.get("child_count", 0),
+            "parameter_count": data.get("parameter_count", 0),
+        }
+
+        if include_errors:
+            result["errors"] = data.get("errors", [])
+
+        if include_connections:
+            result["inputs"] = data.get("inputs", [])
+            result["outputs"] = data.get("outputs", [])
+
+        if include_params:
+            params = data.get("parameters", {})
+            param_items = list(params.items())[:max_params]
+            result["parameters"] = {name: value for name, value in param_items}
+            result["parameters_truncated"] = len(params) > len(param_items)
+            result["non_default_parameter_count"] = len(params)
+
+        return True, result
 
     def get_node_details_text(self, node_path: str) -> Tuple[bool, str]:
         """获取节点详情的文本描述（优化版：只显示部分上下文）"""
@@ -1264,6 +1329,252 @@ class HoudiniMCP:
         except Exception as e:
             return False, f"获取几何体信息失败: {str(e)}"
 
+    def _resolve_geometry_node(self, node_path: str) -> Tuple[Optional[Any], Optional[str]]:
+        node = hou.node(node_path) if hou else None
+        if node is None:
+            return None, f"未找到节点: {node_path}"
+
+        try:
+            node.geometry()
+            return node, None
+        except Exception:
+            pass
+
+        try:
+            display_node = node.displayNode() if hasattr(node, "displayNode") else None
+            if display_node is not None:
+                return display_node, None
+        except Exception:
+            pass
+
+        return node, None
+
+    def _attribute_summary(self, attributes: Any) -> List[Dict[str, Any]]:
+        entries = []
+        for attrib in attributes:
+            try:
+                data_type = attrib.dataType()
+                entries.append({
+                    "name": attrib.name(),
+                    "type": data_type.name() if hasattr(data_type, "name") else str(data_type),
+                    "size": attrib.size(),
+                })
+            except Exception:
+                continue
+        return entries
+
+    def _element_attrib_value(self, element: Any, attrib: Any) -> Any:
+        try:
+            return self._jsonable_value(element.attribValue(attrib))
+        except Exception:
+            return None
+
+    def get_geometry_summary(self, node_path: str, max_sample_points: int = 50,
+                             include_attributes: bool = True,
+                             include_groups: bool = True,
+                             sample_attributes: Optional[List[str]] = None,
+                             sample_primitives: bool = False) -> Tuple[bool, Dict[str, Any]]:
+        """Return structured geometry facts and bounded samples for a SOP node."""
+        if hou is None:
+            return False, {"error": "未检测到 Houdini API"}
+        if not node_path:
+            return False, {"error": "缺少 node_path 参数"}
+
+        node, error = self._resolve_geometry_node(node_path)
+        if error:
+            return False, {"error": error}
+
+        assert node is not None
+        max_sample_points = max(0, min(int(max_sample_points), 500))
+        sample_attributes = [str(name) for name in (sample_attributes or []) if str(name).strip()]
+
+        try:
+            cook_state = "unknown"
+            try:
+                if hasattr(node, "needsToCook") and node.needsToCook():
+                    cook_state = "dirty"
+                    node.cook(force=True)
+                cook_state = "cooked"
+            except Exception:
+                cook_state = "error"
+
+            try:
+                geo = node.geometry()
+            except Exception as exc:
+                return False, {"error": f"节点 {node.path()} 没有可读取几何体: {exc}"}
+            if geo is None:
+                return False, {"error": f"节点 {node.path()} 没有几何体输出"}
+
+            result: Dict[str, Any] = {
+                "node_path": node.path(),
+                "requested_path": node_path,
+                "node_type": node.type().name() if node.type() else "unknown",
+                "cook_state": cook_state,
+                "point_count": geo.intrinsicValue("pointcount"),
+                "primitive_count": geo.intrinsicValue("primitivecount"),
+                "vertex_count": geo.intrinsicValue("vertexcount"),
+                "sample_limit": max_sample_points,
+            }
+
+            try:
+                bbox = geo.boundingBox()
+                result["bounding_box"] = {
+                    "min": self._jsonable_value(bbox.minvec()),
+                    "max": self._jsonable_value(bbox.maxvec()),
+                    "size": self._jsonable_value(bbox.sizevec()),
+                    "center": self._jsonable_value(bbox.center()),
+                }
+            except Exception:
+                result["bounding_box"] = None
+
+            if include_attributes:
+                result["attributes"] = {
+                    "point": self._attribute_summary(geo.pointAttribs()),
+                    "primitive": self._attribute_summary(geo.primAttribs()),
+                    "vertex": self._attribute_summary(geo.vertexAttribs()),
+                    "detail": self._attribute_summary(geo.globalAttribs()),
+                }
+
+            if include_groups:
+                try:
+                    point_groups = [group.name() for group in geo.pointGroups()]
+                except Exception:
+                    point_groups = []
+                try:
+                    prim_groups = [group.name() for group in geo.primGroups()]
+                except Exception:
+                    prim_groups = []
+                result["groups"] = {"point": point_groups, "primitive": prim_groups}
+
+            if max_sample_points > 0:
+                point_attribs = {attrib.name(): attrib for attrib in geo.pointAttribs()}
+                selected_names = sample_attributes or (["P"] if "P" in point_attribs else [])
+                missing = [name for name in selected_names if name not in point_attribs]
+                selected = [point_attribs[name] for name in selected_names if name in point_attribs]
+                sample_points = []
+                for point in itertools.islice(geo.iterPoints(), max_sample_points):
+                    row = {"number": point.number()}
+                    for attrib in selected:
+                        row[attrib.name()] = self._element_attrib_value(point, attrib)
+                    sample_points.append(row)
+                result["sample_points"] = sample_points
+                if missing:
+                    result["missing_sample_attributes"] = missing
+
+                if sample_primitives:
+                    prim_attribs = {attrib.name(): attrib for attrib in geo.primAttribs()}
+                    prim_selected = [prim_attribs[name] for name in sample_attributes if name in prim_attribs]
+                    sample_prims = []
+                    for prim in itertools.islice(geo.iterPrims(), max_sample_points):
+                        row = {"number": prim.number(), "type": prim.type().name()}
+                        for attrib in prim_selected:
+                            row[attrib.name()] = self._element_attrib_value(prim, attrib)
+                        sample_prims.append(row)
+                    result["sample_primitives"] = sample_prims
+
+            return True, result
+        except Exception as exc:
+            return False, {"error": f"获取几何摘要失败: {exc}"}
+
+    def get_scene_snapshot(self, root_path: str = "/obj", include_params: bool = False,
+                           max_depth: int = 6, max_nodes: int = 300) -> Tuple[bool, Dict[str, Any]]:
+        """Serialize a bounded, read-only scene tree for planning and comparison."""
+        if hou is None:
+            return False, {"error": "未检测到 Houdini API"}
+
+        root = hou.node(root_path or "/obj")
+        if root is None:
+            return False, {"error": f"未找到根节点: {root_path}"}
+
+        max_depth = max(0, min(int(max_depth), 12))
+        max_nodes = max(1, min(int(max_nodes), 1000))
+        visited = 0
+        truncated = False
+
+        def snapshot_node(node: Any, depth: int = 0) -> Dict[str, Any]:
+            nonlocal visited, truncated
+            visited += 1
+            node_type = node.type()
+            errors = []
+            warnings = []
+            try:
+                errors = [str(item) for item in node.errors()]
+            except Exception:
+                pass
+            try:
+                warnings = [str(item) for item in node.warnings()]
+            except Exception:
+                pass
+
+            item: Dict[str, Any] = {
+                "name": node.name(),
+                "path": node.path(),
+                "type": node_type.name() if node_type else "unknown",
+                "category": node_type.category().name() if node_type else "unknown",
+                "child_count": len(node.children()) if hasattr(node, "children") else 0,
+                "input_count": len([inp for inp in node.inputs() if inp is not None]) if hasattr(node, "inputs") else 0,
+                "output_count": len(node.outputs()) if hasattr(node, "outputs") else 0,
+                "has_errors": bool(errors),
+                "has_warnings": bool(warnings),
+            }
+
+            if errors:
+                item["errors"] = errors[:5]
+            if warnings:
+                item["warnings"] = warnings[:5]
+
+            flags = []
+            for attr, label in (("isDisplayFlagSet", "display"), ("isRenderFlagSet", "render"),
+                                ("isBypassed", "bypass"), ("isTemplateFlagSet", "template")):
+                try:
+                    if hasattr(node, attr) and getattr(node, attr)():
+                        flags.append(label)
+                except Exception:
+                    pass
+            if flags:
+                item["flags"] = flags
+
+            if include_params:
+                params = {}
+                for parm_tuple in list(node.parmTuples())[:80]:
+                    try:
+                        params[parm_tuple.name()] = self._parm_tuple_value(parm_tuple)
+                    except Exception:
+                        continue
+                item["parameters"] = params
+
+            if depth >= max_depth:
+                if item["child_count"]:
+                    item["children_truncated"] = True
+                return item
+
+            children = []
+            try:
+                for child in node.children():
+                    if visited >= max_nodes:
+                        truncated = True
+                        break
+                    children.append(snapshot_node(child, depth + 1))
+            except Exception:
+                pass
+            if children:
+                item["children"] = children
+            return item
+
+        try:
+            root_snapshot = snapshot_node(root)
+            return True, {
+                "root_path": root.path(),
+                "include_params": include_params,
+                "max_depth": max_depth,
+                "max_nodes": max_nodes,
+                "node_count": visited,
+                "truncated": truncated,
+                "scene": root_snapshot,
+            }
+        except Exception as exc:
+            return False, {"error": f"获取场景快照失败: {exc}"}
+
     def set_display_flag(self, node_path: str, display: bool = True, 
                          render: bool = True) -> Tuple[bool, str]:
         """设置显示/渲染标志"""
@@ -1391,6 +1702,243 @@ class HoudiniMCP:
             return True, header + ":\n" + "\n".join(results[:50])
         
         return False, f"未找到包含参数 '{param_name}' 的节点"
+
+    def _jsonable_value(self, value: Any) -> Any:
+        """Convert Houdini/Python values to JSON-friendly primitives."""
+        try:
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            if isinstance(value, (list, tuple)):
+                return [self._jsonable_value(v) for v in value]
+            if isinstance(value, dict):
+                return {str(k): self._jsonable_value(v) for k, v in value.items()}
+            if hou and hasattr(value, "path"):
+                return value.path()
+            if hou and hasattr(value, "name"):
+                return value.name()
+            return str(value)
+        except Exception:
+            return str(value)
+
+    def _parm_tuple_value(self, parm_tuple: Any) -> Any:
+        try:
+            value = parm_tuple.eval()
+        except Exception:
+            try:
+                value = [parm.eval() for parm in parm_tuple]
+            except Exception:
+                return None
+        value = self._jsonable_value(value)
+        if isinstance(value, list) and len(value) == 1:
+            return value[0]
+        return value
+
+    def _parm_template_info(self, node: Any, parm_tuple: Any) -> Dict[str, Any]:
+        template = parm_tuple.parmTemplate()
+        entry: Dict[str, Any] = {
+            "name": parm_tuple.name(),
+            "label": template.label() if hasattr(template, "label") else parm_tuple.name(),
+            "type": template.type().name() if hasattr(template, "type") else "Unknown",
+            "tuple_size": len(parm_tuple),
+            "current_value": self._parm_tuple_value(parm_tuple),
+        }
+
+        try:
+            default = self._jsonable_value(template.defaultValue())
+            if isinstance(default, list) and len(default) == 1:
+                default = default[0]
+            entry["default"] = default
+        except Exception:
+            pass
+
+        for method_name, key in (("minValue", "min"), ("maxValue", "max")):
+            try:
+                entry[key] = self._jsonable_value(getattr(template, method_name)())
+            except Exception:
+                pass
+
+        try:
+            menu_items = list(template.menuItems())
+            if menu_items:
+                labels = list(template.menuLabels()) if hasattr(template, "menuLabels") else menu_items
+                entry["menu_items"] = [
+                    {"token": str(token), "label": str(label)}
+                    for token, label in zip(menu_items[:40], labels[:40])
+                ]
+                if len(menu_items) > 40:
+                    entry["menu_truncated"] = len(menu_items)
+        except Exception:
+            pass
+
+        try:
+            entry["is_hidden"] = bool(template.isHidden())
+        except Exception:
+            entry["is_hidden"] = False
+
+        try:
+            first_parm = node.parm(parm_tuple.name())
+            if first_parm is not None and hasattr(first_parm, "isTimeDependent"):
+                entry["is_time_dependent"] = bool(first_parm.isTimeDependent())
+        except Exception:
+            pass
+
+        return entry
+
+    def get_parameter_schema(self, node_path: str, pattern: Optional[str] = None,
+                             offset: int = 0, limit: int = 80,
+                             include_hidden: bool = False) -> Tuple[bool, Dict[str, Any]]:
+        """Return structured parameter metadata for safe parameter editing."""
+        if hou is None:
+            return False, {"error": "未检测到 Houdini API"}
+
+        node = hou.node(node_path)
+        if node is None:
+            return False, {"error": f"未找到节点: {node_path}"}
+
+        offset = max(0, offset)
+        limit = max(1, min(limit, 200))
+        pattern_lc = pattern.lower() if pattern else None
+
+        try:
+            parm_tuples = []
+            for parm_tuple in node.parmTuples():
+                try:
+                    template = parm_tuple.parmTemplate()
+                    hidden = bool(template.isHidden()) if hasattr(template, "isHidden") else False
+                    if hidden and not include_hidden:
+                        continue
+                    name = parm_tuple.name()
+                    label = template.label() if hasattr(template, "label") else name
+                    if pattern_lc:
+                        name_lc = name.lower()
+                        label_lc = label.lower()
+                        if not (fnmatch.fnmatch(name_lc, pattern_lc) or fnmatch.fnmatch(label_lc, pattern_lc)):
+                            continue
+                    parm_tuples.append(parm_tuple)
+                except Exception:
+                    continue
+
+            sliced = parm_tuples[offset:offset + limit]
+            node_type = node.type()
+            parameters = [self._parm_template_info(node, parm_tuple) for parm_tuple in sliced]
+            next_offset = offset + len(parameters) if offset + len(parameters) < len(parm_tuples) else None
+            return True, {
+                "node_path": node.path(),
+                "node_type": node_type.name() if node_type else "unknown",
+                "node_category": node_type.category().name() if node_type else "unknown",
+                "pattern": pattern,
+                "include_hidden": include_hidden,
+                "total": len(parm_tuples),
+                "offset": offset,
+                "limit": limit,
+                "count": len(parameters),
+                "has_more": next_offset is not None,
+                "next_offset": next_offset,
+                "parameters": parameters,
+            }
+        except Exception as e:
+            return False, {"error": f"获取参数 schema 失败: {str(e)}"}
+
+    def find_nodes(self, root_path: str = "/obj", name_pattern: str = "*",
+                   node_type: Optional[str] = None, category: Optional[str] = None,
+                   recursive: bool = True, max_results: int = 100,
+                   offset: int = 0) -> Tuple[bool, Dict[str, Any]]:
+        """Find nodes by name glob, type, and category without mutating the scene."""
+        if hou is None:
+            return False, {"error": "未检测到 Houdini API"}
+
+        root = hou.node(root_path or "/obj")
+        if root is None:
+            return False, {"error": f"未找到根节点: {root_path}"}
+
+        offset = max(0, offset)
+        max_results = max(1, min(max_results, 500))
+        name_pattern = name_pattern or "*"
+        name_pattern_lc = name_pattern.lower()
+        type_filter = node_type.lower() if node_type else None
+        category_filter = category.lower() if category else None
+
+        def type_matches(node: Any) -> bool:
+            if not type_filter:
+                return True
+            try:
+                node_type_obj = node.type()
+                type_name = node_type_obj.name().lower()
+                type_key = f"{node_type_obj.category().name().lower()}/{type_name}"
+                if any(ch in type_filter for ch in "*?["):
+                    return fnmatch.fnmatch(type_name, type_filter) or fnmatch.fnmatch(type_key, type_filter)
+                return type_filter in (type_name, type_key) or type_filter in type_name
+            except Exception:
+                return False
+
+        def category_matches(node: Any) -> bool:
+            if not category_filter:
+                return True
+            try:
+                return node.type().category().name().lower() == category_filter
+            except Exception:
+                return False
+
+        def node_summary(node: Any) -> Dict[str, Any]:
+            node_type_obj = node.type()
+            flags = []
+            for attr, label in (("isDisplayFlagSet", "display"), ("isRenderFlagSet", "render"),
+                                ("isBypassed", "bypass"), ("isLocked", "locked")):
+                try:
+                    if hasattr(node, attr) and getattr(node, attr)():
+                        flags.append(label)
+                except Exception:
+                    pass
+            errors = []
+            warnings = []
+            try:
+                errors = list(node.errors())
+            except Exception:
+                pass
+            try:
+                warnings = list(node.warnings())
+            except Exception:
+                pass
+            return {
+                "name": node.name(),
+                "path": node.path(),
+                "type": node_type_obj.name() if node_type_obj else "unknown",
+                "category": node_type_obj.category().name() if node_type_obj else "unknown",
+                "flags": flags,
+                "input_count": len([inp for inp in node.inputs() if inp is not None]) if hasattr(node, "inputs") else 0,
+                "output_count": len(node.outputs()) if hasattr(node, "outputs") else 0,
+                "child_count": len(node.children()) if hasattr(node, "children") else 0,
+                "has_errors": bool(errors),
+                "has_warnings": bool(warnings),
+            }
+
+        try:
+            candidates = list(root.allSubChildren()) if recursive else list(root.children())
+            matches = [
+                node for node in candidates
+                if fnmatch.fnmatch(node.name().lower(), name_pattern_lc)
+                and type_matches(node)
+                and category_matches(node)
+            ]
+            page_nodes = matches[offset:offset + max_results]
+            nodes = [node_summary(node) for node in page_nodes]
+            next_offset = offset + len(nodes) if offset + len(nodes) < len(matches) else None
+            return True, {
+                "root_path": root.path(),
+                "name_pattern": name_pattern,
+                "node_type": node_type,
+                "category": category,
+                "recursive": recursive,
+                "total_matches": len(matches),
+                "offset": offset,
+                "max_results": max_results,
+                "count": len(nodes),
+                "has_more": next_offset is not None,
+                "next_offset": next_offset,
+                "nodes": nodes,
+            }
+        except Exception as e:
+            return False, {"error": f"查找节点失败: {str(e)}"}
 
     def save_hip(self, file_path: Optional[str] = None) -> Tuple[bool, str]:
         """保存 HIP 文件"""
@@ -1918,8 +2466,9 @@ class HoudiniMCP:
     # 节点连接
     # ========================================
     
-    def connect_nodes(self, output_node_path: str, input_node_path: str, 
-                      input_index: int = 0) -> Tuple[bool, str]:
+    def connect_nodes(self, output_node_path: str, input_node_path: str,
+                      input_index: int = 0, output_index: int = 0,
+                      replace: bool = True) -> Tuple[bool, str]:
         """连接两个节点"""
         if hou is None:
             return False, "未检测到 Houdini API"
@@ -1933,20 +2482,17 @@ class HoudiniMCP:
             return False, f"未找到输入节点: {input_node_path}"
         
         try:
-            in_node.setInput(int(input_index), out_node, 0)
-            try:
-                from . import hou_core
-                related_paths = hou_core._collect_related_layout_paths([out_node, in_node])
-                if related_paths:
-                    hou_core.layout_nodes(
-                        parent_path=in_node.parent().path(),
-                        node_paths=related_paths,
-                        method="tidy",
-                        spacing=1.0,
-                    )
-            except Exception:
-                pass
-            return True, f"已连接: {output_node_path} → {input_node_path}[{input_index}]"
+            input_idx = int(input_index)
+            output_idx = int(output_index)
+            max_inputs = in_node.type().maxNumInputs()
+            if input_idx < 0 or input_idx >= max_inputs:
+                return False, f"输入端口索引 {input_idx} 无效 (有效范围 0~{max_inputs - 1})"
+            if output_idx < 0:
+                return False, f"输出端口索引 {output_idx} 无效"
+            if not replace and in_node.input(input_idx) is not None:
+                return False, f"{input_node_path}[{input_idx}] 已有输入；如需替换请设置 replace=true"
+            in_node.setInput(input_idx, out_node, output_idx)
+            return True, f"已连接: {output_node_path}[{output_idx}] → {input_node_path}[{input_idx}]"
         except Exception as exc:
             return False, f"连接失败: {exc}"
 
@@ -1978,20 +2524,318 @@ class HoudiniMCP:
         except Exception as exc:
             return False, f"断开连接失败: {exc}"
 
+    def get_node_connections(self, node_path: str) -> Tuple[bool, Dict[str, Any]]:
+        """读取节点输入/输出连接细节。"""
+        if hou is None:
+            return False, {"error": "未检测到 Houdini API"}
+        node = hou.node(node_path)
+        if node is None:
+            return False, {"error": f"未找到节点: {node_path}"}
+
+        try:
+            node_type = node.type()
+            max_inputs = node_type.maxNumInputs() if node_type else 0
+            inputs = []
+            input_connections = {}
+            try:
+                input_connections = {conn.inputIndex(): conn for conn in node.inputConnections()}
+            except Exception:
+                input_connections = {}
+
+            for index in range(max_inputs):
+                source = None
+                try:
+                    source = node.input(index)
+                except Exception:
+                    pass
+                entry: Dict[str, Any] = {
+                    "index": index,
+                    "label": "",
+                    "connected": source is not None,
+                    "source_path": source.path() if source is not None else None,
+                    "source_type": source.type().name() if source is not None else None,
+                    "source_output_index": 0,
+                }
+                try:
+                    entry["label"] = node.inputLabel(index)
+                except Exception:
+                    pass
+                conn = input_connections.get(index)
+                if conn is not None:
+                    try:
+                        entry["source_output_index"] = conn.outputIndex()
+                    except Exception:
+                        pass
+                inputs.append(entry)
+
+            outputs = []
+            try:
+                for conn in node.outputConnections():
+                    dst = conn.outputNode()
+                    outputs.append({
+                        "target_path": dst.path() if dst is not None else None,
+                        "target_type": dst.type().name() if dst is not None else None,
+                        "output_index": conn.outputIndex(),
+                        "target_input_index": conn.inputIndex(),
+                    })
+            except Exception:
+                for dst in node.outputs():
+                    outputs.append({"target_path": dst.path(), "target_type": dst.type().name()})
+
+            return True, {
+                "path": node.path(),
+                "type": node_type.name() if node_type else "unknown",
+                "category": node_type.category().name() if node_type else "unknown",
+                "inputs": inputs,
+                "outputs": outputs,
+                "input_count": len(inputs),
+                "output_connection_count": len(outputs),
+            }
+        except Exception as exc:
+            return False, {"error": f"读取连接失败: {exc}"}
+
+    def suggest_connection(self, from_path: str, to_path: str) -> Tuple[bool, Dict[str, Any]]:
+        """根据目标输入标签和现有连接推荐 input_index。"""
+        if hou is None:
+            return False, {"error": "未检测到 Houdini API"}
+        from_node = hou.node(from_path)
+        to_node = hou.node(to_path)
+        if from_node is None:
+            return False, {"error": f"未找到上游节点: {from_path}"}
+        if to_node is None:
+            return False, {"error": f"未找到下游节点: {to_path}"}
+
+        ok, data = self.get_node_connections(to_path)
+        if not ok:
+            return ok, data
+
+        from_text = " ".join([
+            from_node.name().lower(),
+            from_node.type().name().lower(),
+            from_node.type().description().lower() if from_node.type() else "",
+        ])
+        to_type = to_node.type().name().lower() if to_node.type() else ""
+        suggestions = []
+        for entry in data.get("inputs", []):
+            index = int(entry.get("index", 0))
+            label = str(entry.get("label") or "").lower()
+            score = 100 - index
+            reasons = []
+            if not entry.get("connected"):
+                score += 50
+                reasons.append("input is empty")
+            if index == 0:
+                score += 10
+                reasons.append("primary input")
+            if any(word in from_text for word in ("point", "scatter", "pop")) and any(word in label for word in ("point", "template", "target")):
+                score += 80
+                reasons.append("point-like source matches point/template input")
+            if any(word in label for word in ("geometry", "geo", "source", "input")) and index == 0:
+                score += 30
+                reasons.append("geometry/source primary input")
+            if "merge" in to_type and not entry.get("connected"):
+                score += 60
+                reasons.append("merge prefers next empty input")
+            suggestions.append({
+                "input_index": index,
+                "label": entry.get("label", ""),
+                "connected": bool(entry.get("connected")),
+                "current_source": entry.get("source_path"),
+                "score": score,
+                "reasons": reasons,
+            })
+
+        suggestions.sort(key=lambda item: item["score"], reverse=True)
+        recommended = suggestions[0] if suggestions else {"input_index": 0, "reasons": ["fallback"]}
+        return True, {
+            "from_path": from_node.path(),
+            "to_path": to_node.path(),
+            "recommended_input_index": recommended.get("input_index", 0),
+            "output_index": 0,
+            "replace_needed": bool(recommended.get("connected", False)),
+            "recommended": recommended,
+            "candidates": suggestions,
+        }
+
+    def preview_node_operation(self, operation: str, args: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+        """Dry-run 预览节点操作影响范围。"""
+        op = (operation or "").strip()
+        if not op:
+            return False, {"error": "缺少 operation"}
+
+        if op == "connect_nodes":
+            from_path = args.get("from_path", "")
+            to_path = args.get("to_path", "")
+            input_index = int(args.get("input_index", 0) or 0)
+            output_index = int(args.get("output_index", 0) or 0)
+            ok, conns = self.get_node_connections(to_path)
+            if not ok:
+                return ok, conns
+            target_input = next((item for item in conns.get("inputs", []) if item.get("index") == input_index), None)
+            return True, {
+                "operation": op,
+                "will_modify": True,
+                "action": "connect",
+                "from_path": from_path,
+                "to_path": to_path,
+                "input_index": input_index,
+                "output_index": output_index,
+                "will_replace": bool(target_input and target_input.get("connected")),
+                "current_source": target_input.get("source_path") if target_input else None,
+            }
+        if op == "disconnect_nodes":
+            node_path = args.get("node_path", "")
+            input_index = args.get("input_index")
+            ok, conns = self.get_node_connections(node_path)
+            if not ok:
+                return ok, conns
+            affected = [item for item in conns.get("inputs", []) if item.get("connected")]
+            if input_index is not None:
+                idx = int(input_index)
+                affected = [item for item in affected if item.get("index") == idx]
+            return True, {"operation": op, "will_modify": bool(affected), "affected_inputs": affected}
+        if op == "set_node_flags":
+            node_path = args.get("node_path", "")
+            ok, data = self.inspect_node(node_path, include_params=False, compact=True)
+            if not ok:
+                return ok, data
+            requested = {key: args.get(key) for key in ("display", "render", "bypass", "template", "lock", "select", "current") if args.get(key) is not None}
+            return True, {"operation": op, "will_modify": bool(requested), "node_path": node_path, "current_flags": data.get("flags", {}), "requested_flags": requested}
+        if op in ("delete_node", "cook_node"):
+            node_path = args.get("node_path", "")
+            ok, conns = self.get_node_connections(node_path)
+            if not ok:
+                return ok, conns
+            return True, {"operation": op, "will_modify": op == "delete_node", "node_path": node_path, "connections": conns}
+        if op == "create_named_null":
+            return True, {"operation": op, "will_modify": True, "node_name": args.get("name"), "parent_path": args.get("parent_path"), "connect_from": args.get("connect_from")}
+        return False, {"error": f"不支持预览操作: {operation}"}
+
+    def create_named_null(self, parent_path: str = "", name: str = "OUT", connect_from: str = "",
+                          input_index: int = 0, output_index: int = 0,
+                          display: bool = False, render: bool = False) -> Tuple[bool, Dict[str, Any]]:
+        """创建语义化 null，可选连接上游。"""
+        if hou is None:
+            return False, {"error": "未检测到 Houdini API"}
+        parent = hou.node(parent_path) if parent_path else self._current_network()
+        if parent is None:
+            return False, {"error": "未找到目标网络"}
+        safe_name = self._sanitize_node_name(name or "OUT")
+        if not safe_name.upper().startswith(("IN_", "OUT_", "CTRL_", "CACHE_")):
+            safe_name = f"OUT_{safe_name}"
+        try:
+            node = parent.createNode("null", safe_name, run_init_scripts=False, load_contents=True, exact_type_name=False)
+            if connect_from:
+                ok, msg = self.connect_nodes(connect_from, node.path(), input_index, output_index, replace=True)
+                if not ok:
+                    node.destroy()
+                    return False, {"error": msg}
+                try:
+                    source = hou.node(connect_from)
+                    if source is not None:
+                        pos = source.position()
+                        # 偏移 2.5 单位（约 Houdini 1 格）避免与上游节点重叠
+                        node.setPosition(hou.Vector2(pos[0], pos[1] - 2.5))
+                except Exception:
+                    pass
+            else:
+                try:
+                    node.moveToGoodPosition()
+                except Exception:
+                    pass
+            if display and hasattr(node, "setDisplayFlag"):
+                node.setDisplayFlag(True)
+            if render and hasattr(node, "setRenderFlag"):
+                node.setRenderFlag(True)
+            return True, {"path": node.path(), "name": node.name(), "parent_path": parent.path(), "connected_from": connect_from or None}
+        except Exception as exc:
+            return False, {"error": f"创建 named null 失败: {exc}"}
+
+    def validate_node_network(self, root_path: str = "/obj", node_paths: Optional[List[str]] = None,
+                              max_nodes: int = 200) -> Tuple[bool, Dict[str, Any]]:
+        """验证节点网络的常见结构问题。"""
+        if hou is None:
+            return False, {"error": "未检测到 Houdini API"}
+        if node_paths:
+            nodes = [hou.node(path) for path in node_paths if hou.node(path) is not None]
+        else:
+            root = hou.node(root_path)
+            if root is None:
+                return False, {"error": f"未找到 root: {root_path}"}
+            nodes = list(root.allSubChildren())[:max_nodes]
+        node_set = {node.path() for node in nodes}
+        issues: List[Dict[str, Any]] = []
+        display_nodes = []
+        render_nodes = []
+        isolated = []
+
+        for node in nodes:
+            path = node.path()
+            try:
+                if node.errors():
+                    issues.append({"severity": "error", "node": path, "kind": "node_errors", "messages": list(node.errors())})
+                if node.warnings():
+                    issues.append({"severity": "warning", "node": path, "kind": "node_warnings", "messages": list(node.warnings())})
+            except Exception:
+                pass
+            try:
+                min_inputs = node.type().minNumInputs()
+                for index in range(min_inputs):
+                    if node.input(index) is None:
+                        issues.append({"severity": "warning", "node": path, "kind": "missing_required_input", "input_index": index})
+            except Exception:
+                pass
+            try:
+                has_inputs = any(inp is not None for inp in (node.inputs() or []))
+                has_outputs = any(out is not None and out.path() in node_set for out in (node.outputs() or []))
+                if not has_inputs and not has_outputs:
+                    isolated.append(path)
+            except Exception:
+                pass
+            try:
+                if hasattr(node, "isDisplayFlagSet") and node.isDisplayFlagSet():
+                    display_nodes.append(path)
+                if hasattr(node, "isRenderFlagSet") and node.isRenderFlagSet():
+                    render_nodes.append(path)
+            except Exception:
+                pass
+
+        if isolated:
+            issues.append({"severity": "info", "kind": "isolated_nodes", "nodes": isolated[:50], "count": len(isolated)})
+        return True, {
+            "root_path": root_path,
+            "node_count": len(nodes),
+            "issue_count": len(issues),
+            "issues": issues,
+            "display_nodes": display_nodes,
+            "render_nodes": render_nodes,
+            "truncated": not node_paths and len(nodes) >= max_nodes,
+        }
+
     def set_node_flags(self, node_path: str,
                        bypass: Optional[bool] = None,
                        template: Optional[bool] = None,
-                       lock: Optional[bool] = None) -> Tuple[bool, str]:
-        """设置节点的 bypass / template / lock 标志"""
+                       lock: Optional[bool] = None,
+                       display: Optional[bool] = None,
+                       render: Optional[bool] = None,
+                       select: Optional[bool] = None,
+                       current: Optional[bool] = None) -> Tuple[bool, str]:
+        """设置节点的 display / render / bypass / template / lock / select/current 标志"""
         if hou is None:
             return False, "未检测到 Houdini API"
         node = hou.node(node_path)
         if node is None:
             return False, f"未找到节点: {node_path}"
-        if bypass is None and template is None and lock is None:
-            return False, "至少需要指定一个标志（bypass / template / lock）"
+        if all(value is None for value in (bypass, template, lock, display, render, select, current)):
+            return False, "至少需要指定一个标志（display / render / bypass / template / lock / select / current）"
         try:
             applied = []
+            if display is not None and hasattr(node, 'setDisplayFlag'):
+                node.setDisplayFlag(display)
+                applied.append(f"display={'on' if display else 'off'}")
+            if render is not None and hasattr(node, 'setRenderFlag'):
+                node.setRenderFlag(render)
+                applied.append(f"render={'on' if render else 'off'}")
             if bypass is not None and hasattr(node, 'bypass'):
                 node.bypass(bypass)
                 applied.append(f"bypass={'on' if bypass else 'off'}")
@@ -2001,11 +2845,37 @@ class HoudiniMCP:
             if lock is not None and hasattr(node, 'setHardLocked'):
                 node.setHardLocked(lock)
                 applied.append(f"lock={'on' if lock else 'off'}")
+            if select is not None and hasattr(node, 'setSelected'):
+                node.setSelected(select, clear_all_selected=bool(select))
+                applied.append(f"select={'on' if select else 'off'}")
+            if current is not None and bool(current) and hasattr(node, 'setCurrent'):
+                node.setCurrent(True, clear_all_selected=True)
+                applied.append("current=on")
             if applied:
                 return True, f"已设置 {node_path}: {', '.join(applied)}"
             return False, f"节点类型 {node.type().name()} 不支持请求的标志"
         except Exception as exc:
             return False, f"设置标志失败: {exc}"
+
+    def cook_node(self, node_path: str, force: bool = False) -> Tuple[bool, Dict[str, Any]]:
+        """Cook 节点并返回 cook 后诊断。"""
+        if hou is None:
+            return False, {"error": "未检测到 Houdini API"}
+        node = hou.node(node_path)
+        if node is None:
+            return False, {"error": f"未找到节点: {node_path}"}
+        try:
+            node.cook(force=bool(force))
+            data = {
+                "path": node.path(),
+                "force": bool(force),
+                "errors": list(node.errors()) if hasattr(node, "errors") else [],
+                "warnings": list(node.warnings()) if hasattr(node, "warnings") else [],
+                "messages": list(node.messages()) if hasattr(node, "messages") else [],
+            }
+            return True, data
+        except Exception as exc:
+            return False, {"error": f"Cook 失败: {exc}"}
 
     # ========================================
     # 参数设置
@@ -2024,6 +2894,48 @@ class HoudiniMCP:
         node = hou.node(node_path)
         if node is None:
             return False, f"未找到节点: {node_path}", None
+
+        def parameter_not_found_message() -> str:
+            try:
+                candidates = sorted({parm_tuple.name() for parm_tuple in node.parmTuples()})
+                close = difflib.get_close_matches(param_name, candidates, n=5, cutoff=0.45)
+                hint_lower = param_name.lower()
+                contains = [name for name in candidates if hint_lower in name.lower() or name.lower() in hint_lower]
+                suggestions = []
+                for name in close + contains:
+                    if name not in suggestions:
+                        suggestions.append(name)
+                err = f"节点 {node_path} 不存在参数 '{param_name}'"
+                if suggestions:
+                    err += f"\nDid you mean: {', '.join(suggestions[:8])}?"
+                else:
+                    sample = candidates[:15]
+                    err += f"\n该节点可用参数(前15): {', '.join(sample)}"
+                    if len(candidates) > 15:
+                        err += f" ... 共 {len(candidates)} 个"
+                return err
+            except Exception:
+                return f"未找到参数: {param_name}"
+
+        def resolve_menu_value(parm_obj: Any, raw_value: Any) -> Any:
+            try:
+                template = parm_obj.parmTemplate()
+                menu_items = list(template.menuItems())
+                if not menu_items or not isinstance(raw_value, str):
+                    return raw_value
+                labels = list(template.menuLabels()) if hasattr(template, "menuLabels") else menu_items
+                raw_lc = raw_value.lower()
+                for index, token in enumerate(menu_items):
+                    if raw_lc == str(token).lower():
+                        return token
+                    if index < len(labels) and raw_lc == str(labels[index]).lower():
+                        return token
+                for index, label in enumerate(labels):
+                    if raw_lc in str(label).lower() or raw_lc in str(menu_items[index]).lower():
+                        return menu_items[index]
+            except Exception:
+                pass
+            return raw_value
         
         # 尝试获取参数
         parm = node.parm(param_name)
@@ -2031,29 +2943,18 @@ class HoudiniMCP:
             # 尝试作为元组参数
             parm_tuple = node.parmTuple(param_name)
             if parm_tuple is None:
-                # 列出相似参数名帮助 AI 纠正
-                try:
-                    all_parms = [p.name() for p in node.parms()]
-                    hint_lower = param_name.lower()
-                    similar = [p for p in all_parms if hint_lower in p.lower() or p.lower() in hint_lower][:8]
-                    err = f"节点 {node_path} 不存在参数 '{param_name}'"
-                    if similar:
-                        err += f"\n相似参数: {', '.join(similar)}"
-                    else:
-                        # 列出前 15 个参数供参考
-                        sample = all_parms[:15]
-                        err += f"\n该节点可用参数(前15): {', '.join(sample)}"
-                        if len(all_parms) > 15:
-                            err += f" ... 共 {len(all_parms)} 个"
-                except Exception:
-                    err = f"未找到参数: {param_name}"
-                return False, err, None
+                return False, parameter_not_found_message(), None
             
             if isinstance(value, (list, tuple)):
                 try:
+                    if len(value) != len(parm_tuple):
+                        return False, f"参数 {param_name} 是 {len(parm_tuple)} 维 tuple，但收到 {len(value)} 个值", None
                     # 快照旧值（元组参数）
                     old_value = list(parm_tuple.eval())
-                    parm_tuple.set(value)
+                    resolved_value = []
+                    for index, component in enumerate(parm_tuple):
+                        resolved_value.append(resolve_menu_value(component, value[index]))
+                    parm_tuple.set(resolved_value)
                     new_value = list(parm_tuple.eval())
                     snapshot = {
                         "node_path": node_path,
@@ -2077,7 +2978,8 @@ class HoudiniMCP:
             except Exception:
                 old_value = parm.eval()
             
-            parm.set(value)
+            resolved_value = resolve_menu_value(parm, value)
+            parm.set(resolved_value)
             actual_value = parm.eval()
             snapshot = {
                 "node_path": node_path,
@@ -2705,6 +3607,39 @@ class HoudiniMCP:
         except Exception as e:
             return {"success": False, "error": f"获取参数失败: {str(e)}"}
 
+    def _tool_get_parameter_schema(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_path = args.get("node_path", "")
+        if not node_path:
+            return {"success": False, "error": "缺少 node_path 参数"}
+
+        ok, data = self.get_parameter_schema(
+            node_path=node_path,
+            pattern=args.get("pattern"),
+            offset=int(args.get("offset", 0) or 0),
+            limit=int(args.get("limit", 80) or 80),
+            include_hidden=bool(args.get("include_hidden", False)),
+        )
+        if ok:
+            return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2)}
+        return {"success": False, "error": str(data.get("error", "获取参数 schema 失败"))}
+
+    def _tool_inspect_node(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_path = args.get("node_path", "")
+        if not node_path:
+            return {"success": False, "error": "缺少 node_path 参数"}
+
+        ok, data = self.inspect_node(
+            node_path=node_path,
+            include_params=bool(args.get("include_params", True)),
+            max_params=int(args.get("max_params", 40) or 40),
+            include_errors=bool(args.get("include_errors", True)),
+            include_connections=bool(args.get("include_connections", True)),
+            compact=bool(args.get("compact", False)),
+        )
+        if ok:
+            return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2)}
+        return {"success": False, "error": str(data.get("error", "读取节点状态失败"))}
+
     def _tool_set_node_parameter(self, args: Dict[str, Any]) -> Dict[str, Any]:
         node_path = args.get("node_path", "")
         param_name = args.get("param_name", "")
@@ -2757,7 +3692,13 @@ class HoudiniMCP:
             missing.append("to_path(下游节点路径)")
         if missing:
             return {"success": False, "error": f"缺少必要参数: {', '.join(missing)}"}
-        ok, msg = self.connect_nodes(from_path, to_path, args.get("input_index", 0))
+        ok, msg = self.connect_nodes(
+            from_path,
+            to_path,
+            args.get("input_index", 0),
+            args.get("output_index", 0),
+            bool(args.get("replace", True)),
+        )
         return {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
 
     def _tool_disconnect_nodes(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -2770,6 +3711,160 @@ class HoudiniMCP:
         ok, msg = self.disconnect_nodes(node_path, input_index)
         return {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
 
+    def _tool_get_node_connections(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_path = args.get("node_path", "")
+        if not node_path:
+            return {"success": False, "error": "缺少 node_path 参数"}
+        ok, data = self.get_node_connections(node_path)
+        if ok:
+            return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2)}
+        return {"success": False, "error": str(data.get("error", "读取节点连接失败"))}
+
+    def _tool_suggest_connection(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        from_path = args.get("from_path", "")
+        to_path = args.get("to_path", "")
+        if not from_path or not to_path:
+            return {"success": False, "error": "缺少 from_path 或 to_path 参数"}
+        ok, data = self.suggest_connection(from_path, to_path)
+        if ok:
+            return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2)}
+        return {"success": False, "error": str(data.get("error", "推荐连接失败"))}
+
+    def _tool_preview_node_operation(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        operation = args.get("operation", "")
+        operation_args = args.get("args", {})
+        if not isinstance(operation_args, dict):
+            operation_args = {}
+        ok, data = self.preview_node_operation(operation, operation_args)
+        if ok:
+            return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2)}
+        return {"success": False, "error": str(data.get("error", "预览操作失败"))}
+
+    def _tool_create_named_null(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        ok, data = self.create_named_null(
+            parent_path=args.get("parent_path", "") or args.get("network_path", ""),
+            name=args.get("name", "OUT"),
+            connect_from=args.get("connect_from", ""),
+            input_index=int(args.get("input_index", 0) or 0),
+            output_index=int(args.get("output_index", 0) or 0),
+            display=bool(args.get("display", False)),
+            render=bool(args.get("render", False)),
+        )
+        if ok:
+            return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2)}
+        return {"success": False, "error": str(data.get("error", "创建 named null 失败"))}
+
+    def preview_layout_nodes(
+        self,
+        parent_path: str = "",
+        node_paths: Optional[List[str]] = None,
+        method: str = "tidy",
+        spacing: float = 1.0,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Dry-run 预览布局：返回当前位置和计划位置，不实际移动节点。"""
+        if hou is None:
+            return False, {"error": "未检测到 Houdini API"}
+        from .hou_core import _layout_columns, _compute_tidy_layout
+        parent = hou.node(parent_path) if parent_path else self._current_network()
+        if parent is None:
+            return False, {"error": "未找到目标网络"}
+        if node_paths:
+            nodes = [hou.node(p) for p in node_paths if hou.node(p)]
+        else:
+            nodes = list(parent.children())
+        if not nodes:
+            return False, {"error": "没有可布局的节点"}
+
+        # 当前位置快照
+        before = {}
+        for n in nodes:
+            pos = n.position()
+            before[n.path()] = {"name": n.name(), "x": round(float(pos[0]), 3), "y": round(float(pos[1]), 3)}
+
+        # 计算目标位置（纯 Python，不移动节点）
+        node_ids = [n.path() for n in nodes]
+        node_set = set(node_ids)
+        edges = []
+        original_positions = {}
+        for n in nodes:
+            try:
+                pos = n.position()
+                original_positions[n.path()] = (float(pos[0]), float(pos[1]))
+            except Exception:
+                original_positions[n.path()] = (0.0, 0.0)
+            try:
+                for idx, inp in enumerate(n.inputs() or []):
+                    if inp is not None and inp.path() in node_set:
+                        edges.append((inp.path(), n.path(), idx))
+            except Exception:
+                pass
+        planned = _compute_tidy_layout(node_ids, edges, spacing=spacing, original_positions=original_positions)
+
+        after = {}
+        for n in nodes:
+            x, y = planned.get(n.path(), (0.0, 0.0))
+            after[n.path()] = {"name": n.name(), "x": round(x, 3), "y": round(y, 3)}
+
+        # 检测潜在重叠（估算节点宽度）
+        def _est_w(name: str) -> float:
+            return max(3.5, len(name) * 0.13 + 2.5)
+
+        overlap_warnings = []
+        after_list = list(after.items())
+        for i in range(len(after_list)):
+            for j in range(i + 1, len(after_list)):
+                p1, d1 = after_list[i]
+                p2, d2 = after_list[j]
+                if abs(d1["y"] - d2["y"]) < 1.0:  # 同层
+                    gap = abs(d1["x"] - d2["x"])
+                    min_gap = (_est_w(d1["name"]) + _est_w(d2["name"])) / 2.0
+                    if gap < min_gap:
+                        overlap_warnings.append({"a": d1["name"], "b": d2["name"], "gap": round(gap, 2), "min_gap": round(min_gap, 2)})
+
+        moves = []
+        for path in node_ids:
+            b = before.get(path, {})
+            a = after.get(path, {})
+            dx = round(a.get("x", 0) - b.get("x", 0), 3)
+            dy = round(a.get("y", 0) - b.get("y", 0), 3)
+            moves.append({"path": path, "name": b.get("name", ""), "from": {"x": b.get("x"), "y": b.get("y")}, "to": {"x": a.get("x"), "y": a.get("y")}, "delta": {"dx": dx, "dy": dy}})
+
+        return True, {
+            "node_count": len(nodes),
+            "method": method,
+            "spacing": spacing,
+            "moves": moves,
+            "overlap_warnings": overlap_warnings,
+            "will_move_count": sum(1 for m in moves if m["delta"]["dx"] != 0 or m["delta"]["dy"] != 0),
+        }
+
+    def _tool_preview_layout_nodes(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_paths = args.get("node_paths")
+        if isinstance(node_paths, str):
+            node_paths = [p.strip() for p in node_paths.split(",") if p.strip()]
+        ok, data = self.preview_layout_nodes(
+            parent_path=args.get("parent_path", ""),
+            node_paths=node_paths or None,
+            method=args.get("method", "tidy"),
+            spacing=float(args.get("spacing", 1.0) or 1.0),
+        )
+        if ok:
+            return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2)}
+        return {"success": False, "error": str(data.get("error", "预览布局失败"))}
+
+    def _tool_validate_node_network(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_paths = args.get("node_paths")
+        if isinstance(node_paths, str):
+            node_paths = [path.strip() for path in node_paths.split(",") if path.strip()]
+        ok, data = self.validate_node_network(
+            root_path=args.get("root_path", "/obj"),
+            node_paths=node_paths,
+            max_nodes=int(args.get("max_nodes", 200) or 200),
+        )
+        if ok:
+            return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2)}
+        return {"success": False, "error": str(data.get("error", "验证网络失败"))}
+
     def _tool_set_node_flags(self, args: Dict[str, Any]) -> Dict[str, Any]:
         node_path = args.get("node_path", "")
         if not node_path:
@@ -2777,10 +3872,32 @@ class HoudiniMCP:
         bypass = args.get("bypass")
         template = args.get("template")
         lock = args.get("lock")
-        if bypass is None and template is None and lock is None:
-            return {"success": False, "error": "至少需要指定一个标志（bypass / template / lock）"}
-        ok, msg = self.set_node_flags(node_path, bypass, template, lock)
+        display = args.get("display")
+        render = args.get("render")
+        select = args.get("select")
+        current = args.get("current")
+        if all(value is None for value in (bypass, template, lock, display, render, select, current)):
+            return {"success": False, "error": "至少需要指定一个标志（display / render / bypass / template / lock / select / current）"}
+        ok, msg = self.set_node_flags(
+            node_path,
+            bypass=bypass,
+            template=template,
+            lock=lock,
+            display=display,
+            render=render,
+            select=select,
+            current=current,
+        )
         return {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
+
+    def _tool_cook_node(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_path = args.get("node_path", "")
+        if not node_path:
+            return {"success": False, "error": "缺少 node_path 参数"}
+        ok, data = self.cook_node(node_path, bool(args.get("force", False)))
+        if ok:
+            return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2)}
+        return {"success": False, "error": str(data.get("error", "Cook 节点失败"))}
 
     def _tool_delete_node(self, args: Dict[str, Any]) -> Dict[str, Any]:
         node_path = args.get("node_path", "")
@@ -2837,6 +3954,52 @@ class HoudiniMCP:
         hint = f'list_children({np_arg}recursive={recursive}, page={page})'
         return {"success": True, "result": self._paginate_tool_result(
             msg, cache_key, hint, page)}
+
+    def _tool_find_nodes(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        ok, data = self.find_nodes(
+            root_path=args.get("root_path", "/obj"),
+            name_pattern=args.get("name_pattern", "*"),
+            node_type=args.get("node_type"),
+            category=args.get("category"),
+            recursive=bool(args.get("recursive", True)),
+            max_results=int(args.get("max_results", 100) or 100),
+            offset=int(args.get("offset", 0) or 0),
+        )
+        if ok:
+            return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2)}
+        return {"success": False, "error": str(data.get("error", "查找节点失败"))}
+
+    def _tool_get_geometry_summary(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_path = args.get("node_path", "")
+        if not node_path:
+            return {"success": False, "error": "缺少 node_path 参数"}
+
+        sample_attributes = args.get("sample_attributes")
+        if sample_attributes is not None and not isinstance(sample_attributes, list):
+            sample_attributes = [str(sample_attributes)]
+
+        ok, data = self.get_geometry_summary(
+            node_path=node_path,
+            max_sample_points=int(args.get("max_sample_points", 50) or 50),
+            include_attributes=bool(args.get("include_attributes", True)),
+            include_groups=bool(args.get("include_groups", True)),
+            sample_attributes=sample_attributes,
+            sample_primitives=bool(args.get("sample_primitives", False)),
+        )
+        if ok:
+            return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2)}
+        return {"success": False, "error": str(data.get("error", "获取几何摘要失败"))}
+
+    def _tool_get_scene_snapshot(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        ok, data = self.get_scene_snapshot(
+            root_path=args.get("root_path", "/obj"),
+            include_params=bool(args.get("include_params", False)),
+            max_depth=int(args.get("max_depth", 6) or 6),
+            max_nodes=int(args.get("max_nodes", 300) or 300),
+        )
+        if ok:
+            return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2)}
+        return {"success": False, "error": str(data.get("error", "获取场景快照失败"))}
 
     def _tool_get_geometry_info(self, args: Dict[str, Any]) -> Dict[str, Any]:
         node_path = args.get("node_path", "")
@@ -3621,16 +4784,28 @@ class HoudiniMCP:
         "create_wrangle_node": "_tool_create_wrangle_node",
         "get_network_structure": "_tool_get_network_structure",
         "get_node_parameters": "_tool_get_node_parameters",
+        "get_parameter_schema": "_tool_get_parameter_schema",
+        "inspect_node": "_tool_inspect_node",
         "set_node_parameter": "_tool_set_node_parameter",
         "create_node": "_tool_create_node",
         "create_nodes_batch": "_tool_create_nodes_batch",
         "connect_nodes": "_tool_connect_nodes",
         "disconnect_nodes": "_tool_disconnect_nodes",
+        "get_node_connections": "_tool_get_node_connections",
+        "suggest_connection": "_tool_suggest_connection",
+        "preview_node_operation": "_tool_preview_node_operation",
+        "create_named_null": "_tool_create_named_null",
+        "validate_node_network": "_tool_validate_node_network",
+        "preview_layout_nodes": "_tool_preview_layout_nodes",
+        "cook_node": "_tool_cook_node",
         "delete_node": "_tool_delete_node",
         "rename_node": "_tool_rename_node",
         "search_node_types": "_tool_search_node_types",
         "semantic_search_nodes": "_tool_semantic_search_nodes",
         "list_children": "_tool_list_children",
+        "find_nodes": "_tool_find_nodes",
+        "get_geometry_summary": "_tool_get_geometry_summary",
+        "get_scene_snapshot": "_tool_get_scene_snapshot",
         # "get_geometry_info" 已移除，由 skill 替代
         "read_selection": "_tool_read_selection",
         "set_display_flag": "_tool_set_display_flag",

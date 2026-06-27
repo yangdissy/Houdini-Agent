@@ -6,6 +6,7 @@ import unittest
 from houdini_agent.core.harness_engine import (
     HarnessToolPolicyEngine,
     build_tool_retry_key,
+    sanitize_tool_result,
 )
 from houdini_agent.core.harness_policy_config import (
     CODE_EXEC_TOOLS,
@@ -50,10 +51,106 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         self.assertEqual(decision.action, "ask")
         self.assertIn("requires confirmation", decision.reason)
 
+    def test_execute_tools_require_code_or_command(self):
+        missing_code = self.policy.decide("execute_python", {}, {"mode": "agent"})
+        self.assertEqual(missing_code.action, "deny")
+        self.assertIn("code", missing_code.reason)
+
+        missing_command = self.policy.decide("execute_shell", {}, {"mode": "agent"})
+        self.assertEqual(missing_command.action, "deny")
+        self.assertIn("command", missing_command.reason)
+
+    def test_sensitive_argument_key_is_denied(self):
+        decision = self.policy.decide(
+            "execute_shell",
+            {"command": "echo ok", "api_key": "sk-test-secret-value"},
+            {"mode": "agent"},
+        )
+        self.assertEqual(decision.action, "deny")
+        self.assertIn("sensitive argument", decision.reason)
+
+    def test_sensitive_value_pattern_is_denied(self):
+        decision = self.policy.decide(
+            "execute_python",
+            {"code": "token = 'abc12345678901234567890'\nprint('ok')"},
+            {"mode": "agent"},
+        )
+        self.assertEqual(decision.action, "deny")
+        self.assertIn("sensitive value", decision.reason)
+
+    def test_dangerous_python_is_denied(self):
+        decision = self.policy.decide(
+            "execute_python",
+            {"code": "import shutil\nshutil.rmtree('C:/tmp/demo')"},
+            {"mode": "agent"},
+        )
+        self.assertEqual(decision.action, "deny")
+        self.assertIn("dangerous Python", decision.reason)
+
+    def test_dangerous_shell_is_denied(self):
+        decision = self.policy.decide(
+            "execute_shell",
+            {"command": "Remove-Item C:/tmp/demo -Recurse"},
+            {"mode": "agent"},
+        )
+        self.assertEqual(decision.action, "deny")
+        self.assertIn("dangerous shell", decision.reason)
+
+    def test_path_traversal_is_denied(self):
+        decision = self.policy.decide(
+            "get_node_parameters",
+            {"node_path": "/obj/../out"},
+            {"mode": "agent"},
+        )
+        self.assertEqual(decision.action, "deny")
+        self.assertIn("path traversal", decision.reason)
+
+    def test_unsupported_houdini_root_is_denied(self):
+        decision = self.policy.decide(
+            "get_node_parameters",
+            {"node_path": "/etc/passwd"},
+            {"mode": "agent"},
+        )
+        self.assertEqual(decision.action, "deny")
+        self.assertIn("unsupported Houdini path root", decision.reason)
+
     def test_missing_node_path_is_denied(self):
         decision = self.policy.decide("get_node_parameters", {}, {"mode": "agent"})
         self.assertEqual(decision.action, "deny")
         self.assertIn("node_path", decision.reason)
+
+    def test_new_readonly_tools_validate_houdini_paths(self):
+        missing_schema_path = self.policy.decide("get_parameter_schema", {}, {"mode": "agent"})
+        self.assertEqual(missing_schema_path.action, "deny")
+        self.assertIn("node_path", missing_schema_path.reason)
+
+        missing_inspect_path = self.policy.decide("inspect_node", {}, {"mode": "agent"})
+        self.assertEqual(missing_inspect_path.action, "deny")
+        self.assertIn("node_path", missing_inspect_path.reason)
+
+        missing_connections_path = self.policy.decide("get_node_connections", {}, {"mode": "agent"})
+        self.assertEqual(missing_connections_path.action, "deny")
+        self.assertIn("node_path", missing_connections_path.reason)
+
+        missing_geo_path = self.policy.decide("get_geometry_summary", {}, {"mode": "agent"})
+        self.assertEqual(missing_geo_path.action, "deny")
+        self.assertIn("node_path", missing_geo_path.reason)
+
+        bad_inspect_root = self.policy.decide("inspect_node", {"node_path": "/etc"}, {"mode": "agent"})
+        self.assertEqual(bad_inspect_root.action, "deny")
+        self.assertIn("unsupported Houdini path root", bad_inspect_root.reason)
+
+        bad_connections_root = self.policy.decide("get_node_connections", {"node_path": "/etc"}, {"mode": "agent"})
+        self.assertEqual(bad_connections_root.action, "deny")
+        self.assertIn("unsupported Houdini path root", bad_connections_root.reason)
+
+        bad_root = self.policy.decide("find_nodes", {"root_path": "/etc"}, {"mode": "agent"})
+        self.assertEqual(bad_root.action, "deny")
+        self.assertIn("unsupported Houdini path root", bad_root.reason)
+
+        bad_snapshot_root = self.policy.decide("get_scene_snapshot", {"root_path": "/etc"}, {"mode": "agent"})
+        self.assertEqual(bad_snapshot_root.action, "deny")
+        self.assertIn("unsupported Houdini path root", bad_snapshot_root.reason)
 
     def test_connect_nodes_requires_from_and_to_paths(self):
         decision = self.policy.decide(
@@ -79,6 +176,31 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         self.assertEqual(missing_to.action, "deny")
         self.assertIn("to_path", missing_to.reason)
 
+    def test_suggest_connection_requires_from_and_to_paths(self):
+        decision = self.policy.decide(
+            "suggest_connection",
+            {"from_path": "/obj/geo1/box1", "to_path": "/obj/geo1/null1"},
+            {"mode": "agent"},
+        )
+        self.assertEqual(decision.action, "allow")
+
+        missing_from = self.policy.decide("suggest_connection", {"to_path": "/obj/geo1/null1"}, {"mode": "agent"})
+        self.assertEqual(missing_from.action, "deny")
+        self.assertIn("from_path", missing_from.reason)
+
+        missing_to = self.policy.decide("suggest_connection", {"from_path": "/obj/geo1/box1"}, {"mode": "agent"})
+        self.assertEqual(missing_to.action, "deny")
+        self.assertIn("to_path", missing_to.reason)
+
+    def test_create_named_null_requires_name(self):
+        missing_name = self.policy.decide("create_named_null", {}, {"mode": "agent"})
+        self.assertEqual(missing_name.action, "deny")
+        self.assertIn("name", missing_name.reason)
+
+        bad_parent = self.policy.decide("create_named_null", {"name": "OUT_TEST", "parent_path": "/etc"}, {"mode": "agent"})
+        self.assertEqual(bad_parent.action, "deny")
+        self.assertIn("unsupported Houdini path root", bad_parent.reason)
+
     def test_get_node_inputs_requires_node_type_not_node_path(self):
         decision = self.policy.decide(
             "get_node_inputs",
@@ -90,6 +212,15 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         missing_type = self.policy.decide("get_node_inputs", {"category": "sop"}, {"mode": "agent"})
         self.assertEqual(missing_type.action, "deny")
         self.assertIn("node_type", missing_type.reason)
+
+    def test_cook_node_requires_valid_node_path(self):
+        missing_path = self.policy.decide("cook_node", {}, {"mode": "agent"})
+        self.assertEqual(missing_path.action, "deny")
+        self.assertIn("node_path", missing_path.reason)
+
+        bad_root = self.policy.decide("cook_node", {"node_path": "/etc"}, {"mode": "agent"})
+        self.assertEqual(bad_root.action, "deny")
+        self.assertIn("unsupported Houdini path root", bad_root.reason)
 
     def test_node_paths_are_normalized(self):
         decision = self.policy.decide(
@@ -113,6 +244,29 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         left = build_tool_retry_key("set_node_parameter", {"b": 2, "a": 1})
         right = build_tool_retry_key("set_node_parameter", {"a": 1, "b": 2})
         self.assertEqual(left, right)
+
+
+class HarnessToolOutputGuardrailTest(unittest.TestCase):
+    def test_non_dict_result_becomes_error_contract(self):
+        sanitized = sanitize_tool_result("plain text")
+        self.assertFalse(sanitized["success"])
+        self.assertIn("Invalid tool result type", sanitized["error"])
+
+    def test_success_result_is_redacted_recursively(self):
+        sanitized = sanitize_tool_result({
+            "success": True,
+            "result": "api_key=sk-testsecret1234567890",
+            "metadata": {"token": "abc123456789"},
+        })
+        self.assertTrue(sanitized["success"])
+        self.assertIn("[REDACTED]", sanitized["result"])
+        self.assertEqual(sanitized["metadata"]["token"], "[REDACTED]")
+        self.assertNotIn("sk-testsecret", str(sanitized))
+
+    def test_failure_without_error_gets_error_message(self):
+        sanitized = sanitize_tool_result({"success": False, "result": "failed with password=abc123"})
+        self.assertFalse(sanitized["success"])
+        self.assertIn("[REDACTED]", sanitized["error"])
 
 
 if __name__ == "__main__":

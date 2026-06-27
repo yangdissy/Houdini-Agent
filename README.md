@@ -159,6 +159,12 @@ Skills are pre-built Python analysis scripts that run inside Houdini. They are p
 | `trace_node_dependencies` | Upstream dependency or downstream impact tracing |
 | `find_attribute_references` | Attribute usage search in VEX, expressions, and string parameters |
 | `analyze_cook_performance` | Network-wide cook-time ranking and bottleneck analysis |
+| `inspect_scene_context` | Current hip file, frame, take, selection, network, and UI pane context |
+| `analyze_groups` | Point, primitive, and edge group counts, empty groups, and sample members |
+| `inspect_material_assignments` | Material nodes, assignments, missing references, and unused material paths |
+| `inspect_lop_stage` | USD stage layers, prim type counts, cameras, lights, references, and payloads |
+| `validate_network_contract` | Network contract checks for OUT/nulls, flags, missing inputs, errors, and dead nodes |
+| `cache_node_report` | Cache/export node paths, frame ranges, disk existence, and modified-time summary |
 
 Built-in skills live in [houdini_agent/skills](houdini_agent/skills). User skills can be configured from the Plugin Manager.
 

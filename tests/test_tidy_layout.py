@@ -59,6 +59,18 @@ class TidyLayoutTests(unittest.TestCase):
             self.assertIsInstance(x_value, float)
             self.assertIsInstance(y_value, float)
 
+    def test_original_center_is_preserved_for_created_batch(self):
+        positions = _compute_tidy_layout(
+            ["shape", "points", "copy"],
+            [("shape", "copy", 0), ("points", "copy", 1)],
+            original_positions={"shape": (10.0, 5.0), "points": (10.0, 5.0), "copy": (10.0, 5.0)},
+        )
+
+        center_x = sum(pos[0] for pos in positions.values()) / len(positions)
+        center_y = sum(pos[1] for pos in positions.values()) / len(positions)
+        self.assertAlmostEqual(center_x, 10.0, places=6)
+        self.assertAlmostEqual(center_y, 5.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

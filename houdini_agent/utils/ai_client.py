@@ -14,7 +14,7 @@ from typing import List, Dict, Optional, Any, Callable, Generator, Tuple
 from urllib.parse import quote_plus
 
 from shared.common_utils import load_config, save_config, load_user_config, save_user_config
-from ..core.harness_engine import is_harness_v2_enabled
+from ..core.harness_engine import is_harness_v2_enabled, sanitize_tool_result
 from ..core.streaming_tool_executor import StreamingToolExecutor
 
 # 强制使用本地 lib 目录中的依赖库
@@ -564,8 +564,45 @@ HOUDINI_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_parameter_schema",
+            "description": "结构化获取节点参数 schema：参数名、标签、类型、tuple 尺寸、当前值、默认值、min/max、菜单 token/label。设置参数前优先用此工具精确确认可用参数和值域；支持 pattern 过滤和 offset/limit 分页。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "节点完整路径，如 '/obj/geo1/box1'"},
+                    "pattern": {"type": "string", "description": "可选 glob 过滤，匹配参数名或标签，如 '*scale*'、't'"},
+                    "offset": {"type": "integer", "description": "分页偏移，默认 0"},
+                    "limit": {"type": "integer", "description": "返回数量，默认 80，最大 200"},
+                    "include_hidden": {"type": "boolean", "description": "是否包含隐藏参数，默认 false"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_node",
+            "description": "结构化读取单个节点的当前状态：类型、标签、备注、flags、位置、输入/输出连接、错误/警告、非默认参数摘要。用于快速理解一个节点，不需要拉取完整参数列表时优先使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "节点完整路径，如 '/obj/geo1/box1'"},
+                    "include_params": {"type": "boolean", "description": "是否包含非默认参数摘要，默认 true"},
+                    "max_params": {"type": "integer", "description": "最多返回多少个非默认参数，默认 40，最大 200"},
+                    "include_errors": {"type": "boolean", "description": "是否包含 errors/warnings，默认 true"},
+                    "include_connections": {"type": "boolean", "description": "是否包含输入输出连接，默认 true"},
+                    "compact": {"type": "boolean", "description": "紧凑模式，仅返回基础状态和计数，默认 false"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_node_parameter",
-            "description": "设置节点参数值。修改已有节点（包括向已选中的 wrangle 节点写入 VEX 代码）必须使用此工具：先用 get_node_parameters 确认参数名，再用本工具将 snippet 参数设为新代码。不要为了写入代码而额外创建新节点。",
+            "description": "设置节点参数值。修改已有节点（包括向已选中的 wrangle 节点写入 VEX 代码）必须使用此工具：先用 get_parameter_schema 或 get_node_parameters 确认参数名和值域，再用本工具设置。菜单参数可传 token 或 label；参数名错误时会返回 did-you-mean 建议。不要为了写入代码而额外创建新节点。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -642,13 +679,15 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "connect_nodes",
-            "description": "连接两个已有节点。仅在节点已经存在或需要补连/改线时使用；如果节点还没创建，优先用 create_nodes_batch 同时创建并连接。连接前应先用 get_node_inputs 查询目标节点的输入端口含义。input_index: 0=第一输入, 1=第二输入(如copytopoints的目标点), 2=第三输入。",
+            "description": "连接两个已有节点。仅在节点已经存在或需要补连/改线时使用；如果节点还没创建，优先用 create_nodes_batch 同时创建并连接。连接前应先用 get_node_inputs 查询目标节点的输入端口含义。默认会替换目标输入端口已有连接；不想覆盖时设置 replace=false。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "from_path": {"type": "string", "description": "上游节点路径（提供数据的节点）"},
                     "to_path": {"type": "string", "description": "下游节点路径（接收数据的节点）"},
-                    "input_index": {"type": "integer", "description": "目标节点的输入端口索引。0=主输入，1=第二输入（如copy的目标点），2=第三输入。默认0"}
+                    "input_index": {"type": "integer", "description": "目标节点的输入端口索引。0=主输入，1=第二输入（如copy的目标点），2=第三输入。默认0"},
+                    "output_index": {"type": "integer", "description": "上游节点输出端口索引，默认0"},
+                    "replace": {"type": "boolean", "description": "目标输入端口已有连接时是否替换，默认 true；设为 false 可防止误覆盖"}
                 },
                 "required": ["from_path", "to_path"]
             }
@@ -701,15 +740,114 @@ HOUDINI_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_node_connections",
+            "description": "结构化读取单个节点的输入/输出连接面板：每个 input slot 的 label、当前来源、source output index，以及所有输出连接目标。改线前优先调用，避免猜 input_index。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "节点完整路径，如 '/obj/geo1/copytopoints1'"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "suggest_connection",
+            "description": "根据上游节点和下游节点的类型、目标 input labels、当前空端口，推荐 connect_nodes 的 input_index/output_index，并说明是否会替换已有连接。用于接线前选择正确端口。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "from_path": {"type": "string", "description": "上游节点路径"},
+                    "to_path": {"type": "string", "description": "下游节点路径"}
+                },
+                "required": ["from_path", "to_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "preview_node_operation",
+            "description": "Dry-run 预览节点操作影响范围，不修改场景。支持 connect_nodes、disconnect_nodes、set_node_flags、delete_node、cook_node、create_named_null。用于确认会替换哪些连接、会断开什么输入、会设置哪些 flags。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation": {"type": "string", "description": "要预览的操作名，如 'connect_nodes'、'disconnect_nodes'、'set_node_flags'"},
+                    "args": {"type": "object", "description": "该操作原本要传入的参数对象"}
+                },
+                "required": ["operation", "args"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_named_null",
+            "description": "创建语义化 null 节点，可选连接上游。用于生成 OUT_* / IN_* / CTRL_* / CACHE_* 这类清晰网络锚点；没有这些前缀时会自动加 OUT_。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "parent_path": {"type": "string", "description": "父网络路径，如 '/obj/geo1'；留空使用当前网络"},
+                    "name": {"type": "string", "description": "null 名称，如 OUT_RESULT、IN_GEO、CTRL_MAIN、CACHE_SIM"},
+                    "connect_from": {"type": "string", "description": "可选上游节点路径；提供后会连接到新 null"},
+                    "input_index": {"type": "integer", "description": "新 null 的目标输入端口，默认 0"},
+                    "output_index": {"type": "integer", "description": "上游输出端口，默认 0"},
+                    "display": {"type": "boolean", "description": "是否将新 null 设为 display，默认 false"},
+                    "render": {"type": "boolean", "description": "是否将新 null 设为 render，默认 false"}
+                },
+                "required": ["name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "validate_node_network",
+            "description": "验证节点网络常见问题：节点 errors/warnings、必需输入缺失、孤立节点、display/render 节点列表。用于建网或改线后的收尾检查；可指定 node_paths 或 root_path。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "root_path": {"type": "string", "description": "验证根路径，默认 '/obj'"},
+                    "node_paths": {"type": "array", "items": {"type": "string"}, "description": "可选，只验证指定节点列表"},
+                    "max_nodes": {"type": "integer", "description": "未指定 node_paths 时最多检查节点数，默认 200"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_node_flags",
-            "description": "设置节点的 bypass / template / lock 标志。bypass=True 使节点变灰并让数据透传（常用于调试对比）；template=True 将节点设为橙色模板节点；lock=True 锁定节点防止误修改。至少指定一个标志。",
+            "description": "统一设置节点标志：display/render/bypass/template/lock/select/current。display/render 用于视口/渲染输出节点，bypass 用于调试透传，template 用于参考显示，lock 用于锁定，select/current 用于选中或设为当前节点。至少指定一个标志。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "node_path": {"type": "string", "description": "节点完整路径，如 '/obj/geo1/box1'"},
+                    "display": {"type": "boolean", "description": "true=设为显示节点，false=关闭显示标志"},
+                    "render": {"type": "boolean", "description": "true=设为渲染节点，false=关闭渲染标志"},
                     "bypass": {"type": "boolean", "description": "true=启用 bypass（节点变灰，数据透传），false=关闭 bypass"},
                     "template": {"type": "boolean", "description": "true=设为模板节点（橙色），false=取消模板"},
-                    "lock": {"type": "boolean", "description": "true=锁定节点（防止修改），false=解锁"}
+                    "lock": {"type": "boolean", "description": "true=锁定节点（防止修改），false=解锁"},
+                    "select": {"type": "boolean", "description": "true=选中该节点并清除其他选择，false=取消选择该节点"},
+                    "current": {"type": "boolean", "description": "true=设为当前节点并选中；false 无操作"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cook_node",
+            "description": "Cook 指定节点，并返回 cook 后 errors/warnings/messages。用于创建或改线后验证节点是否能成功计算；force=true 会强制重新 cook，可能较慢。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "要 cook 的节点完整路径，如 '/obj/geo1/OUT'"},
+                    "force": {"type": "boolean", "description": "是否强制重新 cook，默认 false"}
                 },
                 "required": ["node_path"]
             }
@@ -794,6 +932,66 @@ HOUDINI_TOOLS = [
                     "render": {"type": "boolean", "description": "是否设为渲染节点"}
                 },
                 "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_nodes",
+            "description": "在指定根节点下按名称 glob、节点类型、类别查找节点，返回结构化路径、类型、flags、输入输出数量和错误状态。用于快速定位节点，避免递归 list_children 浪费上下文。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "root_path": {"type": "string", "description": "搜索根路径，默认 '/obj'"},
+                    "name_pattern": {"type": "string", "description": "节点名称 glob，默认 '*'，如 '*scatter*'"},
+                    "node_type": {"type": "string", "description": "可选节点类型过滤，如 'attribwrangle'、'sop/box'、'*vdb*'"},
+                    "category": {"type": "string", "description": "可选类别过滤，如 'Sop'、'Object'、'Lop'"},
+                    "recursive": {"type": "boolean", "description": "是否递归搜索，默认 true"},
+                    "max_results": {"type": "integer", "description": "最大返回数量，默认 100，最大 500"},
+                    "offset": {"type": "integer", "description": "分页偏移，默认 0"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_geometry_summary",
+            "description": "结构化读取 SOP 节点的真实几何摘要：点/面/顶点数量、bbox、属性 schema、groups，以及可选点/primitive 属性抽样。用于验证几何网络实际产物，不要只凭截图猜测。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "SOP 节点或几何容器路径，如 '/obj/geo1/OUT'"},
+                    "max_sample_points": {"type": "integer", "description": "点/primitive 抽样数量，默认 50，最大 500；设为 0 可只取统计信息"},
+                    "include_attributes": {"type": "boolean", "description": "是否返回 point/primitive/vertex/detail 属性 schema，默认 true"},
+                    "include_groups": {"type": "boolean", "description": "是否返回 point/primitive group 名称，默认 true"},
+                    "sample_attributes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "要抽样读取的属性名，如 ['P', 'Cd', 'N']；留空默认读取 P"
+                    },
+                    "sample_primitives": {"type": "boolean", "description": "是否同时抽样 primitive 类型和属性，默认 false"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_scene_snapshot",
+            "description": "获取指定根路径下的结构化只读场景快照：节点树、类型、类别、flags、输入输出数量、错误/警告状态。用于理解场景整体结构、改前改后对比和规划下一步。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "root_path": {"type": "string", "description": "快照根路径，默认 '/obj'；可用 '/stage'、'/out'、'/mat' 等 Houdini 根"},
+                    "include_params": {"type": "boolean", "description": "是否包含每个节点最多 80 个参数当前值，默认 false；开启会显著增大结果"},
+                    "max_depth": {"type": "integer", "description": "最大递归深度，默认 6，最大 12"},
+                    "max_nodes": {"type": "integer", "description": "最大节点数，默认 300，最大 1000"}
+                },
+                "required": []
             }
         }
     },
@@ -975,7 +1173,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "execute_python",
-            "description": "在 Houdini Python Shell 中执行代码。可以执行任意 Python 代码，访问 hou 模块操作场景。执行结果（包括 print 输出和错误信息）会完整返回。输出较长时支持分页，用相同 code 和不同 page 翻页查看。",
+            "description": "【最后手段】在 Houdini Python Shell 中执行任意 Python 代码。需要用户确认，有安全风险。绝大多数 Houdini 操作都有专用工具，优先使用专用工具。禁止使用场景：1)节点/参数操作——用 create_node、set_node_parameter、connect_nodes 等；2)VEX 编写——用 create_wrangle_node 或 set_node_parameter(parm_name='snippet')；3)几何体/属性查询——用 run_skill(analyze_geometry_attribs 等) 或 get_geometry_summary；4)节点查询——用 inspect_node、get_network_structure、find_nodes；5)节点重命名——用 rename_node。仅在确实没有专用工具可以完成任务时才使用此工具。输出较长时支持分页，用相同 code 和不同 page 翻页。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1185,12 +1383,43 @@ HOUDINI_TOOLS = [
                     },
                     "method": {
                         "type": "string",
-                        "enum": ["auto", "tidy", "grid", "columns"],
-                        "description": "布局方法。tidy=推荐的美观拓扑布局，auto=智能选择，grid=网格排列，columns=tidy 的兼容别名。默认 auto。"
+                        "enum": ["auto", "tidy", "native", "grid", "columns"],
+                        "description": "布局方法。tidy=推荐的美观拓扑布局（自定义 DAG 分层+碰撞检测），native=Houdini 原生 layoutChildren/moveToGoodPosition（对新建节点最自然），auto=智能选择，grid=网格排列，columns=tidy 的兼容别名。默认 auto。"
                     },
                     "spacing": {
                         "type": "number",
                         "description": "节点间距倍率，默认 1.0。增大则节点间距更宽松。"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "preview_layout_nodes",
+            "description": "Dry-run 预览 layout_nodes 会把节点移到哪里，不实际移动。返回每个节点的旧坐标、新坐标和是否检测到重叠，供 AI 确认后再调用 layout_nodes 执行。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "network_path": {
+                        "type": "string",
+                        "description": "父网络路径（如 /obj/geo1）。留空则使用当前活跃网络。"
+                    },
+                    "node_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "要预览布局的节点完整路径列表。"
+                    },
+                    "method": {
+                        "type": "string",
+                        "enum": ["auto", "tidy", "native", "grid", "columns"],
+                        "description": "要预览的布局方法，与 layout_nodes 参数相同。默认 tidy。"
+                    },
+                    "spacing": {
+                        "type": "number",
+                        "description": "节点间距倍率，默认 1.0。"
                     }
                 },
                 "required": []
@@ -1553,8 +1782,9 @@ class AIClient:
 
     # 查询型工具 & 操作型工具分类（共用常量）
     _QUERY_TOOLS = frozenset({
-        'get_network_structure', 'get_node_parameters',
-        'list_children',
+        'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'inspect_node',
+        'get_node_connections', 'suggest_connection', 'preview_node_operation', 'validate_node_network',
+        'list_children', 'find_nodes', 'get_geometry_summary', 'get_scene_snapshot',
         'read_selection', 'search_node_types',
         'semantic_search_nodes', 'find_nodes_by_param', 'check_errors',
         'search_local_doc', 'get_houdini_node_doc', 'get_node_inputs',
@@ -1563,15 +1793,17 @@ class AIClient:
         'capture_viewport',
     })
     _OP_TOOLS = frozenset({
-        'create_node', 'create_nodes_batch', 'connect_nodes',
+        'create_node', 'create_nodes_batch', 'create_named_null', 'connect_nodes', 'cook_node',
         'set_node_parameter', 'create_wrangle_node',
     })
     _SIMPLE_SUCCESS_TOOLS = frozenset({
-        'create_node', 'get_node_parameters', 'get_node_inputs',
-        'list_children', 'read_selection', 'check_errors',
+        'create_node', 'get_node_parameters', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
+        'suggest_connection', 'preview_node_operation', 'validate_node_network', 'get_node_inputs',
+        'list_children', 'find_nodes', 'get_geometry_summary', 'get_scene_snapshot',
+        'read_selection', 'check_errors',
     })
     _DEEP_THINK_TOOLS = frozenset({
-        'connect_nodes', 'delete_node', 'disconnect_nodes', 'rename_node',
+        'connect_nodes', 'cook_node', 'create_named_null', 'delete_node', 'disconnect_nodes', 'rename_node', 'preview_layout_nodes',
         'set_node_parameter', 'batch_set_parameters', 'create_nodes_batch',
         'create_wrangle_node', 'copy_node', 'set_display_flag', 'set_node_flags',
         'execute_python', 'execute_shell', 'save_hip', 'run_skill',
@@ -1952,6 +2184,7 @@ class AIClient:
         - 其他工具 → 适度截断
         - 失败 → 保留完整错误
         """
+        result = sanitize_tool_result(result)
         if result.get('success'):
             content = result.get('result', '')
             # 已自带分页逻辑的工具，直接返回不再截断
@@ -2086,7 +2319,9 @@ class AIClient:
 
     # 可被后续同名调用"覆盖"的工具（查询类）
     _STALEABLE_TOOLS = frozenset({
-        'get_network_structure', 'get_node_parameters', 'list_children',
+        'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'inspect_node',
+        'get_node_connections', 'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
+        'get_geometry_summary', 'get_scene_snapshot',
         'check_errors', 'get_node_inputs', 'read_selection',
     })
 

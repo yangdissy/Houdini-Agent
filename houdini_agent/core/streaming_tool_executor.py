@@ -24,7 +24,16 @@ class StreamingToolExecutor:
     _LEGACY_DEDUP_TOOLS = frozenset({
         "get_network_structure",
         "get_node_parameters",
+        "get_parameter_schema",
+        "inspect_node",
+        "get_node_connections",
+        "suggest_connection",
+        "preview_node_operation",
+        "validate_node_network",
         "list_children",
+        "find_nodes",
+        "get_geometry_summary",
+        "get_scene_snapshot",
         "read_selection",
         "search_node_types",
         "semantic_search_nodes",
@@ -35,6 +44,7 @@ class StreamingToolExecutor:
         "get_node_inputs",
         "list_skills",
         "perf_stop_and_report",
+        "preview_layout_nodes",
     })
 
     _LEGACY_ASYNC_TOOL_NAMES = frozenset({"web_search", "fetch_webpage", "execute_shell"})
@@ -42,7 +52,16 @@ class StreamingToolExecutor:
     _LEGACY_BATCH_READONLY = frozenset({
         "get_network_structure",
         "get_node_parameters",
+        "get_parameter_schema",
+        "inspect_node",
+        "get_node_connections",
+        "suggest_connection",
+        "preview_node_operation",
+        "validate_node_network",
         "list_children",
+        "find_nodes",
+        "get_geometry_summary",
+        "get_scene_snapshot",
         "read_selection",
         "search_node_types",
         "semantic_search_nodes",
@@ -56,13 +75,16 @@ class StreamingToolExecutor:
         "list_network_boxes",
         "perf_start_profile",
         "perf_stop_and_report",
+        "preview_layout_nodes",
     })
 
     _LEGACY_NETWORK_MUTATING_TOOLS = frozenset({
         "create_node",
         "create_nodes_batch",
+        "create_named_null",
         "delete_node",
         "connect_nodes",
+        "cook_node",
         "create_wrangle_node",
         "copy_node",
         "set_display_flag",
@@ -71,6 +93,8 @@ class StreamingToolExecutor:
 
     _LEGACY_CACHE_INVALIDATE_TOOLS = frozenset({
         "get_network_structure",
+        "get_geometry_summary",
+        "get_scene_snapshot",
         "list_children",
         "check_errors",
     })

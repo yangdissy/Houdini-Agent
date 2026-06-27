@@ -15,8 +15,9 @@ import os
 import re
 import json
 import zipfile
+import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set, Tuple
 from dataclasses import dataclass
 
 
@@ -31,7 +32,7 @@ class NodeDoc:
     context: str            # sop / dop / obj / cop2 / ...
     title: str              # 显示名称
     description: str        # 简要描述 (≤300 chars)
-    parameters: list        # [[name, description], ...]  (≤15 条)
+    parameters: List[List[str]]  # [[name, description], ...]  (≤15 条)
 
 
 @dataclass
@@ -72,6 +73,8 @@ class HoudiniDocIndex:
     索引来源：$HFS/houdini/help 目录下的 ZIP 文件。
     """
 
+    _CTX_PRIORITY = {"sop": 0, "obj": 1, "dop": 2, "cop2": 3}
+
     def __init__(self, help_dir: Optional[str] = None):
         self._help_dir = self._resolve_help_dir(help_dir)
 
@@ -87,6 +90,13 @@ class HoudiniDocIndex:
         self._node_aliases: Dict[str, str] = {}         # 别名(小写) → node_type
         self._vex_categories: Dict[str, List[str]] = {}  # category → [func_names]
         self._all_node_types: Optional[set] = None       # 懒初始化
+        self._node_search_names: List[Tuple[str, str]] = []
+        self._vex_search_names: List[Tuple[str, str, VexDoc]] = []
+        self._hom_search_names: List[Tuple[str, str, HomDoc]] = []
+        self._knowledge_search_cache: List[Tuple[KnowledgeChunk, Set[str], str, str]] = []
+
+        # Labs 目录缓存（实例变量，避免类变量共享歧义）
+        self._labs_catalog_cache: Optional[str] = None
 
         # 缓存
         project_root = Path(__file__).parent.parent.parent
@@ -168,7 +178,11 @@ class HoudiniDocIndex:
             try:
                 with open(cache_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                if data.get("help_dir") == str(self._help_dir) and data.get("version") == 2:
+                # help_dir 为 None 时 str(None)="None"，需排除该情况避免缓存永久命中
+                cached_help_dir = data.get("help_dir")
+                if (self._help_dir is not None
+                        and cached_help_dir == str(self._help_dir)
+                        and data.get("version") == 2):
                     self._load_from_cache(data)
                     print(f"[DocIndex] 缓存加载: {len(self.node_index)} 节点, "
                           f"{len(self.vex_index)} VEX, {len(self.hom_index)} HOM")
@@ -243,6 +257,7 @@ class HoudiniDocIndex:
                         ))
                     print(f"[DocIndex] 知识库缓存加载: {len(self.knowledge_chunks)} 个片段 "
                           f"(来自 {len(txt_files)} 个文件)")
+                    self._build_knowledge_search_cache()
                     return
                 else:
                     print(f"[DocIndex] 知识库文件变更，重新解析...")
@@ -284,6 +299,20 @@ class HoudiniDocIndex:
                 print(f"[DocIndex] 知识库缓存已保存")
             except Exception as e:
                 print(f"[DocIndex] 知识库缓存保存失败: {e}")
+
+        self._build_knowledge_search_cache()
+
+    def _build_knowledge_search_cache(self):
+        """预缓存知识库搜索时反复计算的小写文本和关键词集合。"""
+        self._knowledge_search_cache = [
+            (
+                chunk,
+                {k.lower() for k in chunk.keywords},
+                chunk.title.lower(),
+                chunk.content.lower(),
+            )
+            for chunk in self.knowledge_chunks
+        ]
 
     @staticmethod
     def _build_kb_fingerprints(txt_files: List[Path], doc_root: Path) -> Dict[str, Dict[str, float]]:
@@ -429,12 +458,12 @@ class HoudiniDocIndex:
                 return 0.14
             return 0.10
 
+        if not self._knowledge_search_cache:
+            self._build_knowledge_search_cache()
+
         scored: List[tuple] = []
-        for chunk in self.knowledge_chunks:
+        for chunk, chunk_kw_set, title_l, content_l in self._knowledge_search_cache:
             score = 0.0
-            chunk_kw_set = {k.lower() for k in chunk.keywords}
-            title_l = chunk.title.lower()
-            content_l = chunk.content.lower()
 
             matched_terms = set()
 
@@ -511,7 +540,8 @@ class HoudiniDocIndex:
 
     def _save_to_cache(self, path: Path):
         data = {
-            "help_dir": str(self._help_dir),
+            # help_dir 为 None 时存空字符串，避免 "None" 字符串导致缓存判断失效
+            "help_dir": str(self._help_dir) if self._help_dir is not None else "",
             "version": 2,
             "nodes": {
                 k: {"node_type": v.node_type, "context": v.context,
@@ -697,11 +727,10 @@ class HoudiniDocIndex:
                             parameters=params[:15],
                         )
                         # 短名(无context前缀)优先 SOP > OBJ > DOP > 其他
-                        _CTX_PRIORITY = {"sop": 0, "obj": 1, "dop": 2, "cop2": 3}
                         existing = self.node_index.get(internal)
                         if existing is None or (
-                            _CTX_PRIORITY.get(context, 99) <
-                            _CTX_PRIORITY.get(existing.context, 99)
+                            self._CTX_PRIORITY.get(context, 99) <
+                            self._CTX_PRIORITY.get(existing.context, 99)
                         ):
                             self.node_index[internal] = nd
                         if context:
@@ -870,6 +899,9 @@ class HoudiniDocIndex:
             self._node_aliases[low_title] = ntype
             self._node_aliases[ntype.lower()] = ntype
         self._all_node_types = {k for k in self.node_index if "/" not in k}
+        self._node_search_names = [(k.lower(), k) for k in (self._all_node_types or set())]
+        self._vex_search_names = [(k.lower(), k, d) for k, d in self.vex_index.items()]
+        self._hom_search_names = [(k.lower(), k, d) for k, d in self.hom_index.items()]
 
     # ==========================================================
     # 查询 API
@@ -986,8 +1018,8 @@ class HoudiniDocIndex:
             for w in words:
                 if len(results) >= top_k:
                     break
-                for ntype in (self._all_node_types or set()):
-                    if w in ntype.lower() and ntype not in seen:
+                for ntype_l, ntype in self._node_search_names:
+                    if w in ntype_l and ntype not in seen:
                         d = self.node_index[ntype]
                         results.append({"type": "node", "name": ntype,
                                         "snippet": self._fmt_node(d), "score": 0.5,
@@ -996,8 +1028,10 @@ class HoudiniDocIndex:
                         seen.add(ntype)
                         if len(results) >= top_k:
                             break
-                for fname, d in self.vex_index.items():
-                    if w in fname.lower() and fname not in seen:
+                if len(results) >= top_k:
+                    break
+                for fname_l, fname, d in self._vex_search_names:
+                    if w in fname_l and fname not in seen:
                         results.append({"type": "vex", "name": fname,
                                         "snippet": self._fmt_vex(d), "score": 0.4,
                                         "source": "vex", "matched_terms": [w],
@@ -1005,15 +1039,19 @@ class HoudiniDocIndex:
                         seen.add(fname)
                         if len(results) >= top_k:
                             break
-                for hname, d in self.hom_index.items():
-                    if w in hname.lower() and hname not in seen:
+                if len(results) >= top_k:
+                    break
+                for hname_l, hname, d in self._hom_search_names:
+                    if w in hname_l and hname not in seen:
                         results.append({"type": "hom", "name": hname,
                                         "snippet": self._fmt_hom(d), "score": 0.4,
                                         "source": "hom", "matched_terms": [w],
                                         "rank_reason": "substring_match"})
                         seen.add(hname)
                         if len(results) >= top_k:
-                                    break
+                            break
+                if len(results) >= top_k:
+                    break
 
         # --- 知识库匹配 ---
         if len(results) < top_k:
@@ -1181,8 +1219,6 @@ class HoudiniDocIndex:
     # Labs 目录生成（供 system prompt 注入）
     # ==========================================================
 
-    _labs_catalog_cache: Optional[str] = None
-
     def get_labs_catalog(self) -> str:
         """生成紧凑的 Labs 节点目录，供注入 system prompt
 
@@ -1311,13 +1347,16 @@ class HoudiniDocIndex:
 # ============================================================
 
 _index_instance: Optional[HoudiniDocIndex] = None
+_index_lock = threading.Lock()
 
 
 def get_doc_index(help_dir: Optional[str] = None) -> HoudiniDocIndex:
     """获取全局文档索引实例（单例）"""
     global _index_instance
     if _index_instance is None:
-        _index_instance = HoudiniDocIndex(help_dir)
+        with _index_lock:
+            if _index_instance is None:
+                _index_instance = HoudiniDocIndex(help_dir)
     return _index_instance
 
 

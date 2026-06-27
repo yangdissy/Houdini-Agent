@@ -69,6 +69,22 @@ class AIClientThinkingHintTest(unittest.TestCase):
         )
         self.assertEqual(hint, "")
 
+    def test_tool_result_compression_redacts_secrets_before_llm(self):
+        client = object.__new__(AIClient)
+        compressed = AIClient._compress_tool_result(
+            client,
+            "execute_shell",
+            {"success": True, "result": "token=abc123456789\nsecret=sk-testsecret1234567890"},
+        )
+        self.assertIn("[REDACTED]", compressed)
+        self.assertNotIn("abc123456789", compressed)
+        self.assertNotIn("sk-testsecret", compressed)
+
+    def test_tool_result_compression_normalizes_invalid_shape(self):
+        client = object.__new__(AIClient)
+        compressed = AIClient._compress_tool_result(client, "execute_shell", "bad result")
+        self.assertIn("Invalid tool result type", compressed)
+
 
 if __name__ == "__main__":
     unittest.main()
