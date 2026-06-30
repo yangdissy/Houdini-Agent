@@ -149,14 +149,21 @@ class RuntimeStateMixin:
                 self.session_tabs.setTabText(i, label[len(self._TAB_RUNNING_PREFIX):])
 
     def _restore_update_mode(self):
-        """恢复 Houdini 更新模式（Agent 结束/错误/停止时调用）"""
+        """恢复 Houdini 更新模式（Agent 结束/错误/停止时调用）
+
+        无论恢复成功与否都清空 _pre_agent_update_mode，避免下一轮把
+        Agent 留下的 Manual 误当成"用户原模式"记录。
+        """
         user_mode = getattr(self, '_pre_agent_update_mode', None)
-        if user_mode is not None:
-            try:
-                import hou  # type: ignore
+        if user_mode is None:
+            return
+        try:
+            import hou  # type: ignore
+            if hou.updateModeSetting() != user_mode:
                 hou.setUpdateMode(user_mode)
-            except Exception:
-                pass
+        except Exception as e:
+            print(f"[Cook Guard] 恢复 update mode 失败: {e}")
+        finally:
             self._pre_agent_update_mode = None
 
     def _on_agent_done(self, result: dict):

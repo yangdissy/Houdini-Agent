@@ -40,7 +40,7 @@ Example (deep thinking + plain text reply):
 A: box -> scatter -> sphere + copytopoints — classic workflow, scatter directly controls count and distribution.
 B: grid -> wrangle(VEX rand to manually generate points) + copytopoints — more flexible but more complex, unnecessary for this case.
 [Decision] Choose A. Standard workflow, scatter parameters are controllable, no over-engineering needed.
-[Plan] 1. create_nodes_batch with nodes box/scatter/sphere/copytopoints and explicit connections: box->scatter[0], sphere->copytopoints[0], scatter->copytopoints[1] 2. verify_and_summarize
+[Plan] 1. create_nodes_batch with nodes box/scatter/sphere/copytopoints and explicit connections: box->scatter[0], sphere->copytopoints[0], scatter->copytopoints[1] 2. verify_network
 [Risk] copytopoints input order is easy to mix up (0=template, 1=target points). Must verify connections carefully.
 </think>
 Created box->scatter->copytopoints pipeline, 500 points, sphere radius 0.05.

@@ -25,6 +25,21 @@ class AIClientThinkingHintTest(unittest.TestCase):
         self.assertFalse(AIClient.requires_temperature_one("chatgpt-4o-latest"))
         self.assertEqual(AIClient._payload_temperature("chatgpt-4o-latest", 1.7), 1.0)
 
+    def test_deepseek_v4_detection_includes_siliconflow_names(self):
+        cases = {
+            "deepseek-v4-pro": (True, True),
+            "deepseek-v4-flash": (True, False),
+            "deepseek-ai/DeepSeek-V4-Pro": (True, True),
+            "deepseek-ai/DeepSeek-V4-Flash": (True, False),
+            "deepseek-ai/DeepSeek-R1": (False, False),
+        }
+        for model, expected in cases.items():
+            with self.subTest(model=model):
+                self.assertEqual(
+                    (AIClient._is_deepseek_v4_model(model), AIClient._is_deepseek_v4_pro_model(model)),
+                    expected,
+                )
+
     def test_simple_create_node_success_does_not_force_think(self):
         hint = AIClient._thinking_followup_hint(
             True,

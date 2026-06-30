@@ -24,7 +24,7 @@ Wrangle Run Over: addpoint()/addprim() code MUST use Detail mode (class=0), not 
 
 VEX Writing: New wrangle -> create_wrangle_node; existing wrangle -> set_node_parameter(parm_name="snippet"). Never use execute_python for VEX. After writing, call check_errors.
 
-Mandatory Verification: Call verify_and_summarize before completing any task. Fix issues and repeat until passed.
+Mandatory Verification: Call verify_network(parent_path) before completing any task. Fix issues and repeat until healthy with non-zero geometry evidence.
 
 Todo: Use add_todo for complex tasks. Call update_todo immediately after each step completes.
 """
@@ -58,13 +58,20 @@ def build_system_prompt(with_thinking: bool = True, full_rules: bool = True) -> 
     else:
         base_prompt += "\nOutput format: Concise, direct, action-oriented. MUST reply in the same language the user uses.\n"
 
-    rules_file = "system_prompt_rules.txt" if full_rules else "system_prompt_rules_core.txt"
-    rules_text = load_prompt_template(rules_file)
-    if not rules_text and not full_rules:
+    # 规则分层加载（避免两份文件漂移）：
+    # - P0 硬性规则：system_prompt_rules_core.txt，两轮都加载
+    # - P1 详细解释/长清单：system_prompt_rules_extra.txt，仅 full_rules=True（首轮）加载
+    # - system_prompt_rules.txt 已废弃为指针说明，不再直接加载
+    rules_text = load_prompt_template("system_prompt_rules_core.txt")
+    if not rules_text:
         rules_text = _CORE_RULES_FALLBACK
     base_prompt += rules_text
 
     if full_rules:
+        # P1 补充段落：详细解释、长清单、帮助文档（仅在首轮加载，节省续接轮 token）
+        extra_text = load_prompt_template("system_prompt_rules_extra.txt")
+        if extra_text:
+            base_prompt += extra_text
         try:
             from houdini_agent.utils.doc_rag import get_doc_index
 

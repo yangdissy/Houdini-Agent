@@ -227,13 +227,18 @@ class SessionManagerMixin:
         new_session_id = self.session_tabs.tabData(tab_index)
         if not new_session_id or new_session_id == self._session_id:
             return
+        if new_session_id not in self._sessions:
+            # tab 数据与 _sessions 字典不同步（不应该发生，但防御性处理）
+            print(f"[SessionManager] _switch_session: '{new_session_id}' 不在 _sessions 中，跳过切换")
+            return
         
         # 保存当前会话（如果当前不是 agent 正在写入的 session，正常保存）
         if self._agent_session_id != self._session_id:
             self._save_current_session_state()
         
         # 加载目标会话
-        self._load_session_state(new_session_id)
+        if not self._load_session_state(new_session_id):
+            return
         
         # 切换显示
         sdata = self._sessions[new_session_id]
@@ -263,8 +268,7 @@ class SessionManagerMixin:
         if session_id == self._session_id:
             new_index = tab_index - 1 if tab_index > 0 else tab_index + 1
             new_sid = self.session_tabs.tabData(new_index)
-            if new_sid:
-                self._load_session_state(new_sid)
+            if new_sid and new_sid in self._sessions and self._load_session_state(new_sid):
                 sdata = self._sessions[new_sid]
                 self.session_stack.setCurrentWidget(sdata['scroll_area'])
         
@@ -314,11 +318,11 @@ class SessionManagerMixin:
         except (RuntimeError, AttributeError):
             pass  # Qt widget 已销毁，保留旧备份
     
-    def _load_session_state(self, session_id: str):
-        """从 _sessions 恢复指定会话的状态"""
+    def _load_session_state(self, session_id: str) -> bool:
+        """从 _sessions 恢复指定会话的状态。找不到返回 False。"""
         sdata = self._sessions.get(session_id)
         if not sdata:
-            return
+            return False
         
         self._session_id = session_id
         self._session_created_at = sdata.get('created_at') or datetime.now().isoformat()
@@ -334,6 +338,7 @@ class SessionManagerMixin:
         self.chat_container = sdata['chat_container']
         self.chat_layout = sdata['chat_layout']
         self.todo_list = sdata.get('todo_list') or self._create_todo_list(self.chat_container)
+        return True
     
     def _auto_rename_tab(self, text: str):
         """根据用户首条消息自动重命名当前标签"""

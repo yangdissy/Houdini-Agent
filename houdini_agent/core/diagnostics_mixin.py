@@ -24,9 +24,17 @@ class DiagnosticsMixin:
             color = '#ef4444'
 
         hint = f"{mode} | {guard}"
+        # 状态快照去重:避免 Qt setStyleSheet/setText 在值未变时仍触发全树样式重算 —
+        # 是 Houdini 20.5 QHeaderView race 的高频源头之一。
+        cache = self.__dict__.setdefault('_mode_guard_cache', {})
         if hasattr(self, 'mode_guard_label') and self.mode_guard_label:
-            self.mode_guard_label.setText(hint)
-            self.mode_guard_label.setStyleSheet(f"color:{color}; font-weight:600;")
+            style = f"color:{color}; font-weight:600;"
+            if cache.get('hint') != hint:
+                self.mode_guard_label.setText(hint)
+                cache['hint'] = hint
+            if cache.get('style') != style:
+                self.mode_guard_label.setStyleSheet(style)
+                cache['style'] = style
 
             lines = [
                 f"当前模式: {mode}",
@@ -37,15 +45,21 @@ class DiagnosticsMixin:
                 lines.append(
                     f"{item.get('time', '')} {item.get('tool', '')} -> {item.get('action', '')}"
                 )
-            self.mode_guard_label.setToolTip("\n".join(lines))
+            tip = "\n".join(lines)
+            if cache.get('tip') != tip:
+                self.mode_guard_label.setToolTip(tip)
+                cache['tip'] = tip
 
         if hasattr(self, 'policy_timeline_btn') and self.policy_timeline_btn:
             n = len(self._policy_timeline_records)
-            self.policy_timeline_btn.setText(f"Policy {n}")
-            if self._policy_failure_count > 0:
-                self.policy_timeline_btn.setStyleSheet("color:#ef4444;")
-            else:
-                self.policy_timeline_btn.setStyleSheet("")
+            text = f"Policy {n}"
+            btn_style = "color:#ef4444;" if self._policy_failure_count > 0 else ""
+            if cache.get('btn_text') != text:
+                self.policy_timeline_btn.setText(text)
+                cache['btn_text'] = text
+            if cache.get('btn_style') != btn_style:
+                self.policy_timeline_btn.setStyleSheet(btn_style)
+                cache['btn_style'] = btn_style
 
     def _append_policy_timeline(self, tool_name: str, action: str, reason: str = ""):
         item = {

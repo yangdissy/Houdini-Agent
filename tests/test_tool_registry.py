@@ -272,6 +272,22 @@ class IntentTest(unittest.TestCase):
         self.assertIn("preview_node_operation", names)
         self.assertIn("validate_node_network", names)
 
+    def test_delete_request_selects_delete_and_safety_tools(self):
+        for name in (
+            "delete_node", "rename_node", "preview_node_operation",
+            "get_node_connections", "get_network_structure",
+        ):
+            self.reg.register(name, _schema(name), modes={"agent"})
+
+        names = {
+            s["function"]["name"]
+            for s in self.reg.select_tools_for_request("\u5220\u9664 popdrag1 \u8282\u70b9", "agent")
+        }
+
+        self.assertIn("delete_node", names)
+        self.assertIn("preview_node_operation", names)
+        self.assertIn("get_node_connections", names)
+
     def test_high_risk_tools_not_selected_without_explicit_code_or_file_intent(self):
         for name in ("execute_shell", "execute_python", "save_hip", "get_network_structure"):
             self.reg.register(name, _schema(name), modes={"agent"})
@@ -285,6 +301,42 @@ class IntentTest(unittest.TestCase):
         self.assertNotIn("execute_shell", names)
         self.assertNotIn("execute_python", names)
         self.assertNotIn("save_hip", names)
+
+    def test_execute_optimization_prefers_dedicated_network_tools(self):
+        for name in (
+            "execute_python", "connect_nodes", "disconnect_nodes", "delete_node",
+            "set_node_parameter", "set_node_flags", "layout_nodes", "verify_network",
+            "get_network_structure", "inspect_node", "get_parameter_schema",
+            "get_node_connections", "get_node_inputs", "suggest_connection",
+            "preview_node_operation", "validate_node_network", "cook_node",
+        ):
+            self.reg.register(name, _schema(name), modes={"agent"})
+
+        names = {
+            s["function"]["name"]
+            for s in self.reg.select_tools_for_request(
+                "需要我帮你执行其中某些优化吗？比如先看看当前参数？", "agent"
+            )
+        }
+
+        self.assertIn("connect_nodes", names)
+        self.assertIn("delete_node", names)
+        self.assertIn("set_node_parameter", names)
+        self.assertIn("set_node_flags", names)
+        self.assertIn("layout_nodes", names)
+        self.assertIn("verify_network", names)
+        self.assertNotIn("execute_python", names)
+
+    def test_explicit_python_request_selects_execute_python(self):
+        for name in ("execute_python", "get_network_structure"):
+            self.reg.register(name, _schema(name), modes={"agent"})
+
+        names = {
+            s["function"]["name"]
+            for s in self.reg.select_tools_for_request("运行一段 Python 脚本", "agent")
+        }
+
+        self.assertIn("execute_python", names)
 
     def test_ask_mode_filters_mutating_dependency_tools(self):
         for name in ("connect_nodes", "get_node_connections", "preview_node_operation"):

@@ -7,7 +7,7 @@ Skill 是预定义的 Python 代码片段，在 Houdini 环境中执行。
   - SKILL_INFO: dict  (name, description, parameters)
   - run(**kwargs) -> dict  入口函数
 
-★ v1.3.5+：Skill 自动注册到 ToolRegistry，可作为独立工具暴露给 AI。
+★ Skill 通过 list_skills / run_skill 元工具暴露给 AI，不再注册为独立 skill_xxx 工具。
 ★ 支持用户自定义 Skill 目录（config/houdini_ai.ini → [skills] user_skill_dir）
 """
 
@@ -22,40 +22,6 @@ from pathlib import Path
 # 全局注册表：skill_name -> module
 _registry: Dict[str, Any] = {}
 _loaded = False
-
-
-def _skill_info_to_openai_schema(info: dict, skill_name: str) -> dict:
-    """将 SKILL_INFO 转换为 OpenAI function calling schema"""
-    properties = {}
-    required = []
-    # JSON Schema 不支持 'float'，需映射为 'number'
-    _TYPE_MAP = {"float": "number", "int": "integer", "bool": "boolean"}
-    for param_name, param_def in info.get("parameters", {}).items():
-        raw_type = param_def.get("type", "string")
-        prop: Dict[str, Any] = {
-            "type": _TYPE_MAP.get(raw_type, raw_type),
-            "description": param_def.get("description", ""),
-        }
-        if "enum" in param_def:
-            prop["enum"] = param_def["enum"]
-        if "default" in param_def:
-            prop["default"] = param_def["default"]
-        properties[param_name] = prop
-        if param_def.get("required", False):
-            required.append(param_name)
-
-    return {
-        "type": "function",
-        "function": {
-            "name": f"skill_{skill_name}",
-            "description": f"[Skill] {info.get('description', skill_name)}",
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-                "required": required,
-            }
-        }
-    }
 
 
 def _get_user_skill_dir() -> Optional[Path]:
@@ -124,48 +90,10 @@ def _load_all():
     if _registry:
         print(f"[Skills] 已加载 {len(_registry)} 个 skill: {', '.join(_registry.keys())}")
 
-    # ★ 自动注册到 ToolRegistry
-    _register_skills_to_registry()
-
-
-def _register_skills_to_registry():
-    """将所有已加载 Skill 注册到 ToolRegistry"""
-    try:
-        from ..utils.tool_registry import get_tool_registry
-        reg = get_tool_registry()
-        for name, mod in _registry.items():
-            info = getattr(mod, "SKILL_INFO", {})
-            schema = _skill_info_to_openai_schema(info, name)
-            run_fn = getattr(mod, "run", None)
-
-            def _make_handler(m):
-                """创建闭包，避免 lambda 捕获变量问题"""
-                def handler(args: dict) -> dict:
-                    fn = getattr(m, "run", None)
-                    if not callable(fn):
-                        return {"success": False, "error": "Skill 没有 run() 函数"}
-                    try:
-                        result = fn(**args)
-                        if not isinstance(result, dict):
-                            result = {"result": str(result)}
-                        result.setdefault("success", True)
-                        return result
-                    except Exception as e:
-                        return {"success": False, "error": f"Skill 执行失败: {e}"}
-                return handler
-
-            reg.register(
-                name=f"skill_{name}",
-                schema=schema,
-                handler=_make_handler(mod),
-                source="skill",
-                tags={"readonly", "geometry", "skill"},
-                modes={"agent", "ask", "plan_executing"},
-            )
-        if _registry:
-            print(f"[Skills] 已注册 {len(_registry)} 个 Skill 到 ToolRegistry")
-    except Exception as e:
-        print(f"[Skills] ToolRegistry 注册失败 (非致命): {e}")
+    # Skill 仅通过 run_skill / list_skills 元工具暴露给 AI，不再注册为
+    # 独立的 skill_xxx 工具。原因：独立工具会被 50+ 工具列表淹没，AI 几乎
+    # 不会主动选用；且独立工具走 ToolRegistry 回退路径绕过了 undo group。
+    # 保留 run_skill 元工具两步走（list_skills → run_skill）更可控。
 
 
 def list_skills() -> List[Dict[str, Any]]:
@@ -212,12 +140,6 @@ def run_skill(skill_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
 def reload_skills():
     """重新加载所有 skill（开发调试用）"""
     global _registry, _loaded
-    # 先从 ToolRegistry 注销旧的 skill 工具
-    try:
-        from ..utils.tool_registry import get_tool_registry
-        get_tool_registry().unregister_by_source("skill")
-    except Exception:
-        pass
     _registry.clear()
     _loaded = False
     _load_all()

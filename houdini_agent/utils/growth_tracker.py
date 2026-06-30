@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .memory_store import MemoryStore, get_memory_store
+from .reward_engine import TAG_ERROR_CORRECTION, TAG_UNRESOLVED_ERROR
 from shared.user_paths import UserPaths, normalize_username
 
 # ============================================================
@@ -254,10 +255,10 @@ class GrowthTracker:
             self.personality.efficiency_bias -= alpha
 
         # 风险容忍度
-        if "error_correction" in metric.tags:
+        if TAG_ERROR_CORRECTION in metric.tags:
             # 犯错后纠正 → 提高风险容忍度
             self.personality.risk_tolerance = min(1.0, self.personality.risk_tolerance + alpha)
-        elif "unresolved_error" in metric.tags:
+        elif TAG_UNRESOLVED_ERROR in metric.tags:
             # 未解决的错误 → 降低风险容忍度
             self.personality.risk_tolerance = max(0.0, self.personality.risk_tolerance - alpha)
 

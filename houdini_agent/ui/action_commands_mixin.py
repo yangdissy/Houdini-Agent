@@ -476,6 +476,25 @@ class ActionCommandsMixin:
         每次 _on_send 时调用一次，不在聊天界面中显示额外卡片。
         调用方式与手动 + 菜单中的 Read Selection / Read Network 保持一致。
         """
+        # ★ 注入 Houdini 更新模式提示（Cook Guard / 用户自身 Manual 都需要让 AI 知道）
+        try:
+            import hou  # type: ignore
+            current_mode = hou.updateModeSetting()
+            if current_mode == hou.updateMode.Manual:
+                self._conversation_history.append({
+                    'role': 'user',
+                    'content': (
+                        "[Scene state] Houdini update mode is Manual. "
+                        "Modifications (create_node, set_display_flag, set_node_parameter, "
+                        "connect_nodes, etc.) will NOT auto-cook. Tool 'success' only means "
+                        "the operation was queued — do NOT assume the viewport or downstream "
+                        "geometry reflects the change. Use check_errors / get_network_structure / "
+                        "verify_network to confirm actual results before reporting completion."
+                    )
+                })
+        except Exception:
+            pass
+
         mode = getattr(self, '_auto_read_mode', 'sel')
         if mode == 'off':
             return
@@ -518,9 +537,14 @@ class ActionCommandsMixin:
         """[主线程] 收集 Houdini 场景上下文用于自动 RAG 增强
         
         返回场景上下文 dict，传给后台线程的 _auto_rag_retrieve 使用。
-        包含：当前网络路径、选中节点类型、选中节点名。
+        包含：当前网络路径、选中节点类型、选中节点名、更新模式。
         """
-        ctx = {'network_path': '', 'selected_types': [], 'selected_names': []}
+        ctx = {
+            'network_path': '',
+            'selected_types': [],
+            'selected_names': [],
+            'update_mode': '',
+        }
         try:
             import hou  # type: ignore
             # 当前网络路径
@@ -534,6 +558,11 @@ class ActionCommandsMixin:
             for n in hou.selectedNodes()[:5]:  # 最多 5 个，避免过多
                 ctx['selected_types'].append(n.type().name())
                 ctx['selected_names'].append(n.name())
+            # 当前 Houdini 更新模式
+            try:
+                ctx['update_mode'] = hou.updateModeSetting().name()
+            except Exception:
+                pass
         except Exception:
             pass
         return ctx

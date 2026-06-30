@@ -16,13 +16,13 @@ import sqlite3
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .embedding import get_embedder, LocalEmbedder, EMBEDDING_DIM
+from .embedding import get_embedder, LocalEmbedder
 from shared.user_paths import UserPaths, normalize_username
 
 # ============================================================
@@ -105,6 +105,8 @@ class SemanticRecord:
             self.created_at = now
         if self.updated_at == 0.0:
             self.updated_at = now
+        if self.category not in MEMORY_CATEGORIES:
+            self.category = "general"
 
 
 @dataclass
@@ -203,6 +205,39 @@ class MemoryStore:
     def _commit(self):
         with self._db_lock:
             self._get_conn().commit()
+
+    def _rank_by_embedding(
+        self,
+        table: str,
+        query: str,
+        where_sql: str,
+        where_params: tuple,
+        top_k: int,
+        weight_col: str,
+        weight_fn,
+        sim_threshold: float = 0.0,
+    ) -> List[Tuple[str, float, float]]:
+        """检索路径瘦身：只拉 (id, embedding, weight_col) 算相似度，返回 top-k 的 id。
+
+        weight_fn(sim, weight) -> combined_score
+        Returns: [(id, sim, combined), ...] 按 combined 降序
+        """
+        query_vec = self.embedder.encode(query)
+        sql = f"SELECT id, embedding, {weight_col} FROM {table} WHERE {where_sql}"
+        rows = self._fetchall(sql, where_params)
+        if not rows:
+            return []
+        scored: List[Tuple[str, float, float]] = []
+        for rec_id, emb_blob, weight in rows:
+            if not emb_blob:
+                continue
+            emb = self.embedder.from_bytes(emb_blob)
+            sim = self.embedder.cosine_similarity(query_vec, emb)
+            if sim < sim_threshold:
+                continue
+            scored.append((rec_id, sim, weight_fn(sim, weight)))
+        scored.sort(key=lambda x: x[2], reverse=True)
+        return scored[:top_k]
 
     def _init_db(self):
         with self._db_lock:
@@ -354,24 +389,29 @@ class MemoryStore:
         Returns:
             [(record, similarity_score), ...] 按相似度降序
         """
-        query_vec = self.embedder.encode(query)
-        rows = self._fetchall(
-            "SELECT * FROM episodic_memory WHERE importance >= ? ORDER BY importance DESC",
-            (min_importance,)
+        ranked = self._rank_by_embedding(
+            table="episodic_memory",
+            query=query,
+            where_sql="importance >= ?",
+            where_params=(min_importance,),
+            top_k=top_k,
+            weight_col="importance",
+            weight_fn=lambda sim, imp: sim * (0.5 + 0.5 * min(imp, 2.0)),
         )
-
-        if not rows:
+        if not ranked:
             return []
-
+        # 按 id 回查完整记录，避免在检索路径反序列化 actions/tags JSON。
+        id_to_score = {rid: combined for rid, _sim, combined in ranked}
+        placeholders = ",".join("?" * len(id_to_score))
+        rows = self._fetchall(
+            f"SELECT * FROM episodic_memory WHERE id IN ({placeholders})",
+            tuple(id_to_score.keys()),
+        )
         results = []
         for row in rows:
             rec = self._row_to_episodic(row)
-            if rec.embedding is not None:
-                sim = self.embedder.cosine_similarity(query_vec, rec.embedding)
-                # 综合分 = 相似度 * importance 权重
-                combined = sim * (0.5 + 0.5 * min(rec.importance, 2.0))
-                results.append((rec, combined))
-
+            results.append((rec, id_to_score[rec.id]))
+        # 回查顺序不保证，按 combined 重排
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]
 
@@ -464,23 +504,27 @@ class MemoryStore:
 
     def search_semantic(self, query: str, top_k: int = 5, min_confidence: float = 0.2) -> List[Tuple[SemanticRecord, float]]:
         """向量检索抽象知识"""
-        query_vec = self.embedder.encode(query)
-        rows = self._fetchall(
-            "SELECT * FROM semantic_memory WHERE confidence >= ?",
-            (min_confidence,),
+        ranked = self._rank_by_embedding(
+            table="semantic_memory",
+            query=query,
+            where_sql="confidence >= ?",
+            where_params=(min_confidence,),
+            top_k=top_k,
+            weight_col="confidence",
+            weight_fn=lambda sim, conf: sim * (0.5 + 0.5 * conf),
         )
-
-        if not rows:
+        if not ranked:
             return []
-
+        id_to_score = {rid: combined for rid, _sim, combined in ranked}
+        placeholders = ",".join("?" * len(id_to_score))
+        rows = self._fetchall(
+            f"SELECT * FROM semantic_memory WHERE id IN ({placeholders})",
+            tuple(id_to_score.keys()),
+        )
         results = []
         for row in rows:
             rec = self._row_to_semantic(row)
-            if rec.embedding is not None:
-                sim = self.embedder.cosine_similarity(query_vec, rec.embedding)
-                combined = sim * (0.5 + 0.5 * rec.confidence)
-                results.append((rec, combined))
-
+            results.append((rec, id_to_score[rec.id]))
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]
 
@@ -512,11 +556,30 @@ class MemoryStore:
         self._commit()
 
     def find_duplicate_semantic(self, rule_text: str, threshold: float = 0.85) -> Optional[SemanticRecord]:
-        """查找是否已存在高度相似的规则（去重用）"""
-        results = self.search_semantic(rule_text, top_k=1, min_confidence=0.0)
+        """查找是否已存在高度相似的规则（去重用）
+
+        注意：去重必须用纯相似度 sim，不能用 search_semantic 返回的 combined
+        （combined = sim * (0.5 + 0.5*confidence) 会被低置信度压低，导致漏判重复）。
+        """
+        query_vec = self.embedder.encode(rule_text)
+        rows = self._fetchall("SELECT id, embedding FROM semantic_memory")
+        if not rows:
+            return None
+
         effective_threshold = self._scale_similarity_threshold(threshold)
-        if results and results[0][1] >= effective_threshold:
-            return results[0][0]
+        best_id: Optional[str] = None
+        best_sim: float = -1.0
+        for rec_id, emb_blob in rows:
+            if not emb_blob:
+                continue
+            emb = self.embedder.from_bytes(emb_blob)
+            sim = self.embedder.cosine_similarity(query_vec, emb)
+            if sim > best_sim:
+                best_sim = sim
+                best_id = rec_id
+
+        if best_id is not None and best_sim >= effective_threshold:
+            return self.get_semantic(best_id)
         return None
 
     def delete_semantic(self, record_id: str):
@@ -556,29 +619,32 @@ class MemoryStore:
         Returns:
             [(record, similarity_score), ...] 按综合分降序
         """
-        query_vec = self.embedder.encode(query)
-        rows = self._fetchall(
-            "SELECT * FROM semantic_memory WHERE abstraction_level = ? AND confidence >= ?",
-            (level, min_confidence)
-        )
-
-        if not rows:
-            return []
-
         # fallback embedding (n-gram hash) 的相似度值域偏低，需要动态缩放阈值。
         effective_threshold = self._scale_similarity_threshold(threshold)
-
+        ranked = self._rank_by_embedding(
+            table="semantic_memory",
+            query=query,
+            where_sql="abstraction_level = ? AND confidence >= ?",
+            where_params=(level, min_confidence),
+            top_k=top_k,
+            weight_col="confidence",
+            weight_fn=lambda sim, conf: sim * (0.5 + 0.5 * conf),
+            sim_threshold=effective_threshold,
+        )
+        if not ranked:
+            return []
+        id_to_score = {rid: combined for rid, _sim, combined in ranked}
+        placeholders = ",".join("?" * len(id_to_score))
+        rows = self._fetchall(
+            f"SELECT * FROM semantic_memory WHERE id IN ({placeholders})",
+            tuple(id_to_score.keys()),
+        )
         results = []
         for row in rows:
             rec = self._row_to_semantic(row)
-            if rec.embedding is not None:
-                sim = self.embedder.cosine_similarity(query_vec, rec.embedding)
-                if sim >= effective_threshold:
-                    combined = sim * (0.5 + 0.5 * rec.confidence)
-                    results.append((rec, combined))
-
+            results.append((rec, id_to_score[rec.id]))
         results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k]
+        return results
 
     def search_all_levels(
         self, query: str, category: Optional[str] = None,
@@ -595,31 +661,33 @@ class MemoryStore:
         Returns:
             [(record, similarity_score), ...] 按综合分降序
         """
-        query_vec = self.embedder.encode(query)
         if category:
-            rows = self._fetchall(
-                "SELECT * FROM semantic_memory WHERE category = ? AND confidence >= ?",
-                (category, min_confidence)
-            )
+            where_sql, where_params = "category = ? AND confidence >= ?", (category, min_confidence)
         else:
-            rows = self._fetchall(
-                "SELECT * FROM semantic_memory WHERE confidence >= ?",
-                (min_confidence,)
-            )
-
-        if not rows:
+            where_sql, where_params = "confidence >= ?", (min_confidence,)
+        ranked = self._rank_by_embedding(
+            table="semantic_memory",
+            query=query,
+            where_sql=where_sql,
+            where_params=where_params,
+            top_k=top_k,
+            weight_col="confidence",
+            weight_fn=lambda sim, conf: sim * (0.5 + 0.5 * conf),
+        )
+        if not ranked:
             return []
-
+        id_to_score = {rid: combined for rid, _sim, combined in ranked}
+        placeholders = ",".join("?" * len(id_to_score))
+        rows = self._fetchall(
+            f"SELECT * FROM semantic_memory WHERE id IN ({placeholders})",
+            tuple(id_to_score.keys()),
+        )
         results = []
         for row in rows:
             rec = self._row_to_semantic(row)
-            if rec.embedding is not None:
-                sim = self.embedder.cosine_similarity(query_vec, rec.embedding)
-                combined = sim * (0.5 + 0.5 * rec.confidence)
-                results.append((rec, combined))
-
+            results.append((rec, id_to_score[rec.id]))
         results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k]
+        return results
 
     # ==========================================================
     # Procedural Memory CRUD
@@ -659,20 +727,27 @@ class MemoryStore:
 
     def search_procedural(self, query: str, top_k: int = 3) -> List[Tuple[ProceduralRecord, float]]:
         """向量检索策略记忆"""
-        query_vec = self.embedder.encode(query)
-        rows = self._fetchall("SELECT * FROM procedural_memory ORDER BY priority DESC")
-
-        if not rows:
+        ranked = self._rank_by_embedding(
+            table="procedural_memory",
+            query=query,
+            where_sql="1=1",
+            where_params=(),
+            top_k=top_k,
+            weight_col="priority",
+            weight_fn=lambda sim, prio: sim * (0.3 + 0.7 * prio),
+        )
+        if not ranked:
             return []
-
+        id_to_score = {rid: combined for rid, _sim, combined in ranked}
+        placeholders = ",".join("?" * len(id_to_score))
+        rows = self._fetchall(
+            f"SELECT * FROM procedural_memory WHERE id IN ({placeholders})",
+            tuple(id_to_score.keys()),
+        )
         results = []
         for row in rows:
             rec = self._row_to_procedural(row)
-            if rec.embedding is not None:
-                sim = self.embedder.cosine_similarity(query_vec, rec.embedding)
-                combined = sim * (0.3 + 0.7 * rec.priority)
-                results.append((rec, combined))
-
+            results.append((rec, id_to_score[rec.id]))
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]
 
@@ -681,20 +756,34 @@ class MemoryStore:
         return [self._row_to_procedural(r) for r in rows]
 
     def update_procedural_usage(self, record_id: str, success: bool):
-        """更新策略使用统计"""
-        rec = self.get_procedural(record_id)
-        if not rec:
-            return
-        rec.usage_count += 1
-        rec.last_used = time.time()
-        # 更新成功率（滑动平均）
-        alpha = min(0.3, 1.0 / rec.usage_count)
-        rec.success_rate = (1 - alpha) * rec.success_rate + alpha * (1.0 if success else 0.0)
-        self._execute(
-            "UPDATE procedural_memory SET usage_count=?, last_used=?, success_rate=? WHERE id=?",
-            (rec.usage_count, rec.last_used, rec.success_rate, record_id)
-        )
-        self._commit()
+        """更新策略使用统计（原子化，避免读改写丢更新）
+
+        success_rate 用滑动平均：alpha = min(0.3, 1/usage_count)，
+        在 SQL 里用 CASE 递增 usage_count 后再算 alpha。
+        """
+        now = time.time()
+        success_val = 1.0 if success else 0.0
+        with self._db_lock:
+            conn = self._get_conn()
+            # 单条 SQL 完成递增 + 滑动平均，避免 read-modify-write 的并发丢更新。
+            conn.execute(
+                """
+                UPDATE procedural_memory
+                SET usage_count = usage_count + 1,
+                    last_used = ?,
+                    success_rate = (
+                        CASE
+                            WHEN usage_count + 1 <= 3
+                                THEN (1.0 - 1.0 / (usage_count + 1)) * success_rate
+                                     + (1.0 / (usage_count + 1)) * ?
+                            ELSE 0.7 * success_rate + 0.3 * ?
+                        END
+                    )
+                WHERE id = ?
+                """,
+                (now, success_val, success_val, record_id),
+            )
+            conn.commit()
 
     def update_procedural_priority(self, record_id: str, priority_delta: float):
         """调整策略优先级"""
@@ -733,7 +822,11 @@ class MemoryStore:
         with self._db_lock:
             conn = self._get_conn()
             now = time.time()
-            rows = conn.execute("SELECT id, timestamp, importance FROM episodic_memory").fetchall()
+            # 早退：只处理 importance 仍高于下限+epsilon 的记录，
+            # 已经接近 0.01 下限的不再扫描/更新。
+            rows = conn.execute(
+                "SELECT id, timestamp, importance FROM episodic_memory WHERE importance > 0.011"
+            ).fetchall()
             for row_id, ts, imp in rows:
                 days = (now - ts) / 86400.0
                 new_imp = imp * math.exp(-lambda_decay * days)
@@ -756,8 +849,10 @@ class MemoryStore:
         with self._db_lock:
             conn = self._get_conn()
             now = time.time()
+            # 早退：跳过已经接近最低下限(0.05)的记录，避免无意义扫描。
             rows = conn.execute(
-                "SELECT id, updated_at, confidence, activation_count, abstraction_level FROM semantic_memory"
+                "SELECT id, updated_at, confidence, activation_count, abstraction_level "
+                "FROM semantic_memory WHERE confidence > 0.051"
             ).fetchall()
 
             for rec_id, updated_at, confidence, activation_count, abstraction_level in rows:
@@ -796,8 +891,10 @@ class MemoryStore:
         with self._db_lock:
             conn = self._get_conn()
             now = time.time()
+            # 早退：跳过已经接近最低下限(0.15)的记录。
             rows = conn.execute(
-                "SELECT id, last_used, priority, success_rate, usage_count FROM procedural_memory"
+                "SELECT id, last_used, priority, success_rate, usage_count "
+                "FROM procedural_memory WHERE priority > 0.151"
             ).fetchall()
 
             for rec_id, last_used, priority, success_rate, usage_count in rows:

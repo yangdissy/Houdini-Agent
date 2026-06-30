@@ -21,7 +21,12 @@ from .memory_store import (
     ProceduralRecord,
     get_memory_store,
 )
-from .reward_engine import RewardEngine, get_reward_engine
+from .reward_engine import (
+    RewardEngine,
+    get_reward_engine,
+    TAG_ERROR_CORRECTION,
+    TAG_UNRESOLVED_ERROR,
+)
 from shared.user_paths import normalize_username
 
 # ============================================================
@@ -215,10 +220,10 @@ class ReflectionModule:
                 break
 
         if has_error and has_success_after_error and episodic.success:
-            tags.append("error_correction")
+            tags.append(TAG_ERROR_CORRECTION)
 
         if has_error and not episodic.success:
-            tags.append("unresolved_error")
+            tags.append(TAG_UNRESOLVED_ERROR)
 
         # 3. 检测复杂任务（工具调用 > 10）
         if len(tool_calls) > 10:
@@ -313,12 +318,19 @@ class ReflectionModule:
             result["episodic_id"] = episodic.id
 
             # 4. Reward 计算 + importance 更新
+            #    维护（全局衰减 + 长期记忆整理）由本模块按节奏调度，
+            #    避免在每次任务热路径上做大开销操作。
+            total_after = self.store.count_episodic()
+            run_maint = total_after > 0 and total_after % 20 == 0
             reward_result = self.reward_engine.process_task_completion(
                 episodic_record=episodic,
                 tool_call_count=len(tool_calls),
+                run_maintenance=run_maint,
             )
             result["reward"] = reward_result["reward"]
             result["importance"] = reward_result["importance"]
+            result["scores"] = reward_result.get("scores")
+            result["memory_maintenance"] = reward_result.get("memory_maintenance")
 
             # 5. 更新统计
             self._task_count_since_reflect += 1
@@ -415,6 +427,7 @@ class ReflectionModule:
                 max_tokens=1500,
                 tools=None,
                 enable_thinking=False,
+                response_format={'type': 'json_object'},
             ):
                 if chunk.get("type") == "content":
                     full_response += chunk.get("content", "")
@@ -827,6 +840,7 @@ class ReflectionModule:
                 max_tokens=max_tokens,
                 tools=None,
                 enable_thinking=False,
+                response_format={'type': 'json_object'},
             ):
                 if chunk.get("type") == "content":
                     full_response += chunk.get("content", "")

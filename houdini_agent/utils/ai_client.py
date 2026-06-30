@@ -543,27 +543,6 @@ HOUDINI_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_node_parameters",
-            "description": "获取节点的完整参数列表及概况信息：类型、状态标志(display/render/bypass)、错误信息、输入输出连接、以及每个参数的内部名称、类型(Float/Int/Menu等)、标签、默认值、当前值、菜单选项。设置参数前必须先调用此工具确认正确的参数名和类型，不要猜测。参数较多时支持分页。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "node_path": {
-                        "type": "string",
-                        "description": "节点完整路径如 '/obj/geo1/box1'"
-                    },
-                    "page": {
-                        "type": "integer",
-                        "description": "页码（从1开始），参数较多时翻页查看后续参数"
-                    }
-                },
-                "required": ["node_path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "get_parameter_schema",
             "description": "结构化获取节点参数 schema：参数名、标签、类型、tuple 尺寸、当前值、默认值、min/max、菜单 token/label。设置参数前优先用此工具精确确认可用参数和值域；支持 pattern 过滤和 offset/limit 分页。",
             "parameters": {
@@ -622,7 +601,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "create_node",
-            "description": "创建单个孤立节点。若任务需要创建 2 个及以上节点并建立连接，必须优先使用 create_nodes_batch 一次声明 nodes 和 connections，以便系统自动连接、整理布局并减少路径猜测。节点类型格式：'box' 或 'sop/box'（推荐直接写节点名如'box'，系统会自动识别类别）。如果创建失败，必须调用 search_node_types 查找正确的节点类型名再重试，不要盲目重试。",
+            "description": "创建【单个孤立节点】，仅用于：(1) 向已有网络加 1 个不需要连接的节点（如调试用 null）；(2) 给已有节点旁边补一个独立辅助节点。\n\n⛔ 反模式：任务涉及 2 个或以上节点 + 连接 → 必须用 create_nodes_batch，禁止用 create_node 拼网络。哪怕只是 box + scatter 这种最小双节点链，也应一次 batch 完成。逐个 create_node + connect_nodes 拼接会浪费 token、错误分散难修、布局碎裂。\n\n节点类型格式：'box' 或 'sop/box'（推荐直接写节点名如 'box'）。创建失败请先调用 search_node_types 找正确类型名。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -642,19 +621,23 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "create_nodes_batch",
-            "description": "批量创建节点、自动连接并整理本批节点布局。只要需要创建 2 个及以上相关节点，尤其是 box->scatter->copytopoints 这类小网络，也应优先使用此工具；不要拆成多个 create_node + connect_nodes。nodes 数组中每个元素需要 id（临时标识）和 type（节点类型）；connections 数组指定连接关系，from/to 使用 nodes 中的 id。",
+            "description": "批量创建节点、自动连接并整理本批节点布局。只要需要创建 2 个及以上相关节点，尤其是 box->scatter->copytopoints 这类小网络，也应优先使用此工具；不要拆成多个 create_node + connect_nodes。\n\n参数约定：\n- parent_path 强烈建议显式传入（如 '/obj/geo1'），不传则用当前网络编辑器焦点（不可靠）。\n- nodes[i].id 为本批临时标识，connections 用它互连；id 找不到会硬报错。\n- nodes[i].parameters 设置参数（旧字段名 parms 也兼容）；参数名不存在会硬报错并提示用 get_parameter_schema 查询。\n- 任何节点或连接失败都会返回 success=False 并附完整错误清单，便于一次性修正后重试。\n- 使用陌生节点类型时，先用 dry_run=True 跑一次校验（不创建任何节点），通过后再真建。",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "parent_path": {
+                        "type": "string",
+                        "description": "父网络路径，如 '/obj/geo1'。强烈建议显式传入；缺省时回退到当前网络编辑器焦点（不可靠）。"
+                    },
                     "nodes": {
                         "type": "array",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "id": {"type": "string"},
-                                "type": {"type": "string"},
-                                "name": {"type": "string"},
-                                "parms": {"type": "object"}
+                                "id": {"type": "string", "description": "本批临时标识，供 connections 引用"},
+                                "type": {"type": "string", "description": "节点类型，如 'box', 'scatter'"},
+                                "name": {"type": "string", "description": "节点名称（可选）"},
+                                "parameters": {"type": "object", "description": "初始参数字典；旧字段名 parms 也兼容"}
                             },
                             "required": ["id", "type"]
                         }
@@ -664,11 +647,16 @@ HOUDINI_TOOLS = [
                         "items": {
                             "type": "object",
                             "properties": {
-                                "from": {"type": "string"},
-                                "to": {"type": "string"},
-                                "input": {"type": "integer"}
-                            }
+                                "from": {"type": "string", "description": "上游节点 id（必须出现在 nodes 数组中）"},
+                                "to": {"type": "string", "description": "下游节点 id（必须出现在 nodes 数组中）"},
+                                "input": {"type": "integer", "description": "目标输入端口索引，默认 0"}
+                            },
+                            "required": ["from", "to"]
                         }
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "只跑预校验（节点类型存在性、id 重复、name 冲突、connections 端点）不创建任何节点。校验失败会返回完整错误清单与 did-you-mean 建议。用陌生节点类型时强烈建议先 dry_run=True。默认 false。"
                     }
                 },
                 "required": ["nodes"]
@@ -842,12 +830,12 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "cook_node",
-            "description": "Cook 指定节点，并返回 cook 后 errors/warnings/messages。用于创建或改线后验证节点是否能成功计算；force=true 会强制重新 cook，可能较慢。",
+            "description": "Cook 指定节点并返回 errors/warnings/messages。\n\n何时用 force=false（默认）：常规验证节点能否计算成功。\n何时用 force=true：上游已改但下游错误/几何没刷新——比如改了 wrangle/VOP/HDA 后下游 copy_to_points、scatter 仍报旧错。force=true 会执行硬复位：bypass 切换打破上游引用缓存 → 清节点的 SOP cache → 重打 display flag → 强制重 cook。这等同于手动操作里的 '先 bypass 再激活、再选回 display' 套路。\n\n建议顺序：先 force=true 修复，再考虑 disconnect/reconnect；删节点重建是最后手段（会丢失连接和参数），但当节点类型本身被换、HDA 引用丢失或用户明确要求重建时也是合理选择。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "node_path": {"type": "string", "description": "要 cook 的节点完整路径，如 '/obj/geo1/OUT'"},
-                    "force": {"type": "boolean", "description": "是否强制重新 cook，默认 false"}
+                    "force": {"type": "boolean", "description": "true 触发硬复位流程（bypass 切换 + 清 cache + 强制 cook），用于上游改了但下游缓存 stale 数据的情况。默认 false。"}
                 },
                 "required": ["node_path"]
             }
@@ -857,7 +845,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "search_node_types",
-            "description": "按关键词搜索 Houdini 可用的节点类型。用于精确查找节点。",
+            "description": "按关键词搜索 Houdini 可用节点类型，返回类型名 + 描述。\n\n何时用：你已经有一个关键词（如 'scatter'、'rbd'、'copy'），想列出所有名字含该词的节点。\n何时不用：不知道节点叫什么 → 用 semantic_search_nodes；知道节点名想看详细信息 → 用 get_node_card。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -873,7 +861,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "semantic_search_nodes",
-            "description": "通过自然语言描述搜索合适的节点类型。例如：'我需要在表面上随机分布点'会找到 scatter 节点。当你不确定用什么节点时使用此工具。",
+            "description": "用自然语言描述想做的操作，反查对应节点类型。\n\n何时用：你不知道节点叫什么、只能描述意图，如 '在表面分布点'、'复制物体到点上'、'按距离衰减选择'。\n何时不用：已经有关键词 → 用 search_node_types。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -890,23 +878,6 @@ HOUDINI_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "list_children",
-            "description": "列出网络下的所有子节点，类似文件系统的 ls 命令。显示节点名称、类型和状态。节点较多时支持分页。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "network_path": {"type": "string", "description": "网络路径，如 '/obj/geo1'。留空使用当前网络"},
-                    "recursive": {"type": "boolean", "description": "是否递归列出子网络，默认 false"},
-                    "show_flags": {"type": "boolean", "description": "是否显示节点标志（显示/渲染/旁路），默认 true"},
-                    "page": {"type": "integer", "description": "页码（从1开始），节点较多时翻页查看"}
-                },
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "read_selection",
             "description": "读取当前选中节点的详细信息。不需要知道节点路径，直接读取用户选中的内容。",
             "parameters": {
@@ -916,22 +887,6 @@ HOUDINI_TOOLS = [
                     "include_geometry": {"type": "boolean", "description": "是否包含几何体信息，默认 false"}
                 },
                 "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "set_display_flag",
-            "description": "设置节点的显示标志。控制哪个节点在视口中显示。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "node_path": {"type": "string", "description": "节点路径"},
-                    "display": {"type": "boolean", "description": "是否设为显示节点"},
-                    "render": {"type": "boolean", "description": "是否设为渲染节点"}
-                },
-                "required": ["node_path"]
             }
         }
     },
@@ -1147,7 +1102,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_houdini_node_doc",
-            "description": "获取节点帮助文档（支持分页）。自动降级：本地帮助服务器->SideFX在线文档->节点类型信息。文档较长时会分页显示，返回结果中会提示总页数和下一页调用方式。优先使用 get_node_inputs 获取输入端口信息，本工具用于需要更详细文档时。",
+            "description": "拉取节点的完整长文档（支持分页）。\n\n何时用：get_node_card 的参数列表不够、需要看 examples / parameter group / 完整说明文本。\n何时不用：只想知道连接和参数 → 用 get_node_card（一次返回，更快）。\n\n降级路径：本地帮助 → SideFX 在线 → 节点类型摘要。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1222,17 +1177,51 @@ HOUDINI_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "check_errors",
-            "description": "检查Houdini节点的cooking错误和警告（仅用于节点cooking问题）。注意：如果工具调用返回了错误信息（如缺少参数），无需调用此工具，直接根据返回的错误信息修正参数即可。",
+            "name": "verify_network",
+            "description": "【建完/改完网络必用】一次性核查一个网络下所有子节点的状态：errors / warnings / display+render+bypass flags / display 节点的几何 evidence（points/prims/vertices）。比逐个调 check_errors 高效得多。\n\n何时用：用 create_nodes_batch 建完一个网络后；改完连接或参数后；用户问 '建好了吗'。tool 返回 success 不等于网络真的工作，请用此工具确认 evidence（健康 + 几何点数非零）再回报用户。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "node_path": {
+                    "parent_path": {
                         "type": "string",
-                        "description": "要检查的节点或网络路径。如果是网络路径，会检查其下所有节点。留空则检查当前网络。"
+                        "description": "要核查的父网络路径，如 '/obj/geo1'"
+                    },
+                    "cook_display": {
+                        "type": "boolean",
+                        "description": "是否强制 cook display 节点让上游错误浮现。默认 true。重场景可设 false 只读已有 errors。"
                     }
                 },
-                "required": []
+                "required": ["parent_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_node_card",
+            "description": "建节点前一站式查节点类型说明（无需先建节点）：min/max inputs、输入/输出端口 label、is_generator、参数名+默认值+menu items（enum 合法值）。\n\n何时用：第一次用某节点类型；不确定该接几个输入；不知道某参数是 enum / float / string；create_nodes_batch 前对陌生类型先查一次比 dry_run 更高效。\n何时不用：只想知道几个输入端口、对方是 210 个常用节点 → get_node_inputs（有 JSON 缓存更快）；想看长文档 → get_houdini_node_doc；查已建好的节点参数 → get_parameter_schema。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_type": {
+                        "type": "string",
+                        "description": "节点类型名，如 'scatter'、'copytopoints'、'rbdbulletsolver'。不带版本号时返回最新版。"
+                    },
+                    "context": {
+                        "type": "string",
+                        "enum": ["Sop", "Lop", "Dop", "Cop", "Chop", "Top", "Object", "Driver", "Vop"],
+                        "description": "节点类别，默认 'Sop'"
+                    },
+                    "parm_filter": {
+                        "type": "string",
+                        "description": "可选：参数名/label 子串过滤，只返回匹配的参数"
+                    },
+                    "max_parms": {
+                        "type": "integer",
+                        "description": "参数返回上限，默认 40"
+                    }
+                },
+                "required": ["node_type"]
             }
         }
     },
@@ -1240,7 +1229,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_node_inputs",
-            "description": "【连接前必用】获取节点输入端口信息(210个常用节点已缓存,快速返回)。连接多输入节点前必用!常见节点已包含完整信息,优先使用此工具而非get_houdini_node_doc。",
+            "description": "查节点输入端口的快速版（210 个常用节点已 JSON 缓存，毫秒级返回）。\n\n何时用：连接现有节点前确认 input_index 含义；只关心端口、不关心参数。\n何时不用：需要参数信息或 menu items → get_node_card；查冷门节点（缓存外）→ get_node_card。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1309,40 +1298,18 @@ HOUDINI_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "verify_and_summarize",
-            "description": "【任务结束前必调用】验证节点网络并生成总结。自动检测:1.孤立节点 2.错误节点 3.连接完整性 4.显示标志。已内置 get_network_structure，不需要在调用前单独查询网络。如果发现问题必须修复后重新调用，直到通过。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "check_items": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "要检查的项目列表(如节点名)"
-                    },
-                    "expected_result": {
-                        "type": "string",
-                        "description": "期望的结果描述"
-                    }
-                },
-                "required": ["check_items", "expected_result"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "run_skill",
-            "description": "执行预定义的 Skill（高级分析脚本）。Skill 是经过优化的专用脚本，比手写 execute_python 更可靠。用 list_skills 查看可用 skill。",
+            "description": "执行预定义的 Skill（专用分析脚本）。Skill 比手写 execute_python 更可靠、更结构化。常见场景：几何属性统计(analyze_geometry_attribs)、边界盒信息(get_bounding_info)、法线质量检测(analyze_normals)、cook 性能分析(analyze_cook_performance)、死节点查找(find_dead_nodes)、节点依赖追溯(trace_node_dependencies)、网络契约验证(validate_network_contract)等。遇到分析类需求时优先用 run_skill 而非 execute_python。用 list_skills 查看完整列表和参数。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "skill_name": {
                         "type": "string",
-                        "description": "Skill 名称（用 list_skills 获取）"
+                        "description": "Skill 名称（用 list_skills 获取，或直接用描述中提到的常见 skill 名）"
                     },
                     "params": {
                         "type": "object",
-                        "description": "传给 Skill 的参数（键值对）"
+                        "description": "传给 Skill 的参数（键值对，具体参数见 list_skills 输出）"
                     }
                 },
                 "required": ["skill_name", "params"]
@@ -1353,7 +1320,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_skills",
-            "description": "列出所有可用的 Skill 及其参数说明。在需要复杂分析（如几何属性统计、批量检查等）时，先调用此工具查看是否有现成 Skill。",
+            "description": "列出所有可用的 Skill 及其参数说明（结构化 JSON 输出）。在需要复杂分析（几何属性统计、性能诊断、网络检查、依赖追溯等）时，先调用此工具查看是否有现成 Skill，比手写 execute_python 更高效可靠。",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -1786,8 +1753,8 @@ class AIClient:
         'get_node_connections', 'suggest_connection', 'preview_node_operation', 'validate_node_network',
         'list_children', 'find_nodes', 'get_geometry_summary', 'get_scene_snapshot',
         'read_selection', 'search_node_types',
-        'semantic_search_nodes', 'find_nodes_by_param', 'check_errors',
-        'search_local_doc', 'get_houdini_node_doc', 'get_node_inputs',
+        'semantic_search_nodes', 'find_nodes_by_param', 'check_errors', 'verify_network',
+        'search_local_doc', 'get_houdini_node_doc', 'get_node_inputs', 'get_node_card',
         'execute_python', 'execute_shell', 'web_search', 'fetch_webpage',
         'run_skill', 'list_skills',
         'capture_viewport',
@@ -1798,9 +1765,9 @@ class AIClient:
     })
     _SIMPLE_SUCCESS_TOOLS = frozenset({
         'create_node', 'get_node_parameters', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
-        'suggest_connection', 'preview_node_operation', 'validate_node_network', 'get_node_inputs',
+        'suggest_connection', 'preview_node_operation', 'validate_node_network', 'get_node_inputs', 'get_node_card',
         'list_children', 'find_nodes', 'get_geometry_summary', 'get_scene_snapshot',
-        'read_selection', 'check_errors',
+        'read_selection', 'check_errors', 'verify_network',
     })
     _DEEP_THINK_TOOLS = frozenset({
         'connect_nodes', 'cook_node', 'create_named_null', 'delete_node', 'disconnect_nodes', 'rename_node', 'preview_layout_nodes',
@@ -2901,9 +2868,11 @@ class AIClient:
                 headers = {'Content-Type': 'application/json'}
                 if api_key:
                     headers['Authorization'] = f'Bearer {api_key}'
+                _ping_model = self._get_default_model(provider)
+                _tok_key = 'max_completion_tokens' if self.uses_max_completion_tokens(_ping_model) else 'max_tokens'
                 response = self._http_session.post(
                     self._get_api_url(provider),
-                    json={'model': self._get_default_model(provider), 'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 1},
+                    json={'model': _ping_model, 'messages': [{'role': 'user', 'content': 'hi'}], _tok_key: 1},
                     headers=headers,
                     timeout=15,
                     proxies={'http': None, 'https': None}
@@ -2940,6 +2909,17 @@ class AIClient:
             or 'v4-pro' in m
             or m == 'glm-4.7'
         )
+
+    @staticmethod
+    def _is_deepseek_v4_model(model: str) -> bool:
+        """判断是否为 DeepSeek V4 模型（含 SiliconFlow 的 deepseek-ai/ 前缀）。"""
+        return 'deepseek-v4' in (model or '').lower()
+
+    @staticmethod
+    def _is_deepseek_v4_pro_model(model: str) -> bool:
+        """判断是否为 DeepSeek V4 Pro 模型。"""
+        m = (model or '').lower()
+        return 'deepseek-v4' in m and 'v4-pro' in m
     
     @staticmethod
     def is_glm47(model: str) -> bool:
@@ -2951,6 +2931,12 @@ class AIClient:
         """判断模型是否只支持 temperature=1（不允许自定义值）"""
         m = model.lower()
         return 'k2' in m or m.startswith('gpt-5')
+
+    @staticmethod
+    def uses_max_completion_tokens(model: str) -> bool:
+        """OpenAI 推理模型族（gpt-5*、o1/o3/o4 系列）需用 max_completion_tokens 取代 max_tokens"""
+        m = model.lower()
+        return m.startswith('gpt-5') or m.startswith('o1') or m.startswith('o3') or m.startswith('o4')
 
     @classmethod
     def _payload_temperature(cls, model: str, temperature: Optional[float]) -> Optional[float]:
@@ -3611,7 +3597,8 @@ class AIClient:
                     max_tokens: Optional[int] = None,
                     tools: Optional[List[dict]] = None,
                     tool_choice: str = 'auto',
-                    enable_thinking: bool = True) -> Generator[Dict[str, Any], None, None]:
+                    enable_thinking: bool = True,
+                    response_format: Optional[dict] = None) -> Generator[Dict[str, Any], None, None]:
         """流式 Chat API
         
         Yields:
@@ -3656,13 +3643,22 @@ class AIClient:
         if payload_temperature is not None:
             payload['temperature'] = payload_temperature
         if max_tokens:
-            payload['max_tokens'] = max_tokens
+            _tok_key = 'max_completion_tokens' if self.uses_max_completion_tokens(model) else 'max_tokens'
+            payload[_tok_key] = max_tokens
+        if response_format:
+            payload['response_format'] = response_format
         
         # GLM-4.7 专属参数（仅原生 GLM 接口）：深度思考 + 流式工具调用
         if self.is_glm47(model) and provider == 'glm' and enable_thinking:
             payload['thinking'] = {'type': 'enabled'}
             if tools:
                 payload['tool_stream'] = True
+
+        # DeepSeek V4 thinking 参数（原生 DeepSeek 与 SiliconFlow OpenAI 兼容接口）
+        if provider in ('deepseek', 'siliconflow') and enable_thinking and self._is_deepseek_v4_model(model):
+            payload['thinking'] = {'type': 'enabled'}
+            if self._is_deepseek_v4_pro_model(model):
+                payload['reasoning_effort'] = 'high'
         
         # Duojie 中转：思考模式通过系统提示词中的 <think> 标签实现
         # 经测试 thinking/reasoningEffort 参数对 Duojie API 无效（reasoning_tokens 始终为 0）
@@ -4037,7 +4033,8 @@ class AIClient:
              max_tokens: Optional[int] = None,
              timeout: int = 60,
              tools: Optional[List[dict]] = None,
-             tool_choice: str = 'auto') -> Dict[str, Any]:
+             tool_choice: str = 'auto',
+             response_format: Optional[dict] = None) -> Dict[str, Any]:
         """非流式 Chat（兼容旧接口）"""
         
         if not HAS_REQUESTS:
@@ -4056,11 +4053,20 @@ class AIClient:
         if payload_temperature is not None:
             payload['temperature'] = payload_temperature
         if max_tokens:
-            payload['max_tokens'] = max_tokens
+            _tok_key = 'max_completion_tokens' if self.uses_max_completion_tokens(model) else 'max_tokens'
+            payload[_tok_key] = max_tokens
+        if response_format:
+            payload['response_format'] = response_format
         
         # GLM-4.7 专属参数（仅原生 GLM 接口）
         if self.is_glm47(model) and provider == 'glm':
             payload['thinking'] = {'type': 'enabled'}
+
+        # DeepSeek V4-Pro：非流式也启用思考（原生 DeepSeek 与 SiliconFlow OpenAI 兼容接口）
+        if provider in ('deepseek', 'siliconflow') and self._is_deepseek_v4_model(model):
+            payload['thinking'] = {'type': 'enabled'}
+            if self._is_deepseek_v4_pro_model(model):
+                payload['reasoning_effort'] = 'high'
         
         # 注意：非流式 chat() 不包含 enable_thinking 参数，不做 think 模型映射
         # 思考模式仅在流式 chat_stream() / agent_loop_stream() 中通过 enable_thinking 控制
@@ -4641,7 +4647,7 @@ class AIClient:
             assistant_msg['content'] = round_content or None
             # reasoning_content 仅在回传消息时对 DeepSeek / 原生 GLM 有效
             # Duojie 的 reasoning_content 无需在后续请求中回传
-            if self.is_reasoning_model(model) and provider in ('deepseek', 'glm'):
+            if self.is_reasoning_model(model) and provider in ('deepseek', 'glm', 'siliconflow'):
                 assistant_msg['reasoning_content'] = round_thinking or ''
             working_messages.append(assistant_msg)
             
@@ -4963,8 +4969,8 @@ class AIClient:
 -连接节点前确认两个节点都已存在
 
 完成前必须检查（任务结束前强制执行）:
--调用verify_and_summarize自动检测(已内置网络检查,不需先调get_network_structure)
--如有问题修复后重新调用verify_and_summarize直到通过
+-调用verify_network(parent_path)自动检测整个网络(errors/warnings/flags/几何 evidence)
+-如有问题修复后重新调用verify_network直到 healthy 且几何点数非零
 
 ## 工具调用格式
 
@@ -5362,7 +5368,7 @@ class AIClient:
             # 添加助手消息（使用清理后的内容，但不要重复添加到full_content）
             json_assistant_msg = {'role': 'assistant', 'content': cleaned_content}
             # reasoning_content 仅在回传时对 DeepSeek / 原生 GLM 有效（Duojie 无需回传）
-            if self.is_reasoning_model(model) and provider in ('deepseek', 'glm'):
+            if self.is_reasoning_model(model) and provider in ('deepseek', 'glm', 'siliconflow'):
                 json_assistant_msg['reasoning_content'] = ''
             working_messages.append(json_assistant_msg)
             

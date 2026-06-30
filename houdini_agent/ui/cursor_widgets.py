@@ -2870,12 +2870,17 @@ class StreamingPlanCard(QtWidgets.QWidget):
             "rejected":  ("REJECTED",  "#ef4444"),
         }
         text, color = badge_map.get(status, ("DRAFT", "#64748b"))
-        self._status_badge.setText(text)
-        self._status_badge.setStyleSheet(
+        style = (
             f"color: {color}; background: rgba(0,0,0,0.3); "
             f"border: 1px solid {color}; border-radius: 4px; "
             f"font-size: 10px; padding: 1px 8px; font-weight: bold;"
         )
+        if getattr(self, '_badge_text_cache', None) != text:
+            self._status_badge.setText(text)
+            self._badge_text_cache = text
+        if getattr(self, '_badge_style_cache', None) != style:
+            self._status_badge.setStyleSheet(style)
+            self._badge_style_cache = style
         if self._btn_row:
             show = status == "draft" and not self._confirmed and not self._rejected
             self._btn_row.setVisible(show)
@@ -3335,12 +3340,17 @@ class PlanViewer(QtWidgets.QWidget):
             "rejected":  ("REJECTED",  "#ef4444"),
         }
         text, color = badge_map.get(status, ("DRAFT", "#64748b"))
-        self._status_badge.setText(text)
-        self._status_badge.setStyleSheet(
+        style = (
             f"color: {color}; background: rgba(0,0,0,0.3); "
             f"border: 1px solid {color}; border-radius: 4px; "
             f"font-size: 10px; padding: 1px 8px; font-weight: bold;"
         )
+        if getattr(self, '_badge_text_cache', None) != text:
+            self._status_badge.setText(text)
+            self._badge_text_cache = text
+        if getattr(self, '_badge_style_cache', None) != style:
+            self._status_badge.setStyleSheet(style)
+            self._badge_style_cache = style
         # 按钮可见性
         show_buttons = status in ("draft", "confirmed") and not self._confirmed and not self._rejected
         self._btn_row.setVisible(show_buttons and status == "draft")

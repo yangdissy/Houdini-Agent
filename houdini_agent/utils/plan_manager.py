@@ -316,11 +316,16 @@ PLAN_TOOL_CREATE = {
             "The plan is displayed as an interactive card with DAG flow diagram. "
             "The user must confirm before execution begins.\n"
             "CRITICAL REQUIREMENTS:\n"
-            "1. Every step MUST have depends_on set (even linear: step-2 depends_on step-1).\n"
-            "2. Plans with 3+ steps MUST use phases for logical grouping.\n"
-            "3. Each step needs detailed description with specific node paths, param names, values.\n"
-            "4. steps.tools must list the exact Houdini tool names to use.\n"
-            "5. depends_on drives the DAG layout — without it the flow diagram will be broken."
+            "1. Group steps by SUBSYSTEM, not by individual node. One step = one complete logical "
+            "subsystem (e.g. 'scatter system: Grid+Scatter+CopyToPoints+Box'), executed via ONE "
+            "create_nodes_batch call. Per-node steps are FORBIDDEN unless the network truly has only one node.\n"
+            "2. Every step MUST have depends_on set (even linear: step-2 depends_on step-1).\n"
+            "3. Plans with 3+ steps MUST use phases for logical grouping.\n"
+            "4. Each step needs detailed description with specific node paths, param names, values.\n"
+            "5. steps.tools must list the exact Houdini tool names. Prefer batch tools "
+            "(create_nodes_batch, batch_set_parameters, layout_nodes) over per-node tools.\n"
+            "6. depends_on drives the DAG layout — without it the flow diagram will be broken.\n"
+            "Anti-pattern check: if step_count >= node_count, you split too finely — merge into subsystems."
         ),
         "parameters": {
             "type": "object",

@@ -25,7 +25,7 @@ The agent uses OpenAI-style Function Calling. Core tools, built-in skills, and p
 
 ### Requirements
 
-- SideFX Houdini 20.5 or newer
+- SideFX Houdini 19.5 or newer (primary: 20.0 / 20.5)
 - Windows, macOS, or Linux with Houdini's Python environment
 - At least one supported AI provider key, unless using a local Ollama model
 
@@ -136,7 +136,7 @@ The exact tool set is registered by `ToolRegistry` at runtime. The common groups
 | Group | Representative tools |
 |-------|----------------------|
 | Node operations | `create_wrangle_node`, `create_node`, `create_nodes_batch`, `connect_nodes`, `set_node_parameter`, `delete_node`, `copy_node`, `rename_node` |
-| Query and inspection | `get_network_structure`, `get_node_parameters`, `list_children`, `read_selection`, `check_errors`, `verify_and_summarize` |
+| Query and inspection | `get_network_structure`, `get_parameter_schema`, `inspect_node`, `find_nodes`, `read_selection`, `verify_network`, `get_node_card`, `get_node_inputs` |
 | Code execution | `execute_python`, `execute_shell` |
 | Documentation and web | `search_local_doc`, `get_houdini_node_doc`, `web_search`, `fetch_webpage` |
 | NetworkBox and layout | `create_network_box`, `add_nodes_to_box`, `list_network_boxes`, `layout_nodes`, `get_node_positions` |

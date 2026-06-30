@@ -526,43 +526,6 @@ class AITab(
         if dialog.should_reset_stats:
             self._reset_token_stats()
 
-    def _refresh_mode_guard_ui(self):
-        """刷新输入区模式风险提示与策略时间线入口。"""
-        mode = 'PLAN' if self._plan_mode else ('AGENT' if self._agent_mode else 'ASK')
-        if mode == 'ASK':
-            guard = 'RO'
-            color = '#10b981'
-        elif self._confirm_mode:
-            guard = 'CONFIRM'
-            color = '#f59e0b'
-        else:
-            guard = 'HIGH-RISK'
-            color = '#ef4444'
-
-        hint = f"{mode} | {guard}"
-        if hasattr(self, 'mode_guard_label') and self.mode_guard_label:
-            self.mode_guard_label.setText(hint)
-            self.mode_guard_label.setStyleSheet(f"color:{color}; font-weight:600;")
-
-            lines = [
-                f"当前模式: {mode}",
-                f"确认开关: {'ON' if self._confirm_mode else 'OFF'}",
-                f"策略失败次数: {self._policy_failure_count}",
-            ]
-            for item in self._policy_timeline_records[-5:]:
-                lines.append(
-                    f"{item.get('time', '')} {item.get('tool', '')} -> {item.get('action', '')}"
-                )
-            self.mode_guard_label.setToolTip("\n".join(lines))
-
-        if hasattr(self, 'policy_timeline_btn') and self.policy_timeline_btn:
-            n = len(self._policy_timeline_records)
-            self.policy_timeline_btn.setText(f"Policy {n}")
-            if self._policy_failure_count > 0:
-                self.policy_timeline_btn.setStyleSheet("color:#ef4444;")
-            else:
-                self.policy_timeline_btn.setStyleSheet("")
-
     def _cook_displayed_nodes_if_manual(self):
         """★ 在 Manual 保护模式下，对当前工作区的 display 节点做针对性 cook
         
@@ -881,10 +844,6 @@ class AITab(
                 self._updateTodo.emit(todo_id, "", status)
                 return {"success": True, "result": f"Updated todo {todo_id} to {status}"}
             
-            elif tool_name == "verify_and_summarize":
-                # 需要在主线程执行 Houdini 操作
-                return self._execute_tool_in_main_thread(tool_name, kwargs)
-            
             # 不依赖 hou 的工具 → 直接在后台线程执行（避免阻塞 UI）
             if tool_name in self._BG_SAFE_TOOLS:
                 return self._execute_tool_in_bg(tool_name, kwargs)
@@ -1111,7 +1070,7 @@ class AITab(
     # 如果不 cook，AI 会看到 stale 数据从而误判操作结果
     _COOK_BEFORE_READ_TOOLS = frozenset({
         'get_network_structure', 'get_node_parameters', 'list_children',
-        'check_errors', 'verify_and_summarize',
+        'check_errors', 'verify_network',
         'capture_viewport',  # 截图前需确保几何体已 cook
     })
 
@@ -1184,73 +1143,7 @@ class AITab(
                 except Exception:
                     use_undo_group = False  # hou 不可用则跳过
             
-            if tool_name == "verify_and_summarize":
-                check_items = kwargs.get("check_items", [])
-                expected = kwargs.get("expected_result", "")
-                
-                # 确保 check_items 是列表类型（防止 unhashable type: 'slice' 错误）
-                if not isinstance(check_items, list):
-                    if isinstance(check_items, str):
-                        check_items = [check_items]
-                    elif hasattr(check_items, '__iter__') and not isinstance(check_items, (dict, str)):
-                        check_items = list(check_items)
-                    else:
-                        check_items = []
-                
-                # 获取当前网络结构进行验证
-                ok, structure_data = self.mcp.get_network_structure()
-                
-                # 自动检测问题
-                issues = []
-                if ok and isinstance(structure_data, dict):
-                    nodes = structure_data.get('nodes', [])
-                    connections = structure_data.get('connections', [])
-                    
-                    # 收集所有已连接的节点
-                    connected_nodes = set()
-                    for conn in connections:
-                        from_path = conn.get('from', '')
-                        to_path = conn.get('to', '')
-                        if from_path:
-                            connected_nodes.add(from_path.split('/')[-1])
-                        if to_path:
-                            connected_nodes.add(to_path.split('/')[-1])
-                    
-                    # 检测问题
-                    for node in nodes:
-                        node_name = node.get('name', '')
-                        # 检测错误节点
-                        if node.get('has_errors'):
-                            issues.append(tr('ai.err_issues', node_name))
-                        # 检测孤立节点（非输出节点且未连接）
-                        if node_name not in connected_nodes:
-                            node_type = node.get('type', '').lower()
-                            # 排除输出节点和根节点
-                            if not any(x in node_type for x in ['output', 'null', 'out', 'merge']):
-                                if not any(x in node_name.lower() for x in ['out', 'output', 'result']):
-                                    issues.append(f"orphan:{node_name}")
-                    
-                    # 检查是否有显示的输出节点
-                    has_displayed = any(node.get('is_displayed') for node in nodes)
-                    if not has_displayed and nodes:
-                        issues.append(tr('ai.no_display'))
-                
-                # 生成验证结果
-                if issues:
-                    issues_str = ' | '.join(issues[:5])  # 最多显示5个问题
-                    result = {
-                        "success": True,
-                        "result": tr('ai.check_fail', issues_str)
-                    }
-                else:
-                    check_items_str = ', '.join(str(item) for item in check_items[:3]) if check_items else tr('ai.check_none')
-                    result = {
-                        "success": True,
-                        "result": tr('ai.check_pass', expected[:30] if expected else 'done')
-                    }
-            else:
-                # 其他工具交给 MCP 处理
-                result = self.mcp.execute_tool(tool_name, kwargs)
+            result = self.mcp.execute_tool(tool_name, kwargs)
         except Exception as e:
             result = {"success": False, "error": tr('ai.tool_exec_err', str(e))}
         finally:
@@ -1311,7 +1204,7 @@ class AITab(
         '|copy_node|batch_set_parameters|find_nodes_by_param|save_hip|undo_redo'
         '|web_search|fetch_webpage|search_local_doc|get_houdini_node_doc'
         '|execute_python|execute_shell|check_errors|get_node_inputs|add_todo|update_todo'
-        '|verify_and_summarize|run_skill|list_skills'
+        '|verify_network|run_skill|list_skills'
         '|layout_nodes|preview_layout_nodes|get_node_positions'
         '|perf_start_profile|perf_stop_and_report'
     )
@@ -1921,9 +1814,15 @@ class AITab(
         self._start_active_aurora()
         
         # ★ 记录用户当前的 Houdini 更新模式（Agent 结束后恢复）
+        # 只在干净状态下记录：如果上一轮恢复失败导致 _pre_agent_update_mode 未清空，
+        # 当前模式可能已是 Agent 留下的 Manual，覆盖会让用户原始模式永久丢失。
         try:
             import hou  # type: ignore
-            self._pre_agent_update_mode = hou.updateModeSetting()
+            if getattr(self, '_pre_agent_update_mode', None) is None:
+                self._pre_agent_update_mode = hou.updateModeSetting()
+            else:
+                print(f"[Cook Guard] 检测到上一轮未恢复的 update mode 记录，"
+                      f"保留原值 {self._pre_agent_update_mode}（当前 {hou.updateModeSetting()}）")
         except Exception:
             self._pre_agent_update_mode = None
         
@@ -2380,11 +2279,13 @@ class AITab(
                                      if t['function']['name'] not in ('web_search', 'fetch_webpage')]
                 tools = UltraOptimizer.optimize_tool_definitions(plan_filtered)
             elif plan_mode and plan_executing:
-                # ★ Plan 执行阶段：按当前步骤意图暴露工具 + update_plan_step
-                exec_tools = self._select_agent_tools_for_message(user_last_msg, use_web=use_web)
+                # ★ Plan 执行阶段：暴露全部 Agent 工具（user_last_msg 是 "[Plan Confirmed] ..." 拼出的
+                # 占位文本，按意图筛会丢掉 create_nodes_batch 等关键工具，导致 AI 退化到逐节点单建）。
+                # 计划阶段已经在 create_plan 里规划好了每个 step 该用什么工具，执行阶段不该再过滤。
+                exec_tools = list(HOUDINI_TOOLS)
                 exec_names = {t.get('function', {}).get('name') for t in exec_tools}
                 if PLAN_TOOL_UPDATE_STEP.get('function', {}).get('name') not in exec_names:
-                    exec_tools = list(exec_tools) + [PLAN_TOOL_UPDATE_STEP]
+                    exec_tools = exec_tools + [PLAN_TOOL_UPDATE_STEP]
                 if not use_web:
                     exec_tools = [t for t in exec_tools
                                   if t['function']['name'] not in ('web_search', 'fetch_webpage')]
@@ -2401,7 +2302,7 @@ class AITab(
                 # ★ Agent 模式：按本轮用户意图选择最小工具集，避免每轮暴露全量工具。
                 tools = self._select_agent_tools_for_message(user_last_msg, use_web=use_web)
             
-            # ★ 合并外部工具（HookManager 插件工具 + ToolRegistry Skill 工具）
+            # ★ 合并外部工具（HookManager 插件工具；Skill 通过 list_skills/run_skill 元工具暴露）
             try:
                 from ..utils.hooks import get_hook_manager as _ghm_tools
                 _ext = _ghm_tools().get_external_tools()
@@ -2412,7 +2313,7 @@ class AITab(
             try:
                 from ..utils.tool_registry import get_tool_registry
                 _reg = get_tool_registry()
-                # 获取 ToolRegistry 中 source=skill 的工具（避免与上面重复）
+                # 兼容旧插件/外部工具：只合并显式注册到 ToolRegistry 的 skill 来源工具。
                 _existing_names = {t.get('function', {}).get('name', '') for t in tools}
                 for meta in _reg._tools.values():
                     if meta.source == "skill" and meta.enabled and meta.name not in _existing_names:

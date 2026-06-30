@@ -48,8 +48,8 @@ _ASK_TOOLS = frozenset({
     'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
     'get_geometry_summary', 'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
-    'find_nodes_by_param', 'get_node_inputs', 'check_errors',
-    'verify_and_summarize', 'web_search', 'fetch_webpage',
+    'find_nodes_by_param', 'get_node_inputs', 'get_node_card', 'check_errors',
+    'verify_network', 'web_search', 'fetch_webpage',
     'search_local_doc', 'get_houdini_node_doc', 'list_skills',
     'add_todo', 'update_todo', 'get_node_positions',
     'list_network_boxes', 'perf_start_profile', 'perf_stop_and_report',
@@ -62,8 +62,8 @@ _PLAN_PLANNING_TOOLS = frozenset({
     'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
     'get_geometry_summary', 'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
-    'find_nodes_by_param', 'get_node_inputs', 'check_errors',
-    'verify_and_summarize', 'web_search', 'fetch_webpage',
+    'find_nodes_by_param', 'get_node_inputs', 'get_node_card', 'check_errors',
+    'verify_network', 'web_search', 'fetch_webpage',
     'search_local_doc', 'get_houdini_node_doc', 'list_skills',
     'add_todo', 'update_todo', 'get_node_positions',
     'list_network_boxes', 'perf_start_profile', 'perf_stop_and_report',
@@ -77,8 +77,8 @@ _READONLY_TOOLS = frozenset({
     'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
     'get_geometry_summary', 'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
-    'find_nodes_by_param', 'get_node_inputs', 'check_errors',
-    'verify_and_summarize', 'web_search', 'fetch_webpage',
+    'find_nodes_by_param', 'get_node_inputs', 'get_node_card', 'check_errors',
+    'verify_network', 'web_search', 'fetch_webpage',
     'search_local_doc', 'get_houdini_node_doc', 'list_skills',
     'get_node_positions', 'list_network_boxes',
     'perf_start_profile', 'perf_stop_and_report',
@@ -255,6 +255,10 @@ class ToolRegistry:
         meta = self._tools.get(name)
         return meta.handler if meta else None
 
+    def get_meta(self, name: str) -> Optional[ToolMeta]:
+        """获取工具的完整元数据（含 risk_level / tags / modes 等）"""
+        return self._tools.get(name)
+
     def list_all(self) -> List[Dict[str, Any]]:
         """列出所有工具元数据（供 UI 显示）"""
         with self._lock:
@@ -406,49 +410,61 @@ class ToolRegistry:
     # 工具按功能分组
     _INTENT_TOOL_GROUPS: Dict[str, Set[str]] = {
         'base': {
-            'get_network_structure', 'read_selection', 'check_errors',
-            'search_memory', 'verify_and_summarize',
+            'get_network_structure', 'read_selection', 'verify_network',
+            'search_memory',
         },
         'query': {
-            'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
-            'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
+            'get_network_structure', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
+            'suggest_connection', 'preview_node_operation', 'validate_node_network', 'find_nodes',
             'get_geometry_summary', 'get_scene_snapshot',
-            'check_errors', 'read_selection', 'get_node_inputs',
+            'verify_network', 'read_selection', 'get_node_inputs', 'get_node_card',
             'get_node_positions', 'list_network_boxes',
-            'verify_and_summarize',
             'search_memory',
             'capture_viewport',
         },
         'create': {
             'create_node', 'create_nodes_batch', 'create_wrangle_node',
             'connect_nodes', 'cook_node', 'copy_node', 'create_named_null',
+            'get_node_card', 'verify_network',
         },
         'connection': {
-            'get_node_connections', 'get_node_inputs', 'suggest_connection',
+            'get_node_connections', 'get_node_inputs', 'get_node_card', 'suggest_connection',
             'preview_node_operation', 'connect_nodes', 'disconnect_nodes',
         },
         'parameter': {
-            'get_node_parameters', 'get_parameter_schema', 'inspect_node',
+            'get_parameter_schema', 'inspect_node', 'get_node_card',
             'set_node_parameter', 'batch_set_parameters', 'cook_node',
         },
         'flags': {
             'inspect_node', 'preview_node_operation', 'set_node_flags',
-            'set_display_flag', 'validate_node_network',
+            'validate_node_network',
         },
         'validate': {
             'inspect_node', 'get_node_connections', 'validate_node_network',
-            'check_errors', 'get_geometry_summary', 'verify_and_summarize',
+            'verify_network', 'get_geometry_summary',
         },
         'cook': {
-            'inspect_node', 'cook_node', 'check_errors', 'validate_node_network',
+            'inspect_node', 'cook_node', 'verify_network', 'validate_node_network',
         },
         'null': {
             'create_named_null', 'get_node_connections', 'suggest_connection',
             'preview_node_operation', 'validate_node_network',
         },
         'modify': {
-            'set_node_parameter', 'batch_set_parameters', 'set_display_flag',
+            'set_node_parameter', 'batch_set_parameters',
             'set_node_flags',
+        },
+        'operation': {
+            'get_network_structure', 'inspect_node', 'get_parameter_schema',
+            'get_node_connections', 'get_node_inputs', 'suggest_connection',
+            'preview_node_operation', 'validate_node_network',
+            'set_node_parameter', 'batch_set_parameters', 'set_node_flags',
+            'connect_nodes', 'disconnect_nodes', 'delete_node', 'rename_node',
+            'layout_nodes', 'cook_node', 'verify_network',
+        },
+        'delete': {
+            'delete_node', 'rename_node',
+            'preview_node_operation', 'get_node_connections', 'get_network_structure',
         },
         'code': {
             'execute_python', 'execute_shell',
@@ -498,8 +514,12 @@ class ToolRegistry:
                  '空节点', '输出空节点', '命名null'],
         'modify': ['change', 'set', 'modify', 'update', 'adjust', 'tweak',
                    '修改', '设置', '调整', '改', '变'],
-        'code': ['python', 'script', 'code', 'run', 'execute', 'vex', 'wrangle',
-                 '脚本', '代码', '运行', '执行'],
+        'delete': ['delete', 'remove', 'destroy', 'rename',
+                   '删除', '删掉', '移除', '销毁', '清除', '重命名', '改名'],
+        'operation': ['apply', 'implement', 'optimize', 'fix', 'repair', 'cleanup', 'clean up',
+                      '应用', '落实', '优化', '修复', '执行优化', '清理', '简化'],
+        'code': ['python', 'script', 'code', 'vex', 'wrangle',
+                  '脚本', '代码'],
         'search': ['search', 'find', 'where', 'document', 'doc', 'web', 'online',
                    'memory', 'remember', 'recall',
                    '搜索', '查找', '文档', '网上', '在线',
@@ -513,20 +533,27 @@ class ToolRegistry:
 
     _DEFAULT_INTENT_GROUPS = frozenset({'base', 'task'})
 
+    # Agent 模式应始终具备最小写操作能力；Ask 模式仍保持只读。
+    _AGENT_ALWAYS_TOOLS = frozenset({
+        'create_node', 'create_nodes_batch', 'create_wrangle_node',
+        'set_node_parameter', 'batch_set_parameters', 'set_node_flags',
+        'connect_nodes', 'disconnect_nodes', 'delete_node', 'rename_node',
+        'layout_nodes', 'cook_node', 'copy_node', 'create_named_null',
+    })
+
     _TOOL_DEPENDENCIES: Dict[str, Set[str]] = {
         'connect_nodes': {'get_node_connections', 'get_node_inputs', 'suggest_connection', 'preview_node_operation'},
         'disconnect_nodes': {'get_node_connections', 'preview_node_operation'},
         'set_node_parameter': {'inspect_node', 'get_parameter_schema'},
         'batch_set_parameters': {'inspect_node', 'get_parameter_schema'},
         'set_node_flags': {'inspect_node', 'preview_node_operation', 'validate_node_network'},
-        'set_display_flag': {'inspect_node', 'preview_node_operation'},
-        'create_node': {'get_network_structure', 'search_node_types'},
-        'create_nodes_batch': {'get_network_structure', 'search_node_types', 'get_node_inputs'},
+        'create_node': {'get_network_structure', 'search_node_types', 'get_node_card'},
+        'create_nodes_batch': {'get_network_structure', 'search_node_types', 'get_node_inputs', 'get_node_card', 'verify_network'},
         'create_wrangle_node': {'get_network_structure', 'get_houdini_node_doc'},
         'create_named_null': {'get_node_connections', 'suggest_connection', 'preview_node_operation', 'validate_node_network'},
         'layout_nodes': {'get_node_positions', 'get_network_structure'},
         'create_network_box': {'get_node_positions', 'list_network_boxes'},
-        'cook_node': {'inspect_node', 'check_errors'},
+        'cook_node': {'inspect_node', 'verify_network'},
         'copy_node': {'inspect_node', 'get_network_structure'},
         'save_hip': {'get_scene_snapshot'},
     }
@@ -577,6 +604,8 @@ class ToolRegistry:
         target_names: Set[str] = set()
         for group in active_groups:
             target_names |= self._INTENT_TOOL_GROUPS.get(group, set())
+        if mode == 'agent':
+            target_names |= self._AGENT_ALWAYS_TOOLS
         target_names = self._expand_tool_dependencies(target_names)
 
         # 添加所有 skill 工具（skill 通常应始终可用）

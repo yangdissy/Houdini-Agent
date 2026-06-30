@@ -375,7 +375,7 @@ class ChatTrainingExporter:
 -不输出思考过程
 -先检查节点存在再操作
 -VEX代码优先使用create_wrangle_node
--完成后调用verify_and_summarize验证"""
+-完成后调用verify_network验证"""
 
 
 def export_chat_training_data(

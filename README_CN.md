@@ -25,7 +25,7 @@ Agent 使用 OpenAI 风格的 Function Calling 协议。核心工具、内置 Sk
 
 ### 环境要求
 
-- SideFX Houdini 20.5 或更高版本
+- SideFX Houdini 19.5 或更高版本（主力：20.0 / 20.5）
 - Windows、macOS 或 Linux，使用 Houdini 自带 Python 环境
 - 至少一个受支持的 AI Provider API Key；如果使用本地 Ollama 模型则可以不需要云端 Key
 
@@ -136,7 +136,7 @@ launcher.show_tool()
 | 分组 | 代表性工具 |
 |------|------------|
 | 节点操作 | `create_wrangle_node`、`create_node`、`create_nodes_batch`、`connect_nodes`、`set_node_parameter`、`delete_node`、`copy_node`、`rename_node` |
-| 查询和检查 | `get_network_structure`、`get_node_parameters`、`list_children`、`read_selection`、`check_errors`、`verify_and_summarize` |
+| 查询和检查 | `get_network_structure`、`get_parameter_schema`、`inspect_node`、`find_nodes`、`read_selection`、`verify_network`、`get_node_card`、`get_node_inputs` |
 | 代码执行 | `execute_python`、`execute_shell` |
 | 文档和联网 | `search_local_doc`、`get_houdini_node_doc`、`web_search`、`fetch_webpage` |
 | NetworkBox 和布局 | `create_network_box`、`add_nodes_to_box`、`list_network_boxes`、`layout_nodes`、`get_node_positions` |

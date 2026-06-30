@@ -11,12 +11,23 @@
 """
 
 import math
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from .memory_store import MemoryStore, EpisodicRecord, get_memory_store
 from shared.user_paths import normalize_username
+
+# ============================================================
+# 跨模块共享的 tag 常量
+# ------------------------------------------------------------
+# 这些 tag 在 reflection.py（生产）、reward_engine.py / growth_tracker.py
+# （消费）之间流转。提取为常量避免字符串拼写漂移导致信号静默失效。
+# ============================================================
+
+TAG_ERROR_CORRECTION = "error_correction"   # 出错 → 纠正 → 成功
+TAG_UNRESOLVED_ERROR = "unresolved_error"   # 出错且未解决
 
 # ============================================================
 # 奖励权重配置
@@ -48,6 +59,9 @@ class RewardEngine:
         self.strengthen_factor = 1.2
         self.weaken_factor = 0.8
         self.error_correction_factor = 1.5  # 犯错后纠正的特殊强化
+        # 缓存 embedder 引用，避免 hot path 每次反复 import + 走单例锁
+        from .embedding import get_embedder
+        self._embedder = get_embedder()
 
     # ==========================================================
     # 核心：计算 Reward Score
@@ -61,29 +75,21 @@ class RewardEngine:
         tool_call_count: int = 0,
         had_error_correction: bool = False,
         task_embedding=None,
-    ) -> float:
-        """计算任务的 reward score (0~1)
-
-        Args:
-            success: 任务是否成功完成
-            error_count: 出错次数
-            retry_count: 重试次数
-            tool_call_count: 工具调用总次数
-            had_error_correction: 是否经历了"出错→纠正→成功"
-            task_embedding: 任务 embedding（用于计算新颖度）
+    ) -> Dict[str, float]:
+        """计算任务的 reward score 与分项分数
 
         Returns:
-            reward score (0~1)
+            dict 含 reward 与各分项：{reward, success, efficiency, novelty, error_penalty}
         """
         w = self.weights
 
         # 1. 成功分
         success_score = 1.0 if success else 0.0
 
-        # 2. 效率分（工具调用和重试次数的倒数，越少越高效）
-        if tool_call_count <= 0:
-            tool_call_count = 1
-        efficiency_score = 1.0 / (1.0 + 0.1 * tool_call_count + 0.3 * retry_count)
+        # 2. 效率分（0 次工具调用视为完美效率；retry 直接拉低）
+        tc = max(0, tool_call_count)
+        rc = max(0, retry_count)
+        efficiency_score = 1.0 / (1.0 + 0.1 * tc + 0.3 * rc)
 
         # 3. 新颖度分（与已有记忆的最大相似度的反数）
         novelty_score = self._calculate_novelty(task_embedding)
@@ -106,7 +112,13 @@ class RewardEngine:
         # 裁剪到 [0, 1]
         reward = max(0.0, min(1.0, reward))
 
-        return reward
+        return {
+            "reward": reward,
+            "success": success_score,
+            "efficiency": efficiency_score,
+            "novelty": novelty_score,
+            "error_penalty": error_penalty,
+        }
 
     def _calculate_novelty(self, task_embedding) -> float:
         """计算任务的新颖度
@@ -122,8 +134,7 @@ class RewardEngine:
             return 1.0  # 无历史记忆 → 完全新颖
 
         max_sim = 0.0
-        from .embedding import get_embedder
-        embedder = get_embedder()
+        embedder = self._embedder
         for ep in recent:
             if ep.embedding is not None:
                 sim = embedder.cosine_similarity(task_embedding, ep.embedding)
@@ -155,7 +166,7 @@ class RewardEngine:
             importance *= self.weaken_factor
 
         # 犯错后纠正的特殊强化
-        if "error_correction" in record.tags:
+        if TAG_ERROR_CORRECTION in record.tags:
             importance *= self.error_correction_factor
 
         # 上限/下限
@@ -185,21 +196,25 @@ class RewardEngine:
         self,
         episodic_record: EpisodicRecord,
         tool_call_count: int = 0,
+        run_maintenance: bool = False,
     ) -> Dict:
         """完整的任务后 reward 处理流程
 
         Args:
             episodic_record: 已创建但尚未计算 reward 的事件记忆
             tool_call_count: 工具调用总次数
+            run_maintenance: 是否在本次调用中执行全局衰减/长期维护。
+                默认 False — 维护职责交给上层调度（避免在热路径阻塞）。
+                调用方可基于自己的节奏（条数、时间窗口、空闲信号）决定。
 
         Returns:
-            处理结果字典
+            处理结果字典，含 reward、分项分数、importance 等
         """
         # 检测是否有纠错行为
-        had_error_correction = "error_correction" in episodic_record.tags
+        had_error_correction = TAG_ERROR_CORRECTION in episodic_record.tags
 
-        # 计算 reward
-        reward = self.calculate_reward(
+        # 计算 reward（含分项分数）
+        scores = self.calculate_reward(
             success=episodic_record.success,
             error_count=episodic_record.error_count,
             retry_count=episodic_record.retry_count,
@@ -207,27 +222,33 @@ class RewardEngine:
             had_error_correction=had_error_correction,
             task_embedding=episodic_record.embedding,
         )
+        reward = scores["reward"]
 
         # 更新 importance
         new_importance = self.update_importance(episodic_record, reward)
 
-        # 定期全局衰减（每 10 个任务执行一次）
-        total = self.store.count_episodic()
-        if total % 10 == 0:
-            self.apply_time_decay()
-
-        maintenance = None
-        # 定期执行语义/策略记忆维护（每 20 个任务执行一次）
-        if total % 20 == 0:
-            maintenance = self.store.maintain_long_term_memory()
-
-        return {
+        result = {
             "reward": reward,
+            "scores": scores,
             "importance": new_importance,
             "had_error_correction": had_error_correction,
-            "total_episodes": total,
-            "memory_maintenance": maintenance,
+            "total_episodes": self.store.count_episodic(),
+            "memory_maintenance": None,
         }
+
+        if run_maintenance:
+            result["memory_maintenance"] = self.run_maintenance()
+
+        return result
+
+    def run_maintenance(self) -> Dict:
+        """执行全局衰减 + 长期记忆维护。
+
+        从 process_task_completion 拆出，便于上层按时间窗口/空闲调度调用，
+        避免在每次任务完成的热路径上做大开销操作。
+        """
+        self.apply_time_decay()
+        return self.store.maintain_long_term_memory()
 
 
 # ============================================================
@@ -235,17 +256,15 @@ class RewardEngine:
 # ============================================================
 
 _engine_instances: Dict[str, RewardEngine] = {}
+_engine_instances_lock = threading.RLock()
 
 def get_reward_engine(username: Optional[str] = None) -> RewardEngine:
-    """获取 RewardEngine 实例（按用户隔离）。"""
-    global _engine_instances
-    if not username:
-        key = "default"
-        if key not in _engine_instances:
-            _engine_instances[key] = RewardEngine()
-        return _engine_instances[key]
-
-    uname = normalize_username(username)
-    if uname not in _engine_instances:
-        _engine_instances[uname] = RewardEngine(store=get_memory_store(uname))
-    return _engine_instances[uname]
+    """获取 RewardEngine 实例（按用户隔离，线程安全）。"""
+    key = "default" if not username else normalize_username(username)
+    with _engine_instances_lock:
+        eng = _engine_instances.get(key)
+        if eng is None:
+            store = get_memory_store(username) if username else None
+            eng = RewardEngine(store=store) if store else RewardEngine()
+            _engine_instances[key] = eng
+        return eng
