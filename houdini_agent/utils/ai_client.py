@@ -494,8 +494,8 @@ HOUDINI_TOOLS = [
                     },
                     "wrangle_type": {
                         "type": "string",
-                        "enum": ["attribwrangle", "pointwrangle", "primitivewrangle", "volumewrangle", "vertexwrangle"],
-                        "description": "Wrangle 类型。默认 'attribwrangle'（最通用）。pointwrangle 处理点，primitivewrangle 处理图元"
+                        "enum": ["attribwrangle", "pointwrangle", "primitivewrangle", "volumewrangle", "vertexwrangle", "popwrangle", "gaswrangle", "channelwrangle"],
+                        "description": "Wrangle 类型（可选）。留空时工具会根据 parent_path 所在网络自动选择：SOP→attribwrangle，DOP→popwrangle，CHOP→channelwrangle，LOP→attribwrangle。仅在需要覆盖默认时才显式指定（如 SOP 里的 pointwrangle/volumewrangle，DOP 里的 gaswrangle）。"
                     },
                     "node_name": {
                         "type": "string",

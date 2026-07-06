@@ -42,10 +42,14 @@ class RuntimeStateMixin:
 
             self.client.reset_stop()
             self._thinking_timer = QtCore.QTimer(self)
-            self._thinking_timer.timeout.connect(lambda: self._updateThinkingTime.emit())
+            # 信号-信号直连：Qt 在对象销毁时自动断开，避免 lambda 捕获已销毁的 self
+            self._thinking_timer.timeout.connect(self._updateThinkingTime)
             self._thinking_timer.start(1000)
             self._start_input_glow()
+            self._selection_stop_triggered = False
+            self._start_selection_watch()
         else:
+            self._stop_selection_watch()
             if self._thinking_timer:
                 self._thinking_timer.stop()
                 self._thinking_timer = None
@@ -75,6 +79,111 @@ class RuntimeStateMixin:
             self._agent_chat_layout = None
 
         self._update_run_buttons()
+
+    def _start_selection_watch(self):
+        """★ 启动用户选择监视：Agent 运行期间轮询 Houdini 选择集。
+
+        目的：Agent 运行时若用户在视口/网络里点选节点（手动交互），会与
+        主线程正在进行的 hou 操作/cook 交错重入，触发 Qt/hou 段错误崩溃
+        （crash 分析 2026-07）。检测到用户改变选择即自动停止 Agent。
+
+        用 hou.ui.addEventLoopCallback 在主线程事件循环轮询，回调天然线程
+        安全；request_stop 只 set 线程事件、不触碰 hou 场景，不引入新竞态。
+        以启动时的选择为基线，只有之后发生变化才判定为用户操作。
+        """
+        self._selection_watch_cb = None
+        self._agent_selection_baseline = None
+        # 启动瞬间给一个短抑制期，吸收 Agent 首个工具执行前的选择抖动
+        self._selection_settle_until = time.time() + 1.0
+        try:
+            import hou  # type: ignore
+            self._agent_selection_baseline = {n.path() for n in hou.selectedNodes()}
+            hou.ui.addEventLoopCallback(self._on_selection_poll)
+            self._selection_watch_cb = self._on_selection_poll
+        except Exception:
+            # 无 UI 环境 / hou 不可用 / 无 addEventLoopCallback：静默跳过，不影响运行
+            self._selection_watch_cb = None
+
+    def _refresh_selection_baseline(self):
+        """★ 把当前选择集刷新为新基线（Agent 每次工具执行后调用）。
+
+        Agent 自身操作（如 create_node、delete_node）会改变节点选择，若不
+        更新基线，下一次 poll 会把 Agent 造成的选择变化误判为用户手动操作
+        而误触发停止。工具在主线程执行完毕后调用此方法吸收该变化。
+
+        同时记录时间戳建立"抑制窗口"：工具执行可能触发嵌套事件循环
+        （cook/UI 刷新），使 poll 在基线刷新前插入、读到 Agent 改后的选择
+        而误报。抑制窗口内 poll 只刷新基线、不触发停止，消除该时序竞态。
+        仅在监视处于激活状态时更新，避免无谓开销。
+        """
+        if getattr(self, '_selection_watch_cb', None) is None:
+            return
+        self._selection_settle_until = time.time() + 2.0
+        try:
+            import hou  # type: ignore
+            self._agent_selection_baseline = {n.path() for n in hou.selectedNodes()}
+        except Exception:
+            pass  # 读取失败时保留旧基线，不影响运行
+
+    def _stop_selection_watch(self):
+        """注销选择监视回调（Agent 结束/停止/AITab 销毁时调用）。"""
+        cb = getattr(self, '_selection_watch_cb', None)
+        if cb is not None:
+            try:
+                import hou  # type: ignore
+                hou.ui.removeEventLoopCallback(cb)
+            except Exception:
+                pass
+            self._selection_watch_cb = None
+        self._agent_selection_baseline = None
+
+    def _on_selection_poll(self):
+        """事件循环回调（主线程）：检测到用户改变选择则自动停止 Agent。"""
+        if not getattr(self, '_is_running', False):
+            return
+        if getattr(self, '_selection_stop_triggered', False):
+            return
+        try:
+            import hou  # type: ignore
+            current = {n.path() for n in hou.selectedNodes()}
+        except Exception:
+            return  # 读取失败时保守不触发，避免误停
+        # ★ 抑制窗口：工具执行前后（含其触发的 cook/UI 刷新导致的选择抖动）
+        #   期间，把当前选择持续吸收为基线、不触发停止，消除 Agent 自身操作
+        #   与 poll 之间的时序竞态误报。
+        if time.time() < getattr(self, '_selection_settle_until', 0.0):
+            self._agent_selection_baseline = current
+            return
+        baseline = getattr(self, '_agent_selection_baseline', None)
+        if baseline is None or current == baseline:
+            return
+        # 用户改变了选择 → 停止一次（原因提示在 _on_agent_stopped 里写入正文，
+        # 避免这里 emit 的状态被后续停止流程覆盖或一闪而过）
+        self._selection_stop_triggered = True
+        try:
+            self.client.request_stop()
+        except (RuntimeError, AttributeError):
+            pass
+
+    def cleanup(self):
+        """销毁前清理：停止所有定时器并请求停止 agent，避免悬空回调。
+
+        当 AITab 被销毁（如切换用户）时，若 agent 仍在运行，运行中的
+        QTimer 会在 C++ 对象销毁后继续触发，导致 RuntimeError。
+        """
+        try:
+            self.client.request_stop()
+        except (RuntimeError, AttributeError):
+            pass
+        self._stop_selection_watch()
+        for attr in ("_thinking_timer", "_glow_timer"):
+            timer = getattr(self, attr, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except RuntimeError:
+                    pass
+                setattr(self, attr, None)
 
     def _start_input_glow(self):
         """启动输入框边框呼吸光晕（AI 运行期间）"""
@@ -448,15 +557,28 @@ class RuntimeStateMixin:
             self._on_append_content(self._output_buffer)
             self._output_buffer = ""
 
+        # ★ 若因用户手动操作 Houdini 而自动停止，用独立警示横幅显示原因，
+        #   与 status_label("Stopped")/正文完全解耦，避免 finalize 时被
+        #   "执行完成/no_reply" 覆盖吞掉（见 crash 分析 2026-07）。
+        stopped_by_selection = getattr(self, '_selection_stop_triggered', False)
+
         response = self._agent_response or self._current_response
         try:
             if response:
                 response.finalize()
                 response.add_status("Stopped")
+                if stopped_by_selection and hasattr(response, 'show_warning'):
+                    response.show_warning(
+                        "⚠ 检测到你手动操作了 Houdini（选择了节点）。"
+                        "为防止与 Agent 操作冲突导致崩溃，已自动停止本次任务。"
+                    )
         except RuntimeError:
             pass
 
-        self._ensure_history_ends_with_assistant("[Stopped by user]")
+        self._ensure_history_ends_with_assistant(
+            "[因用户手动操作 Houdini 自动停止]" if stopped_by_selection
+            else "[Stopped by user]"
+        )
         self._set_running(False)
         self._hideToolStatus.emit()
 

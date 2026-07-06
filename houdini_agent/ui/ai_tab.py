@@ -552,6 +552,11 @@ class AITab(
                 try:
                     display_node = child.displayNode()
                     if display_node is not None:
+                        # ★ 跳过含体积/VDB 的 display 节点：force cook 会驱动 GPU
+                        #   体积重绘，与用户视口交互叠加时易引发主线程渲染竞态崩溃
+                        #   （GR_VolumeVK，见 crash 分析 2026-07）。
+                        if self._display_node_has_volume(display_node):
+                            continue
                         display_node.cook(force=True)
                         cooked += 1
                 except Exception:
@@ -560,6 +565,29 @@ class AITab(
                 print(f"[Cook Guard] Manual 模式下针对性 cook 了 {cooked} 个 display 节点")
         except Exception as e:
             print(f"[Cook Guard] 针对性 cook 失败: {e}")
+
+    @staticmethod
+    def _display_node_has_volume(display_node) -> bool:
+        """判断 display 节点几何是否含 Volume/VDB primitive（用于跳过强制 cook）。
+
+        含体积/VDB 时返回 True，让调用方跳过 cook(force=True)，避免驱动
+        GPU 体积重绘与用户视口交互竞态。判断失败时保守返回 False（不跳过）。
+        """
+        try:
+            import hou  # type: ignore
+            # 节点尚未 cook 过时不强制读取几何（geometry() 可能触发 cook），
+            # 直接跳过以避免竞态：未 cook 的体积节点更危险。
+            if display_node.needsToCook():
+                return True
+            geo = display_node.geometry()
+            if geo is None:
+                return False
+            for ptype in (hou.primType.Volume, hou.primType.VDB):
+                if geo.countPrimType(ptype) > 0:
+                    return True
+            return False
+        except Exception:
+            return False
 
     def _on_update_todo(self, todo_id: str, text: str, status: str):
         """更新 Todo 列表（跟随对话流内联显示）
@@ -963,7 +991,8 @@ class AITab(
                 result = {"success": False, "error": str(e)}
             results.append(result)
         self._tool_result_queue.put(results)
-    
+        # ★ 吸收 Agent 操作造成的选择变化（与单工具执行同理）
+        self._refresh_selection_baseline()
     # ------------------------------------------------------------------
     # Plan 模式工具处理
     # ------------------------------------------------------------------
@@ -1172,6 +1201,10 @@ class AITab(
             # ★ 清除主线程忙标记
             # 无论工具执行成功或失败，主线程已经空闲
             self._main_thread_busy = False
+
+            # ★ 吸收 Agent 操作造成的选择变化：把当前选择刷新为新基线，
+            #   避免下一次 poll 把 Agent 自己改的选择误判为用户手动操作。
+            self._refresh_selection_baseline()
 
             # ★ macOS 崩溃修复：不再在此处调用 processEvents()
             # ─────────────────────────────────────────────────────

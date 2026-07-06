@@ -2406,14 +2406,31 @@ class HoudiniMCP:
             if network is None:
                 return False, "未找到当前网络"
         
-        # 验证 wrangle 类型
-        valid_types = ["attribwrangle", "pointwrangle", "primitivewrangle", 
-                       "volumewrangle", "vertexwrangle"]
-        if wrangle_type not in valid_types:
-            wrangle_type = "attribwrangle"
-        
-        # 确保在正确的网络层级
-        network = self._ensure_target_network(network, self._category_from_hint("sop"))
+        # 按父网络类别推断合适的 wrangle 类型（全自动）
+        try:
+            cat_name = network.childTypeCategory().name().lower()
+        except Exception:
+            cat_name = "sop"
+
+        # 每个类别的合法 wrangle 类型 + 默认值（列表首项为默认）
+        _wrangle_by_cat = {
+            "sop":  ["attribwrangle", "pointwrangle", "primitivewrangle",
+                     "volumewrangle", "vertexwrangle"],
+            "dop":  ["popwrangle", "gaswrangle", "volumewrangle"],
+            "chop": ["channelwrangle"],
+            "lop":  ["attribwrangle"],
+        }
+        # childTypeCategory().name() 形如 Sop/Dop/Chop/Lop；其余类别（Object 等）回退 sop 处理
+        _cat_key = next((k for k in _wrangle_by_cat if cat_name.startswith(k)), "sop")
+        _valid = _wrangle_by_cat[_cat_key]
+
+        # 用户显式传入且在当前类别合法 → 尊重用户；否则用该类别默认值
+        if wrangle_type not in _valid:
+            wrangle_type = _valid[0]
+
+        # 仅 SOP 需要确保/自动创建 geo 容器；DOP/CHOP/LOP 网络本身已是正确类别
+        if _cat_key == "sop":
+            network = self._ensure_target_network(network, self._category_from_hint("sop"))
         
         # 创建节点
         safe_name = self._sanitize_node_name(node_name)
@@ -2465,7 +2482,7 @@ class HoudiniMCP:
             pass  # 某些 wrangle 类型可能没有 class 参数
         
         # 布局和选择
-        new_node.moveToGoodPosition()
+        self._place_new_node(new_node, network)
         new_node.setSelected(True, clear_all_selected=True)
         
         try:
@@ -2637,7 +2654,7 @@ class HoudiniMCP:
                     f"创建节点 {node_path_for_msg} 后参数设置失败，已回滚销毁节点:\n  - "
                     + "\n  - ".join(parm_errors))
         
-        new_node.moveToGoodPosition()
+        self._place_new_node(new_node, network)
         new_node.setSelected(True, clear_all_selected=True)
         
         try:
@@ -6010,7 +6027,67 @@ class HoudiniMCP:
     # ========================================
     # 内部辅助方法
     # ========================================
-    
+
+    def _place_new_node(self, new_node: Any, network: Any) -> None:
+        """为新建节点选择合适的位置。
+
+        moveToGoodPosition() 会依据输入/输出连接放置节点；若新节点没有连接，
+        Houdini 会把它丢到网络里"看起来合适"的空白区（往往远离用户当前关注的
+        区域）。为贴合用户在网络编辑器里的实际操作位置，改用以下锚点优先级：
+
+        1. 有输入/输出连接 → 交给 moveToGoodPosition()（沿用连接节点排布）。
+        2. 用户在同一父网络里选中的节点 → 放到其右下方。
+        3. 网络编辑器当前视口的可见中心 → 放到视口中心。
+        4. 都拿不到 → 回退 moveToGoodPosition()。
+        """
+        try:
+            has_connection = any(inp is not None for inp in (new_node.inputs() or []))
+            if not has_connection:
+                has_connection = any(out is not None for out in (new_node.outputs() or []))
+        except Exception:
+            has_connection = False
+
+        if has_connection:
+            try:
+                new_node.moveToGoodPosition()
+            except Exception:
+                pass
+            return
+
+        # 锚点 2：用户预先选中的同父网络节点（排除刚创建的这个）
+        try:
+            selected = [
+                n for n in hou.selectedNodes()
+                if n is not None and n != new_node and n.parent() == network
+            ]
+        except Exception:
+            selected = []
+        if selected:
+            try:
+                anchor = selected[-1]
+                pos = anchor.position()
+                new_node.setPosition(hou.Vector2(pos[0] + 1.5, pos[1] - 1.0))
+                return
+            except Exception:
+                pass
+
+        # 锚点 3：网络编辑器当前视口可见中心
+        try:
+            editor = hou.ui.curDesktop().paneTabOfType(hou.paneTabType.NetworkEditor)
+            if editor and editor.pwd() == network:
+                bounds = editor.visibleBounds()
+                center = bounds.center()
+                new_node.setPosition(hou.Vector2(center[0], center[1]))
+                return
+        except Exception:
+            pass
+
+        # 锚点 4：回退原生布局
+        try:
+            new_node.moveToGoodPosition()
+        except Exception:
+            pass
+
     def _current_network(self) -> Any:
         """获取当前网络编辑器中的网络
         

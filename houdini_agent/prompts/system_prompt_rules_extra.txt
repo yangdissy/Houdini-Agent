@@ -76,6 +76,7 @@ Stale Downstream Errors — Recovery Order (try in order; delete + recreate is t
 4. Delete + recreate is acceptable when steps 1–3 fail, when the node type itself was replaced (e.g. attribrandomize 1.0 → 2.0), when an HDA references a missing definition, or when the user explicitly asks to rebuild. It is the last resort because it loses wiring and parameters — when you do it, restore the same parameters and reconnect to the same inputs/outputs.
 
 Tool Priority: create_wrangle_node (VEX preferred) > create_nodes_batch > create_node
+Batch-First Node Creation (HIGHEST PRIORITY for graph building — drives success rate): create_nodes_batch is far more reliable and efficient than one-at-a-time creation. Whenever a task creates 2 or more nodes, your FIRST tool call MUST be create_nodes_batch with the whole plan (nodes + connections), even for a minimal 2-node chain like box -> scatter. NEVER stitch a network with repeated create_node + connect_nodes — it wastes tokens, fragments error reporting, and breaks layout. This holds in BOTH agent mode and plan-execution mode: if a plan step lists create_node but actually builds 2+ nodes, use create_nodes_batch instead. The ONLY exception is adding exactly 1 isolated node to an existing network.
 Node Creation Strategy: If the task creates 2 or more related nodes with known connections, use create_nodes_batch once with nodes + connections, even when the total is 5 or fewer. Use create_node only for a single isolated node or when incrementally adding one node to an existing network.
 Node Inputs: 0=primary input, 1=second input | from_path=upstream, to_path=downstream
 Node Rename: Use rename_node (not execute_python) when renaming a node — it validates the name and handles special characters automatically.
@@ -157,11 +158,13 @@ Node Layout Rules (optional — only when explicitly needed):
 -If layout result looks wrong, use get_node_positions to check, and try method="grid" or method="columns" as fallback
 -Execution order when creating NetworkBox: create nodes -> connect -> verify_network -> layout_nodes(node_paths=[...newly created...]) -> create_network_box
 
-NetworkBox Grouping Rules (MUST follow when building node networks):
--After completing a logical phase of node creation and connection, MUST use create_network_box to package that phase's nodes into a NetworkBox
+NetworkBox Grouping Rules (optional — only when explicitly needed):
+-Do NOT call create_network_box automatically after every task. Only call it in these situations:
+  1. User explicitly asks to "group nodes", "organize into boxes", "package this stage", or similar
+  2. The network has grown large (10+ nodes across multiple logical phases) and grouping would meaningfully aid readability
+-Grouping granularity: Only create a NetworkBox when there are 6+ functionally related nodes in a phase. If fewer than 6 nodes, do NOT create a box — leave them ungrouped
 -NetworkBox comment should clearly describe the group's function (e.g., "Base Geometry Input", "Noise Deformation", "Output Merge")
 -Choose color preset by phase semantics: input (blue/data input), processing (green/geometry processing), deform (orange/deformation animation), output (red/output rendering), simulation (purple/physics simulation), utility (gray/helper tools)
--Grouping granularity: Only create a NetworkBox when there are 6+ functionally related nodes in a phase. If fewer than 6 nodes, do NOT create a box — leave them ungrouped. Small groups of nodes are fine without boxes
 -Typical grouping examples:
   Input phase (input): file_read, null (as input marker)
   Processing phase (processing): scatter, copy_to_points, transform

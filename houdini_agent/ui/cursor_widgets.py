@@ -1022,6 +1022,14 @@ class AIResponse(QtWidgets.QWidget):
         
         self._summary_layout.addLayout(status_row)
         
+        # ★ 独立的停止/警示横幅（默认隐藏）—— 与 status_label / content_label
+        #   完全解耦，finalize 不会改写它，避免"执行完成/no_reply/Stopped"覆盖提醒。
+        self._warning_banner = QtWidgets.QLabel()
+        self._warning_banner.setObjectName("aiWarningBanner")
+        self._warning_banner.setWordWrap(True)
+        self._warning_banner.setVisible(False)
+        self._summary_layout.addWidget(self._warning_banner)
+        
         # ★ 已冻结段落容器 — 增量渲染时冻结的富文本/代码块放在这里
         self._frozen_container = QtWidgets.QWidget()
         self._frozen_layout = QtWidgets.QVBoxLayout(self._frozen_container)
@@ -1110,6 +1118,14 @@ class AIResponse(QtWidgets.QWidget):
             self._add_tool_call(tool_name)
         else:
             self.status_label.setText(text)
+    
+    def show_warning(self, text: str):
+        """★ 在独立横幅显示警示（如自动停止原因），不受 finalize 覆盖。"""
+        try:
+            self._warning_banner.setText(text)
+            self._warning_banner.setVisible(True)
+        except RuntimeError:
+            pass
     
     def _add_tool_call(self, tool_name: str):
         """添加工具调用"""
@@ -5244,34 +5260,14 @@ class UnifiedStatusBar(QtWidgets.QWidget):
             self._paint_tool(event)
 
     def _paint_thinking(self, event):
-        """绘制思考状态 — 流光文字"""
+        """绘制思考状态 — 流光文字 + 忙态警示"""
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
         w, h = self.width(), self.height()
-        text = f"Thinking {self._elapsed:.1f}s" if self._elapsed > 0 else "Thinking..."
-        font = QtGui.QFont(CursorTheme.FONT_BODY, 10)
-        p.setFont(font)
-        fm = p.fontMetrics()
-        tw = fm.horizontalAdvance(text)
-        x = (w - tw) // 2
-        y = (h + fm.ascent() - fm.descent()) // 2
-        # 底色文字
-        p.setPen(QtGui.QColor(100, 116, 139, 120))
-        p.drawText(x, y, text)
-        # 流光高亮（扫过效果）
-        grad = QtGui.QLinearGradient(x, 0, x + tw, 0)
-        pos = self._phase
-        before = max(0.0, pos - 0.15)
-        after = min(1.0, pos + 0.15)
-        grad.setColorAt(0.0, QtGui.QColor(226, 232, 240, 0))
-        if before > 0:
-            grad.setColorAt(before, QtGui.QColor(226, 232, 240, 0))
-        grad.setColorAt(pos, QtGui.QColor(226, 232, 240, 200))
-        if after < 1.0:
-            grad.setColorAt(after, QtGui.QColor(226, 232, 240, 0))
-        grad.setColorAt(1.0, QtGui.QColor(226, 232, 240, 0))
-        p.setPen(QtGui.QPen(QtGui.QBrush(grad), 0))
-        p.drawText(x, y, text)
+        # ★ 忙态警示：Agent 运行全程提醒用户不要操作 Houdini，避免与主线程
+        #   hou 操作/cook 竞态崩溃（crash 分析 2026-07）
+        status = f"Thinking {self._elapsed:.1f}s" if self._elapsed > 0 else "Thinking..."
+        self._paint_busy_text(p, w, h, status, "⚠ 请勿操作 Houdini")
         p.end()
 
     def _paint_generating(self, event):
@@ -5279,31 +5275,45 @@ class UnifiedStatusBar(QtWidgets.QWidget):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
         w, h = self.width(), self.height()
-        text = "Generating..."
-        font = QtGui.QFont(CursorTheme.FONT_BODY, 10)
+        # ★ 忙态警示：Generating 是 Agent 运行期最常驻状态，在此提醒用户不要
+        #   操作 Houdini，避免与主线程 hou 操作/cook 竞态崩溃（crash 分析 2026-07）
+        self._paint_busy_text(p, w, h, "Generating...", "⚠ 请勿操作 Houdini")
+        p.end()
+
+    def _paint_busy_text(self, p, w, h, status, warning, status_base=(150, 160, 175), status_glow=(225, 235, 250)):
+        """统一绘制"状态 + 忙态警示"：状态用柔和流光，警示用醒目橙红加粗。"""
+        gap = "   "
+        font = QtGui.QFont(CursorTheme.FONT_BODY, 12)
+        font.setBold(True)
         p.setFont(font)
         fm = p.fontMetrics()
-        tw = fm.horizontalAdvance(text)
+        sw = fm.horizontalAdvance(status + gap)
+        ww = fm.horizontalAdvance(warning)
+        tw = sw + ww
         x = (w - tw) // 2
         y = (h + fm.ascent() - fm.descent()) // 2
-        # 底色文字（暖灰色）
-        p.setPen(QtGui.QColor(139, 116, 100, 120))
-        p.drawText(x, y, text)
-        # 流光高亮（暖白色扫过）
-        grad = QtGui.QLinearGradient(x, 0, x + tw, 0)
+        # 状态段：柔和底色 + 流光扫过
+        sx = x
+        br, bg, bb = status_base
+        gr, gg, gb = status_glow
+        p.setPen(QtGui.QColor(br, bg, bb, 150))
+        p.drawText(sx, y, status + gap)
+        grad = QtGui.QLinearGradient(sx, 0, sx + sw, 0)
         pos = self._phase
         before = max(0.0, pos - 0.15)
         after = min(1.0, pos + 0.15)
-        grad.setColorAt(0.0, QtGui.QColor(240, 226, 210, 0))
+        grad.setColorAt(0.0, QtGui.QColor(gr, gg, gb, 0))
         if before > 0:
-            grad.setColorAt(before, QtGui.QColor(240, 226, 210, 0))
-        grad.setColorAt(pos, QtGui.QColor(240, 232, 220, 200))
+            grad.setColorAt(before, QtGui.QColor(gr, gg, gb, 0))
+        grad.setColorAt(pos, QtGui.QColor(gr, gg, gb, 210))
         if after < 1.0:
-            grad.setColorAt(after, QtGui.QColor(240, 226, 210, 0))
-        grad.setColorAt(1.0, QtGui.QColor(240, 226, 210, 0))
+            grad.setColorAt(after, QtGui.QColor(gr, gg, gb, 0))
+        grad.setColorAt(1.0, QtGui.QColor(gr, gg, gb, 0))
         p.setPen(QtGui.QPen(QtGui.QBrush(grad), 0))
-        p.drawText(x, y, text)
-        p.end()
+        p.drawText(sx, y, status + gap)
+        # 警示段：醒目橙红，恒亮
+        p.setPen(QtGui.QColor(255, 140, 90, 255))
+        p.drawText(x + sw, y, warning)
 
     def _paint_planning(self, event):
         """绘制规划状态 — 紫色调流光 + 进度文本"""
@@ -5338,35 +5348,18 @@ class UnifiedStatusBar(QtWidgets.QWidget):
         p.end()
 
     def _paint_tool(self, event):
-        """绘制工具执行状态 — 流光文字（金色调，与 Thinking/Generating 统一风格）"""
+        """绘制工具执行状态 — 金色调状态 + 忙态警示（与 Thinking/Generating 统一）"""
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
         w, h = self.width(), self.height()
         tool_name = getattr(self, '_tool_name', '')
-        text = f"Exec: {tool_name}" if tool_name else "Executing..."
-        font = QtGui.QFont(CursorTheme.FONT_BODY, 10)
-        p.setFont(font)
-        fm = p.fontMetrics()
-        tw = fm.horizontalAdvance(text)
-        x = (w - tw) // 2
-        y = (h + fm.ascent() - fm.descent()) // 2
-        # 底色文字（暗金色）
-        p.setPen(QtGui.QColor(170, 145, 100, 120))
-        p.drawText(x, y, text)
-        # 流光高亮（金色扫过）
-        grad = QtGui.QLinearGradient(x, 0, x + tw, 0)
-        pos = self._phase
-        before = max(0.0, pos - 0.15)
-        after = min(1.0, pos + 0.15)
-        grad.setColorAt(0.0, QtGui.QColor(212, 190, 140, 0))
-        if before > 0:
-            grad.setColorAt(before, QtGui.QColor(212, 190, 140, 0))
-        grad.setColorAt(pos, QtGui.QColor(230, 210, 170, 220))
-        if after < 1.0:
-            grad.setColorAt(after, QtGui.QColor(212, 190, 140, 0))
-        grad.setColorAt(1.0, QtGui.QColor(212, 190, 140, 0))
-        p.setPen(QtGui.QPen(QtGui.QBrush(grad), 0))
-        p.drawText(x, y, text)
+        # ★ 忙态警示：Agent 执行工具期间提醒用户不要操作 Houdini，
+        #   避免与主线程 hou 操作/cook 竞态导致崩溃（见 crash 分析 2026-07）
+        status = f"⚡ {tool_name}" if tool_name else "执行中"
+        self._paint_busy_text(
+            p, w, h, status, "⚠ 请勿操作 Houdini 视口/节点",
+            status_base=(170, 145, 100), status_glow=(230, 210, 170),
+        )
         p.end()
 
 

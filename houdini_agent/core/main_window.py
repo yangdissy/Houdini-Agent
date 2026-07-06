@@ -102,6 +102,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 替换 AITab
         if hasattr(self, 'ai_tab') and self.ai_tab:
+            try:
+                self.ai_tab.cleanup()
+            except Exception:
+                pass
             self.ai_tab.setParent(None)
             self.ai_tab.deleteLater()
         self.ai_tab = AITab(workspace_dir=self._workspace_dir, username=self._username)

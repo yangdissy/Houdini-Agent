@@ -179,7 +179,8 @@ class StreamingParserMixin:
         # 重启计时器（如果已停止）
         if not self._thinking_timer:
             self._thinking_timer = QtCore.QTimer(self)
-            self._thinking_timer.timeout.connect(lambda: self._updateThinkingTime.emit())
+            # 信号-信号直连：Qt 在对象销毁时自动断开，避免 lambda 捕获已销毁的 self
+            self._thinking_timer.timeout.connect(self._updateThinkingTime)
             self._thinking_timer.start(1000)
         # ★ 重新启动输入框上方的思考指示条
         try:

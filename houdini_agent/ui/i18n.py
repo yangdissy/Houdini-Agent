@@ -497,6 +497,14 @@ _ZH = {
         '- 如果你感觉上下文很长，不要因此停止。继续调用工具执行下一个步骤。\n'
         '- 完成一个步骤后，立即开始下一个步骤，不要停顿或等待用户指示。\n\n'
 
+        '## 批量执行纪律（最高优先级 — 直接决定成功率）\n\n'
+        '**一个 step 要创建 2 个及以上节点时，必须用 `create_nodes_batch` 一次性创建并连接，禁止拆成多次 `create_node` + `connect_nodes`。**\n'
+        '- 即使某个 step 的 `tools` 字段只写了 `create_node`，只要该 step 实际要建 2+ 节点，也必须改用 `create_nodes_batch`。以实际节点数为准，不受 tools 字段字面限制。\n'
+        '- 批量创建的成功率和效率远高于逐个创建：一次调用完成建节点+连接+布局，错误集中可一次性修正，逐个创建会浪费 token、错误分散、布局碎裂。\n'
+        '- 陌生节点类型先用 `create_nodes_batch(dry_run=True)` 校验，通过后再真建。\n'
+        '- 修改多个节点参数时用 `batch_set_parameters`，不要逐个 `set_node_parameter`。\n'
+        '- 只有该 step 确实只涉及 1 个孤立节点时，才允许用单个 `create_node`。\n\n'
+
         '## 执行纪律\n\n'
         '1. **严格遵循步骤顺序和依赖关系**。depends_on 中列出的前置步骤必须全部 done 后才能开始当前步骤。\n'
         '2. **状态同步**（每次都要做，不可省略）：\n'
@@ -1086,6 +1094,14 @@ _EN = {
         '- Do NOT output a text-only summary in the middle of execution. Text-only replies are ONLY allowed after ALL steps are done.\n'
         '- If the context feels long, do NOT stop. Continue calling tools to execute the next step.\n'
         '- After completing one step, IMMEDIATELY start the next step. Do not pause or wait for user instructions.\n\n'
+
+        '## Batch Execution Discipline (HIGHEST PRIORITY — directly drives success rate)\n\n'
+        '**When a step creates 2 or more nodes, you MUST use `create_nodes_batch` to create and connect them in ONE call. Do NOT split into multiple `create_node` + `connect_nodes`.**\n'
+        '- Even if a step\'s `tools` field only lists `create_node`, if the step actually builds 2+ nodes you MUST use `create_nodes_batch` instead. Judge by the real node count, not the literal tools field.\n'
+        '- Batch creation has far higher success rate and efficiency: one call builds nodes + connections + layout, errors are reported together and fixable in one pass. One-at-a-time creation wastes tokens, fragments errors, and breaks layout.\n'
+        '- For unfamiliar node types, run `create_nodes_batch(dry_run=True)` first to validate, then build for real.\n'
+        '- To change parameters on multiple nodes, use `batch_set_parameters`, not repeated `set_node_parameter`.\n'
+        '- Only use a single `create_node` when the step genuinely involves exactly 1 isolated node.\n\n'
 
         '## Execution Discipline\n\n'
         '1. **Respect step order and dependencies.** All depends_on predecessors must be "done" before starting a step.\n'

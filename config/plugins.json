@@ -1,5 +1,3 @@
 {
-  "disabled_tools": [
-    "create_network_box"
-  ]
+  "disabled_tools": []
 }

@@ -86,6 +86,10 @@ def show_tool(username: str = None, force_login: bool = False):
                             _main_window.ai_tab._auto_save_timer.stop()
                         except Exception:
                             pass
+                        try:
+                            _main_window.ai_tab.cleanup()
+                        except Exception:
+                            pass
                     _main_window._already_saved = True  # 禁止旧 MainWindow atexit 再保存
                 except Exception:
                     pass

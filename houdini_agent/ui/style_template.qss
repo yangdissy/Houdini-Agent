@@ -48,18 +48,23 @@ QToolTip {
    ============================================================ */
 
 QScrollBar:vertical {
-    background: transparent;
-    width: 5px;
+    background: rgba(255,255,255,6);
+    width: 16px;
     margin: 0;
     border: none;
+    border-radius: 7px;
 }
 QScrollBar::handle:vertical {
-    background: rgba(255,255,255,10);
-    border-radius: 2px;
-    min-height: 28px;
+    background: rgba(255,255,255,55);
+    border-radius: 6px;
+    min-height: 40px;
+    margin: 2px;
 }
 QScrollBar::handle:vertical:hover {
-    background: rgba(255,255,255,45);
+    background: rgba(255,255,255,110);
+}
+QScrollBar::handle:vertical:pressed {
+    background: rgba(140,170,255,160);
 }
 QScrollBar::add-line:vertical,
 QScrollBar::sub-line:vertical {
@@ -484,6 +489,15 @@ QFrame#aiSummary {
 QLabel#aiStatusLabel {
     color: #64748b;
     font-size: {FS_BODY}px;
+}
+QLabel#aiWarningBanner {
+    color: #fca5a5;
+    background: rgba(80,20,20,120);
+    border: 1px solid rgba(248,113,113,90);
+    border-radius: 6px;
+    font-size: {FS_BODY}px;
+    font-weight: bold;
+    padding: 6px 10px;
 }
 QPushButton#aiCopyBtn {
     color: #94a3b8;
