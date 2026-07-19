@@ -48,11 +48,11 @@ _ASK_TOOLS = frozenset({
     'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
     'get_geometry_summary', 'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
-    'find_nodes_by_param', 'get_node_inputs', 'get_node_card', 'check_errors',
+    'check_errors',
     'verify_network', 'web_search', 'fetch_webpage',
     'search_local_doc', 'get_houdini_node_doc', 'list_skills',
-    'add_todo', 'update_todo', 'get_node_positions',
-    'list_network_boxes', 'perf_start_profile', 'perf_stop_and_report',
+    'add_todo', 'update_todo',
+    'perf_start_profile', 'perf_stop_and_report',
     'search_memory', 'capture_viewport', 'preview_layout_nodes',
 })
 
@@ -62,11 +62,11 @@ _PLAN_PLANNING_TOOLS = frozenset({
     'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
     'get_geometry_summary', 'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
-    'find_nodes_by_param', 'get_node_inputs', 'get_node_card', 'check_errors',
+    'check_errors',
     'verify_network', 'web_search', 'fetch_webpage',
-    'search_local_doc', 'get_houdini_node_doc', 'list_skills',
-    'add_todo', 'update_todo', 'get_node_positions',
-    'list_network_boxes', 'perf_start_profile', 'perf_stop_and_report',
+    'search_local_doc', 'get_houdini_node_doc', 'list_skills', 'run_skill',
+    'add_todo', 'update_todo',
+    'perf_start_profile', 'perf_stop_and_report',
     'search_memory', 'capture_viewport', 'preview_layout_nodes',
     'create_plan', 'ask_question',
 })
@@ -77,10 +77,9 @@ _READONLY_TOOLS = frozenset({
     'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
     'get_geometry_summary', 'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
-    'find_nodes_by_param', 'get_node_inputs', 'get_node_card', 'check_errors',
+    'check_errors',
     'verify_network', 'web_search', 'fetch_webpage',
     'search_local_doc', 'get_houdini_node_doc', 'list_skills',
-    'get_node_positions', 'list_network_boxes',
     'perf_start_profile', 'perf_stop_and_report',
     'capture_viewport', 'search_memory', 'preview_layout_nodes',
 })
@@ -417,23 +416,22 @@ class ToolRegistry:
             'get_network_structure', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
             'suggest_connection', 'preview_node_operation', 'validate_node_network', 'find_nodes',
             'get_geometry_summary', 'get_scene_snapshot',
-            'verify_network', 'read_selection', 'get_node_inputs', 'get_node_card',
-            'get_node_positions', 'list_network_boxes',
+            'verify_network', 'read_selection',
             'search_memory',
             'capture_viewport',
         },
         'create': {
             'create_node', 'create_nodes_batch', 'create_wrangle_node',
-            'connect_nodes', 'cook_node', 'copy_node', 'create_named_null',
-            'get_node_card', 'verify_network',
+            'connect_nodes', 'copy_node', 'create_named_null',
+            'verify_network',
         },
         'connection': {
-            'get_node_connections', 'get_node_inputs', 'get_node_card', 'suggest_connection',
+            'get_node_connections', 'suggest_connection',
             'preview_node_operation', 'connect_nodes', 'disconnect_nodes',
         },
         'parameter': {
-            'get_parameter_schema', 'inspect_node', 'get_node_card',
-            'set_node_parameter', 'batch_set_parameters', 'cook_node',
+            'get_parameter_schema', 'inspect_node',
+            'set_node_parameter', 'set_parameter_expression', 'batch_set_parameters',
         },
         'flags': {
             'inspect_node', 'preview_node_operation', 'set_node_flags',
@@ -451,16 +449,16 @@ class ToolRegistry:
             'preview_node_operation', 'validate_node_network',
         },
         'modify': {
-            'set_node_parameter', 'batch_set_parameters',
+            'set_node_parameter', 'set_parameter_expression', 'batch_set_parameters',
             'set_node_flags',
         },
         'operation': {
             'get_network_structure', 'inspect_node', 'get_parameter_schema',
-            'get_node_connections', 'get_node_inputs', 'suggest_connection',
+            'get_node_connections', 'suggest_connection',
             'preview_node_operation', 'validate_node_network',
             'set_node_parameter', 'batch_set_parameters', 'set_node_flags',
             'connect_nodes', 'disconnect_nodes', 'delete_node', 'rename_node',
-            'layout_nodes', 'cook_node', 'verify_network',
+            'layout_nodes', 'verify_network',
         },
         'delete': {
             'delete_node', 'rename_node',
@@ -472,7 +470,7 @@ class ToolRegistry:
         'search': {
             'web_search', 'fetch_webpage', 'search_local_doc',
             'search_node_types', 'semantic_search_nodes',
-            'find_nodes', 'find_nodes_by_param', 'inspect_node', 'get_node_connections', 'suggest_connection',
+            'find_nodes', 'inspect_node', 'get_node_connections', 'suggest_connection',
             'preview_node_operation', 'validate_node_network', 'get_scene_snapshot', 'get_houdini_node_doc',
             'search_memory',
         },
@@ -538,21 +536,21 @@ class ToolRegistry:
         'create_node', 'create_nodes_batch', 'create_wrangle_node',
         'set_node_parameter', 'batch_set_parameters', 'set_node_flags',
         'connect_nodes', 'disconnect_nodes', 'delete_node', 'rename_node',
-        'layout_nodes', 'cook_node', 'copy_node', 'create_named_null',
+        'layout_nodes', 'copy_node', 'create_named_null',
     })
 
     _TOOL_DEPENDENCIES: Dict[str, Set[str]] = {
-        'connect_nodes': {'get_node_connections', 'get_node_inputs', 'suggest_connection', 'preview_node_operation'},
+        'connect_nodes': {'get_node_connections', 'suggest_connection', 'preview_node_operation'},
         'disconnect_nodes': {'get_node_connections', 'preview_node_operation'},
         'set_node_parameter': {'inspect_node', 'get_parameter_schema'},
         'batch_set_parameters': {'inspect_node', 'get_parameter_schema'},
         'set_node_flags': {'inspect_node', 'preview_node_operation', 'validate_node_network'},
-        'create_node': {'get_network_structure', 'search_node_types', 'get_node_card'},
-        'create_nodes_batch': {'get_network_structure', 'search_node_types', 'get_node_inputs', 'get_node_card', 'verify_network'},
+        'create_node': {'get_network_structure', 'search_node_types'},
+        'create_nodes_batch': {'get_network_structure', 'search_node_types', 'verify_network'},
         'create_wrangle_node': {'get_network_structure', 'get_houdini_node_doc'},
         'create_named_null': {'get_node_connections', 'suggest_connection', 'preview_node_operation', 'validate_node_network'},
-        'layout_nodes': {'get_node_positions', 'get_network_structure'},
-        'create_network_box': {'get_node_positions', 'list_network_boxes'},
+        'layout_nodes': {'get_network_structure'},
+        'create_network_box': set(),
         'cook_node': {'inspect_node', 'verify_network'},
         'copy_node': {'inspect_node', 'get_network_structure'},
         'save_hip': {'get_scene_snapshot'},
@@ -608,11 +606,9 @@ class ToolRegistry:
             target_names |= self._AGENT_ALWAYS_TOOLS
         target_names = self._expand_tool_dependencies(target_names)
 
-        # 添加所有 skill 工具（skill 通常应始终可用）
-        with self._lock:
-            for name, meta in self._tools.items():
-                if meta.source == 'skill' and meta.enabled:
-                    target_names.add(name)
+        # Skill 元工具始终可用：skill 通过 run_skill/list_skills 暴露（非独立工具），
+        # 不属于任何意图组，必须显式纳入，否则会被意图过滤剔除。
+        target_names |= {'run_skill', 'list_skills'}
 
         # 过滤：必须在指定 mode 中且启用
         with self._lock:

@@ -31,7 +31,9 @@ class ChatViewMixin:
             for b64_data, _mt, thumb in images:
                 # 从 base64 还原完整 pixmap 用于放大预览
                 full_pixmap = QtGui.QPixmap()
-                full_pixmap.loadFromData(__import__('base64').b64decode(b64_data))
+                if not full_pixmap.loadFromData(__import__('base64').b64decode(b64_data)) or full_pixmap.isNull():
+                    # ★ 图片数据无效则跳过，避免空 pixmap 进入布局触发崩溃
+                    continue
                 thumb_scaled = thumb.scaled(48, 48, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
                 lbl = ClickableImageLabel(thumb_scaled, full_pixmap)
                 lbl.setObjectName("imgThumb")

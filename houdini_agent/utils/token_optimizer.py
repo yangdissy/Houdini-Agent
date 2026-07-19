@@ -109,8 +109,9 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
     'glm-4.7':              {'input': 0.50,  'input_cache': 0.50,  'output': 0.50},
     'glm-5-turbo':          {'input': 0.50,  'input_cache': 0.50,  'output': 0.50},
     'glm-5.1':              {'input': 0.50,  'input_cache': 0.50,  'output': 0.50},
-    # ---- Kimi ----
-    'kimi-k2.5':            {'input': 2.00,  'input_cache': 0.50,  'output': 8.00},
+    # ---- Kimi Code（订阅套餐，非按 token 计费；此处仅作参考估算，前缀匹配 k3[1m]/kimi-for-coding*） ----
+    'k3':                   {'input': 0.0,   'input_cache': 0.0,   'output': 0.0},
+    'kimi-for-coding':      {'input': 0.0,   'input_cache': 0.0,   'output': 0.0},
     # ---- MiniMax ----
     'MiniMax-M2.5':         {'input': 1.00,  'input_cache': 0.25,  'output': 4.00},
     'MiniMax-M2.7':         {'input': 1.00,  'input_cache': 0.25,  'output': 4.00},

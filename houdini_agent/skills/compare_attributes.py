@@ -7,11 +7,13 @@
 
 SKILL_INFO = {
     "name": "compare_attributes",
+    "category": "geometry",
     "description": (
         "对比两个节点的属性差异（哪些属性多了/少了/类型不同）。"
         "覆盖 point/vertex/prim/detail 四种类别。"
         "适用于调试管线、检查节点前后数据变化等场景。"
     ),
+    "risk_level": "low",
     "parameters": {
         "node_path_a": {
             "type": "string",

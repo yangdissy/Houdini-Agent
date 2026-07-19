@@ -106,6 +106,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.ai_tab.cleanup()
             except Exception:
                 pass
+            # ★ 先隐藏再从父布局摘除，避免已 deleteLater 的旧 AITab 继续参与
+            #   布局/绘制事件，导致对半销毁 widget 计算 sizeHint 崩溃。
+            try:
+                self.ai_tab.hide()
+            except Exception:
+                pass
             self.ai_tab.setParent(None)
             self.ai_tab.deleteLater()
         self.ai_tab = AITab(workspace_dir=self._workspace_dir, username=self._username)

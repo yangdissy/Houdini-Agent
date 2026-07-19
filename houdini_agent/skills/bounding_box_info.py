@@ -6,10 +6,12 @@
 
 SKILL_INFO = {
     "name": "get_bounding_info",
+    "category": "geometry",
     "description": (
         "获取几何体的边界盒信息：min/max/center/size/对角线长度/体积/表面积/长宽比/最长轴/最短轴。"
         "适用于检查模型尺寸、对齐、缩放等场景。"
     ),
+    "risk_level": "low",
     "parameters": {
         "node_path": {
             "type": "string",

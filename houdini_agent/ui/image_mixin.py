@@ -134,7 +134,11 @@ class ImageMixin:
         # 创建缩略图和完整 pixmap
         img_bytes = __import__('base64').b64decode(b64_data)
         full_pixmap = QtGui.QPixmap()
-        full_pixmap.loadFromData(img_bytes)
+        # ★ 校验加载结果：损坏/不支持的数据会返回 False，空 pixmap 进入布局
+        #   会在 sizeHint 阶段触发 Qt 告警甚至崩溃，这里直接跳过。
+        if not full_pixmap.loadFromData(img_bytes) or full_pixmap.isNull():
+            print("[AI Tab] 图片数据无效，已跳过预览")
+            return
         thumb = full_pixmap.scaled(60, 60, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
 
         # 存储
@@ -194,7 +198,10 @@ class ImageMixin:
 
             # 从 base64 还原完整 pixmap 用于放大预览
             full_pixmap = QtGui.QPixmap()
-            full_pixmap.loadFromData(__import__('base64').b64decode(b64))
+            if not full_pixmap.loadFromData(__import__('base64').b64decode(b64)) or full_pixmap.isNull():
+                # ★ 图片数据无效则跳过，避免空 pixmap 进入布局
+                img_widget.deleteLater()
+                continue
             lbl = ClickableImageLabel(thumb, full_pixmap)
             lbl.setObjectName("imgThumb")
             img_layout.addWidget(lbl)

@@ -87,9 +87,13 @@ class RewardEngine:
         success_score = 1.0 if success else 0.0
 
         # 2. 效率分（0 次工具调用视为完美效率；retry 直接拉低）
+        #    工具调用数用对数软饱和惩罚（而非线性），避免正当的复杂任务
+        #    （如需要 80+ 次调用的建图）被线性重罚到接近 0。
+        #    retry 仍用线性惩罚——它是真实的低效/试错信号。
+        #    对照：tc=10→0.81, tc=30→0.63, tc=90→0.46（线性旧公式 tc=90→0.10）。
         tc = max(0, tool_call_count)
         rc = max(0, retry_count)
-        efficiency_score = 1.0 / (1.0 + 0.1 * tc + 0.3 * rc)
+        efficiency_score = 1.0 / (1.0 + 0.35 * math.log1p(tc) + 0.3 * rc)
 
         # 3. 新颖度分（与已有记忆的最大相似度的反数）
         novelty_score = self._calculate_novelty(task_embedding)

@@ -7,10 +7,12 @@ import re
 
 SKILL_INFO = {
     "name": "cache_node_report",
+    "category": "performance",
     "description": (
         "Scan cache and export nodes, report output paths, frame ranges, disk existence, "
         "and modified times. Read-only; does not cook or write caches."
     ),
+    "risk_level": "low",
     "parameters": {
         "root_path": {
             "type": "string",

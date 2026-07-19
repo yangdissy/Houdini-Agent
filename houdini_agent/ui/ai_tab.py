@@ -179,6 +179,7 @@ class AITab(
         # 上下文管理
         self._max_context_messages = 20
         self._context_summary = ""
+        self._last_auto_read_context = None
         
         # 缓存管理
         self._session_id = str(uuid.uuid4())[:8]  # 当前会话 ID
@@ -526,6 +527,57 @@ class AITab(
         if dialog.should_reset_stats:
             self._reset_token_stats()
 
+    def _capture_pre_agent_update_mode(self):
+        """记录本轮 Agent 启动前的 Houdini update mode。
+
+        该快照用于区分用户/hip 原始 Manual 和 Cook Guard 临时 Manual。
+        已有快照时保留原值，避免恢复失败或 Plan 执行阶段覆盖真实原始模式。
+        """
+        if getattr(self, '_pre_agent_update_mode', None) is not None:
+            return self._pre_agent_update_mode
+        try:
+            import hou  # type: ignore
+            self._pre_agent_update_mode = hou.updateModeSetting()
+        except Exception:
+            self._pre_agent_update_mode = None
+        return self._pre_agent_update_mode
+
+    def _build_manual_mode_directive(self, confirm_mode: bool = True) -> str:
+        """★ 若用户/hip 自身处于 Manual 更新模式，返回一段 system prompt 硬约束。
+
+        判断依据是 _pre_agent_update_mode（在 _on_send 时记录的用户原始模式），
+        而非当前 hou.updateModeSetting()：后者在 Agent 运行期间会被 Cook Guard
+        临时切为 Manual，直接读会误把「Agent 临时保护」当成「用户持久设置」。
+        只有当用户原始模式就是 Manual 时才注入，避免噪声。
+        """
+        try:
+            import hou  # type: ignore
+        except Exception:
+            return ""
+        user_mode = getattr(self, '_pre_agent_update_mode', None)
+        try:
+            if user_mode is None:
+                return ""
+            if user_mode != hou.updateMode.Manual:
+                return ""
+        except Exception:
+            return ""
+        mode_rule = (
+            "4. 不要擅自把用户的更新模式改回 Auto——这是用户有意的设置。"
+            if confirm_mode
+            else "4. 直接执行模式下，为验证真实几何结果可临时切 Auto；Agent 结束时框架会恢复用户原始更新模式，最终总结中说明曾临时切 Auto。"
+        )
+        return (
+            "[Houdini 状态 — 重要] 当前 hip 文件的更新模式是 **Manual（手动）**，这是用户的持久设置。\n"
+            "含义：创建/修改节点（create_node、set_node_parameter、connect_nodes、"
+            "set_display_flag 等）后，Houdini 不会自动 cook，视口与下游几何不会自动刷新。\n"
+            "你必须遵守：\n"
+            "1. 工具返回 success 只代表操作已排队，绝不能据此宣称「已生效/视口已更新/效果已完成」。\n"
+            "2. 报告完成前，必须用 verify_network / check_errors / get_network_structure 确认真实结果。\n"
+            "3. 若用户期望看到结果，在总结中主动说明「当前为 Manual 模式，需手动 cook 或切回 Auto 才能看到更新」。\n"
+            + mode_rule
+        )
+
     def _cook_displayed_nodes_if_manual(self):
         """★ 在 Manual 保护模式下，对当前工作区的 display 节点做针对性 cook
         
@@ -781,6 +833,26 @@ class AITab(
 
         return self._execute_tool_impl(tool_name, kwargs)
 
+    def _skill_risk_level(self, skill_name: str) -> str:
+        """返回 skill 的 risk_level（'low'/'normal'/'high'），未知/查询失败按最保守 'normal' 处理。
+
+        用 name->risk_level 映射缓存到实例属性，避免每次调用都遍历 skill 列表。
+        risk_level 语义：'low'=只读/不改场景（规划阶段可用）；其余=会改场景/建图（规划阶段拦）。
+        """
+        if not skill_name:
+            return 'normal'
+        cache = getattr(self, '_skill_risk_cache', None)
+        if cache is None:
+            cache = {}
+            try:
+                from ..skills import list_skills
+                for info in list_skills():
+                    cache[info.get('name', '')] = info.get('risk_level', 'normal')
+            except Exception:
+                pass
+            self._skill_risk_cache = cache
+        return cache.get(skill_name, 'normal')
+
     def _execute_tool_impl(self, tool_name: str, kwargs: dict, skip_builtin_confirm: bool = False) -> dict:
         """Execute a tool after the public harness/policy boundary has run."""
         kwargs = dict(kwargs or {})
@@ -818,22 +890,35 @@ class AITab(
         
         # ★ Plan 规划阶段安全守卫
         if self._plan_mode and self._plan_phase == 'planning':
-            allowed = self._PLAN_PLANNING_TOOLS | {'create_plan'}
-            if tool_name not in allowed:
-                # 额外检查 ToolRegistry（插件/Skill 工具可能注册了 plan_planning 模式）
-                _plan_allowed = False
-                try:
-                    from ..utils.tool_registry import get_tool_registry
-                    _meta = get_tool_registry()._tools.get(tool_name)
-                    if _meta and _meta.enabled and "plan_planning" in _meta.modes:
-                        _plan_allowed = True
-                except Exception:
-                    pass
-                if not _plan_allowed:
+            # run_skill 在规划阶段仅允许只读 skill（risk_level == 'low'）：
+            # 只读 skill（get_node_card / analyze_* / inspect_*）可分析现网、查真实参数以设计计划；
+            # 会改场景/建图的 skill（setup_*，risk_level != low）留到执行阶段。
+            if tool_name == 'run_skill':
+                skill_name = (kwargs or {}).get('skill_name', '')
+                if self._skill_risk_level(skill_name) != 'low':
                     return {
                         "success": False,
-                        "error": f"Plan 规划阶段不允许执行 {tool_name}，只能使用查询工具和 create_plan"
+                        "error": (f"Plan 规划阶段不允许执行会改场景/建图的 skill '{skill_name}'，"
+                                  f"仅可运行只读 skill（如 get_node_card、analyze_*、inspect_*）辅助设计计划")
                     }
+            else:
+                allowed = self._PLAN_PLANNING_TOOLS | {'create_plan'}
+                if tool_name not in allowed:
+                    # 额外检查 ToolRegistry（插件/Skill 工具可能注册了 plan_planning 模式）
+                    _plan_allowed = False
+                    try:
+                        from ..utils.tool_registry import get_tool_registry
+                        _meta = get_tool_registry()._tools.get(tool_name)
+                        if _meta and _meta.enabled and "plan_planning" in _meta.modes:
+                            _plan_allowed = True
+                    except Exception:
+                        pass
+                    if not _plan_allowed:
+                        return {
+                            "success": False,
+                            "error": f"Plan 规划阶段不允许执行 {tool_name}，只能使用查询工具和 create_plan"
+                        }
+
         
         # ★ 确认模式：对关键节点操作弹出预览确认
         if (not skip_builtin_confirm) and self._confirm_mode and tool_name in self._CONFIRM_TOOLS:
@@ -1234,11 +1319,11 @@ class AITab(
         '|connect_nodes|cook_node|get_node_connections|suggest_connection|preview_node_operation'
         '|create_named_null|validate_node_network|delete_node|search_node_types|semantic_search_nodes'
         '|list_children|find_nodes|get_geometry_summary|get_scene_snapshot|read_selection|set_display_flag'
-        '|copy_node|batch_set_parameters|find_nodes_by_param|save_hip|undo_redo'
+        '|copy_node|batch_set_parameters|save_hip|undo_redo'
         '|web_search|fetch_webpage|search_local_doc|get_houdini_node_doc'
-        '|execute_python|execute_shell|check_errors|get_node_inputs|add_todo|update_todo'
+        '|execute_python|execute_shell|check_errors|add_todo|update_todo'
         '|verify_network|run_skill|list_skills'
-        '|layout_nodes|preview_layout_nodes|get_node_positions'
+        '|layout_nodes|preview_layout_nodes'
         '|perf_start_profile|perf_stop_and_report'
     )
     _FAKE_TOOL_PATTERNS = re.compile(
@@ -1792,6 +1877,49 @@ class AITab(
         
         return text + hint
 
+    def _start_agent_run(self, agent_params_overrides: dict = None, inject_scene: bool = True):
+        """启动一次 Agent/Plan 执行，共享运行前准备逻辑。
+
+        普通 Agent 与 Plan 执行阶段都必须走这里，避免 Plan copy 一套
+        update-mode 快照、UI 状态、参数收集和线程启动逻辑。
+        """
+        # 先记录用户/hip 原始 Update Mode。后续 Cook Guard 临时 Manual
+        # 不能被误判为用户持久 Manual。
+        self._capture_pre_agent_update_mode()
+
+        if inject_scene:
+            self._auto_inject_scene_read()
+
+        self._update_context_stats()
+
+        # 开始运行（先设置状态，再创建回复块）
+        self._set_running(True)
+
+        # 创建 AI 回复块（必须在 _set_running 之后，否则会被清除）
+        self._add_ai_response()
+        self._agent_response = self._current_response
+        self._start_active_aurora()
+
+        agent_params = {
+            'provider': self._current_provider(),
+            'model': self.model_combo.currentText(),
+            'use_web': self.web_check.isChecked(),
+            'use_agent': self._agent_mode,  # True=Agent(full), False=Ask(read-only)
+            'use_think': self.think_check.isChecked(),
+            'context_limit': self._get_current_context_limit(),
+            'scene_context': self._collect_scene_context(),
+            'supports_vision': self._current_model_supports_vision(),
+            'plan_mode': self._plan_mode,
+            'confirm_mode': bool(getattr(self, '_confirm_mode', False)),
+        }
+        if agent_params_overrides:
+            agent_params.update(agent_params_overrides)
+
+        self._save_model_preference()
+
+        thread = threading.Thread(target=self._run_agent, args=(agent_params,), daemon=True)
+        thread.start()
+
     # ===== 事件处理 =====
     
     def _on_send(self):
@@ -1823,61 +1951,14 @@ class AITab(
         # 检测 URL 并添加提示
         processed_text = self._process_urls_in_text(text)
 
-        # 自动读取场景信息（静默注入对话历史，放在用户问题之前）
-        self._auto_inject_scene_read()
-
         # 构建消息内容（文字或多模态）
         if pending_imgs:
             msg_content = self._build_multimodal_content(processed_text, pending_imgs)
             self._conversation_history.append({'role': 'user', 'content': msg_content})
         else:
             self._conversation_history.append({'role': 'user', 'content': processed_text})
-        
-        # 更新上下文统计
-        self._update_context_stats()
-        
-        # 开始运行（先设置状态，再创建回复块）
-        self._set_running(True)
-        
-        # 创建 AI 回复块（必须在 _set_running 之后，否则会被清除）
-        self._add_ai_response()
-        # 同步 agent 锚点到刚创建的 response widget
-        self._agent_response = self._current_response
-        # ★ 启动流光边框动画
-        self._start_active_aurora()
-        
-        # ★ 记录用户当前的 Houdini 更新模式（Agent 结束后恢复）
-        # 只在干净状态下记录：如果上一轮恢复失败导致 _pre_agent_update_mode 未清空，
-        # 当前模式可能已是 Agent 留下的 Manual，覆盖会让用户原始模式永久丢失。
-        try:
-            import hou  # type: ignore
-            if getattr(self, '_pre_agent_update_mode', None) is None:
-                self._pre_agent_update_mode = hou.updateModeSetting()
-            else:
-                print(f"[Cook Guard] 检测到上一轮未恢复的 update mode 记录，"
-                      f"保留原值 {self._pre_agent_update_mode}（当前 {hou.updateModeSetting()}）")
-        except Exception:
-            self._pre_agent_update_mode = None
-        
-        # ⚠️ 在主线程中获取所有 Qt 控件的值（后台线程不能直接访问）
-        agent_params = {
-            'provider': self._current_provider(),
-            'model': self.model_combo.currentText(),
-            'use_web': self.web_check.isChecked(),
-            'use_agent': self._agent_mode,  # True=Agent(full), False=Ask(read-only)
-            'use_think': self.think_check.isChecked(),
-            'context_limit': self._get_current_context_limit(),  # 也在主线程获取
-            'scene_context': self._collect_scene_context(),  # ★ 主线程收集 Houdini 场景上下文
-            'supports_vision': self._current_model_supports_vision(),  # 模型是否支持图片
-            'plan_mode': self._plan_mode,  # ★ Plan 模式标记
-        }
-        
-        # 保存模型选择
-        self._save_model_preference()
-        
-        # 后台执行（传递参数而不是直接访问控件）
-        thread = threading.Thread(target=self._run_agent, args=(agent_params,), daemon=True)
-        thread.start()
+
+        self._start_agent_run()
 
     def _select_agent_tools_for_message(self, user_message: str, use_web: bool = True) -> List[dict]:
         """Select a minimal Agent-mode tool set using ToolRegistry intent groups."""
@@ -1920,6 +2001,7 @@ class AITab(
         supports_vision = agent_params.get('supports_vision', True)
         plan_mode = agent_params.get('plan_mode', False)
         plan_executing = agent_params.get('plan_executing', False)
+        confirm_mode = agent_params.get('confirm_mode', True)
         if self._harness_v2_enabled:
             self._harness_state = HarnessRuntimeState(session_id=self._session_id)
         
@@ -1966,6 +2048,9 @@ class AITab(
             # ★ Agent 模式：追加复杂任务建议切换 Plan 的提示
             if use_agent and not plan_mode:
                 sys_prompt = sys_prompt + tr('ai.agent_suggest_plan_prompt')
+                # ★ 直接执行模式：抑制模型主动逐步征询确认，一次性完成整条流程
+                if not confirm_mode:
+                    sys_prompt = sys_prompt + tr('ai.direct_execute_prompt')
             
             # ★ 个性注入：将成长系统形成的个性特征追加到 system prompt 末尾
             personality_text = self._get_personality_injection()
@@ -1989,6 +2074,13 @@ class AITab(
             rules_text = self._get_user_rules_injection()
             if rules_text:
                 sys_prompt = sys_prompt + "\n\n" + rules_text
+            
+            # ★ Houdini 更新模式硬约束注入（放在 system prompt 末尾，AI 无法忽略）
+            # 只在用户/hip 自身处于 Manual 时注入——此时 _pre_agent_update_mode 记录的是
+            # 用户原始模式（Agent 尚未切换或已恢复），若它就是 Manual 说明这是用户的持久设置。
+            manual_directive = self._build_manual_mode_directive(confirm_mode=confirm_mode)
+            if manual_directive:
+                sys_prompt = sys_prompt + "\n\n" + manual_directive
             
             messages = [{'role': 'system', 'content': sys_prompt}]
             
@@ -2319,6 +2411,8 @@ class AITab(
                 exec_names = {t.get('function', {}).get('name') for t in exec_tools}
                 if PLAN_TOOL_UPDATE_STEP.get('function', {}).get('name') not in exec_names:
                     exec_tools = exec_tools + [PLAN_TOOL_UPDATE_STEP]
+                if PLAN_TOOL_ASK_QUESTION.get('function', {}).get('name') not in exec_names:
+                    exec_tools = exec_tools + [PLAN_TOOL_ASK_QUESTION]
                 if not use_web:
                     exec_tools = [t for t in exec_tools
                                   if t['function']['name'] not in ('web_search', 'fetch_webpage')]
@@ -3203,6 +3297,7 @@ class AITab(
                 # 静默恢复：当前会话为空时直接加载到当前标签
                 self._conversation_history = history
                 self._context_summary = context_summary
+                self._last_auto_read_context = None
                 self._session_id = cached_session_id
                 self._session_created_at = created_at
                 self._token_stats = saved_token_stats
@@ -3285,6 +3380,7 @@ class AITab(
             self._session_created_at = created_at
             self._conversation_history = history
             self._context_summary = context_summary
+            self._last_auto_read_context = None
             self._current_response = None
             self._token_stats = saved_token_stats
             self.scroll_area = scroll_area
@@ -3543,6 +3639,7 @@ class AITab(
     
     # ---------- 历史渲染辅助 ----------
     _CONTEXT_HEADERS = ('[Network structure]', '[Selected nodes]',
+                        '[Auto-read: Network structure]', '[Auto-read: Selected nodes]',
                         '[网络结构]', '[选中节点]')
 
     # ★ 分批渲染常量（借鉴 markstream-vue 的批次策略）

@@ -71,6 +71,19 @@ class TidyLayoutTests(unittest.TestCase):
         self.assertAlmostEqual(center_x, 10.0, places=6)
         self.assertAlmostEqual(center_y, 5.0, places=6)
 
+    def test_anchor_position_overrides_original_center(self):
+        positions = _compute_tidy_layout(
+            ["shape", "points", "copy"],
+            [("shape", "copy", 0), ("points", "copy", 1)],
+            original_positions={"shape": (-100.0, -20.0), "points": (-100.0, -20.0), "copy": (-100.0, -20.0)},
+            anchor_position=(25.0, 12.0),
+        )
+
+        center_x = sum(pos[0] for pos in positions.values()) / len(positions)
+        center_y = sum(pos[1] for pos in positions.values()) / len(positions)
+        self.assertAlmostEqual(center_x, 25.0, places=6)
+        self.assertAlmostEqual(center_y, 12.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

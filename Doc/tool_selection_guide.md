@@ -8,8 +8,8 @@ This guide helps the AI choose the smallest useful tool set for each Houdini tas
 2. Prefer the most specific read-only tool. Do not call broad scene snapshots when a node-level query is enough.
 3. Preview risky node operations. Use `preview_node_operation` before connection replacement, disconnection, deletion, flag changes, cooking, or named null creation when the impact is unclear.
 4. Keep layout explicit. Do not rely on connection tools to arrange nodes; use `layout_nodes` only when the user asks for layout or the workflow has created a new batch of nodes.
-5. Keep high-risk tools explicit. `execute_shell`, `execute_python`, `delete_node`, `save_hip`, and `undo_redo` require a clear user intent and remain governed by harness policy.
-6. Validate after writes. After creating, connecting, changing parameters, flags, or cooking, use the smallest sufficient verification tool: `inspect_node` for one node, `get_node_connections` for a wire change, `verify_network` for an entire parent network (preferred after `create_nodes_batch`), `validate_node_network` for structural issues (orphans, missing required inputs).
+5. Keep high-risk tools explicit. `execute_shell`, `execute_python`, `delete_node`, `save_hip`, `undo_redo`, and `cook_node` require a clear user intent and remain governed by harness policy. Never call `cook_node` to "verify" your own changes; cooking runs on the Houdini main thread and can freeze the UI on heavy nodes.
+6. Validate after writes with read-only tools. After creating, connecting, changing parameters, or flags, use the smallest sufficient verification tool: `inspect_node` for one node, `check_errors` for error details, `get_node_connections` for a wire change, `verify_network` for an entire parent network (preferred after `create_nodes_batch`), `validate_node_network` for structural issues (orphans, missing required inputs). These read Houdini's existing cook state and do not trigger a recook.
 
 ## Mode Boundaries
 
@@ -27,18 +27,18 @@ This guide helps the AI choose the smallest useful tool set for each Houdini tas
 | Understand network structure | `get_network_structure`, `find_nodes` | None | `verify_network` |
 | Inspect one node | `inspect_node` | None | `verify_network` if upstream errors suspected |
 | Inspect parameters | `get_parameter_schema` | None | None |
-| Set parameters | `get_parameter_schema` | `set_node_parameter`, `batch_set_parameters` | `inspect_node`, `cook_node` only when needed |
-| Create a node (1 isolated, no connection) | `get_node_card`, `search_node_types` | `create_node` | `verify_network`, `validate_node_network` |
-| Create multiple nodes (2+ or any with connections) — DEFAULT for new graphs | `get_node_card` (for unfamiliar types), `search_node_types` | `create_nodes_batch` (try `dry_run=True` first for unfamiliar types). Never substitute with `create_node` + `connect_nodes`. | `verify_network`, `validate_node_network` |
-| Connect nodes | `get_node_connections`, `get_node_inputs`, `suggest_connection` | `preview_node_operation`, `connect_nodes` | `get_node_connections`, `verify_network` |
+| Set parameters | `get_parameter_schema` | `set_node_parameter`, `batch_set_parameters` | `inspect_node`, `check_errors` |
+| Create a node (1 isolated, no connection) | `run_skill('get_node_card')`, `search_node_types` | `create_node` | `verify_network`, `validate_node_network` |
+| Create multiple nodes (2+ or any with connections) — DEFAULT for new graphs | `run_skill('get_node_card')` (for unfamiliar types), `search_node_types` | `create_nodes_batch` (try `dry_run=True` first for unfamiliar types). Never substitute with `create_node` + `connect_nodes`. | `verify_network`, `validate_node_network` |
+| Connect nodes | `get_node_connections`, `run_skill('get_node_inputs')`, `suggest_connection` | `preview_node_operation`, `connect_nodes` | `get_node_connections`, `verify_network` |
 | Disconnect nodes | `get_node_connections` | `preview_node_operation`, `disconnect_nodes` | `get_node_connections` |
 | Create OUT/IN/CTRL/CACHE null | `get_node_connections`, `suggest_connection` | `preview_node_operation`, `create_named_null` | `verify_network`, `inspect_node` |
 | Set flags | `inspect_node` | `preview_node_operation`, `set_node_flags` | `inspect_node`, `verify_network` |
-| Cook or cache result | `inspect_node` | `cook_node` | `verify_network`, `validate_node_network` |
+| Cook / force-recompute a node (only when the user explicitly asks) | `inspect_node`, `check_errors` | `cook_node` (high risk; may block the UI) | `inspect_node`, `verify_network` |
 | Validate network health | `verify_network`, `validate_node_network` | None | None |
-| Layout nodes | `get_node_positions`, `get_network_structure` | `layout_nodes` | `get_node_positions` |
-| Make a network box | `get_node_positions`, `list_network_boxes` | `create_network_box` | `list_network_boxes` |
-| Find documentation | `get_node_card`, `search_local_doc`, `get_houdini_node_doc`, `web_search` when enabled | None | None |
+| Layout nodes | `run_skill('get_node_positions')`, `get_network_structure` | `layout_nodes` | `run_skill('get_node_positions')` |
+| Make a network box | `run_skill('get_node_positions')`, `run_skill('list_network_boxes')` | `create_network_box` | `run_skill('list_network_boxes')` |
+| Find documentation | `run_skill('get_node_card')`, `search_local_doc`, `get_houdini_node_doc`, `web_search` when enabled | None | None |
 | Use skills | `list_skills` | `run_skill` | Tool-specific read-only checks |
 | Execute code or shell | Ask whether code/shell is truly needed | `execute_python`, `execute_shell` | Inspect output, do not call unrelated scene checks |
 | Save or undo | Confirm explicit file intent | `save_hip`, `undo_redo` | Use scene summary only if relevant |

@@ -306,24 +306,12 @@ class PlanMixin:
             'role': 'user', 'content': exec_msg
         })
 
-        # 创建新的 AI 回复块
-        self._set_running(True)
-        self._add_ai_response()
-        self._agent_response = self._current_response
-        self._start_active_aurora()
-
-        # 构造 agent_params（复用上次的 provider/model 设置）
-        agent_params = getattr(self, '_last_agent_params', {}).copy()
-        agent_params['use_agent'] = True          # 执行阶段用完整工具
-        agent_params['plan_mode'] = True
-        agent_params['plan_executing'] = True     # 标记为 Plan 执行阶段
-        agent_params['plan_data'] = plan_data
-
-        # 后台线程执行
-        thread = threading.Thread(
-            target=self._run_agent, args=(agent_params,), daemon=True
-        )
-        thread.start()
+        self._start_agent_run({
+            'use_agent': True,          # 执行阶段用完整工具
+            'plan_mode': True,
+            'plan_executing': True,     # 标记为 Plan 执行阶段
+            'plan_data': plan_data,
+        })
 
     def _on_plan_rejected(self):
         """用户点击 Reject 按钮 → 丢弃 Plan"""

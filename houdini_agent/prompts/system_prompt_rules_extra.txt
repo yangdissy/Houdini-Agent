@@ -17,7 +17,7 @@ Tool Call Parameter Rules (highest priority — MUST check before every tool cal
 -Before calling a tool, MUST verify all required parameters are filled. Missing required params will cause failure
 -Parameter values must use correct data types (string/number/boolean/array). Don't write numbers as strings, don't omit quotes around paths
 -node_path parameters passed to tools must be full Houdini paths (e.g., "/obj/geo1/box1"), because tool execution needs exact lookup paths. This tool-call requirement does not force absolute paths in user-facing reply text.
--Don't guess parameter names or values from memory. First use query tools (get_node_parameters, get_node_inputs, search_node_types) to confirm
+-Don't guess parameter names or values from memory. First use query tools (get_node_parameters, run_skill('get_node_inputs', ...), search_node_types) to confirm
 -If a tool call returns "missing parameter" or "parameter error", it means YOUR call parameters were wrong. Fix and retry, don't call check_errors
 -When calling the same tool multiple times, always fill all required parameters each time. Don't assume the system remembers previous parameters
 
@@ -155,7 +155,7 @@ Node Layout Rules (optional — only when explicitly needed):
 -Wrong: layout_nodes()  <- rearranges entire network, FORBIDDEN
 -Correct: layout_nodes(node_paths=["/obj/geo1/box1", "/obj/geo1/scatter1"])  <- only newly created nodes
 -If user explicitly asks to layout the entire network, you may omit node_paths, but warn the user this will rearrange all nodes
--If layout result looks wrong, use get_node_positions to check, and try method="grid" or method="columns" as fallback
+-If layout result looks wrong, use run_skill('get_node_positions', ...) to check, and try method="grid" or method="columns" as fallback
 -Execution order when creating NetworkBox: create nodes -> connect -> verify_network -> layout_nodes(node_paths=[...newly created...]) -> create_network_box
 
 NetworkBox Grouping Rules (optional — only when explicitly needed):

@@ -25,6 +25,7 @@ SCENE_MUTATION_TOOLS = frozenset({
     "create_named_null",
     "rename_node",
     "set_node_parameter",
+    "set_parameter_expression",
     "batch_set_parameters",
     "connect_nodes",
     "cook_node",

@@ -309,6 +309,7 @@ def layout_nodes(
     node_paths: Optional[List[str]] = None,
     method: str = "auto",
     spacing: float = 1.0,
+    anchor_position: Optional[Tuple[float, float]] = None,
 ) -> Tuple[bool, str, List[Dict[str, Any]]]:
     """多策略节点布局
 
@@ -317,6 +318,7 @@ def layout_nodes(
         node_paths: 要布局的节点路径列表；为空时布局整个网络
         method: 布局方法 auto / tidy / grid / columns
         spacing: 间距倍率（默认 1.0）
+        anchor_position: 可选整体布局中心；未传时保留原始位置中心
 
     Returns:
         (success, message, positions_list)
@@ -361,7 +363,7 @@ def layout_nodes(
 
         if method == "auto":
             if node_paths:
-                _layout_columns(nodes, spacing)
+                _layout_columns(nodes, spacing, anchor_position=anchor_position)
                 layout_method_used = "tidy(auto)"
             else:
                 # 全网络 → layoutChildren（支持间距）
@@ -398,7 +400,7 @@ def layout_nodes(
                 layout_method_used = "native(moveToGoodPosition)"
 
         elif method in ("tidy", "columns"):
-            _layout_columns(nodes, spacing)
+            _layout_columns(nodes, spacing, anchor_position=anchor_position)
             layout_method_used = "tidy" if method == "tidy" else "columns(tidy)"
 
         elif method == "grid":
@@ -443,7 +445,11 @@ def _layout_grid(nodes: list, spacing: float = 1.0) -> None:
         node.setPosition(hou.Vector2(col * h_sp, -row * v_sp))
 
 
-def _layout_columns(nodes: list, spacing: float = 1.0) -> None:
+def _layout_columns(
+    nodes: list,
+    spacing: float = 1.0,
+    anchor_position: Optional[Tuple[float, float]] = None,
+) -> None:
     """按拓扑关系整理节点：主链垂直，分支左右展开。"""
     if not nodes:
         return
@@ -471,6 +477,7 @@ def _layout_columns(nodes: list, spacing: float = 1.0) -> None:
         edges,
         spacing=spacing,
         original_positions=original_positions,
+        anchor_position=anchor_position,
     )
     for node in nodes:
         x, y = positions.get(node.path(), (0.0, 0.0))
@@ -482,6 +489,7 @@ def _compute_tidy_layout(
     edges: List[Tuple[str, str, int]],
     spacing: float = 1.0,
     original_positions: Optional[Dict[str, Tuple[float, float]]] = None,
+    anchor_position: Optional[Tuple[float, float]] = None,
 ) -> Dict[str, Tuple[float, float]]:
     """Compute readable DAG positions without depending on Houdini APIs.
 
@@ -637,10 +645,14 @@ def _compute_tidy_layout(
                 layer_nodes_sorted[i] = curr_id  # keep sorted view consistent
     # ────────────────────────────────────────────────────────────────────────
 
-    if original_positions:
-        selected_positions = [original_positions.get(node_id, (0.0, 0.0)) for node_id in node_ids]
-        anchor_x = sum(pos[0] for pos in selected_positions) / float(len(selected_positions))
-        anchor_y = sum(pos[1] for pos in selected_positions) / float(len(selected_positions))
+    if anchor_position is not None or original_positions:
+        if anchor_position is not None:
+            anchor_x = float(anchor_position[0])
+            anchor_y = float(anchor_position[1])
+        else:
+            selected_positions = [original_positions.get(node_id, (0.0, 0.0)) for node_id in node_ids]
+            anchor_x = sum(pos[0] for pos in selected_positions) / float(len(selected_positions))
+            anchor_y = sum(pos[1] for pos in selected_positions) / float(len(selected_positions))
         new_positions = [positions[node_id] for node_id in node_ids]
         center_x = sum(pos[0] for pos in new_positions) / float(len(new_positions))
         center_y = sum(pos[1] for pos in new_positions) / float(len(new_positions))

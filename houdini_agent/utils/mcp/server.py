@@ -264,6 +264,38 @@ def _setup_fastmcp_tools():
 
 	@mcp.tool  # type: ignore[attr-defined]
 	@tool_wrapper
+	def set_parameter_expression(node_path: str, param_name: str, expression: str,
+								 language: str = "hscript") -> dict:
+		"""给参数设置表达式/通道引用（如 ch("../size")、$F），而非静态值。"""
+		if hou is None:
+			return err("Houdini 环境不可用。")
+		if not expression or not str(expression).strip():
+			return err("expression 不能为空！")
+		node = hou.node(node_path)
+		if not node:
+			return err(f"节点 {node_path} 未找到！")
+		parm = node.parm(param_name)
+		if not parm:
+			parm_tuple = node.parmTuple(param_name)
+			if parm_tuple:
+				comp_names = ", ".join(p.name() for p in parm_tuple)
+				return err(f"'{param_name}' 是元组参数，表达式需按分量设置：{comp_names}")
+			return err(f"节点 {node_path} 中未找到参数 '{param_name}'！")
+		lang_key = str(language).strip().lower()
+		if lang_key in ("python", "py"):
+			expr_lang = hou.exprLanguage.Python
+		elif lang_key in ("hscript", "hs", ""):
+			expr_lang = hou.exprLanguage.Hscript
+		else:
+			return err(f"未知表达式语言: {language}（应为 hscript 或 python）")
+		parm.setExpression(str(expression), language=expr_lang)
+		return ok(
+			f"成功为节点 {node_path} 的参数 '{param_name}' 设置{lang_key or 'hscript'}表达式。",
+			{"node_path": node_path, "parameter": param_name, "expression": expression, "language": lang_key or "hscript"},
+		)
+
+	@mcp.tool  # type: ignore[attr-defined]
+	@tool_wrapper
 	def get_node_parameters(node_path: str, include_hidden: bool = False) -> dict:
 		if hou is None:
 			return err("Houdini 环境不可用。")

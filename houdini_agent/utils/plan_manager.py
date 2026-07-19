@@ -558,9 +558,11 @@ PLAN_TOOL_ASK_QUESTION = {
     "function": {
         "name": "ask_question",
         "description": (
-            "Ask the user clarifying questions before creating the plan. "
-            "Use this when information is insufficient, ambiguous, or when multiple "
-            "significantly different implementation approaches exist. "
+            "Ask the user clarifying questions or request authorization. "
+            "In planning, use this when information is insufficient, ambiguous, or when multiple "
+            "significantly different implementation approaches exist. In plan execution, use it "
+            "when continuing safely requires user action or authorization (for example switching "
+            "Houdini Update Mode, manual cook, selecting viewport objects, installing assets). "
             "Ask at most 1-2 key questions per call. Do not over-ask."
         ),
         "parameters": {

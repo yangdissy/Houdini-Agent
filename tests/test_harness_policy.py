@@ -201,18 +201,6 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         self.assertEqual(bad_parent.action, "deny")
         self.assertIn("unsupported Houdini path root", bad_parent.reason)
 
-    def test_get_node_inputs_requires_node_type_not_node_path(self):
-        decision = self.policy.decide(
-            "get_node_inputs",
-            {"node_type": "null", "category": "sop"},
-            {"mode": "agent"},
-        )
-        self.assertEqual(decision.action, "allow")
-
-        missing_type = self.policy.decide("get_node_inputs", {"category": "sop"}, {"mode": "agent"})
-        self.assertEqual(missing_type.action, "deny")
-        self.assertIn("node_type", missing_type.reason)
-
     def test_cook_node_requires_valid_node_path(self):
         missing_path = self.policy.decide("cook_node", {}, {"mode": "agent"})
         self.assertEqual(missing_path.action, "deny")
@@ -221,6 +209,23 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         bad_root = self.policy.decide("cook_node", {"node_path": "/etc"}, {"mode": "agent"})
         self.assertEqual(bad_root.action, "deny")
         self.assertIn("unsupported Houdini path root", bad_root.reason)
+
+    def test_cook_node_without_force_is_allowed_in_agent(self):
+        decision = self.policy.decide(
+            "cook_node",
+            {"node_path": "/obj/geo1/OUT"},
+            {"mode": "agent"},
+        )
+        self.assertEqual(decision.action, "allow")
+
+    def test_cook_node_force_requires_confirmation(self):
+        decision = self.policy.decide(
+            "cook_node",
+            {"node_path": "/obj/geo1/OUT", "force": True},
+            {"mode": "agent"},
+        )
+        self.assertEqual(decision.action, "ask")
+        self.assertIn("cook_node force", decision.reason)
 
     def test_node_paths_are_normalized(self):
         decision = self.policy.decide(

@@ -37,6 +37,8 @@ from shared.user_paths import normalize_username
 DEEP_REFLECT_INTERVAL = 5
 # 错误率上升阈值（触发紧急反思）
 ERROR_RATE_SPIKE_THRESHOLD = 0.5
+# 低 reward 阈值（单个任务 reward 低于此值时触发深度反思，从失败/低质量任务中学习）
+LOW_REWARD_REFLECT_THRESHOLD = 0.4
 
 # LLM 反思 Prompt 模板
 REFLECTION_PROMPT = """你是一个自我改进的 AI 助手。请分析以下最近完成的任务记录，提取可复用的经验规则。
@@ -339,7 +341,7 @@ class ReflectionModule:
                 self._recent_error_counts = self._recent_error_counts[-self._max_recent:]
 
             # 6. 判断是否触发 LLM 深度反思
-            should_deep_reflect = self._should_deep_reflect()
+            should_deep_reflect = self._should_deep_reflect(reward_result["reward"])
             if should_deep_reflect and ai_client is not None:
                 try:
                     deep_result = self._deep_reflect(ai_client, model, provider)
@@ -359,7 +361,7 @@ class ReflectionModule:
     # LLM 深度反思
     # ==========================================================
 
-    def _should_deep_reflect(self) -> bool:
+    def _should_deep_reflect(self, reward: Optional[float] = None) -> bool:
         """判断是否应该触发 LLM 深度反思"""
         # 1. 每 N 个任务
         if self._task_count_since_reflect >= DEEP_REFLECT_INTERVAL:
@@ -371,6 +373,11 @@ class ReflectionModule:
             error_rate = sum(1 for e in recent if e > 0) / len(recent)
             if error_rate >= ERROR_RATE_SPIKE_THRESHOLD:
                 return True
+
+        # 3. 单个任务 reward 偏低 → 立即深度反思，从低质量任务中学习
+        #    （不必等满 5 个任务，避免错过教训）
+        if reward is not None and reward < LOW_REWARD_REFLECT_THRESHOLD:
+            return True
 
         return False
 

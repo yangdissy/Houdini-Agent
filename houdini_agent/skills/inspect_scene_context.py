@@ -7,10 +7,12 @@ working context before making or suggesting changes.
 
 SKILL_INFO = {
     "name": "inspect_scene_context",
+    "category": "scene",
     "description": (
         "Inspect current Houdini scene context: hip file, frame range, take, "
         "selection, common network counts, and visible UI panes. Read-only."
     ),
+    "risk_level": "low",
     "parameters": {
         "include_panes": {
             "type": "boolean",

@@ -5,7 +5,7 @@ Cursor 风格 UI 组件 - 重构版
 每次对话形成完整块：思考 → 操作 → 总结
 """
 
-from houdini_agent.qt_compat import QtWidgets, QtCore, QtGui
+from houdini_agent.qt_compat import QtWidgets, QtCore, QtGui, safe_single_shot
 from datetime import datetime
 from typing import Optional, List, Dict
 import html
@@ -368,8 +368,8 @@ class ThinkingSection(CollapsibleSection):
         self._thinking_text += text
         self.thinking_label.setPlainText(self._thinking_text)
         # ★ 延迟到下一事件循环（确保 Qt 布局完成后再计算高度，和 ChatInput 同策略）
-        QtCore.QTimer.singleShot(0, self._update_height)
-        QtCore.QTimer.singleShot(0, self._scroll_to_bottom)
+        safe_single_shot(0, self, '_update_height')
+        safe_single_shot(0, self, '_scroll_to_bottom')
     
     def update_time(self):
         if self._finalized:
@@ -386,7 +386,7 @@ class ThinkingSection(CollapsibleSection):
         self._round_count += 1
         self._thinking_text += f"\n{tr('thinking.round', self._round_count + 1)}\n"
         self.thinking_label.setPlainText(self._thinking_text)
-        QtCore.QTimer.singleShot(0, self._update_height)
+        safe_single_shot(0, self, '_update_height')
         self.set_title(tr('thinking.progress', _fmt_duration(self._total_elapsed())))
         # ★ 始终确保展开
         self.expand()
@@ -883,7 +883,7 @@ class UserMessage(QtWidgets.QWidget):
         layout.addWidget(self._container)
 
         # 延迟判断是否需要折叠（等 QLabel 完成布局后再算行数）
-        QtCore.QTimer.singleShot(0, self._maybe_collapse)
+        safe_single_shot(0, self, '_maybe_collapse')
 
     # ------------------------------------------------------------------
     def _maybe_collapse(self):
@@ -5740,7 +5740,7 @@ class ChatInput(QtWidgets.QPlainTextEdit):
     
     def _schedule_adjust(self):
         """延迟调整高度，确保文档布局已更新"""
-        QtCore.QTimer.singleShot(0, self._adjust_height)
+        safe_single_shot(0, self, '_adjust_height')
     
     def _adjust_height(self):
         """根据视觉行数（含软换行）自动调整高度——向上扩展"""
@@ -7766,6 +7766,81 @@ class PluginSettingsPage(QtWidgets.QDialog):
 
 
 # ============================================================
+# IME-enabled 输入控件 — 修复 Houdini + PySide2 下无法输入中文
+# ============================================================
+
+class IMELineEdit(QtWidgets.QLineEdit):
+    """支持输入法（中文/日文/韩文）的单行输入框。
+
+    PySide2 嵌入 Houdini 时，原生 QLineEdit 的 inputMethodQuery 可能返回
+    错误值导致 IME 无法激活。显式启用输入法属性并覆写查询即可修复。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WA_InputMethodEnabled, True)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        try:
+            self.setInputMethodHints(QtCore.Qt.ImhNone)
+        except Exception:
+            pass
+
+    def inputMethodQuery(self, query):
+        qt = QtCore.Qt
+        if query == qt.ImEnabled:
+            return True
+        if query == qt.ImCursorRectangle:
+            return self.cursorRect()
+        if query == qt.ImFont:
+            return self.font()
+        return super().inputMethodQuery(query)
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self.setAttribute(QtCore.Qt.WA_InputMethodEnabled, True)
+        self.update()
+
+
+class IMEPlainTextEdit(QtWidgets.QPlainTextEdit):
+    """支持输入法（中文/日文/韩文）的多行输入框。
+
+    同 IMELineEdit，显式启用输入法属性并为 IME 提供正确的光标矩形/
+    周围文本，使 Houdini + PySide2 环境下的预编辑/候选框正常工作。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WA_InputMethodEnabled, True)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        try:
+            self.setInputMethodHints(QtCore.Qt.ImhNone)
+        except Exception:
+            pass
+
+    def inputMethodQuery(self, query):
+        qt = QtCore.Qt
+        if query == qt.ImEnabled:
+            return True
+        if query == qt.ImCursorRectangle:
+            return self.cursorRect()
+        if query == qt.ImFont:
+            return self.font()
+        if query == qt.ImCursorPosition:
+            tc = self.textCursor()
+            return tc.position() - tc.block().position()
+        if query == qt.ImSurroundingText:
+            return self.textCursor().block().text()
+        if query == qt.ImCurrentSelection:
+            return self.textCursor().selectedText()
+        return super().inputMethodQuery(query)
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self.setAttribute(QtCore.Qt.WA_InputMethodEnabled, True)
+        self.update()
+
+
+# ============================================================
 # Rules Editor Dialog — 用户自定义规则编辑器
 # ============================================================
 
@@ -7776,7 +7851,7 @@ class RulesEditorDialog(QtWidgets.QDialog):
     右侧：标题 + 内容编辑区（或空状态引导）
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, username: Optional[str] = None):
         super().__init__(parent)
         self.setObjectName("rulesEditorDlg")
         self.setWindowTitle(tr('rules.title'))
@@ -7785,7 +7860,11 @@ class RulesEditorDialog(QtWidgets.QDialog):
         self._current_rule_id: Optional[str] = None
         self._rules: list = []
         self._dirty = False
-        self._username = getattr(parent, '_username', 'default') if parent else 'default'
+        self._username = (
+            username
+            or (getattr(parent, '_username', None) if parent else None)
+            or 'default'
+        )
 
         self._build_ui()
         self._load_rules()
@@ -7892,13 +7971,13 @@ class RulesEditorDialog(QtWidgets.QDialog):
         edit_lay.setContentsMargins(0, 0, 0, 0)
         edit_lay.setSpacing(6)
 
-        self._title_edit = QtWidgets.QLineEdit()
+        self._title_edit = IMELineEdit()
         self._title_edit.setObjectName("rulesTitleEdit")
         self._title_edit.setPlaceholderText(tr('rules.placeholder_title'))
         self._title_edit.textChanged.connect(self._on_title_changed)
         edit_lay.addWidget(self._title_edit)
 
-        self._content_edit = QtWidgets.QPlainTextEdit()
+        self._content_edit = IMEPlainTextEdit()
         self._content_edit.setObjectName("rulesContentEdit")
         self._content_edit.setPlaceholderText(tr('rules.placeholder_content'))
         self._content_edit.textChanged.connect(self._on_content_changed)

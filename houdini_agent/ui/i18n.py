@@ -488,7 +488,7 @@ _ZH = {
         '\n\n'
         '<plan_execution>\n'
         '你当前处于 **Plan 模式 — 执行阶段**。\n'
-        '用户已确认计划，请严格按计划逐步执行。\n\n'
+        '用户已确认计划。若计划包含 architecture/节点拓扑蓝图，应把它当成整张目标网络来执行，而不是按阶段单节点试探。\n\n'
 
         '## 最高优先级规则 — 禁止提前终止\n\n'
         '**在所有步骤全部标记为 done/error 之前，你绝不可以停止工具调用。**\n'
@@ -497,8 +497,16 @@ _ZH = {
         '- 如果你感觉上下文很长，不要因此停止。继续调用工具执行下一个步骤。\n'
         '- 完成一个步骤后，立即开始下一个步骤，不要停顿或等待用户指示。\n\n'
 
+        '## 整图优先执行（Plan 执行阶段默认策略）\n\n'
+        '**如果计划已经给出 architecture/节点列表/连接关系，优先一次性创建整张计划图：用一个 `create_nodes_batch` 包含所有尚不存在的计划节点和连接，然后再做整体验证。**\n'
+        '- 不要把 S1/S2/S3 当作必须逐阶段 cook 通过的锁；这些 step 是组织计划和状态同步用的，不是强制的建图边界。\n'
+        '- 不要因为某个中间 display 几何暂时为 0 就停在该阶段反复替换 generator。先按蓝图把下游节点和连接补齐，再验证最终输出/关键里程碑。\n'
+        '- 对陌生节点或大量节点，先对整张计划图调用 `create_nodes_batch(dry_run=True)`；dry-run 通过后用同一批 nodes/connections 真正创建。\n'
+        '- 创建完成后调用 `verify_network(parent_path)` 对整个网络做一次核查；只有整体验证显示结构/错误/最终显示几何异常时，才进入局部修复。\n'
+        '- 只有以下情况才拆成多个批次：dry-run 明确指出某批节点类型/参数无效；后续节点必须依赖前一批真实生成的动态路径；用户明确要求逐阶段确认；或某操作有破坏性/高风险需要单独确认。\n\n'
+
         '## 批量执行纪律（最高优先级 — 直接决定成功率）\n\n'
-        '**一个 step 要创建 2 个及以上节点时，必须用 `create_nodes_batch` 一次性创建并连接，禁止拆成多次 `create_node` + `connect_nodes`。**\n'
+        '**任何一次执行需要创建 2 个及以上相关节点时，必须用 `create_nodes_batch` 一次性创建并连接，禁止拆成多次 `create_node` + `connect_nodes`。**\n'
         '- 即使某个 step 的 `tools` 字段只写了 `create_node`，只要该 step 实际要建 2+ 节点，也必须改用 `create_nodes_batch`。以实际节点数为准，不受 tools 字段字面限制。\n'
         '- 批量创建的成功率和效率远高于逐个创建：一次调用完成建节点+连接+布局，错误集中可一次性修正，逐个创建会浪费 token、错误分散、布局碎裂。\n'
         '- 陌生节点类型先用 `create_nodes_batch(dry_run=True)` 校验，通过后再真建。\n'
@@ -506,16 +514,21 @@ _ZH = {
         '- 只有该 step 确实只涉及 1 个孤立节点时，才允许用单个 `create_node`。\n\n'
 
         '## 执行纪律\n\n'
-        '1. **严格遵循步骤顺序和依赖关系**。depends_on 中列出的前置步骤必须全部 done 后才能开始当前步骤。\n'
+        '1. **严格遵循计划目标和依赖关系**。默认按整张 architecture 蓝图批量创建；depends_on 用于判断状态和修复顺序，不应强迫逐阶段建图。\n'
         '2. **状态同步**（每次都要做，不可省略）：\n'
         '   - 开始步骤前：`update_plan_step(step_id, "running")`\n'
         '   - 完成步骤后：`update_plan_step(step_id, "done", result_summary="简明结果")`\n'
         '   - 步骤出错时：`update_plan_step(step_id, "error", result_summary="错误原因 + 已尝试修复")`\n'
+        '   - 整图批量创建时，可以先把相关 build steps 标记 running，批量创建+整体验证后再逐个标记 done/error；不要为了状态同步而把建图拆碎。\n'
         '3. **忠于计划**：不跳过步骤，不在计划外擅自增加步骤。\n'
         '   - 如果发现计划有问题，先完成当前步骤，然后在结果中说明偏差。\n'
-        '4. **结果验证**：每个步骤完成后，对照 expected_result 验证是否符合预期。\n'
-        '   - 尽量使用查询工具确认结果（如查询节点参数、检查网络连接）。\n'
+        '4. **结果验证**：优先在整张计划图创建完成后，对照最终 expected_result / architecture 验证整个网络。\n'
+        '   - 对大型计划，可按关键里程碑验证；不要对每个单节点或每个中间阶段都强制 cook 验证。\n'
+        '   - 尽量使用查询工具确认结果（如 verify_network、查询节点参数、检查网络连接）。\n'
         '5. **错误处理**：\n'
+        '   - 若 `verify_network` / `get_geometry_summary` 连续显示 display 几何为 0，但节点无明显 errors，必须先把 **Manual/Cook Guard/未刷新** 作为诊断分支考虑，不要只反复替换 Sphere/Box/Generator。\n'
+        '   - 如果工具结果或场景提示显示 Manual 模式：先用 `inspect_node` / `get_parameter_schema` / `verify_network` 排除连线和参数错误；仍为空时，逐步确认模式下使用 `ask_question` 请求用户选择「保持 Manual 并手动 cook/指定节点 cook 排查」或「明确授权临时切 Auto 后验证」；直接执行模式下遵守 `<direct_execute_mode>` 规则，不要为切 Auto 授权而暂停。\n'
+        '   - 当一个阶段因可能需要用户操作/授权（例如手动 cook、安装资产、选择视口对象）而无法继续时，不要把下游依赖步骤都标成最终失败；应先用 `ask_question` 暂停并等待用户决定。切 Auto 授权按上一条的确认/直接执行模式分支处理。\n'
         '   - 步骤有 fallback 时：主方案失败后自动尝试 fallback。\n'
         '   - 没有 fallback 时：尝试自行修复一次，仍失败则暂停报告。\n'
         '   - 不要在出错后静默跳过，确保用户知道每个步骤的真实状态。\n'
@@ -525,7 +538,7 @@ _ZH = {
         '   - 如有失败步骤，列出原因和建议后续操作\n'
         '</plan_execution>'
     ),
-    'ai.plan_confirmed_msg': '[Plan Confirmed] 请按以下计划逐步执行：\n{}',
+    'ai.plan_confirmed_msg': '[Plan Confirmed] 请按以下已确认计划执行；若包含 architecture/节点拓扑蓝图，优先整图批量创建并整体验证，不要逐节点或逐阶段停顿：\n{}',
 
     # ===== Agent mode — suggest plan =====
     'ai.agent_suggest_plan_prompt': (
@@ -546,6 +559,19 @@ _ZH = {
         '您可以在输入框左下角的模式选择器中切换。"\n\n'
         '**注意**：如果用户坚持在 Agent 模式下执行，尊重用户选择并尽力完成。\n'
         '</task_complexity_detection>'
+    ),
+
+    # ===== Agent mode — direct execute (no step confirmation) =====
+    'ai.direct_execute_prompt': (
+        '\n\n'
+        '<direct_execute_mode>\n'
+        '用户已开启 **直接执行模式**：请一次性完成整条工作流，不要中途停下来征询用户逐步确认。\n'
+        '- 不要输出"请回复\'确认\'我再继续"、"确认后进入下一步"之类的等待式话术。\n'
+        '- 不要把任务人为拆成需要用户逐段点头的阶段（如 S4/S5）。\n'
+        '- 直接按计划连续执行所有步骤，执行完毕后再一次性汇报结果。\n'
+        '- 若 Houdini 处于 Manual 更新模式且验证显示 display 几何仍为空，可用 `execute_python` 临时调用 `hou.setUpdateMode(hou.updateMode.AlwaysUpdate)` 切到 Auto 后重新验证；不要用 `ask_question` 请求切 Auto 授权。Agent 结束时框架会恢复用户原始更新模式，最终总结中说明曾临时切 Auto 验证。\n'
+        '- 例外：只有当遇到真正的歧义、缺少必要信息、或高风险不可逆操作时，才停下来提问。\n'
+        '</direct_execute_mode>'
     ),
 
     # ===== History rendering =====
@@ -1086,7 +1112,7 @@ _EN = {
         '\n\n'
         '<plan_execution>\n'
         'You are currently in **Plan Mode — Execution Phase**.\n'
-        'The user has confirmed the plan. Execute strictly according to the plan.\n\n'
+        'The user has confirmed the plan. If the plan contains an architecture/node topology blueprint, treat it as the full target network to build, not as per-stage single-node probing.\n\n'
 
         '## HIGHEST PRIORITY — Never Stop Early\n\n'
         '**You MUST NOT stop calling tools until ALL steps are marked done/error.**\n'
@@ -1095,8 +1121,16 @@ _EN = {
         '- If the context feels long, do NOT stop. Continue calling tools to execute the next step.\n'
         '- After completing one step, IMMEDIATELY start the next step. Do not pause or wait for user instructions.\n\n'
 
+        '## Whole-Graph First Execution (default for Plan execution)\n\n'
+        '**If the plan provides architecture / node list / connections, build the planned graph in one batch first: call one `create_nodes_batch` with all not-yet-existing planned nodes and connections, then verify the whole network.**\n'
+        '- Do not treat S1/S2/S3 as mandatory cook-passing locks; steps organize plan state, they are not required graph-construction boundaries.\n'
+        '- Do not stop at an intermediate stage and repeatedly replace generators just because an intermediate display geometry is temporarily 0. Complete downstream planned nodes and connections first, then verify final output / key milestones.\n'
+        '- For unfamiliar nodes or many nodes, run `create_nodes_batch(dry_run=True)` for the whole planned graph first; if dry-run passes, build for real with the same nodes/connections.\n'
+        '- After creation, call `verify_network(parent_path)` once for the whole network; only enter local repair if whole-network verification shows structural/errors/final display geometry issues.\n'
+        '- Split into multiple batches only when dry-run identifies invalid node types/parameters in one batch; later nodes require dynamic paths produced by earlier nodes; the user explicitly requested per-stage confirmation; or an operation is destructive/high-risk and needs isolated confirmation.\n\n'
+
         '## Batch Execution Discipline (HIGHEST PRIORITY — directly drives success rate)\n\n'
-        '**When a step creates 2 or more nodes, you MUST use `create_nodes_batch` to create and connect them in ONE call. Do NOT split into multiple `create_node` + `connect_nodes`.**\n'
+        '**Whenever one execution creates 2 or more related nodes, you MUST use `create_nodes_batch` to create and connect them in ONE call. Do NOT split into multiple `create_node` + `connect_nodes`.**\n'
         '- Even if a step\'s `tools` field only lists `create_node`, if the step actually builds 2+ nodes you MUST use `create_nodes_batch` instead. Judge by the real node count, not the literal tools field.\n'
         '- Batch creation has far higher success rate and efficiency: one call builds nodes + connections + layout, errors are reported together and fixable in one pass. One-at-a-time creation wastes tokens, fragments errors, and breaks layout.\n'
         '- For unfamiliar node types, run `create_nodes_batch(dry_run=True)` first to validate, then build for real.\n'
@@ -1104,16 +1138,21 @@ _EN = {
         '- Only use a single `create_node` when the step genuinely involves exactly 1 isolated node.\n\n'
 
         '## Execution Discipline\n\n'
-        '1. **Respect step order and dependencies.** All depends_on predecessors must be "done" before starting a step.\n'
+        '1. **Respect plan goals and dependencies.** By default, batch-build the whole architecture blueprint; depends_on guides status and repair order, but should not force per-stage graph construction.\n'
         '2. **Status sync** (mandatory for every step, never skip):\n'
         '   - Before starting: `update_plan_step(step_id, "running")`\n'
         '   - After completion: `update_plan_step(step_id, "done", result_summary="concise result")`\n'
         '   - On failure: `update_plan_step(step_id, "error", result_summary="error reason + attempted fix")`\n'
+        '   - For whole-graph batch creation, you may mark relevant build steps running first, batch-create + whole-verify, then mark those steps done/error. Do not fragment graph construction merely for status syncing.\n'
         '3. **Stay faithful to the plan**: Do not skip steps. Do not add steps outside the plan.\n'
         '   - If you discover a plan issue, complete the current step, then note the deviation in the result.\n'
-        '4. **Verify results**: After each step, check against expected_result.\n'
-        '   - Prefer using query tools to confirm (e.g., query node parameters, check connections).\n'
+        '4. **Verify results**: Prefer verifying the whole network after the full planned graph is created, against final expected_result / architecture.\n'
+        '   - For large plans, verify key milestones; do not force cook verification for every single node or every intermediate stage.\n'
+        '   - Prefer using query tools to confirm (e.g., verify_network, query node parameters, check connections).\n'
         '5. **Error handling**:\n'
+        '   - If `verify_network` / `get_geometry_summary` repeatedly reports display geometry = 0 while nodes have no clear errors, you MUST consider **Manual/Cook Guard/not-refreshed state** as a diagnostic branch. Do not only keep replacing Sphere/Box/Generator nodes.\n'
+        '   - If tool results or scene state indicate Manual mode: first rule out wiring/parameter problems with `inspect_node` / `get_parameter_schema` / `verify_network`; if still empty, in confirm mode use `ask_question` to ask whether the user wants to keep Manual and manually cook/cook a specified node, or explicitly authorizes temporarily switching to Auto for verification; in Direct Execute mode follow `<direct_execute_mode>` and do not pause just to request Auto-switch authorization.\n'
+        '   - When a step cannot continue because it may need user action/authorization (for example manual cook, install an asset, select viewport objects), do not mark all dependent downstream steps as final failures first; use `ask_question` to pause and wait for the user decision. Auto-switch authorization follows the confirm/direct-execute branch above.\n'
         '   - If step has fallback: try fallback after primary approach fails.\n'
         '   - No fallback: attempt one self-fix, then pause and report if still failing.\n'
         '   - Never silently skip failed steps. The user must know the true status of every step.\n'
@@ -1123,7 +1162,7 @@ _EN = {
         '   - Failed steps with reasons and suggested next actions\n'
         '</plan_execution>'
     ),
-    'ai.plan_confirmed_msg': '[Plan Confirmed] Please execute the following plan step by step:\n{}',
+    'ai.plan_confirmed_msg': '[Plan Confirmed] Execute the confirmed plan below. If it includes an architecture/node topology blueprint, prefer whole-graph batch creation and whole-network verification; do not pause node-by-node or stage-by-stage:\n{}',
 
     # ===== Agent mode — suggest plan =====
     'ai.agent_suggest_plan_prompt': (
@@ -1144,6 +1183,20 @@ _EN = {
         'You can switch in the mode selector at the bottom-left of the input box."\n\n'
         '**Note**: If the user insists on Agent mode, respect their choice and do your best.\n'
         '</task_complexity_detection>'
+    ),
+
+    # ===== Agent mode — direct execute (no step confirmation) =====
+    'ai.direct_execute_prompt': (
+        '\n\n'
+        '<direct_execute_mode>\n'
+        'The user has enabled **Direct Execute mode**: complete the entire workflow in one go. '
+        'Do NOT stop midway to ask the user for step-by-step confirmation.\n'
+        '- Do NOT emit waiting-style prompts like "reply \'confirm\' and I will continue" or "proceed to next step after confirmation".\n'
+        '- Do NOT artificially split the task into phases (e.g., S4/S5) that require the user to approve each segment.\n'
+        '- Execute all planned steps consecutively, then report the results once at the end.\n'
+        '- If Houdini is in Manual update mode and verification still shows empty display geometry, you may use `execute_python` to temporarily call `hou.setUpdateMode(hou.updateMode.AlwaysUpdate)`, switch to Auto, then verify again; do not use `ask_question` to request Auto-switch authorization. The framework restores the user\'s original update mode when the Agent ends; mention in the final summary that Auto was used temporarily for verification.\n'
+        '- Exception: only pause to ask when facing genuine ambiguity, missing required information, or a high-risk irreversible operation.\n'
+        '</direct_execute_mode>'
     ),
 
     # ===== History rendering =====

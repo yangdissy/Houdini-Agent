@@ -196,6 +196,7 @@ class SessionManagerMixin:
         self._session_created_at = new_created_at
         self._conversation_history = []
         self._context_summary = ''
+        self._last_auto_read_context = None
         self._current_response = None
         self._token_stats = new_token_stats
         self._pending_ops.clear()
@@ -328,6 +329,7 @@ class SessionManagerMixin:
         self._session_created_at = sdata.get('created_at') or datetime.now().isoformat()
         self._conversation_history = sdata.get('conversation_history', [])
         self._context_summary = sdata.get('context_summary', '')
+        self._last_auto_read_context = None
         self._current_response = sdata.get('current_response')
         self._token_stats = sdata.get('token_stats', {
             'input_tokens': 0, 'output_tokens': 0,

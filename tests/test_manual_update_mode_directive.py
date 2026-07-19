@@ -1,0 +1,144 @@
+# -*- coding: utf-8 -*-
+"""Manual update mode prompt injection tests."""
+
+import sys
+import unittest
+
+from tests.test_import_smoke import (
+    _install_qt_stubs,
+    _install_thirdparty_stubs,
+)
+
+
+class _UpdateMode:
+    Auto = object()
+    Manual = object()
+
+
+class _HouStub:
+    updateMode = _UpdateMode
+
+    def __init__(self, current_mode):
+        self.current_mode = current_mode
+        self.set_modes = []
+
+    def updateModeSetting(self):
+        return self.current_mode
+
+    def setUpdateMode(self, mode):
+        self.set_modes.append(mode)
+        self.current_mode = mode
+
+
+_install_thirdparty_stubs()
+_install_qt_stubs()
+sys.modules["hou"] = _HouStub(_UpdateMode.Auto)
+
+from houdini_agent.ui.action_commands_mixin import ActionCommandsMixin
+from houdini_agent.ui.ai_tab import AITab
+
+
+class ManualUpdateModeDirectiveTest(unittest.TestCase):
+    def _make_start_tab(self):
+        tab = object.__new__(AITab)
+        tab._pre_agent_update_mode = None
+        tab._conversation_history = []
+        tab._auto_read_mode = "off"
+        tab._agent_mode = True
+        tab._plan_mode = False
+        tab._confirm_mode = True
+        tab._current_provider = lambda: "mock-provider"
+        tab._get_current_context_limit = lambda: 64000
+        tab._collect_scene_context = lambda: {"source": "test"}
+        tab._current_model_supports_vision = lambda: True
+        tab._update_context_stats = lambda: None
+        tab._set_running = lambda running: setattr(tab, "_running_value", running)
+        tab._add_ai_response = lambda: setattr(tab, "_current_response", object())
+        tab._start_active_aurora = lambda: setattr(tab, "_aurora_started", True)
+        tab._save_model_preference = lambda: setattr(tab, "_saved_model_preference", True)
+        tab.web_check = type("Check", (), {"isChecked": lambda self: True})()
+        tab.think_check = type("Check", (), {"isChecked": lambda self: True})()
+        tab.model_combo = type("Combo", (), {"currentText": lambda self: "mock-model"})()
+
+        def fake_run_agent(agent_params):
+            tab._captured_agent_params = agent_params
+
+        tab._run_agent = fake_run_agent
+        return tab
+
+    def test_directive_does_not_fallback_to_realtime_manual_without_snapshot(self):
+        sys.modules["hou"] = _HouStub(_UpdateMode.Manual)
+        tab = object.__new__(AITab)
+        tab._pre_agent_update_mode = None
+
+        self.assertEqual(AITab._build_manual_mode_directive(tab), "")
+
+    def test_directive_only_mentions_persistent_setting_for_snapshot_manual(self):
+        sys.modules["hou"] = _HouStub(_UpdateMode.Auto)
+        tab = object.__new__(AITab)
+        tab._pre_agent_update_mode = _UpdateMode.Manual
+
+        directive = AITab._build_manual_mode_directive(tab)
+
+        self.assertIn("这是用户的持久设置", directive)
+
+    def test_scene_read_uses_snapshot_not_realtime_manual(self):
+        sys.modules["hou"] = _HouStub(_UpdateMode.Manual)
+        tab = object.__new__(ActionCommandsMixin)
+        tab._pre_agent_update_mode = _UpdateMode.Auto
+        tab._auto_read_mode = "off"
+        tab._conversation_history = []
+
+        ActionCommandsMixin._auto_inject_scene_read(tab)
+
+        self.assertEqual(tab._conversation_history, [])
+
+    def test_scene_read_injects_when_snapshot_manual(self):
+        sys.modules["hou"] = _HouStub(_UpdateMode.Auto)
+        tab = object.__new__(ActionCommandsMixin)
+        tab._pre_agent_update_mode = _UpdateMode.Manual
+        tab._auto_read_mode = "off"
+        tab._conversation_history = []
+
+        ActionCommandsMixin._auto_inject_scene_read(tab)
+
+        self.assertEqual(len(tab._conversation_history), 1)
+        self.assertIn("before this Agent run", tab._conversation_history[0]["content"])
+
+    def test_start_agent_run_captures_shared_params(self):
+        sys.modules["hou"] = _HouStub(_UpdateMode.Auto)
+        tab = self._make_start_tab()
+
+        AITab._start_agent_run(tab, inject_scene=False)
+
+        self.assertIs(tab._pre_agent_update_mode, _UpdateMode.Auto)
+        self.assertTrue(tab._running_value)
+        self.assertTrue(tab._aurora_started)
+        self.assertEqual(tab._captured_agent_params["model"], "mock-model")
+        self.assertTrue(tab._captured_agent_params["use_agent"])
+        self.assertFalse(tab._captured_agent_params["plan_mode"])
+
+    def test_plan_execution_uses_shared_start_overrides(self):
+        hou_stub = _HouStub(_UpdateMode.Manual)
+        sys.modules["hou"] = hou_stub
+        tab = self._make_start_tab()
+        tab._confirm_mode = False
+
+        AITab._start_agent_run(tab, {
+            "use_agent": True,
+            "plan_mode": True,
+            "plan_executing": True,
+            "plan_data": {"title": "Test Plan"},
+        }, inject_scene=False)
+
+        params = tab._captured_agent_params
+        self.assertTrue(params["plan_mode"])
+        self.assertTrue(params["plan_executing"])
+        self.assertFalse(params["confirm_mode"])
+        self.assertEqual(params["plan_data"]["title"], "Test Plan")
+        # Plan 直接执行不再擅自切 Auto；保持用户/Cook Guard 的原模式。
+        self.assertEqual(hou_stub.set_modes, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -29,7 +29,7 @@ class HeaderMixin:
         # 提供商
         self.provider_combo = QtWidgets.QComboBox()
         self.provider_combo.setObjectName("providerCombo")
-        self.provider_combo.addItem("Ollama", 'ollama')
+        # self.provider_combo.addItem("Ollama", 'ollama')
         self.provider_combo.addItem("DeepSeek", 'deepseek')
         # self.provider_combo.addItem("GLM", 'glm')
         # self.provider_combo.addItem("OpenAI", 'openai')
@@ -91,7 +91,7 @@ class HeaderMixin:
                 'qwen/qwen3-235b-a22b',
                 'mistralai/mistral-large-2512',
             ],
-            'kimi_coding': ['kimi-for-coding'],
+            'kimi_coding': ['k3[1m]', 'kimi-for-coding', 'kimi-for-coding-highspeed'],
             'of3d': ['gpt-5.5', 'chatgpt-4o-latest'],
             'siliconflow': [
                 'deepseek-ai/DeepSeek-V4-Pro',
@@ -153,8 +153,9 @@ class HeaderMixin:
             'qwen/qwen3-235b-a22b': 131072,
             'mistralai/mistral-large-2512': 262144,
             # Kimi Coding
-            'kimi-for-coding': 256000,
-            'k2p5': 262144,
+            'k3[1m]': 1048576,
+            'kimi-for-coding': 262144,
+            'kimi-for-coding-highspeed': 262144,
             # OF3D
             'chatgpt-4o-latest': 128000,
             'gpt-5.5': 128000,
@@ -219,8 +220,9 @@ class HeaderMixin:
             'qwen/qwen3-235b-a22b':               {'supports_prompt_caching': True, 'supports_vision': False},
             'mistralai/mistral-large-2512':       {'supports_prompt_caching': True, 'supports_vision': True},
             # Kimi Coding
-            'kimi-for-coding':                    {'supports_prompt_caching': False, 'supports_vision': False},
-            'k2p5':                               {'supports_prompt_caching': False, 'supports_vision': True},
+            'k3[1m]':                             {'supports_prompt_caching': True, 'supports_vision': False},
+            'kimi-for-coding':                    {'supports_prompt_caching': True, 'supports_vision': False},
+            'kimi-for-coding-highspeed':          {'supports_prompt_caching': True, 'supports_vision': False},
             # OF3D
             'chatgpt-4o-latest':                  {'supports_prompt_caching': False, 'supports_vision': True},
             'gpt-5.5':                            {'supports_prompt_caching': False, 'supports_vision': False},
@@ -236,7 +238,7 @@ class HeaderMixin:
             'Qwen/Qwen3-8B':                      {'supports_prompt_caching': False, 'supports_vision': False},
             'THUDM/GLM-Z1-32B-0414':              {'supports_prompt_caching': False, 'supports_vision': False},
         }
-        self._refresh_models('ollama')
+        self._refresh_models('deepseek')
         self.model_combo.setMinimumWidth(100)
         self.model_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.model_combo.setEditable(False)  # 默认不可编辑，Custom 时切换为可编辑
@@ -359,8 +361,15 @@ class HeaderMixin:
         """打开用户自定义规则编辑器"""
         try:
             from .cursor_widgets import RulesEditorDialog
+            # 非模态显示：模态 exec_() 在 Houdini 嵌入环境下会启动独立事件循环，
+            # 导致输入法上下文无法正确附加，中文无法输入。改用 show() 并持有引用。
             dlg = RulesEditorDialog(parent=self, username=getattr(self, "_username", None))
-            dlg.exec_()
+            self._rules_editor_dlg = dlg
+            dlg.setModal(False)
+            dlg.setWindowModality(QtCore.Qt.NonModal)
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
         except Exception as e:
             print(f"[Header] Failed to open rules editor: {e}")
 

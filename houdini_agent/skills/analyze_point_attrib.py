@@ -7,10 +7,12 @@
 
 SKILL_INFO = {
     "name": "analyze_geometry_attribs",
+    "category": "geometry",
     "description": (
         "分析节点几何体属性。支持 point/vertex/prim/detail 四种类别。"
         "不传 attrib_name 时返回属性列表；传入时返回统计信息（min/max/mean/std/nan/inf）。"
     ),
+    "risk_level": "low",
     "parameters": {
         "node_path": {
             "type": "string",

@@ -10,13 +10,13 @@
 
 SKILL_INFO = {
     "name": "analyze_cook_performance",
+    "category": "performance",
     "description": (
         "分析网络中所有节点的 cook 性能：耗时排名、几何体膨胀点、"
         "错误/警告节点、总 cook 时间统计。适用于性能诊断和优化场景。"
     ),
-    # force_cook=True 会触发整条节点链重新求值（副作用），不是纯只读。
-    # 标为 normal 风险：注册时自动移除 readonly 标签，避免进入 ask 模式去重缓存。
-    "risk_level": "normal",
+    # 不建图/不改拓扑，规划阶段可安全调用；force_cook 仅触发求值，不产生场景变更。
+    "risk_level": "low",
     "tags": ["geometry", "skill"],
     "parameters": {
         "network_path": {

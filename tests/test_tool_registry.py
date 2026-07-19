@@ -213,17 +213,27 @@ class IntentTest(unittest.TestCase):
         self.assertEqual(self.reg.classify_intent(""), set())
 
     def test_get_tools_for_intent_includes_base_groups(self):
-        # 注册 query 基础工具与 create 工具
+        # 注册 query 基础工具与一个非兜底的意图工具（create_network_box 只属于 layout 意图组）
         self.reg.register("get_network_structure", _schema("get_network_structure"),
                           modes={"agent"})
-        self.reg.register("create_node", _schema("create_node"), modes={"agent"})
+        self.reg.register("create_network_box", _schema("create_network_box"), modes={"agent"})
         # 意图为空也应包含 query 基础组
         names = {s["function"]["name"] for s in self.reg.get_tools_for_intent(set(), "agent")}
         self.assertIn("get_network_structure", names)
-        self.assertNotIn("create_node", names)
-        # 带 create 意图后应包含 create_node
-        names2 = {s["function"]["name"] for s in self.reg.get_tools_for_intent({"create"}, "agent")}
-        self.assertIn("create_node", names2)
+        # create_network_box 不在 _AGENT_ALWAYS_TOOLS，空意图下不应出现
+        self.assertNotIn("create_network_box", names)
+        # 带 layout 意图后应包含 create_network_box
+        names2 = {s["function"]["name"] for s in self.reg.get_tools_for_intent({"layout"}, "agent")}
+        self.assertIn("create_network_box", names2)
+
+    def test_agent_always_tools_present_regardless_of_intent(self):
+        # _AGENT_ALWAYS_TOOLS 保证 agent 模式始终具备最小写操作能力，与意图无关
+        for name in ("create_node", "connect_nodes", "set_node_parameter"):
+            self.reg.register(name, _schema(name), modes={"agent"})
+        names = {s["function"]["name"] for s in self.reg.get_tools_for_intent(set(), "agent")}
+        self.assertIn("create_node", names)
+        self.assertIn("connect_nodes", names)
+        self.assertIn("set_node_parameter", names)
 
     def test_connection_request_selects_preview_and_connection_tools(self):
         for name in (
@@ -243,7 +253,8 @@ class IntentTest(unittest.TestCase):
         self.assertIn("preview_node_operation", names)
 
     def test_parameter_request_selects_schema_before_mutation(self):
-        for name in ("set_node_parameter", "get_parameter_schema", "inspect_node", "connect_nodes"):
+        # create_network_box 不在 _AGENT_ALWAYS_TOOLS，用它验证意图过滤对非兜底工具生效
+        for name in ("set_node_parameter", "get_parameter_schema", "inspect_node", "create_network_box"):
             self.reg.register(name, _schema(name), modes={"agent"})
 
         names = {
@@ -254,7 +265,7 @@ class IntentTest(unittest.TestCase):
         self.assertIn("set_node_parameter", names)
         self.assertIn("get_parameter_schema", names)
         self.assertIn("inspect_node", names)
-        self.assertNotIn("connect_nodes", names)
+        self.assertNotIn("create_network_box", names)
 
     def test_named_null_request_gets_safe_helper_tools(self):
         for name in (

@@ -3,10 +3,12 @@
 
 SKILL_INFO = {
     "name": "analyze_groups",
+    "category": "geometry",
     "description": (
         "Analyze SOP geometry point, primitive, and edge groups. Reports group "
         "sizes, empty groups, and compact membership samples. Read-only."
     ),
+    "risk_level": "low",
     "parameters": {
         "node_path": {
             "type": "string",

@@ -476,6 +476,29 @@ class WebSearcher:
 
 
 # ============================================================
+# 循环检测阈值
+# ============================================================
+# 连续相同调用达到此值 → 软提示（注入换策略提示，给模型自我纠正机会）
+_LOOP_SOFT_HINT_THRESHOLD = 3
+# 连续相同调用达到此值 → 硬熔断（强制终止 agent loop）
+_LOOP_HARD_ABORT_THRESHOLD = 5
+# 交替循环检测：最近 N 次调用的滑动窗口大小
+_LOOP_WINDOW_SIZE = 8
+# 窗口内同一签名出现次数达到此值 → 硬熔断（覆盖 A→B→A→B 交替死循环）
+# 注意：设为 4 可捕获双工具交替（窗口8内每种最多4次）；副作用是连续相同调用
+# 会在第 4 次而非第 5 次熔断，属于更果断的行为，无害。
+_LOOP_WINDOW_HIT_THRESHOLD = 4
+
+# 同工具名连续调用计数（不看参数，只看工具名）
+# 用于捕获"同工具换不同参数反复调用"的循环——完整签名计数会被参数变化打断。
+# 允许模型用不同 pattern 合理探索，只在真正卡死时干预。
+# 注意：批量操作（如连续 set_node_parameter 设置多个节点参数、get_parameter_schema
+# 查多个节点）是合理场景，阈值需足够高避免误报。软提示只在明显卡死时触发一次引导。
+_LOOP_SAME_TOOL_SOFT_HINT = 15  # 同工具连续调用 ≥15 次 → 软提示（批量操作常见，需高阈值）
+_LOOP_SAME_TOOL_HARD_ABORT = 25  # 同工具连续调用 ≥25 次 → 硬熔断（已禁用，保留常量供恢复）
+
+
+# ============================================================
 # Houdini 工具定义
 # ============================================================
 
@@ -600,6 +623,27 @@ HOUDINI_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "set_parameter_expression",
+            "description": "给参数设置【表达式/通道引用】而非静态值。用于程序化连参场景：如让一个参数跟随另一个节点参数变化 ch(\"../box1/sizex\")、随帧变化 $F、fit01(...) 等。⚠️ 与 set_node_parameter 的区别：set_node_parameter 写死静态值，本工具建立可实时求值的表达式链接。仅对标量参数有效；tuple 参数需按分量名（如 tx/ty/tz）分别调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "节点完整路径，如 '/obj/geo1/copy1'"},
+                    "param_name": {"type": "string", "description": "标量参数名。tuple 参数请用分量名（如 tx 而非 t）"},
+                    "expression": {"type": "string", "description": "表达式字符串，如 'ch(\"../box1/sizex\")'、'$F'、'fit01(@P.x, 0, 1)'"},
+                    "language": {
+                        "type": "string",
+                        "enum": ["hscript", "python"],
+                        "description": "表达式语言，默认 hscript。ch()/$F 等用 hscript；写 Python 表达式时用 python"
+                    }
+                },
+                "required": ["node_path", "param_name", "expression"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_node",
             "description": "创建【单个孤立节点】，仅用于：(1) 向已有网络加 1 个不需要连接的节点（如调试用 null）；(2) 给已有节点旁边补一个独立辅助节点。\n\n⛔ 反模式：任务涉及 2 个或以上节点 + 连接 → 必须用 create_nodes_batch，禁止用 create_node 拼网络。哪怕只是 box + scatter 这种最小双节点链，也应一次 batch 完成。逐个 create_node + connect_nodes 拼接会浪费 token、错误分散难修、布局碎裂。\n\n节点类型格式：'box' 或 'sop/box'（推荐直接写节点名如 'box'）。创建失败请先调用 search_node_types 找正确类型名。",
             "parameters": {
@@ -667,7 +711,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "connect_nodes",
-            "description": "连接两个已有节点。仅在节点已经存在或需要补连/改线时使用；如果节点还没创建，优先用 create_nodes_batch 同时创建并连接。连接前应先用 get_node_inputs 查询目标节点的输入端口含义。默认会替换目标输入端口已有连接；不想覆盖时设置 replace=false。",
+            "description": "连接两个已有节点。仅在节点已经存在或需要补连/改线时使用；如果节点还没创建，优先用 create_nodes_batch 同时创建并连接。连接前应先用 run_skill('get_node_inputs', ...) 查询目标节点的输入端口含义。默认会替换目标输入端口已有连接；不想覆盖时设置 replace=false。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -830,12 +874,12 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "cook_node",
-            "description": "Cook 指定节点并返回 errors/warnings/messages。\n\n何时用 force=false（默认）：常规验证节点能否计算成功。\n何时用 force=true：上游已改但下游错误/几何没刷新——比如改了 wrangle/VOP/HDA 后下游 copy_to_points、scatter 仍报旧错。force=true 会执行硬复位：bypass 切换打破上游引用缓存 → 清节点的 SOP cache → 重打 display flag → 强制重 cook。这等同于手动操作里的 '先 bypass 再激活、再选回 display' 套路。\n\n建议顺序：先 force=true 修复，再考虑 disconnect/reconnect；删节点重建是最后手段（会丢失连接和参数），但当节点类型本身被换、HDA 引用丢失或用户明确要求重建时也是合理选择。",
+            "description": "在 Houdini 主线程强制计算指定节点。⚠️ 高风险：cook 重节点（模拟/VDB/大 scatter/坏 HDA/循环依赖）会阻塞 Houdini 主线程，可能导致界面卡死。\n\n⚠️ 不要用它来'验证'刚创建或刚改参数的节点。验证请改用只读工具：inspect_node（看节点状态/错误）、check_errors（看错误信息）、verify_network / validate_node_network（检查网络结构）、get_geometry_summary（看几何统计）。这些工具依赖 Houdini 已有的 cook 结果，不会主动触发重算。\n\n仅在用户明确要求 cook / 刷新 / 强制重算某个节点时才调用本工具。force=true 会额外做 bypass 切换 + 清 cache + 强制重 cook，属于更高风险操作，仅当用户明确要求硬复位/强制刷新缓存时使用，且需要用户确认。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "node_path": {"type": "string", "description": "要 cook 的节点完整路径，如 '/obj/geo1/OUT'"},
-                    "force": {"type": "boolean", "description": "true 触发硬复位流程（bypass 切换 + 清 cache + 强制 cook），用于上游改了但下游缓存 stale 数据的情况。默认 false。"}
+                    "force": {"type": "boolean", "description": "true 触发硬复位流程（bypass 切换 + 清 cache + 强制 cook）。高风险，需用户明确确认后才使用。默认 false。"}
                 },
                 "required": ["node_path"]
             }
@@ -845,7 +889,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "search_node_types",
-            "description": "按关键词搜索 Houdini 可用节点类型，返回类型名 + 描述。\n\n何时用：你已经有一个关键词（如 'scatter'、'rbd'、'copy'），想列出所有名字含该词的节点。\n何时不用：不知道节点叫什么 → 用 semantic_search_nodes；知道节点名想看详细信息 → 用 get_node_card。",
+            "description": "按关键词搜索 Houdini 可用节点类型，返回类型名 + 描述。\n\n何时用：你已经有一个关键词（如 'scatter'、'rbd'、'copy'），想列出所有名字含该词的节点。\n何时不用：不知道节点叫什么 → 用 semantic_search_nodes；知道节点名想看详细信息 → run_skill('get_node_card', ...)。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -993,23 +1037,6 @@ HOUDINI_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "find_nodes_by_param",
-            "description": "在网络中搜索具有特定参数值的节点。类似 grep 搜索。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "network_path": {"type": "string", "description": "搜索的网络路径，留空使用当前网络"},
-                    "param_name": {"type": "string", "description": "参数名"},
-                    "value": {"type": ["string", "number"], "description": "要匹配的值（可选，留空则列出所有有此参数的节点）"},
-                    "recursive": {"type": "boolean", "description": "是否递归搜索子网络，默认 true"}
-                },
-                "required": ["param_name"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "save_hip",
             "description": "保存当前 HIP 文件。可以保存到当前路径或指定新路径。",
             "parameters": {
@@ -1102,7 +1129,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_houdini_node_doc",
-            "description": "拉取节点的完整长文档（支持分页）。\n\n何时用：get_node_card 的参数列表不够、需要看 examples / parameter group / 完整说明文本。\n何时不用：只想知道连接和参数 → 用 get_node_card（一次返回，更快）。\n\n降级路径：本地帮助 → SideFX 在线 → 节点类型摘要。",
+            "description": "拉取节点的完整长文档（支持分页）。\n\n⚠️ 谨慎使用：此工具可能耗时较久（需加载/解析完整帮助文档、可能触发在线降级请求），仅在确有必要时调用。优先用更快的 run_skill('get_node_card', ...)。\n\n何时用：run_skill('get_node_card', ...) 的参数列表不够、需要看 examples / parameter group / 完整说明文本。\n何时不用：只想知道连接和参数 → run_skill('get_node_card', ...)（一次返回，更快）。\n\n降级路径：本地帮助 → SideFX 在线 → 节点类型摘要 → search_houdini_help 全文兜底。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1178,7 +1205,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "verify_network",
-            "description": "【建完/改完网络必用】一次性核查一个网络下所有子节点的状态：errors / warnings / display+render+bypass flags / display 节点的几何 evidence（points/prims/vertices）。比逐个调 check_errors 高效得多。\n\n何时用：用 create_nodes_batch 建完一个网络后；改完连接或参数后；用户问 '建好了吗'。tool 返回 success 不等于网络真的工作，请用此工具确认 evidence（健康 + 几何点数非零）再回报用户。",
+            "description": "【建完/改完网络必用】一次性核查一个网络下所有子节点的状态：errors / warnings / display+render+bypass flags / display 节点的几何 evidence（points/prims/vertices）。比逐个调 check_errors 高效得多。\n\n何时用：用 create_nodes_batch 建完一个网络后；改完连接或参数后；用户问 '建好了吗'。tool 返回 success 不等于网络真的工作，请用此工具确认 evidence（健康 + 几何点数非零）再回报用户。\n\n★ Manual 模式：本工具已在 Manual 更新模式下自动对 display 节点强制重 cook 再读几何，若返回的几何点数仍为 0，说明这是真实空几何（缓存假象已排除），应转向排查上游连线/过滤参数，不要反复重试同一验证。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1192,58 +1219,6 @@ HOUDINI_TOOLS = [
                     }
                 },
                 "required": ["parent_path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_node_card",
-            "description": "建节点前一站式查节点类型说明（无需先建节点）：min/max inputs、输入/输出端口 label、is_generator、参数名+默认值+menu items（enum 合法值）。\n\n何时用：第一次用某节点类型；不确定该接几个输入；不知道某参数是 enum / float / string；create_nodes_batch 前对陌生类型先查一次比 dry_run 更高效。\n何时不用：只想知道几个输入端口、对方是 210 个常用节点 → get_node_inputs（有 JSON 缓存更快）；想看长文档 → get_houdini_node_doc；查已建好的节点参数 → get_parameter_schema。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "node_type": {
-                        "type": "string",
-                        "description": "节点类型名，如 'scatter'、'copytopoints'、'rbdbulletsolver'。不带版本号时返回最新版。"
-                    },
-                    "context": {
-                        "type": "string",
-                        "enum": ["Sop", "Lop", "Dop", "Cop", "Chop", "Top", "Object", "Driver", "Vop"],
-                        "description": "节点类别，默认 'Sop'"
-                    },
-                    "parm_filter": {
-                        "type": "string",
-                        "description": "可选：参数名/label 子串过滤，只返回匹配的参数"
-                    },
-                    "max_parms": {
-                        "type": "integer",
-                        "description": "参数返回上限，默认 40"
-                    }
-                },
-                "required": ["node_type"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_node_inputs",
-            "description": "查节点输入端口的快速版（210 个常用节点已 JSON 缓存，毫秒级返回）。\n\n何时用：连接现有节点前确认 input_index 含义；只关心端口、不关心参数。\n何时不用：需要参数信息或 menu items → get_node_card；查冷门节点（缓存外）→ get_node_card。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "node_type": {
-                        "type": "string",
-                        "description": "节点类型名称，如 'copytopoints', 'boolean', 'scatter'"
-                    },
-                    "category": {
-                        "type": "string",
-                        "enum": ["sop", "obj", "dop", "vop"],
-                        "description": "节点类别，默认 'sop'"
-                    }
-                },
-                "required": ["node_type"]
             }
         }
     },
@@ -1299,7 +1274,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "run_skill",
-            "description": "执行预定义的 Skill（专用分析脚本）。Skill 比手写 execute_python 更可靠、更结构化。常见场景：几何属性统计(analyze_geometry_attribs)、边界盒信息(get_bounding_info)、法线质量检测(analyze_normals)、cook 性能分析(analyze_cook_performance)、死节点查找(find_dead_nodes)、节点依赖追溯(trace_node_dependencies)、网络契约验证(validate_network_contract)等。遇到分析类需求时优先用 run_skill 而非 execute_python。用 list_skills 查看完整列表和参数。",
+            "description": "执行预定义的 Skill（专用分析脚本）。Skill 比手写 execute_python 更可靠、更结构化。常见场景：几何属性统计(analyze_geometry_attribs)、边界盒信息(get_bounding_info)、法线质量检测(analyze_normals)、cook 性能分析(analyze_cook_performance)、死节点查找(find_dead_nodes)、节点依赖追溯(trace_node_dependencies)、网络契约验证(validate_network_contract)等。遇到分析类需求时优先用 run_skill 而非 execute_python。用 list_skills 查看完整列表和参数。Plan 规划阶段可用只读 skill（如 get_node_card 查真实参数、analyze_*/inspect_* 分析现有网络）来设计更合理的计划；会改场景/建图的 skill（setup_*）仅执行阶段可用。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1320,10 +1295,15 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_skills",
-            "description": "列出所有可用的 Skill 及其参数说明（结构化 JSON 输出）。在需要复杂分析（几何属性统计、性能诊断、网络检查、依赖追溯等）时，先调用此工具查看是否有现成 Skill，比手写 execute_python 更高效可靠。",
+            "description": "列出所有可用的 Skill，按分类分组输出（结构化 JSON）。分类含 geometry(几何分析)/graph(网络节点)/scene(场景上下文)/usd(LOPs)/materials(材质)/performance(性能缓存)/docs(文档)/workflow(一键搭建)。在需要复杂分析时先调用此工具查看是否有现成 Skill，比手写 execute_python 更高效可靠。可传 category 只看某一类以节省 token。",
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "可选。只列出该分类下的 Skill（如 geometry/graph/usd/performance/workflow）。留空返回全部并按分类分组。"
+                    }
+                },
                 "required": []
             }
         }
@@ -1396,31 +1376,6 @@ HOUDINI_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_node_positions",
-            "description": "获取节点的位置信息（坐标、类型），用于检查布局效果或在手动微调时查看当前状态。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "network_path": {
-                        "type": "string",
-                        "description": "父网络路径（如 /obj/geo1）。留空则使用当前活跃网络。"
-                    },
-                    "node_paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "要查询的节点完整路径列表。留空则返回整个网络下所有子节点的位置。"
-                    }
-                },
-                "required": []
-            }
-        }
-    },
-    # ============================================================
-    # NetworkBox 工具 — 节点分组与可视化组织
-    # ============================================================
-    {
-        "type": "function",
-        "function": {
             "name": "create_network_box",
             "description": "创建 NetworkBox（节点分组框），用于将功能相关的节点组织在一起。支持设置名称、注释、颜色预设，并可在创建时直接包含指定节点。建议在每完成一个逻辑阶段后使用此工具将该阶段的节点打包。",
             "parameters": {
@@ -1483,26 +1438,6 @@ HOUDINI_TOOLS = [
             }
         }
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_network_boxes",
-            "description": "列出指定网络中所有 NetworkBox 及其包含的节点。用于了解当前网络的分组组织情况。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "parent_path": {
-                        "type": "string",
-                        "description": "要查询的网络路径（如 /obj/geo1）。留空则使用当前活跃网络。"
-                    }
-                },
-                "required": []
-            }
-        }
-    },
-    # ============================================================
-    # PerfMon 性能分析工具
-    # ============================================================
     {
         "type": "function",
         "function": {
@@ -1624,7 +1559,7 @@ class AIClient:
     DUOJIE_API_URL = "https://api.duojie.games/v1/chat/completions"  # 拼好饭中转站（OpenAI 协议）
     DUOJIE_ANTHROPIC_API_URL = "https://api.duojie.games/v1/messages"  # 拼好饭中转站（Anthropic 协议）
     OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"  # OpenRouter（OpenAI 兼容）
-    KIMI_CODING_API_URL = "https://api.kimi.com/coding/v1/messages"  # Kimi K2.5 Coding（Anthropic 协议）
+    KIMI_CODING_API_URL = "https://api.kimi.com/coding/v1/messages"  # Kimi Code（K3 / K2.7 Code，Anthropic 协议）
     SILICONFLOW_API_URL = "https://api.siliconflow.cn/v1/chat/completions"  # SiliconFlow（OpenAI 化）
     OF3D_API_URL = "https://oneapi.of3d.com/v1/chat/completions"  # OF3D 公司内部中转（OpenAI 化）
     # OF3D 统一 key（base64 混淆，非加密，仅防止明文直接可见）
@@ -1753,8 +1688,8 @@ class AIClient:
         'get_node_connections', 'suggest_connection', 'preview_node_operation', 'validate_node_network',
         'list_children', 'find_nodes', 'get_geometry_summary', 'get_scene_snapshot',
         'read_selection', 'search_node_types',
-        'semantic_search_nodes', 'find_nodes_by_param', 'check_errors', 'verify_network',
-        'search_local_doc', 'get_houdini_node_doc', 'get_node_inputs', 'get_node_card',
+        'semantic_search_nodes', 'check_errors', 'verify_network',
+        'search_local_doc', 'get_houdini_node_doc',
         'execute_python', 'execute_shell', 'web_search', 'fetch_webpage',
         'run_skill', 'list_skills',
         'capture_viewport',
@@ -1765,7 +1700,7 @@ class AIClient:
     })
     _SIMPLE_SUCCESS_TOOLS = frozenset({
         'create_node', 'get_node_parameters', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
-        'suggest_connection', 'preview_node_operation', 'validate_node_network', 'get_node_inputs', 'get_node_card',
+        'suggest_connection', 'preview_node_operation', 'validate_node_network',
         'list_children', 'find_nodes', 'get_geometry_summary', 'get_scene_snapshot',
         'read_selection', 'check_errors', 'verify_network',
     })
@@ -1850,6 +1785,55 @@ class AIClient:
             f"当前信息如已足够请直接使用。"
             f"注意：用相同参数重复调用会得到相同结果。"
             f"如需更多信息请换用更精确的查询条件，或使用 fetch_webpage 获取特定 URL 的完整内容（支持 start_line 翻页）。"
+        )
+
+    @classmethod
+    def _soft_cap_with_offset_hint(cls, tool_name: str, content: str) -> str:
+        """对自带分页工具的结果做软上限截断，并引导模型用 offset 翻页。
+
+        与 _paginate_result 的区别：
+        - 软上限更宽松（默认 600 行），避免结构化参数列表被砍到看不全
+        - 提示明确区分 pattern（过滤）vs offset（翻页），纠正模型认知错位
+        - 尝试从 JSON 结果中提取 offset/limit/next_offset 生成精确翻页指令
+        """
+        if not content:
+            return content
+        lines = content.split('\n')
+        total = len(lines)
+        if total <= cls._SELF_PAGED_SOFT_CAP:
+            return content
+
+        cap = cls._SELF_PAGED_SOFT_CAP
+        page = '\n'.join(lines[:cap])
+
+        # 尝试从 JSON 结果中提取分页字段，生成精确翻页指令
+        offset_hint = ""
+        try:
+            import json as _json
+            # 结果可能是纯 JSON 或带前缀的 JSON，尝试找到第一个 { 到最后一个 }
+            start = content.find('{')
+            end = content.rfind('}')
+            if start != -1 and end > start:
+                data = _json.loads(content[start:end + 1])
+                cur_offset = data.get('offset', 0)
+                cur_limit = data.get('limit', 0)
+                next_offset = data.get('next_offset')
+                node_path = data.get('node_path')
+                has_more = data.get('has_more', next_offset is not None)
+                if has_more and next_offset is not None and node_path:
+                    offset_hint = (
+                        f"\n当前 offset={cur_offset}, limit={cur_limit}, next_offset={next_offset}。"
+                        f"\n👉 获取后续参数请调用：{tool_name}(node_path=\"{node_path}\", offset={next_offset})"
+                    )
+        except Exception:
+            pass
+
+        return (
+            f"{page}\n\n"
+            f"[分页提示] 输出已截断（显示前 {cap} 行，共 {total} 行）。"
+            f"\n⚠️ 重要：本工具支持 offset/limit 翻页——pattern 是【过滤】（按名字匹配），不是翻页！"
+            f"\n要看后续参数请用 offset 参数，不要换 pattern 重复调用。"
+            f"{offset_hint}"
         )
 
     # ------------------------------------------------------------------
@@ -2114,8 +2098,12 @@ class AIClient:
         1. assistant 消息中 tool_calls 的 id 为空
         2. role:tool 消息的 tool_call_id 与 assistant 中的 id 不匹配
         3. 移除无效的 tool 消息（没有对应 assistant tool_call）
+        4. ★ 修复未配对的 assistant tool_calls：若 assistant 的 tool_calls 缺少
+           对应的 tool 响应消息，补发占位 tool 消息（避免 API 400 错误：
+           "An assistant message with 'tool_calls' must be followed by tool
+           messages responding to each 'tool_call_id'"）
         """
-        # 收集所有有效的 tool_call_id
+        # 第一遍：收集所有有效的 tool_call_id，并确保 id 完整
         valid_tc_ids = set()
         for msg in messages:
             if msg.get('role') == 'assistant' and 'tool_calls' in msg:
@@ -2124,7 +2112,15 @@ class AIClient:
                     if tc.get('id'):
                         valid_tc_ids.add(tc['id'])
         
-        # 修复 tool 消息的 tool_call_id
+        # 第二遍：收集已存在的 tool 响应消息的 tool_call_id
+        answered_tc_ids = set()
+        for msg in messages:
+            if msg.get('role') == 'tool':
+                tc_id = msg.get('tool_call_id', '')
+                if tc_id:
+                    answered_tc_ids.add(tc_id)
+        
+        # 第三遍：构建清洗后的消息列表
         sanitized = []
         for msg in messages:
             if msg.get('role') == 'tool':
@@ -2133,19 +2129,51 @@ class AIClient:
                     # 跳过孤儿 tool 消息（没有对应的 assistant tool_call）
                     continue
             sanitized.append(msg)
-        return sanitized
+        
+        # ★ 第四遍：为未配对的 assistant tool_calls 补发占位 tool 消息
+        # 场景：循环熔断/错误中断时，assistant 已发出 N 个 tool_calls，
+        # 但只执行了部分，剩余的 tool_call_id 缺少响应 → API 400
+        result = []
+        for idx, msg in enumerate(sanitized):
+            result.append(msg)
+            if msg.get('role') == 'assistant' and 'tool_calls' in msg:
+                # 收集该 assistant 消息中所有 tool_call_id
+                tc_ids_in_msg = [tc.get('id') for tc in msg['tool_calls'] if tc.get('id')]
+                # 查找紧随其后的 tool 响应（直到下一个 assistant/user/system 消息）
+                following_tool_ids = set()
+                for j in range(idx + 1, len(sanitized)):
+                    nxt = sanitized[j]
+                    if nxt.get('role') != 'tool':
+                        break
+                    following_tool_ids.add(nxt.get('tool_call_id', ''))
+                # 为缺失响应的 tool_call_id 补发占位消息
+                missing_ids = [tid for tid in tc_ids_in_msg if tid not in following_tool_ids]
+                if missing_ids:
+                    print(f"[AI Client] 📝 消息清洗：为 {len(missing_ids)} 个未配对的 tool_call 补发占位响应")
+                    for tid in missing_ids:
+                        result.append({
+                            'role': 'tool',
+                            'tool_call_id': tid,
+                            'content': '[工具执行被中断，无结果返回]',
+                        })
+        
+        return result
 
     # 已自带分页的工具，不再二次截断
     _SELF_PAGED_TOOLS = frozenset({
         'get_houdini_node_doc', 'get_network_structure', 'get_node_parameters',
-        'list_children', 'execute_python', 'execute_shell',
+        'get_parameter_schema', 'list_children', 'execute_python', 'execute_shell',
     })
+
+    # 自带分页工具的软上限（行）：超过则截断并追加 offset 翻页提示。
+    # 避免 184 参数节点序列化后 2600+ 行撑爆上下文。
+    _SELF_PAGED_SOFT_CAP = 600
 
     def _compress_tool_result(self, tool_name: str, result: dict) -> str:
         """统一工具结果压缩逻辑（供两种 agent loop 共用）
 
         策略：
-        - 已自带分页的工具 → 直接返回（如 get_houdini_node_doc）
+        - 已自带分页的工具 → 软上限截断 + offset 翻页提示（不再二次 50 行截断）
         - 查询工具 → 按行分页（默认 50 行）
         - 操作工具 → 提取路径，保留关键信息
         - 其他工具 → 适度截断
@@ -2154,9 +2182,9 @@ class AIClient:
         result = sanitize_tool_result(result)
         if result.get('success'):
             content = result.get('result', '')
-            # 已自带分页逻辑的工具，直接返回不再截断
+            # 已自带分页逻辑的工具：软上限截断 + 引导用 offset 翻页
             if tool_name in self._SELF_PAGED_TOOLS:
-                return content
+                return self._soft_cap_with_offset_hint(tool_name, content)
             if tool_name in self._QUERY_TOOLS:
                 return self._paginate_result(content, max_lines=50)
             elif tool_name in self._OP_TOOLS:
@@ -2289,7 +2317,7 @@ class AIClient:
         'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'inspect_node',
         'get_node_connections', 'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
         'get_geometry_summary', 'get_scene_snapshot',
-        'check_errors', 'get_node_inputs', 'read_selection',
+        'check_errors', 'read_selection',
     })
 
     @classmethod
@@ -2930,7 +2958,8 @@ class AIClient:
     def requires_temperature_one(model: str) -> bool:
         """判断模型是否只支持 temperature=1（不允许自定义值）"""
         m = model.lower()
-        return 'k2' in m or m.startswith('gpt-5')
+        # Kimi Code 模型（k3[1m]、kimi-for-coding、-highspeed）与 k2 系、gpt-5 系固定 temperature=1
+        return 'k2' in m or m.startswith('k3') or m.startswith('kimi-for-coding') or m.startswith('gpt-5')
 
     @staticmethod
     def uses_max_completion_tokens(model: str) -> bool:
@@ -3236,9 +3265,17 @@ class AIClient:
         if system_text:
             payload['system'] = system_text
         
-        # 思考模式（kimi_coding 不支持 Anthropic thinking 格式，跳过）
-        if enable_thinking and provider != 'kimi_coding':
-            payload['thinking'] = {'type': 'enabled', 'budget_tokens': min(max_tokens or 16384, 10000)}
+        # 思考模式
+        # Kimi Code 说明（https://www.kimi.com/code/docs/kimi-code/models）：
+        #   - K3（k3[1m]）默认已开启深度思考，effort 缺省即映射为 max，无需显式传 thinking
+        #   - K2.7 Code（kimi-for-coding / -highspeed）需开启 Thinking，否则会被降级路由到 K2.6
+        if enable_thinking:
+            if provider == 'kimi_coding':
+                model_lc = (model or '').lower()
+                if model_lc.startswith('kimi-for-coding'):
+                    payload['thinking'] = {'type': 'enabled', 'budget_tokens': min(max_tokens or 16384, 10000)}
+            else:
+                payload['thinking'] = {'type': 'enabled', 'budget_tokens': min(max_tokens or 16384, 10000)}
         
         # 工具
         if tools:
@@ -4224,8 +4261,11 @@ class AIClient:
         # 防止死循环：检测重复工具调用
         max_tool_calls = 999  # 不限制总调用次数（仅保留连续重复检测）
         total_tool_calls = 0
-        consecutive_same_calls = 0  # 连续相同调用计数
+        consecutive_same_calls = 0  # 连续相同调用计数（工具名+参数完全相同）
         last_call_signature = None
+        recent_call_signatures = []  # 最近调用签名滑动窗口（交替循环检测）
+        consecutive_same_tool = 0  # 同工具名连续调用计数（不看参数，捕获换参数循环）
+        last_tool_name = None
         server_error_retries = 0    # 连续服务端错误重试计数
         max_server_retries = 3      # 最多重试 3 次服务端错误
 
@@ -4420,10 +4460,16 @@ class AIClient:
                     ))
                     
                     # 3. 压缩/格式问题
-                    is_format_error = ('HTTP 4' in error_msg and not is_context_exceeded and iteration > 1)
+                    # ★ 移除 iteration > 1 限制：iteration 1 也可能因历史消息
+                    #    格式问题（如未配对的 tool_calls）触发 400，需要清洗后重试
+                    is_format_error = ('HTTP 4' in error_msg and not is_context_exceeded)
                     is_compress_fail = '压缩失败' in error_msg
                     
-                    is_recoverable = is_context_exceeded or is_server_transient or is_format_error or is_compress_fail
+                    # ★ 专项检测：未配对的 tool_calls（API 明确报错）
+                    is_unpaired_tool_calls = 'tool_call_id' in error_msg or 'tool_calls' in error_msg
+                    
+                    is_recoverable = (is_context_exceeded or is_server_transient
+                                      or is_format_error or is_compress_fail)
                     
                     if is_recoverable:
                         server_error_retries += 1
@@ -4472,15 +4518,23 @@ class AIClient:
                                 cleanup_count = old_len - len(working_messages)
                             
                         else:
-                            # ---- 4xx 格式问题 → 移除末尾可能有问题的消息 ----
-                            while (working_messages and cleanup_count < 20 and
-                                   working_messages[-1].get('role') in ('tool', 'system')
-                                   and working_messages[-1] is not messages[0]):
-                                working_messages.pop()
-                                cleanup_count += 1
-                            if working_messages and working_messages[-1].get('role') == 'assistant':
-                                working_messages.pop()
-                                cleanup_count += 1
+                            # ---- 4xx 格式问题 ----
+                            if is_unpaired_tool_calls:
+                                # ★ 专项修复：未配对的 tool_calls
+                                # 先强制重新清洗（补发占位 tool 消息），再重试
+                                print(f"[AI Client] 🔧 检测到未配对的 tool_calls，强制重新清洗消息")
+                                working_messages = self._sanitize_working_messages(working_messages)
+                                _needs_sanitize = False  # 已清洗，避免重复
+                            else:
+                                # 其他 4xx 格式问题 → 移除末尾可能有问题的消息
+                                while (working_messages and cleanup_count < 20 and
+                                       working_messages[-1].get('role') in ('tool', 'system')
+                                       and working_messages[-1] is not messages[0]):
+                                    working_messages.pop()
+                                    cleanup_count += 1
+                                if working_messages and working_messages[-1].get('role') == 'assistant':
+                                    working_messages.pop()
+                                    cleanup_count += 1
                         
                         print(f"[AI Client] 重试 {server_error_retries}/{max_server_retries}, 移除了 {cleanup_count} 条消息")
                         should_retry = True
@@ -4692,6 +4746,7 @@ class AIClient:
                     print(f"[AI Client] ⏭️ 早期终止: 跳过 {_early_skip_count} 个冗余查询")
 
                 should_break_tool_limit = False
+                _loop_abort_reason = None  # 非 None 表示因循环检测硬熔断
                 for i, (tool_id, tool_name, arguments, _tc) in enumerate(parsed_calls):
                     result = results_ordered[i] if i < len(results_ordered) else {
                         'success': False,
@@ -4713,8 +4768,34 @@ class AIClient:
                         consecutive_same_calls = 1
                         last_call_signature = call_signature
 
-                    # ★ 循环检测：连续 3 次相同工具调用，向本条 tool 消息追加强制换策略提示
-                    if consecutive_same_calls >= 3:
+                    # 同工具名连续调用计数（不看参数，捕获"换 pattern 反复调同一工具"的循环）
+                    if tool_name == last_tool_name:
+                        consecutive_same_tool += 1
+                    else:
+                        consecutive_same_tool = 1
+                        last_tool_name = tool_name
+
+                    # 交替循环检测：维护最近调用签名滑动窗口
+                    recent_call_signatures.append(call_signature)
+                    if len(recent_call_signatures) > _LOOP_WINDOW_SIZE:
+                        recent_call_signatures.pop(0)
+                    _window_same_count = recent_call_signatures.count(call_signature)
+
+                    # ★ 硬熔断已临时禁用：仅保留软提示，避免误杀合理的同工具多参数探索
+                    # 原逻辑：consecutive_same_calls/_window_same_count/consecutive_same_tool 达阈值即强制终止
+                    # 恢复时取消下方注释即可（常量仍保留：_LOOP_HARD_ABORT_THRESHOLD 等）
+                    # if (consecutive_same_calls >= _LOOP_HARD_ABORT_THRESHOLD
+                    #         or _window_same_count >= _LOOP_WINDOW_HIT_THRESHOLD
+                    #         or consecutive_same_tool >= _LOOP_SAME_TOOL_HARD_ABORT):
+                    #     print(f"[AI Client] ⛔ 循环检测硬熔断：{tool_name}（连续相同 {consecutive_same_calls} 次 / 窗口内 {_window_same_count} 次 / 同工具 {consecutive_same_tool} 次），强制终止")
+                    #     _loop_abort_reason = (...)
+                    #     should_break_tool_limit = True
+                    #     break
+
+                    # ★ 循环检测软提示：连续相同调用或同工具连续调用达软阈值 → 注入换策略提示
+                    _loop_inject = False
+                    _loop_hint = ""
+                    if consecutive_same_calls >= _LOOP_SOFT_HINT_THRESHOLD:
                         print(f"[AI Client] ⚠️ 循环检测：{tool_name} 已连续 {consecutive_same_calls} 次相同调用，注入换策略提示")
                         _loop_hint = (
                             f"\n\n[循环检测] 你已连续 {consecutive_same_calls} 次用相同参数调用 {tool_name}，"
@@ -4722,8 +4803,26 @@ class AIClient:
                             "search_local_doc、execute_python）或直接向用户说明无法找到相关信息。"
                         )
                         _loop_inject = True
-                    else:
-                        _loop_inject = False
+                    elif consecutive_same_tool >= _LOOP_SAME_TOOL_SOFT_HINT:
+                        print(f"[AI Client] ⚠️ 循环检测：{tool_name} 已连续 {consecutive_same_tool} 次调用（参数在变），注入换策略提示")
+                        # 区分查询类和写操作类工具，给不同的引导文案
+                        _query_tools = {'get_parameter_schema', 'search_node_types', 'search_local_doc',
+                                        'list_node_parameters', 'get_node_info', 'search_parameters'}
+                        if tool_name in _query_tools:
+                            _loop_hint = (
+                                f"\n\n[循环检测] 你已连续 {consecutive_same_tool} 次调用 {tool_name}（参数在变化但工具没换）。"
+                                "反复用不同参数查同一工具通常说明返回结果被截断或方向有误。"
+                                "请检查结果中的[分页提示]——若需看后续内容请用 offset 翻页，而非换 pattern 重试；"
+                                "或改用其他工具（如 search_node_types、search_local_doc、execute_python）。"
+                            )
+                        else:
+                            _loop_hint = (
+                                f"\n\n[循环检测] 你已连续 {consecutive_same_tool} 次调用 {tool_name}（参数在变化）。"
+                                "如果是批量操作（如连续设置多个节点参数），请继续但注意效率；"
+                                "若是在反复尝试同一操作却得不到预期结果，请检查参数值是否正确、"
+                                "节点路径是否存在，或改用 execute_python 一次性完成批量操作。"
+                            )
+                        _loop_inject = True
 
                     if on_tool_call:
                         on_tool_call(tool_name, arguments)
@@ -4765,10 +4864,14 @@ class AIClient:
                         print(f"[AI Client] 📸 视口截图已注入消息 ({len(_img_b64)//1024}KB base64)")
 
                 if should_break_tool_limit:
+                    if _loop_abort_reason is not None:
+                        _abort_msg = _loop_abort_reason
+                    else:
+                        _abort_msg = f"已达到工具调用次数限制({max_tool_calls})，自动停止。"
                     return {
                         'ok': True,
-                        'content': full_content + f"\n\n已达到工具调用次数限制({max_tool_calls})，自动停止。",
-                        'final_content': f"\n\n已达到工具调用次数限制({max_tool_calls})，自动停止。",
+                        'content': full_content + f"\n\n{_abort_msg}",
+                        'final_content': f"\n\n{_abort_msg}",
                         'new_messages': working_messages[initial_msg_count:],
                         'tool_calls_history': tool_calls_history,
                         'call_records': call_records,
@@ -5122,6 +5225,9 @@ class AIClient:
         total_tool_calls = 0
         consecutive_same_calls = 0
         last_call_signature = None
+        recent_call_signatures = []  # 最近调用签名滑动窗口（交替循环检测）
+        consecutive_same_tool = 0  # 同工具名连续调用计数（不看参数，捕获换参数循环）
+        last_tool_name = None
         server_error_retries = 0    # 连续服务端错误重试计数
         max_server_retries = 3      # 最多重试 3 次服务端错误
         
@@ -5411,9 +5517,8 @@ class AIClient:
             _BATCH_READONLY_JSON = frozenset({
                 'get_network_structure', 'get_node_parameters', 'list_children',
                 'read_selection', 'search_node_types', 'semantic_search_nodes',
-                'find_nodes_by_param', 'get_node_inputs', 'check_errors',
+                'check_errors',
                 'search_local_doc', 'get_houdini_node_doc', 'list_skills',
-                'get_node_positions', 'list_network_boxes',
                 'perf_start_profile', 'perf_stop_and_report',
             })
             readonly_batch_j = [(i, tc) for i, tc in houdini_tc if tc['name'] in _BATCH_READONLY_JSON]
@@ -5457,6 +5562,7 @@ class AIClient:
 
             # 统一处理结果
             should_break_limit = False
+            _loop_abort_reason = None  # 非 None 表示因循环检测硬熔断
             for i, tc in enumerate(tool_calls):
                 tool_name = tc['name']
                 arguments = tc['arguments']
@@ -5476,15 +5582,58 @@ class AIClient:
                     consecutive_same_calls = 1
                     last_call_signature = call_signature
 
-                # ★ 循环检测：连续 3 次相同工具调用，向工具结果追加强制换策略提示
+                # 同工具名连续调用计数（不看参数，捕获"换 pattern 反复调同一工具"的循环）
+                if tool_name == last_tool_name:
+                    consecutive_same_tool += 1
+                else:
+                    consecutive_same_tool = 1
+                    last_tool_name = tool_name
+
+                # 交替循环检测：维护最近调用签名滑动窗口
+                recent_call_signatures.append(call_signature)
+                if len(recent_call_signatures) > _LOOP_WINDOW_SIZE:
+                    recent_call_signatures.pop(0)
+                _window_same_count = recent_call_signatures.count(call_signature)
+
+                # ★ 硬熔断已临时禁用：仅保留软提示，避免误杀合理的同工具多参数探索
+                # 原逻辑：consecutive_same_calls/_window_same_count/consecutive_same_tool 达阈值即强制终止
+                # 恢复时取消下方注释即可（常量仍保留：_LOOP_HARD_ABORT_THRESHOLD 等）
+                # if (consecutive_same_calls >= _LOOP_HARD_ABORT_THRESHOLD
+                #         or _window_same_count >= _LOOP_WINDOW_HIT_THRESHOLD
+                #         or consecutive_same_tool >= _LOOP_SAME_TOOL_HARD_ABORT):
+                #     print(f"[AI Client] ⛔ JSON模式循环检测硬熔断：...")
+                #     _loop_abort_reason = (...)
+                #     should_break_limit = True
+                #     break
+
+                # ★ 循环检测软提示：连续相同调用或同工具连续调用达软阈值 → 注入换策略提示
                 _json_loop_hint = ""
-                if consecutive_same_calls >= 3:
+                if consecutive_same_calls >= _LOOP_SOFT_HINT_THRESHOLD:
                     print(f"[AI Client] ⚠️ JSON模式循环检测：{tool_name} 已连续 {consecutive_same_calls} 次相同调用，注入换策略提示")
                     _json_loop_hint = (
                         f"[循环检测] 你已连续 {consecutive_same_calls} 次用相同参数调用 {tool_name}，"
                         "继续重试不会得到不同结果。请立即停止重试此工具，改用其他工具（如 search_node_types、"
                         "search_local_doc、execute_python）或直接向用户说明无法找到相关信息。"
                     )
+                elif consecutive_same_tool >= _LOOP_SAME_TOOL_SOFT_HINT:
+                    print(f"[AI Client] ⚠️ JSON模式循环检测：{tool_name} 已连续 {consecutive_same_tool} 次调用（参数在变），注入换策略提示")
+                    # 区分查询类和写操作类工具，给不同的引导文案
+                    _query_tools = {'get_parameter_schema', 'search_node_types', 'search_local_doc',
+                                    'list_node_parameters', 'get_node_info', 'search_parameters'}
+                    if tool_name in _query_tools:
+                        _json_loop_hint = (
+                            f"[循环检测] 你已连续 {consecutive_same_tool} 次调用 {tool_name}（参数在变化但工具没换）。"
+                            "反复用不同参数查同一工具通常说明返回结果被截断或方向有误。"
+                            "请检查结果中的[分页提示]——若需看后续内容请用 offset 翻页，而非换 pattern 重试；"
+                            "或改用其他工具（如 search_node_types、search_local_doc、execute_python）。"
+                        )
+                    else:
+                        _json_loop_hint = (
+                            f"[循环检测] 你已连续 {consecutive_same_tool} 次调用 {tool_name}（参数在变化）。"
+                            "如果是批量操作（如连续设置多个节点参数），请继续但注意效率；"
+                            "若是在反复尝试同一操作却得不到预期结果，请检查参数值是否正确、"
+                            "节点路径是否存在，或改用 execute_python 一次性完成批量操作。"
+                        )
 
                 if on_tool_call:
                     on_tool_call(tool_name, arguments)
@@ -5512,9 +5661,13 @@ class AIClient:
                     tool_results.append(f"{tool_name}:错误:{compressed}{suffix}")
 
             if should_break_limit:
+                if _loop_abort_reason is not None:
+                    _abort_msg = _loop_abort_reason
+                else:
+                    _abort_msg = f"已达到工具调用次数限制({max_tool_calls})，自动停止。"
                 return {
                     'ok': True,
-                    'content': full_content + f"\n\n已达到工具调用次数限制({max_tool_calls})，自动停止。",
+                    'content': full_content + f"\n\n{_abort_msg}",
                     'tool_calls_history': tool_calls_history,
                     'iterations': iteration
                 }

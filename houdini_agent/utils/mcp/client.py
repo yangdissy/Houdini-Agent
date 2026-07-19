@@ -94,6 +94,28 @@ if not HAS_SKILLS:
 # 抑制 Houdini Qt 主窗口在批量节点操作期间的逐次重绘，
 # 退出时一次性恢复并合并刷新。降低 QHeaderView/QLayout 在高频
 # OPchange 通知下的悬空指针 race（Houdini 20.5 已知偶发 SIGSEGV）。
+def _display_node_has_volume(display_node) -> bool:
+    """判断 display 节点几何是否含 Volume/VDB primitive（用于跳过强制 cook）。
+
+    含体积/VDB 时返回 True，让调用方跳过 cook(force=True)，避免驱动
+    GPU 体积重绘与用户视口交互竞态崩溃。判断失败时保守返回 True（跳过更安全）。
+    """
+    if hou is None:
+        return False
+    try:
+        if display_node.needsToCook():
+            return True
+        geo = display_node.geometry()
+        if geo is None:
+            return False
+        for ptype in (hou.primType.Volume, hou.primType.VDB):
+            if geo.countPrimType(ptype) > 0:
+                return True
+        return False
+    except Exception:
+        return True
+
+
 class _SuspendHoudiniUIRedraw:
     def __init__(self):
         self._mw = None
@@ -1092,9 +1114,20 @@ class HoudiniMCP:
                 display = parent.displayNode()
             except Exception:
                 display = None
+        # ★ Manual 模式检测：Agent 运行期间 Cook Guard 会把更新模式切为 Manual，
+        #   此时 cook(force=False) 对时间戳未过期的节点可能直接返回 stale 缓存，
+        #   导致几何 evidence 读到旧的 0 值（改了源/连线也不反映）。
+        manual_mode = False
+        try:
+            manual_mode = (hou.updateModeSetting() == hou.updateMode.Manual)
+        except Exception:
+            manual_mode = False
         if cook_display and display is not None:
             try:
-                display.cook(force=False)
+                # Manual 模式下用 force=True 强制重算，绕过 stale 缓存；
+                # 但含 Volume/VDB 的节点跳过强制 cook（GPU 体积重绘竞态崩溃风险）。
+                force = manual_mode and not _display_node_has_volume(display)
+                display.cook(force=force)
             except Exception as exc:
                 # cook 失败本身就是 evidence，不当作工具错误
                 pass
@@ -1168,6 +1201,13 @@ class HoudiniMCP:
             lines.append(
                 f"Display 几何: points={geom_summary['points']}, "
                 f"prims={geom_summary['prims']}, vertices={geom_summary['vertices']}")
+            # ★ 几何为空 + Manual 模式：0 可能是 stale 缓存假象而非真实空几何。
+            #   给 Agent 明确诊断方向，避免把「0」当事实反复死循环。
+            if geom_summary['points'] == 0 and geom_summary['prims'] == 0 and manual_mode:
+                lines.append(
+                    "⚠️ 几何为 0 且当前处于 **Manual 更新模式**：本次已对 display 节点强制 "
+                    "cook 后仍为 0，若源节点参数正常，请优先怀疑上游连线/过滤参数问题；"
+                    "如需排除缓存干扰，可让用户临时切回 Auto 更新模式再核查。")
 
         if error_nodes:
             lines.append("")
@@ -1268,25 +1308,36 @@ class HoudiniMCP:
         
         return index
     
-    def search_nodes(self, keyword: str, limit: int = 12) -> Tuple[bool, str]:
-        """搜索节点类型（使用缓存）"""
+    def search_nodes(self, keyword: str, limit: int = 12,
+                     category: Optional[str] = None) -> Tuple[bool, str]:
+        """搜索节点类型（使用缓存）
+
+        Args:
+            keyword: 搜索关键词
+            limit: 最大结果数
+            category: 节点类别过滤（sop/obj/dop/vop/cop 等），None 或 'all' 表示全部
+        """
         if hou is None:
             return False, "未检测到 Houdini API"
         if not keyword:
             return False, "请输入关键字"
         
         kw = keyword.lower()
+        cat_filter = category.lower() if category and category.lower() != "all" else None
         matches: List[str] = []
         
         # 使用缓存的节点类型索引
         index = self._get_node_types_index()
         for cat_name, types in index.items():
+            if cat_filter and cat_name != cat_filter:
+                continue
             for type_name, desc, full_path in types:
                 if kw in full_path.lower() or kw in desc.lower():
                     matches.append(f"- `{full_path}` — {desc}")
         
         if not matches:
-            return False, f"未找到包含 '{keyword}' 的节点类型"
+            scope = f"（类别 '{category}'）" if cat_filter else ""
+            return False, f"未找到包含 '{keyword}' 的节点类型{scope}"
         
         if len(matches) > limit:
             extra = len(matches) - limit
@@ -2512,7 +2563,23 @@ class HoudiniMCP:
     # ========================================
     # 节点创建
     # ========================================
-    
+
+    def _manual_mode_hint(self) -> str:
+        """若 Houdini 当前处于 Manual 更新模式，返回一句提醒串，否则返回空串。
+
+        Agent 运行期间会主动将 Houdini 切到 Manual 模式（防 cook 阻塞死锁），
+        此时创建/修改节点不会自动 cook。将此提示附到工具返回消息，
+        让模型知道 success 仅代表已排队，需 verify_network 确认真实结果。
+        """
+        if hou is None:
+            return ""
+        try:
+            if hou.updateModeSetting() == hou.updateMode.Manual:
+                return " ⚠Manual模式：数据未自动cook，success仅表示已排队，需verify_network确认"
+        except Exception:
+            pass
+        return ""
+
     def create_node(self, type_hint: str, node_name: Optional[str] = None, 
                     parameters: Optional[Dict[str, Any]] = None,
                     parent_path: Optional[str] = None) -> Tuple[bool, str]:
@@ -2680,7 +2747,7 @@ class HoudiniMCP:
                     diff_parts.append(f"输入: {', '.join(connected)}")
         except Exception:
             pass
-        return True, ' '.join(diff_parts)
+        return True, ' '.join(diff_parts) + self._manual_mode_hint()
 
     def create_network(self, plan: Dict[str, Any]) -> Tuple[bool, str]:
         """批量创建节点网络
@@ -2976,6 +3043,14 @@ class HoudiniMCP:
             if created:
                 try:
                     from . import hou_core
+                    anchor_position = None
+                    try:
+                        editor = hou.ui.curDesktop().paneTabOfType(hou.paneTabType.NetworkEditor)
+                        if editor and editor.pwd() == network:
+                            center = editor.visibleBounds().center()
+                            anchor_position = (float(center[0]), float(center[1]))
+                    except Exception:
+                        anchor_position = None
                     created_paths = [
                         created[nid].path()
                         for nid in creation_order
@@ -2986,6 +3061,7 @@ class HoudiniMCP:
                         node_paths=created_paths,
                         method="tidy",
                         spacing=1.0,
+                        anchor_position=anchor_position,
                     )
                 except Exception:
                     pass  # 布局失败不影响节点创建结果
@@ -3020,6 +3096,7 @@ class HoudiniMCP:
             msg = f"已创建 {len(created)} 个节点: {summary}"
             if messages:
                 msg += f"\n备注: {'; '.join(messages)}"
+            msg += self._manual_mode_hint()
             return True, msg
         except Exception as exc:
             # 回滚：删除已创建的节点以保持场景干净
@@ -3603,6 +3680,79 @@ class HoudiniMCP:
             return True, f"已设置 {node_path} {param_name}: {old_value} → {actual_value}", snapshot
         except Exception as exc:
             return False, f"设置失败: {exc}", None
+
+    def set_parameter_expression(self, node_path: str, param_name: str,
+                                 expression: str, language: str = "hscript"
+                                 ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """给节点参数设置表达式/通道引用（如 ch("../size")、$F、fit01(...)）。
+
+        与 set_parameter 的区别：set_parameter 写入静态值，本方法建立可求值的
+        表达式链接（HScript 或 Python）。设置前自动快照旧状态以支持撤销。
+
+        Args:
+            node_path: 节点完整路径
+            param_name: 参数名（必须是标量参数，不能是 tuple 名）
+            expression: 表达式字符串
+            language: "hscript"（默认）或 "python"
+
+        Returns:
+            (success, message, undo_snapshot)
+        """
+        if hou is None:
+            return False, "未检测到 Houdini API", None
+        if not expression or not str(expression).strip():
+            return False, "expression 不能为空", None
+
+        node = hou.node(node_path)
+        if node is None:
+            return False, f"未找到节点: {node_path}", None
+
+        parm = node.parm(param_name)
+        if parm is None:
+            # tuple 参数需逐分量设置，提示用户改用分量名
+            parm_tuple = node.parmTuple(param_name)
+            if parm_tuple is not None:
+                comp_names = ", ".join(p.name() for p in parm_tuple)
+                return False, (
+                    f"'{param_name}' 是 tuple 参数，表达式需按分量设置。"
+                    f"请对以下分量分别调用：{comp_names}"
+                ), None
+            return False, f"节点 {node_path} 不存在参数 '{param_name}'", None
+
+        lang_key = str(language).strip().lower()
+        if lang_key in ("python", "py"):
+            expr_lang = hou.exprLanguage.Python
+        elif lang_key in ("hscript", "hs", ""):
+            expr_lang = hou.exprLanguage.Hscript
+        else:
+            return False, f"未知表达式语言: {language}（应为 hscript 或 python）", None
+
+        # 快照旧状态（可能是表达式，也可能是静态值）
+        try:
+            old_expr = parm.expression()
+            old_lang = str(parm.expressionLanguage())
+            old_state = {"expr": old_expr, "lang": old_lang}
+        except Exception:
+            try:
+                old_state = {"value": parm.eval()}
+            except Exception:
+                old_state = None
+
+        try:
+            parm.setExpression(str(expression), language=expr_lang)
+        except Exception as exc:
+            return False, f"设置表达式失败: {exc}", None
+
+        snapshot = {
+            "node_path": node_path,
+            "param_name": param_name,
+            "old_value": old_state,
+            "new_value": {"expr": str(expression), "lang": lang_key or "hscript"},
+            "is_expression": True,
+        }
+        return True, (
+            f"已为 {node_path} {param_name} 设置{lang_key or 'hscript'}表达式: {expression}"
+        ), snapshot
 
     # ========================================
     # 节点删除
@@ -4293,6 +4443,26 @@ class HoudiniMCP:
                 result["_undo_snapshot"] = snapshot  # 供 UI 撤销使用，不会发给 AI
         return result
 
+    def _tool_set_parameter_expression(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_path = args.get("node_path", "")
+        param_name = args.get("param_name", "")
+        expression = args.get("expression", "")
+        language = args.get("language", "hscript")
+        missing = []
+        if not node_path:
+            missing.append("node_path(节点路径)")
+        if not param_name:
+            missing.append("param_name(参数名)")
+        if not expression:
+            missing.append("expression(表达式)")
+        if missing:
+            return {"success": False, "error": f"缺少必要参数: {', '.join(missing)}"}
+        ok, msg, snapshot = self.set_parameter_expression(node_path, param_name, expression, language)
+        result = {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
+        if ok and snapshot:
+            result["_undo_snapshot"] = snapshot  # 供 UI 撤销使用，不会发给 AI
+        return result
+
     def _tool_create_node(self, args: Dict[str, Any]) -> Dict[str, Any]:
         node_type = args.get("node_type", "")
         if not node_type:
@@ -4562,7 +4732,8 @@ class HoudiniMCP:
         keyword = args.get("keyword", "")
         if not keyword:
             return {"success": False, "error": "缺少 keyword 参数"}
-        ok, msg = self.search_nodes(keyword, args.get("limit", 10))
+        ok, msg = self.search_nodes(
+            keyword, args.get("limit", 10), category=args.get("category"))
         return {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
 
     def _tool_semantic_search_nodes(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -5127,17 +5298,20 @@ class HoudiniMCP:
     # ========================================
 
     def _tool_list_skills(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """列出所有可用 Skill"""
+        """列出所有可用 Skill（按分类分组）"""
         if not HAS_SKILLS or _list_skills is None:
             return {"success": False, "error": "Skill 系统未加载"}
         try:
-            skills = _list_skills()
+            category = (args or {}).get("category") or None
+            skills = _list_skills(category) if category else _list_skills()
             if not skills:
+                if category:
+                    return {"success": True, "result": f"分类 '{category}' 下没有可用的 Skill。"}
                 return {"success": True, "result": "当前没有可用的 Skill。"}
             # 结构化输出：每个 skill 的 name/description/parameters 一次性给全，
             # AI 拿到后可直接调 run_skill，无需二次探索。
             import json as _json
-            compact = []
+            grouped: Dict[str, list] = {}
             for s in skills:
                 params = s.get('parameters', {})
                 param_list = []
@@ -5148,19 +5322,25 @@ class HoudiniMCP:
                         "description": pinfo.get("description", ""),
                         "required": bool(pinfo.get("required", False)),
                     })
-                compact.append({
+                cat = s.get("category", "other")
+                grouped.setdefault(cat, []).append({
                     "name": s.get("name", ""),
                     "description": s.get("description", ""),
                     "risk_level": s.get("risk_level", "low"),
                     "parameters": param_list,
                 })
+            total = sum(len(v) for v in grouped.values())
+            cats = ", ".join(f"{c}({len(v)})" for c, v in sorted(grouped.items()))
             hint = (
-                f"共 {len(compact)} 个 Skill。调用方式：run_skill(skill_name=\"<name>\", "
-                f"params={{...}})。risk_level != low 的 Skill 有副作用，Ask 模式慎用。"
+                f"共 {total} 个 Skill，分 {len(grouped)} 类：{cats}。"
+                f"调用方式：run_skill(skill_name=\"<name>\", params={{...}})。"
+                f"可用 list_skills(category=\"<类名>\") 只看某一类。"
+                f"risk_level != low 的 Skill 会改场景/建图，Plan 规划阶段不可用（仅执行阶段）。"
             )
+            payload = {c: grouped[c] for c in sorted(grouped)}
             return {
                 "success": True,
-                "result": hint + "\n\n" + _json.dumps(compact, ensure_ascii=False, indent=2),
+                "result": hint + "\n\n" + _json.dumps(payload, ensure_ascii=False, indent=2),
             }
         except Exception as e:
             return {"success": False, "error": f"列出 Skill 失败: {e}"}
@@ -5433,6 +5613,7 @@ class HoudiniMCP:
         "get_network_structure": 'get_network_structure(network_path="/obj/geo1", page=1)',
         "get_node_parameters": 'get_node_parameters(node_path="/obj/geo1/box1", page=1)',
         "set_node_parameter": 'set_node_parameter(node_path="/obj/geo1/box1", param_name="sizex", value=2.0)',
+        "set_parameter_expression": 'set_parameter_expression(node_path="/obj/geo1/copy1", param_name="ncy", expression="ch(\\"../box1/sizex\\")", language="hscript")  # 设表达式/通道引用，非静态值',
         "create_node": 'create_node(parent_path="/obj/geo1", node_type="box", node_name="box1")',
         "get_node_card": 'get_node_card(node_type="scatter", context="Sop")  # 用陌生节点前查：min/max inputs + 参数 + menu items',
         "create_nodes_batch": 'create_nodes_batch(parent_path="/obj/geo1", nodes=[{"id":"a","type":"box","parameters":{"sizex":2}},{"id":"b","type":"scatter"}], connections=[{"from":"a","to":"b","input":0}])  # 陌生节点先用 dry_run=True 校验',
@@ -5480,6 +5661,7 @@ class HoudiniMCP:
         "get_node_card": "_tool_get_node_card",
         "inspect_node": "_tool_inspect_node",
         "set_node_parameter": "_tool_set_node_parameter",
+        "set_parameter_expression": "_tool_set_parameter_expression",
         "create_node": "_tool_create_node",
         "create_nodes_batch": "_tool_create_nodes_batch",
         "connect_nodes": "_tool_connect_nodes",
@@ -6318,7 +6500,43 @@ class HoudiniMCP:
         if node_type_obj is not None:
             return self._extract_type_info(node_type_obj, node_type)
 
+        # ---------- 策略 4: search_houdini_help 全文兜底 ----------
+        # 前三策略全部失败（本地帮助服务器/在线/类型信息都拿不到）时，
+        # 用离线手册全文检索兜底——可命中结构化索引之外的概念页/长文。
+        help_result = self._fetch_help_fulltext(node_type)
+        if help_result is not None:
+            return True, help_result
+
         return False, f"找不到节点类型 '{node_type}' 的文档。请用 search_node_types 确认正确的节点名。"
+
+    def _fetch_help_fulltext(self, node_type: str) -> Optional[str]:
+        """策略 4：用 search_houdini_help skill 全文检索离线手册兜底。
+
+        返回格式化文本，或 None（未命中/skill 不可用时降级到上层的硬失败）。
+        """
+        try:
+            from houdini_agent.skills import run_skill
+        except Exception:
+            return None
+        try:
+            res = run_skill("search_houdini_help", {"mode": "search",
+                                                    "query": node_type, "top_k": 3})
+        except Exception:
+            return None
+        if not isinstance(res, dict) or res.get("error") or not res.get("hits"):
+            return None
+
+        lines = [f"# {node_type} — 离线手册全文检索兜底 (search_houdini_help)", ""]
+        for h in res["hits"]:
+            title = h.get("title", "")
+            path = h.get("path", "")
+            snippet = h.get("snippet", "")
+            lines.append(f"## {title}  ({path})")
+            if snippet:
+                lines.append(snippet)
+            lines.append("")
+        lines.append("提示：用 run_skill('search_houdini_help', {mode:'page', path:'<上面某条 path>'}) 取完整正文。")
+        return "\n".join(lines)
 
     # ---- 帮助文档 子方法 ----
 
@@ -6455,11 +6673,13 @@ class HoudiniMCP:
                     inputs.append(f"  输入 {i}: {lbl}")
             except Exception:
                 pass
-            # 参数摘要（前 20 个）
+            # 参数摘要（前 40 个，与 get_node_card 的 max_parms=40 对齐）
             parms = []
+            total_parms = 0
             try:
                 parm_templates = node_type_obj.parmTemplates()
-                for pt in parm_templates[:20]:
+                total_parms = len(parm_templates)
+                for pt in parm_templates[:40]:
                     parms.append(f"  {pt.name()}: {pt.label()} ({pt.type().name()})")
             except Exception:
                 pass
@@ -6468,7 +6688,14 @@ class HoudiniMCP:
             if inputs:
                 doc.append("输入端口:\n" + '\n'.join(inputs))
             if parms:
-                doc.append(f"参数 (前{min(20, len(parms))}个):\n" + '\n'.join(parms))
+                shown = min(40, len(parms))
+                doc.append(f"参数 (前{shown}个):\n" + '\n'.join(parms))
+                if total_parms > shown:
+                    doc.append(
+                        f"\n⚠️ 本节点类型共有 {total_parms} 个参数，此处仅显示前 {shown} 个。"
+                        f"\n完整参数列表请用：get_node_card(node_type=\"{node_type}\", max_parms={total_parms})"
+                        f" 或对已建节点用 get_parameter_schema(node_path=\"...\") 查看（支持 offset 翻页）。"
+                    )
             return True, '\n'.join(doc)
         except Exception as e:
             return False, f"提取节点信息失败: {e}"

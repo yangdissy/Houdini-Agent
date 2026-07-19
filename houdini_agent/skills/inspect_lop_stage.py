@@ -3,10 +3,12 @@
 
 SKILL_INFO = {
     "name": "inspect_lop_stage",
+    "category": "usd",
     "description": (
         "Inspect a LOP node's USD stage: layers, prim type counts, cameras, "
         "lights, material-binding candidates, payloads, and references. Read-only."
     ),
+    "risk_level": "low",
     "parameters": {
         "node_path": {
             "type": "string",

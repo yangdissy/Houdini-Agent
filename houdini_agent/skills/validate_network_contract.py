@@ -3,10 +3,12 @@
 
 SKILL_INFO = {
     "name": "validate_network_contract",
+    "category": "graph",
     "description": (
         "Validate a Houdini network for common pipeline contract issues: OUT/null naming, "
         "display/render flags, missing inputs, bypass/locked nodes, errors/warnings, and dead nodes. Read-only."
     ),
+    "risk_level": "low",
     "parameters": {
         "network_path": {
             "type": "string",

@@ -3,10 +3,12 @@
 
 SKILL_INFO = {
     "name": "inspect_material_assignments",
+    "category": "materials",
     "description": (
         "Scan material libraries and material-like parameter references to find "
         "assigned, missing, and unused material paths. Read-only."
     ),
+    "risk_level": "low",
     "parameters": {
         "root_path": {
             "type": "string",

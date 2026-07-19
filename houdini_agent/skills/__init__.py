@@ -4,8 +4,20 @@ Skill 注册表 & 加载器
 
 Skill 是预定义的 Python 代码片段，在 Houdini 环境中执行。
 每个 skill 文件放在 skills/ 目录下，包含:
-  - SKILL_INFO: dict  (name, description, parameters)
+  - SKILL_INFO: dict  (name, category, description, parameters)
   - run(**kwargs) -> dict  入口函数
+
+★ 新增 skill 时，SKILL_INFO 必须标明 "category"，用于 list_skills 分组导航。
+  可用分类（新增分类前先复用现有的）：
+    geometry    - SOP 几何/属性/组分析
+    graph       - 网络结构、节点端口/卡片、依赖追溯、契约校验
+    scene       - 场景上下文、单节点报错诊断
+    usd         - LOPs / USD stage 检查
+    materials   - 材质指认/网络
+    performance - cook 性能、缓存报告
+    docs        - 文档检索
+    workflow    - 一键搭建蓝图（返回节点配方，不直接建节点）
+  未标注 category 的 skill 会被归入 "other"（应避免）。
 
 ★ Skill 通过 list_skills / run_skill 元工具暴露给 AI，不再注册为独立 skill_xxx 工具。
 ★ 支持用户自定义 Skill 目录（config/houdini_ai.ini → [skills] user_skill_dir）
@@ -96,13 +108,21 @@ def _load_all():
     # 保留 run_skill 元工具两步走（list_skills → run_skill）更可控。
 
 
-def list_skills() -> List[Dict[str, Any]]:
-    """返回所有已注册 skill 的元数据"""
+def list_skills(category: Optional[str] = None) -> List[Dict[str, Any]]:
+    """返回所有已注册 skill 的元数据
+
+    Args:
+        category: 可选，按分类过滤（如 'geometry'/'graph'/'usd'）。为 None 时返回全部。
+                  未标注 category 的 skill 归入 'other'。
+    """
     _load_all()
     result = []
     for name, mod in _registry.items():
         info = dict(getattr(mod, "SKILL_INFO", {}))
         info.setdefault("name", name)
+        info.setdefault("category", "other")
+        if category and info.get("category") != category:
+            continue
         result.append(info)
     return result
 

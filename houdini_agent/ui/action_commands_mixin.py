@@ -95,6 +95,7 @@ class ActionCommandsMixin:
         
         self._conversation_history.clear()
         self._context_summary = ""
+        self._last_auto_read_context = None
         self._current_response = None
         self._token_stats = {
             'input_tokens': 0, 'output_tokens': 0,
@@ -476,15 +477,17 @@ class ActionCommandsMixin:
         每次 _on_send 时调用一次，不在聊天界面中显示额外卡片。
         调用方式与手动 + 菜单中的 Read Selection / Read Network 保持一致。
         """
-        # ★ 注入 Houdini 更新模式提示（Cook Guard / 用户自身 Manual 都需要让 AI 知道）
+        # ★ 注入 Houdini 更新模式提示。
+        # 只根据本轮启动前快照判断用户/hip 是否原始 Manual；不要读取实时状态，
+        # 因为 Agent/Cook Guard 可能已临时切到 Manual，不能把它写成用户持久偏好。
         try:
             import hou  # type: ignore
-            current_mode = hou.updateModeSetting()
-            if current_mode == hou.updateMode.Manual:
+            original_mode = getattr(self, '_pre_agent_update_mode', None)
+            if original_mode == hou.updateMode.Manual:
                 self._conversation_history.append({
                     'role': 'user',
                     'content': (
-                        "[Scene state] Houdini update mode is Manual. "
+                        "[Scene state] Houdini update mode was Manual before this Agent run. "
                         "Modifications (create_node, set_display_flag, set_node_parameter, "
                         "connect_nodes, etc.) will NOT auto-cook. Tool 'success' only means "
                         "the operation was queued — do NOT assume the viewport or downstream "
@@ -508,6 +511,10 @@ class ActionCommandsMixin:
                 ok, text = self.mcp.get_network_structure_text()
                 label = "Network structure"
             if ok and text:
+                context_key = (mode, label, text)
+                if getattr(self, '_last_auto_read_context', None) == context_key:
+                    return
+                self._last_auto_read_context = context_key
                 self._conversation_history.append({
                     'role': 'user',
                     'content': f"[Auto-read: {label}]\n{text}"

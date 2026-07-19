@@ -165,6 +165,7 @@ class HarnessToolPolicyEngine:
         "delete_node": ("node_path",),
         "rename_node": ("node_path",),
         "set_node_parameter": ("node_path",),
+        "set_parameter_expression": ("node_path", "param_name"),
         "batch_set_parameters": ("node_path",),
         "connect_nodes": ("from_path", "to_path"),
         "create_named_null": ("name",),
@@ -175,7 +176,6 @@ class HarnessToolPolicyEngine:
         "copy_node": ("source_path",),
         "set_display_flag": ("node_path",),
         "set_node_flags": ("node_path",),
-        "get_node_inputs": ("node_type",),
         "check_errors": ("node_path",),
         "read_selection": ("node_path",),
     }
@@ -248,6 +248,16 @@ class HarnessToolPolicyEngine:
                     patched_args=patched,
                     retry_key=f"{tool_name}:output_path_ext",
                 )
+
+        # cook_node force=true 触发硬复位（bypass 切换 + 清 cache + 强制 cook），
+        # 可能长时间阻塞 Houdini 主线程。无论是否开启 confirm_mode，都要求用户确认，
+        # 防止模型绕过工具描述直接硬 cook 导致界面卡死。
+        if tool_name == "cook_node" and bool(safe_args.get("force")) and mode in {"agent", "plan"}:
+            return ToolPolicyDecision(
+                action="ask",
+                reason="cook_node force=true may block Houdini; requires confirmation",
+                patched_args=safe_args if safe_args != args else None,
+            )
 
         if safe_args != args:
             return ToolPolicyDecision(

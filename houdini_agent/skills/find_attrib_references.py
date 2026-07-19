@@ -6,11 +6,13 @@
 
 SKILL_INFO = {
     "name": "find_attribute_references",
+    "category": "geometry",
     "description": (
         "查找网络中所有引用了某个属性的节点。"
         "检查范围: VEX 代码（wrangle）、参数表达式、字符串参数值。"
         "适用于追踪属性使用、重构属性名、调试管线等场景。"
     ),
+    "risk_level": "low",
     "parameters": {
         "network_path": {
             "type": "string",

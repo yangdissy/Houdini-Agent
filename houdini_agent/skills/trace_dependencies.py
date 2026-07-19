@@ -6,11 +6,13 @@
 
 SKILL_INFO = {
     "name": "trace_node_dependencies",
+    "category": "graph",
     "description": (
         "追溯节点的上游依赖树或下游影响范围。"
         "upstream: 查看该节点依赖了哪些上游节点；downstream: 查看修改该节点会影响哪些下游。"
         "返回层级分组列表和可视化树形文本。"
     ),
+    "risk_level": "low",
     "parameters": {
         "node_path": {
             "type": "string",

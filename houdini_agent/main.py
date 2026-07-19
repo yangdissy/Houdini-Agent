@@ -70,6 +70,14 @@ def show_tool(username: str = None, force_login: bool = False):
     else:
         app = QtWidgets.QApplication.instance()
 
+    # ★ 禁用 Qt 无障碍桥接：规避 Windows UIAutomation 与中文输入法(WeType)
+    #   争用导致的 setText → QAccessible::updateAccessibility 段错误崩溃。
+    try:
+        from houdini_agent.qt_compat import disable_accessibility_bridge
+        disable_accessibility_bridge()
+    except Exception:
+        pass
+
     try:
         if _main_window is not None:
             if _main_window.isVisible():
@@ -95,6 +103,12 @@ def show_tool(username: str = None, force_login: bool = False):
                     pass
                 _main_window.force_quit = True
                 _main_window.close()
+                # ★ 显式隐藏，确保已进入删除流程的旧窗口及其子按钮不再参与
+                #   任何残留的布局/绘制事件（配合 safe_single_shot 存活守卫）。
+                try:
+                    _main_window.hide()
+                except Exception:
+                    pass
                 _main_window.deleteLater()
                 _main_window = None
                 # ★ 不要 processEvents()，它会触发队列中残留的事件导致窗口闪烁
