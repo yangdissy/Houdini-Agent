@@ -193,10 +193,32 @@ class DiagnosticsMixin:
         mode = 'plan' if self._plan_mode else ('agent' if self._agent_mode else 'ask')
         session_audit_jsonl = None
         session_audit_exists = False
+        session_audit_records = 0
+        session_audit_last_recorded_at = None
+        session_audit_stale = None
         try:
             session_audit_path = self._get_session_diagnostics_jsonl_path(session_id)
             session_audit_jsonl = str(session_audit_path)
             session_audit_exists = session_audit_path.exists()
+            if session_audit_exists:
+                last_recorded_at = None
+                with open(session_audit_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        session_audit_records += 1
+                        try:
+                            row = json.loads(line)
+                            last_recorded_at = row.get('recorded_at') or last_recorded_at
+                        except Exception:
+                            pass
+                session_audit_last_recorded_at = last_recorded_at
+                if last_recorded_at:
+                    try:
+                        last_dt = datetime.fromisoformat(str(last_recorded_at))
+                        session_audit_stale = (datetime.now() - last_dt).total_seconds() > 300
+                    except Exception:
+                        session_audit_stale = None
         except Exception:
             pass
 
@@ -213,6 +235,9 @@ class DiagnosticsMixin:
                 'conversation_messages': len(getattr(self, '_conversation_history', []) or []),
                 'session_audit_jsonl': session_audit_jsonl,
                 'session_audit_exists': session_audit_exists,
+                'session_audit_records': session_audit_records,
+                'session_audit_last_recorded_at': session_audit_last_recorded_at,
+                'session_audit_stale': session_audit_stale,
             },
             'runtime': {
                 'provider': provider,

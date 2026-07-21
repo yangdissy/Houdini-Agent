@@ -21,6 +21,11 @@ class AIClientThinkingHintTest(unittest.TestCase):
         self.assertTrue(AIClient.requires_temperature_one("gpt-5.3-codex"))
         self.assertEqual(AIClient._payload_temperature("gpt-5.5", 0.17), 1)
 
+    def test_legacy_kimi_k3_display_id_normalizes_to_api_model(self):
+        self.assertEqual(AIClient._normalize_model_id("k3[1m]"), "k3")
+        self.assertEqual(AIClient._normalize_model_id(" k3 "), "k3")
+        self.assertTrue(AIClient.requires_temperature_one(AIClient._normalize_model_id("k3[1m]")))
+
     def test_regular_models_keep_clamped_temperature(self):
         self.assertFalse(AIClient.requires_temperature_one("chatgpt-4o-latest"))
         self.assertEqual(AIClient._payload_temperature("chatgpt-4o-latest", 1.7), 1.0)

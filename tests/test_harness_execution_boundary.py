@@ -48,6 +48,17 @@ class HarnessExecutionBoundaryTest(unittest.TestCase):
         tab._execute_tool_impl = lambda *args, **kwargs: {"success": True, "result": "should not run"}
         return tab
 
+    @staticmethod
+    def _empty_geometry_result(node_path="/obj/geo1/OUT"):
+        return {
+            "success": True,
+            "result": "empty geometry",
+            "node_path": node_path,
+            "manual_mode": True,
+            "is_empty_geometry": True,
+            "recommended_next_action": "temporary_auto_validate",
+        }
+
     def test_model_supplied_policy_checked_flag_cannot_bypass_harness(self):
         tab = self._make_tab()
 
@@ -82,6 +93,28 @@ class HarnessExecutionBoundaryTest(unittest.TestCase):
 
         self.assertFalse(result["success"])
         self.assertEqual(confirmations[0][0], "execute_shell")
+
+    def test_empty_geometry_after_cook_gets_recovery_hint(self):
+        tab = self._make_tab()
+        tab._agent_mode = True
+        diagnostics = []
+        tab._append_session_diagnostics_records = lambda records, *args, **kwargs: diagnostics.extend(records)
+        results = [
+            self._empty_geometry_result(),
+            {"success": True, "result": "cooked"},
+            self._empty_geometry_result(),
+        ]
+        tab._execute_tool_impl = lambda *args, **kwargs: results.pop(0)
+
+        first = AITab._execute_tool_with_todo(tab, "get_geometry_summary", node_path="/obj/geo1/OUT")
+        cook = AITab._execute_tool_with_todo(tab, "cook_node", node_path="/obj/geo1/OUT")
+        second = AITab._execute_tool_with_todo(tab, "get_geometry_summary", node_path="/obj/geo1/OUT")
+
+        self.assertNotIn("recovery_hint", first)
+        self.assertTrue(cook["success"])
+        self.assertIn("recovery_hint", second)
+        self.assertIn("temporary_auto_validate", second["recovery_hint"])
+        self.assertTrue(any(record.get("event_type") == "geometry_validation_loop_guard" for record in diagnostics))
 
 
 if __name__ == "__main__":

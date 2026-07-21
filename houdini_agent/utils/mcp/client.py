@@ -1641,14 +1641,38 @@ class HoudiniMCP:
             if geo is None:
                 return False, {"error": f"节点 {node.path()} 没有几何体输出"}
 
+            update_mode = "unknown"
+            manual_mode = False
+            try:
+                mode = hou.updateModeSetting()
+                update_mode = mode.name() if hasattr(mode, "name") else str(mode)
+                manual_mode = (mode == hou.updateMode.Manual)
+            except Exception:
+                pass
+
+            point_count = geo.intrinsicValue("pointcount")
+            primitive_count = geo.intrinsicValue("primitivecount")
+            vertex_count = geo.intrinsicValue("vertexcount")
+            is_empty_geometry = (int(point_count) == 0 and int(primitive_count) == 0)
+            recommended_next_action = "inspect_wiring_or_parameters"
+            validation_confidence = "high"
+            if manual_mode and is_empty_geometry:
+                recommended_next_action = "temporary_auto_validate"
+                validation_confidence = "needs_refresh_validation"
+
             result: Dict[str, Any] = {
                 "node_path": node.path(),
                 "requested_path": node_path,
                 "node_type": node.type().name() if node.type() else "unknown",
                 "cook_state": cook_state,
-                "point_count": geo.intrinsicValue("pointcount"),
-                "primitive_count": geo.intrinsicValue("primitivecount"),
-                "vertex_count": geo.intrinsicValue("vertexcount"),
+                "update_mode": update_mode,
+                "manual_mode": manual_mode,
+                "is_empty_geometry": is_empty_geometry,
+                "validation_confidence": validation_confidence,
+                "recommended_next_action": recommended_next_action,
+                "point_count": point_count,
+                "primitive_count": primitive_count,
+                "vertex_count": vertex_count,
                 "sample_limit": max_sample_points,
             }
 
@@ -5384,7 +5408,46 @@ class HoudiniMCP:
             return {"success": False, "error": "缺少 parent_path 参数（要核查的网络路径，如 '/obj/geo1'）"}
         cook = bool(args.get("cook_display", True))
         ok, text = self.verify_network(parent_path, cook_display=cook)
-        return {"success": ok, "result": text if ok else "", "error": "" if ok else text}
+        result = {"success": ok, "result": text if ok else "", "error": "" if ok else text}
+        if ok:
+            result["validation_signal"] = self._verify_network_validation_signal(parent_path)
+        return result
+
+    def _verify_network_validation_signal(self, parent_path: str) -> Dict[str, Any]:
+        signal = {
+            "manual_mode_detected": False,
+            "display_geometry_empty": None,
+            "recommended_next_action": "inspect_wiring_or_parameters",
+        }
+        if hou is None:
+            return signal
+        try:
+            mode = hou.updateModeSetting()
+            signal["update_mode"] = mode.name() if hasattr(mode, "name") else str(mode)
+            signal["manual_mode_detected"] = (mode == hou.updateMode.Manual)
+        except Exception:
+            signal["update_mode"] = "unknown"
+        try:
+            parent = hou.node(parent_path)
+            display = parent.displayNode() if parent is not None and hasattr(parent, "displayNode") else None
+            if display is None:
+                return signal
+            geo = display.geometry()
+            if geo is None:
+                return signal
+            points = int(geo.intrinsicValue("pointcount"))
+            prims = int(geo.intrinsicValue("primitivecount"))
+            signal["display_geometry"] = {
+                "points": points,
+                "prims": prims,
+                "vertices": int(geo.intrinsicValue("vertexcount")),
+            }
+            signal["display_geometry_empty"] = (points == 0 and prims == 0)
+            if signal["manual_mode_detected"] and signal["display_geometry_empty"]:
+                signal["recommended_next_action"] = "temporary_auto_validate"
+        except Exception:
+            pass
+        return signal
 
     def _tool_search_local_doc(self, args: Dict[str, Any]) -> Dict[str, Any]:
         if not HAS_DOC_RAG:

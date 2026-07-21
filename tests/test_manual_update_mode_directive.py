@@ -36,6 +36,7 @@ sys.modules["hou"] = _HouStub(_UpdateMode.Auto)
 
 from houdini_agent.ui.action_commands_mixin import ActionCommandsMixin
 from houdini_agent.ui.ai_tab import AITab
+from houdini_agent.ui.i18n import tr
 
 
 class ManualUpdateModeDirectiveTest(unittest.TestCase):
@@ -81,6 +82,23 @@ class ManualUpdateModeDirectiveTest(unittest.TestCase):
         directive = AITab._build_manual_mode_directive(tab)
 
         self.assertIn("这是用户的持久设置", directive)
+
+    def test_confirm_directive_forbids_switching_auto(self):
+        sys.modules["hou"] = _HouStub(_UpdateMode.Auto)
+        tab = object.__new__(AITab)
+        tab._pre_agent_update_mode = _UpdateMode.Manual
+
+        directive = AITab._build_manual_mode_directive(tab, confirm_mode=True)
+
+        self.assertIn("不要擅自", directive)
+        self.assertIn("Auto", directive)
+
+    def test_direct_execute_prompt_allows_temporary_auto_validation(self):
+        prompt = tr('ai.direct_execute_prompt')
+
+        self.assertIn("AlwaysUpdate", prompt)
+        self.assertIn("临时", prompt)
+        self.assertIn("恢复用户原始更新模式", prompt)
 
     def test_scene_read_uses_snapshot_not_realtime_manual(self):
         sys.modules["hou"] = _HouStub(_UpdateMode.Manual)

@@ -662,6 +662,69 @@ class AITab(
         else:
             todo.update_todo(todo_id, status)
 
+    @staticmethod
+    def _geometry_validation_signal_from_result(result: dict) -> dict:
+        signal = result.get('validation_signal') if isinstance(result, dict) else None
+        if isinstance(signal, dict):
+            return {
+                'manual_mode': bool(signal.get('manual_mode_detected')),
+                'is_empty_geometry': bool(signal.get('display_geometry_empty')),
+                'recommended_next_action': signal.get('recommended_next_action'),
+            }
+        if isinstance(result, dict):
+            return {
+                'manual_mode': bool(result.get('manual_mode')),
+                'is_empty_geometry': bool(result.get('is_empty_geometry')),
+                'recommended_next_action': result.get('recommended_next_action'),
+            }
+        return {'manual_mode': False, 'is_empty_geometry': False, 'recommended_next_action': None}
+
+    def _apply_geometry_validation_loop_guard(self, tool_name: str, args: dict, result: dict, mode: str) -> dict:
+        if not isinstance(result, dict) or not result.get('success'):
+            return result
+        state = getattr(self, '_geometry_validation_loop_state', None)
+        if not isinstance(state, dict):
+            state = {}
+            self._geometry_validation_loop_state = state
+
+        target = args.get('node_path') or args.get('parent_path') or ''
+        if tool_name == 'cook_node' and target:
+            entry = state.setdefault(target, {'empty_count': 0, 'cook_after_empty': False})
+            if entry.get('empty_count', 0) > 0:
+                entry['cook_after_empty'] = True
+            return result
+
+        if tool_name not in {'get_geometry_summary', 'verify_network'}:
+            return result
+
+        signal = self._geometry_validation_signal_from_result(result)
+        if not (signal.get('manual_mode') and signal.get('is_empty_geometry')):
+            if target:
+                state.pop(target, None)
+            return result
+
+        entry = state.setdefault(target, {'empty_count': 0, 'cook_after_empty': False})
+        entry['empty_count'] = int(entry.get('empty_count', 0) or 0) + 1
+        if entry['empty_count'] >= 2 and entry.get('cook_after_empty'):
+            hint = (
+                'geometry_empty_after_cook: Manual update mode still reports empty geometry. '
+                'Follow recommended_next_action=temporary_auto_validate in Direct Execute mode; '
+                'do not keep using ordinary cook_node, parameter schema checks, or Sphere/Box replacement as validation.'
+            )
+            result['recovery_hint'] = hint
+            self._append_session_diagnostics_records([
+                {
+                    'event_type': 'geometry_validation_loop_guard',
+                    'tool': tool_name,
+                    'target': target,
+                    'mode': mode,
+                    'manual_mode': True,
+                    'is_empty_geometry': True,
+                    'recommended_next_action': signal.get('recommended_next_action'),
+                }
+            ])
+        return result
+
     def _execute_tool_with_policy(self, tool_name: str, kwargs: dict) -> dict:
         """Harness V2 policy gate for tool execution.
 
@@ -726,6 +789,7 @@ class AITab(
                 skip_builtin_confirm=True,
             )
             result = sanitize_tool_result(result)
+            result = self._apply_geometry_validation_loop_guard(tool_name, exec_kwargs, result, mode)
             self._append_session_diagnostics_records([
                 {
                     'event_type': 'tool_call',
@@ -797,6 +861,7 @@ class AITab(
         ])
         result = self._execute_tool_impl(tool_name, exec_kwargs)
         result = sanitize_tool_result(result)
+        result = self._apply_geometry_validation_loop_guard(tool_name, exec_kwargs, result, mode)
         self._append_session_diagnostics_records([
             {
                 'event_type': 'tool_call',

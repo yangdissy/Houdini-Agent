@@ -874,7 +874,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "cook_node",
-            "description": "在 Houdini 主线程强制计算指定节点。⚠️ 高风险：cook 重节点（模拟/VDB/大 scatter/坏 HDA/循环依赖）会阻塞 Houdini 主线程，可能导致界面卡死。\n\n⚠️ 不要用它来'验证'刚创建或刚改参数的节点。验证请改用只读工具：inspect_node（看节点状态/错误）、check_errors（看错误信息）、verify_network / validate_node_network（检查网络结构）、get_geometry_summary（看几何统计）。这些工具依赖 Houdini 已有的 cook 结果，不会主动触发重算。\n\n仅在用户明确要求 cook / 刷新 / 强制重算某个节点时才调用本工具。force=true 会额外做 bypass 切换 + 清 cache + 强制重 cook，属于更高风险操作，仅当用户明确要求硬复位/强制刷新缓存时使用，且需要用户确认。",
+            "description": "在 Houdini 主线程强制计算指定节点。⚠️ 高风险：cook 重节点（模拟/VDB/大 scatter/坏 HDA/循环依赖）会阻塞 Houdini 主线程，可能导致界面卡死。\n\n⚠️ 不要用它来'验证'刚创建或刚改参数的节点。验证请改用只读工具：inspect_node（看节点状态/错误）、check_errors（看错误信息）、verify_network / validate_node_network（检查网络结构）、get_geometry_summary（看几何统计）。这些工具依赖 Houdini 已有的 cook 结果，不会主动触发重算。\n\n普通 cook_node 成功不代表 Manual 更新模式下的空几何已排除；若 get_geometry_summary / verify_network 返回 recommended_next_action=temporary_auto_validate，请遵循该信号，不要继续普通 cook、查参数或替换 Sphere/Box 来验证。\n\n仅在用户明确要求 cook / 刷新 / 强制重算某个节点时才调用本工具。force=true 会额外做 bypass 切换 + 清 cache + 强制重 cook，属于更高风险操作，仅当用户明确要求硬复位/强制刷新缓存时使用，且需要用户确认。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -958,7 +958,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_geometry_summary",
-            "description": "结构化读取 SOP 节点的真实几何摘要：点/面/顶点数量、bbox、属性 schema、groups，以及可选点/primitive 属性抽样。用于验证几何网络实际产物，不要只凭截图猜测。",
+            "description": "结构化读取 SOP 节点的真实几何摘要：点/面/顶点数量、bbox、属性 schema、groups、update_mode/manual_mode/is_empty_geometry/recommended_next_action，以及可选点/primitive 属性抽样。用于验证几何网络实际产物，不要只凭截图猜测；Manual 更新模式下若 recommended_next_action=temporary_auto_validate，直接执行模式应临时切 Auto 验证后再判断。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2798,6 +2798,14 @@ class AIClient:
             return True
         return provider == 'duojie' and model.lower() in self._DUOJIE_ANTHROPIC_MODELS
 
+    @staticmethod
+    def _normalize_model_id(model: str) -> str:
+        """Normalize known legacy/display model names before sending requests."""
+        model = str(model or '').strip()
+        if model == 'k3[1m]':
+            return 'k3'
+        return model
+
     def _get_api_url(self, provider: str, model: str = '') -> str:
         provider = (provider or 'openai').lower()
         if provider == 'deepseek':
@@ -2958,7 +2966,7 @@ class AIClient:
     def requires_temperature_one(model: str) -> bool:
         """判断模型是否只支持 temperature=1（不允许自定义值）"""
         m = model.lower()
-        # Kimi Code 模型（k3[1m]、kimi-for-coding、-highspeed）与 k2 系、gpt-5 系固定 temperature=1
+        # Kimi Code 模型（k3、kimi-for-coding、-highspeed）与 k2 系、gpt-5 系固定 temperature=1
         return 'k2' in m or m.startswith('k3') or m.startswith('kimi-for-coding') or m.startswith('gpt-5')
 
     @staticmethod
@@ -3267,7 +3275,7 @@ class AIClient:
         
         # 思考模式
         # Kimi Code 说明（https://www.kimi.com/code/docs/kimi-code/models）：
-        #   - K3（k3[1m]）默认已开启深度思考，effort 缺省即映射为 max，无需显式传 thinking
+        #   - K3（k3）默认已开启深度思考，effort 缺省即映射为 max，无需显式传 thinking
         #   - K2.7 Code（kimi-for-coding / -highspeed）需开启 Thinking，否则会被降级路由到 K2.6
         if enable_thinking:
             if provider == 'kimi_coding':
@@ -3650,6 +3658,7 @@ class AIClient:
             return
         
         provider = (provider or 'openai').lower()
+        model = self._normalize_model_id(model)
         api_key = self._get_api_key(provider)
         
         # Ollama / Custom（无 Key）不需要 API Key 验证
@@ -4078,6 +4087,7 @@ class AIClient:
             return {'ok': False, 'error': '需要安装 requests 库'}
         
         provider = (provider or 'openai').lower()
+        model = self._normalize_model_id(model)
         api_key = self._get_api_key(provider)
         if not api_key and provider not in ('ollama', 'custom'):
             return {'ok': False, 'error': f'缺少 API Key'}
@@ -4228,6 +4238,7 @@ class AIClient:
         if not self._tool_executor:
             return {'ok': False, 'error': '未设置工具执行器', 'content': '', 'tool_calls_history': [], 'iterations': 0}
         
+        model = self._normalize_model_id(model)
         working_messages = list(messages)
         
         # ── 预处理：非视觉模型剥离所有 image_url 内容 ──
@@ -5171,6 +5182,8 @@ class AIClient:
         if not self._tool_executor:
             return {'ok': False, 'error': '未设置工具执行器', 'content': '', 'tool_calls_history': [], 'iterations': 0}
         
+        model = self._normalize_model_id(model)
+
         # 重置空内容计数器（每次新的 agent loop 调用都重置）
         self._json_empty_no_tool_count = 0
         
@@ -5804,6 +5817,7 @@ class AIClient:
                         provider: str = 'openai',
                         **kwargs) -> Dict[str, Any]:
         """自动选择合适的 Agent Loop 模式"""
+        model = self._normalize_model_id(model)
         if self._supports_function_calling(provider, model):
             return self.agent_loop_stream(messages=messages, model=model, provider=provider, **kwargs)
         else:
