@@ -9,6 +9,7 @@ import traceback
 
 from houdini_agent.qt_compat import QtCore, QtWidgets
 from houdini_agent.ui.i18n import tr
+from houdini_agent.core.harness_engine import build_tool_retry_key, sanitize_tool_result
 
 
 class ToolExecutionMixin:
