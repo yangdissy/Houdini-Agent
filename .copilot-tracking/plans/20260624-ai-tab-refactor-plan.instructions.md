@@ -63,28 +63,34 @@ Split the 7073-line `houdini_agent/ui/ai_tab.py` into focused mixins while prese
 - [x] Task 2.3: Extract action command mixin
   - Details: .copilot-tracking/details/20260624-ai-tab-refactor-details.md (Lines 104-120)
 
-### [ ] Phase 3: Extract Context And Cache Domains
+### [x] Phase 3: Extract Context And Cache Domains
 
-- [ ] Task 3.1: Extract context manager mixin
+- [x] Task 3.1: Extract context manager mixin
   - Details: .copilot-tracking/details/20260624-ai-tab-refactor-details.md (Lines 124-140)
 
-- [ ] Task 3.2: Extract cache and history rendering mixin
+- [x] Task 3.2: Extract cache and history rendering mixin
   - Details: .copilot-tracking/details/20260624-ai-tab-refactor-details.md (Lines 142-159)
 
-### [ ] Phase 4: Extract Tool Execution And Update Domains
+### [x] Phase 4: Extract Tool Execution And Update Domains
 
-- [ ] Task 4.1: Extract update mixin
+- [x] Task 4.1: Extract update mixin
   - Details: .copilot-tracking/details/20260624-ai-tab-refactor-details.md (Lines 163-178)
 
-- [ ] Task 4.2: Extract tool execution mixin last
+- [x] Task 4.2: Extract tool execution mixin last
   - Details: .copilot-tracking/details/20260624-ai-tab-refactor-details.md (Lines 180-201)
+  - Includes a runnable check for the tool-dispatch path (assert `_execute_tool_with_policy` reaches the policy gate and main-thread slot).
 
-### [ ] Phase 5: Verify And Clean Composition Root
+- [x] Task 4.3: Extract send orchestration mixin
+  - Details: .copilot-tracking/details/20260624-ai-tab-refactor-details.md (Task 4.3 section)
+  - Covers `_on_send` / `_run_agent` (~700-line block) — must not remain in `ai_tab.py` or be silently absorbed by another task.
 
-- [ ] Task 5.1: Reduce ai_tab.py to composition root
+### [x] Phase 5: Verify And Clean Composition Root
+
+- [x] Task 5.1: Reduce ai_tab.py to composition root
   - Details: .copilot-tracking/details/20260624-ai-tab-refactor-details.md (Lines 205-219)
+  - Includes MRO audit: list duplicate method names across all mixins and confirm inheritance order before finalizing.
 
-- [ ] Task 5.2: Run focused verification
+- [x] Task 5.2: Run focused verification
   - Details: .copilot-tracking/details/20260624-ai-tab-refactor-details.md (Lines 221-237)
 
 ## Dependencies
@@ -98,7 +104,13 @@ Split the 7073-line `houdini_agent/ui/ai_tab.py` into focused mixins while prese
 ## Success Criteria
 
 - `AITab` remains import-compatible and constructor-compatible.
-- `ai_tab.py` is reduced to a smaller composition root.
+- `ai_tab.py` is reduced to a composition root of 1500 lines or fewer (from 7073 originally; 4643 at Phase 3 start).
+- Each extraction task states its expected line-count budget in the details file and the result is checked against it.
+- `_on_send` and `_run_agent` (the ~700-line send/orchestration block) are explicitly assigned to a mixin via Task 4.3 — they must not remain in `ai_tab.py` or be silently absorbed by another task.
 - New focused mixins contain migrated behavior without rewrites.
 - Agent safety, main-thread execution, diagnostics audit, session anchoring, cache formats, and history restore behavior are preserved.
-- Import smoke test, compile check, and targeted tests pass or have documented unrelated failures.
+- After each phase (not only Phase 5): import smoke test for `AITab` and `compileall` on affected modules pass.
+- Task 4.2 includes a runnable check for the tool-dispatch path (unit test or script asserting `_execute_tool_with_policy` reaches the policy gate and main-thread slot).
+- Final inheritance order is backed by an MRO audit showing no unintended method shadowing.
+- Import smoke test, compile check, and targeted tests (`tests/test_agent_tool_selection.py`, `tests/test_diagnostics_export.py`) pass or have documented unrelated failures.
+- Completed tasks record their actual output filenames in the details file.

@@ -200,6 +200,26 @@ Move policy-gated tool execution, background/main-thread dispatch, cook/update-m
   - Diagnostics mixin available.
   - Runtime state mixin available.
 
+### Task 4.3: Extract send orchestration mixin
+
+Move the send/run orchestration block — `_on_send`, tool selection, and `_run_agent` (originally lines 3001-3724, the largest remaining mixed block) — into a dedicated mixin. This block is NOT covered by Tasks 3.1 (context helpers only) or 4.2 (policy/dispatch only); it must not be left behind or absorbed silently.
+
+- **Files**:
+  - `houdini_agent/core/send_orchestrator_mixin.py` - `_on_send`, tool selection, `_run_agent` and its direct private helpers. (Alternative: merge into existing `houdini_agent/core/agent_runner.py` if the added size stays under ~800 lines — decide before starting, not during.)
+  - `houdini_agent/ui/ai_tab.py` - inherit the new mixin and remove moved methods.
+- **Expected budget**: ~700 lines moved out of `ai_tab.py`.
+- **Success**:
+  - `_on_send` / `_run_agent` no longer exist in `ai_tab.py`.
+  - `_agent_session_id` anchoring still routes background callbacks to the correct session.
+  - Streaming, tool calls, and Plan-mode paths through `_run_agent` are unchanged.
+  - Import smoke test and `compileall` pass immediately after this task.
+- **Research References**:
+  - #file:../research/20260624-ai-tab-refactor-research.md - Key Line Evidence: lines 3001-3724 send/tool-selection/`_run_agent` block.
+  - #file:../research/20260624-ai-tab-refactor-research.md - Migration Strategy: move leaf domains before the large `_run_agent` block.
+- **Dependencies**:
+  - Task 3.1 (context manager mixin) complete — `_run_agent` depends on context helpers.
+  - Task 4.2 (tool execution mixin) complete — `_run_agent` calls tool dispatch.
+
 ## Phase 5: Verify And Clean Composition Root
 
 ### Task 5.1: Reduce ai_tab.py to composition root
