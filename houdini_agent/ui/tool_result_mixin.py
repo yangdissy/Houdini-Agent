@@ -5,11 +5,13 @@ import json
 import re
 
 from houdini_agent.qt_compat import QtCore, invoke_on_main
-from houdini_agent.ui.cursor_widgets import (
+from houdini_agent.ui.cursor_chat_widgets import (
     NodeOperationLabel,
+    StreamingCodePreview,
+)
+from houdini_agent.ui.cursor_rich_content import (
     PythonShellWidget,
     SystemShellWidget,
-    StreamingCodePreview,
 )
 from houdini_agent.ui.i18n import tr
 

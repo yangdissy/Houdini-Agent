@@ -105,6 +105,22 @@ class AIClientThinkingHintTest(unittest.TestCase):
         compressed = AIClient._compress_tool_result(client, "execute_shell", "bad result")
         self.assertIn("Invalid tool result type", compressed)
 
+    def test_tool_result_compression_handles_structured_result(self):
+        client = object.__new__(AIClient)
+
+        compressed = AIClient._compress_tool_result(
+            client,
+            "temporary_auto_validate_geometry",
+            {
+                "success": True,
+                "summary": "临时 Auto 验证完成: /obj/geo1/OUT points=4",
+                "result": {"node_path": "/obj/geo1/OUT", "point_count": 4},
+            },
+        )
+
+        self.assertIn("points=4", compressed)
+        self.assertIn("/obj/geo1/OUT", compressed)
+
 
 if __name__ == "__main__":
     unittest.main()

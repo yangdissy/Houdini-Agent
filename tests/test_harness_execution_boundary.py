@@ -46,6 +46,7 @@ class HarnessExecutionBoundaryTest(unittest.TestCase):
         tab._append_session_diagnostics_records = lambda *args, **kwargs: None
         tab._addStatus = _SignalStub()
         tab._execute_tool_impl = lambda *args, **kwargs: {"success": True, "result": "should not run"}
+        tab._pre_agent_update_mode = None
         return tab
 
     @staticmethod
@@ -94,7 +95,7 @@ class HarnessExecutionBoundaryTest(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(confirmations[0][0], "execute_shell")
 
-    def test_empty_geometry_after_cook_gets_recovery_hint(self):
+    def test_empty_geometry_after_cook_blocks_validation_signal(self):
         tab = self._make_tab()
         tab._agent_mode = True
         diagnostics = []
@@ -114,7 +115,28 @@ class HarnessExecutionBoundaryTest(unittest.TestCase):
         self.assertTrue(cook["success"])
         self.assertIn("recovery_hint", second)
         self.assertIn("temporary_auto_validate", second["recovery_hint"])
+        self.assertTrue(second["validation_blocked"])
+        self.assertEqual(second["validation_block_reason"], "manual_empty_geometry_after_cook")
+        self.assertEqual(second["recommended_next_action"], "temporary_auto_validate")
         self.assertTrue(any(record.get("event_type") == "geometry_validation_loop_guard" for record in diagnostics))
+
+
+    def test_set_update_mode_policy_path_updates_restore_snapshot(self):
+        tab = self._make_tab()
+        tab._agent_mode = True
+        tab._confirm_mode = True
+        tab._pre_agent_update_mode = "Manual"
+        tab._execute_tool_impl = lambda *args, **kwargs: {
+            "success": True,
+            "mode": "Auto",
+            "persistent_update_mode_change": True,
+        }
+
+        result = AITab._execute_tool_with_todo(tab, "set_update_mode", mode="auto")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["mode"], "Auto")
+        self.assertNotEqual(tab._pre_agent_update_mode, "Manual")
 
 
 if __name__ == "__main__":

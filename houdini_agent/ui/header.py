@@ -8,6 +8,12 @@ Header UI 构建 — 顶部设置栏（模型选择、Provider、Web/Think 开�
 
 from houdini_agent.qt_compat import QtWidgets, QtCore
 from .i18n import tr, get_language, set_language, language_changed
+from ..utils.dev_feature_toggles import (
+    DEV_FEATURE_TOGGLES,
+    is_dev_reload_enabled,
+    is_toggle_enabled,
+    set_toggle_enabled,
+)
 
 
 class HeaderMixin:
@@ -339,6 +345,9 @@ class HeaderMixin:
         if hasattr(self, "_request_user_switch"):
             menu.addAction("Switch User", self._request_user_switch)
         menu.addSeparator()
+        if is_dev_reload_enabled():
+            self._add_dev_feature_toggle_menu(menu)
+            menu.addSeparator()
         
         # 语言子菜单
         lang_menu = menu.addMenu("Language")
@@ -357,10 +366,25 @@ class HeaderMixin:
             QtCore.QPoint(0, self.btn_overflow.height())
         ))
 
+    def _add_dev_feature_toggle_menu(self, menu):
+        dev_menu = menu.addMenu("Dev Feature Toggles")
+        for toggle in DEV_FEATURE_TOGGLES:
+            action = dev_menu.addAction(toggle.label)
+            action.setCheckable(True)
+            action.setChecked(is_toggle_enabled(toggle))
+            if toggle.description:
+                try:
+                    action.setToolTip(f"{toggle.env_name}: {toggle.description}")
+                except Exception:
+                    pass
+            action.triggered.connect(
+                lambda checked=False, t=toggle: set_toggle_enabled(t, bool(checked))
+            )
+
     def _open_rules_editor(self):
         """打开用户自定义规则编辑器"""
         try:
-            from .cursor_widgets import RulesEditorDialog
+            from .cursor_rules_editor_dialog import RulesEditorDialog
             # 非模态显示：模态 exec_() 在 Houdini 嵌入环境下会启动独立事件循环，
             # 导致输入法上下文无法正确附加，中文无法输入。改用 show() 并持有引用。
             dlg = RulesEditorDialog(parent=self, username=getattr(self, "_username", None))
@@ -376,7 +400,7 @@ class HeaderMixin:
     def _open_plugin_manager(self):
         """打开插件管理面板"""
         try:
-            from .cursor_widgets import PluginManagerDialog
+            from .cursor_plugin_manager_dialog import PluginManagerDialog
             dlg = PluginManagerDialog(parent=self)
             dlg.pluginStateChanged.connect(self._on_plugin_state_changed)
             dlg.exec_()

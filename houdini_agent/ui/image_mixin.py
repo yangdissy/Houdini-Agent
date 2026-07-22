@@ -13,7 +13,7 @@ Image Mixin — 图片附件与多模态消息处理
 import os
 
 from houdini_agent.qt_compat import QtWidgets, QtCore, QtGui
-from .cursor_widgets import ClickableImageLabel
+from .cursor_chat_widgets import ClickableImageLabel
 
 
 class ImageMixin:

@@ -420,7 +420,7 @@ class ActionCommandsMixin:
 
     def _slash_help(self):
         """/help — 显示所有斜杠命令"""
-        from .cursor_widgets import SLASH_COMMANDS
+        from .cursor_input_widgets import SLASH_COMMANDS
         from .i18n import get_language
 
         is_zh = (get_language() == 'zh')

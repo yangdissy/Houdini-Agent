@@ -958,7 +958,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_geometry_summary",
-            "description": "结构化读取 SOP 节点的真实几何摘要：点/面/顶点数量、bbox、属性 schema、groups、update_mode/manual_mode/is_empty_geometry/recommended_next_action，以及可选点/primitive 属性抽样。用于验证几何网络实际产物，不要只凭截图猜测；Manual 更新模式下若 recommended_next_action=temporary_auto_validate，直接执行模式应临时切 Auto 验证后再判断。",
+            "description": "结构化读取 SOP 节点的真实几何摘要：点/面/顶点数量、bbox、属性 schema、groups、update_mode/manual_mode/is_empty_geometry/recommended_next_action，以及可选点/primitive 属性抽样。用于验证几何网络实际产物，不要只凭截图猜测；若多个基础源 SOP 都读到空，第一步先看 update_mode/manual_mode，不要先改参数或替换 generator。Manual 更新模式下若 recommended_next_action=temporary_auto_validate，优先调用 set_update_mode(mode='auto') 切到 Auto Update 后再判断。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -974,6 +974,37 @@ HOUDINI_TOOLS = [
                     "sample_primitives": {"type": "boolean", "description": "是否同时抽样 primitive 类型和属性，默认 false"}
                 },
                 "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "temporary_auto_validate_geometry",
+            "description": "专用几何验证工具：当 Manual 更新模式下 get_geometry_summary/verify_network 返回 recommended_next_action=temporary_auto_validate 或 validation_blocked=manual_empty_geometry_after_cook 时使用。工具会临时切到 Auto/AlwaysUpdate，cook 并读取指定 SOP 节点几何摘要，然后恢复原 update mode。不要用 execute_python 手写 setUpdateMode。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "要验证的 SOP 节点路径，如 '/obj/geo1/OUT'"},
+                    "max_sample_points": {"type": "integer", "description": "点/primitive 抽样数量，默认 0，最大 500"},
+                    "include_attributes": {"type": "boolean", "description": "是否返回属性 schema，默认 false"},
+                    "include_groups": {"type": "boolean", "description": "是否返回 group 名称，默认 false"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_update_mode",
+            "description": "agent 工具，不是 Houdini 原生 API：设置当前 hip 的 Houdini Update Mode。Manual 模式导致基础源 SOP/最终输出持续读空时，优先调用 set_update_mode(mode='auto') 直接切到 Auto Update，再重新验证几何。此工具是受限状态切换，不执行任意 Python。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["auto", "manual"], "description": "目标更新模式：auto=Auto/AlwaysUpdate，manual=Manual"}
+                },
+                "required": ["mode"]
             }
         }
     },
@@ -2181,7 +2212,9 @@ class AIClient:
         """
         result = sanitize_tool_result(result)
         if result.get('success'):
-            content = result.get('result', '')
+            content = result.get('summary') or result.get('result', '')
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False, default=str)
             # 已自带分页逻辑的工具：软上限截断 + 引导用 offset 翻页
             if tool_name in self._SELF_PAGED_TOOLS:
                 return self._soft_cap_with_offset_hint(tool_name, content)

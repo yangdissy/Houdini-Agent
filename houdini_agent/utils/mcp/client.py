@@ -4970,6 +4970,112 @@ class HoudiniMCP:
         error_parts.append(f"执行时间: {result.get('execution_time', 0):.3f}s")
         return {"success": False, "error": "\n".join(error_parts), "result": partial_output}
 
+    def _tool_temporary_auto_validate_geometry(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_path = str(args.get("node_path") or "").strip()
+        if not node_path:
+            return {"success": False, "error": "缺少 node_path 参数（要验证的 SOP 节点路径）"}
+        if hou is None:
+            return {"success": False, "error": "未检测到 Houdini API"}
+
+        original_mode = None
+        original_mode_name = "unknown"
+        auto_mode = None
+        try:
+            original_mode = hou.updateModeSetting()
+            original_mode_name = original_mode.name() if hasattr(original_mode, "name") else str(original_mode)
+        except Exception:
+            original_mode = None
+
+        try:
+            auto_mode = (
+                getattr(hou.updateMode, "AutoUpdate", None)
+                or getattr(hou.updateMode, "AlwaysUpdate", None)
+                or getattr(hou.updateMode, "Auto", None)
+            )
+            if auto_mode is not None and hasattr(hou, "setUpdateMode"):
+                hou.setUpdateMode(auto_mode)
+
+            node, error = self._resolve_geometry_node(node_path)
+            if error:
+                return {"success": False, "error": error}
+            assert node is not None
+            try:
+                node.cook(force=True)
+            except Exception as exc:
+                return {"success": False, "error": f"临时 Auto 验证 cook 失败: {exc}"}
+
+            ok, result = self.get_geometry_summary(
+                node_path,
+                max_sample_points=int(args.get("max_sample_points", 0) or 0),
+                include_attributes=bool(args.get("include_attributes", False)),
+                include_groups=bool(args.get("include_groups", False)),
+                sample_attributes=args.get("sample_attributes"),
+                sample_primitives=bool(args.get("sample_primitives", False)),
+            )
+            if not ok:
+                return {"success": False, "error": result.get("error", "临时 Auto 验证失败") if isinstance(result, dict) else str(result)}
+            point_count = result.get("point_count", "?") if isinstance(result, dict) else "?"
+            primitive_count = result.get("primitive_count", "?") if isinstance(result, dict) else "?"
+            update_mode = result.get("update_mode", "unknown") if isinstance(result, dict) else "unknown"
+            return {
+                "success": True,
+                "temporary_auto_validation": True,
+                "original_update_mode": original_mode_name,
+                "restored_update_mode": original_mode_name,
+                "auto_update_mode": auto_mode.name() if hasattr(auto_mode, "name") else str(auto_mode),
+                "summary": (
+                    f"临时 Auto 验证完成: {node_path} points={point_count}, "
+                    f"prims={primitive_count}, verification_update_mode={update_mode}; "
+                    f"已恢复 update mode={original_mode_name}"
+                ),
+                "result": result,
+            }
+        finally:
+            if original_mode is not None and hasattr(hou, "setUpdateMode"):
+                try:
+                    hou.setUpdateMode(original_mode)
+                except Exception:
+                    pass
+
+    def _tool_set_update_mode(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        mode_text = str(args.get("mode") or "").strip().lower().replace("_", "-").replace(" ", "-")
+        if not mode_text:
+            return {"success": False, "error": "缺少 mode 参数（auto 或 manual）"}
+        if hou is None:
+            return {"success": False, "error": "未检测到 Houdini API"}
+
+        if mode_text in {"auto", "auto-update", "autoupdate", "always", "alwaysupdate", "always-update"}:
+            target_mode = (
+                getattr(hou.updateMode, "AutoUpdate", None)
+                or getattr(hou.updateMode, "AlwaysUpdate", None)
+                or getattr(hou.updateMode, "Auto", None)
+            )
+        elif mode_text == "manual":
+            target_mode = getattr(hou.updateMode, "Manual", None)
+        else:
+            return {"success": False, "error": "mode 必须是 auto 或 manual"}
+        if target_mode is None:
+            return {"success": False, "error": f"无法解析 update mode 枚举: {mode_text}"}
+
+        try:
+            previous = hou.updateModeSetting()
+            previous_name = previous.name() if hasattr(previous, "name") else str(previous)
+        except Exception:
+            previous_name = "unknown"
+        try:
+            hou.setUpdateMode(target_mode)
+            current = hou.updateModeSetting()
+            current_name = current.name() if hasattr(current, "name") else str(current)
+            return {
+                "success": True,
+                "result": f"Update Mode 已设置为 {current_name}（之前: {previous_name}）",
+                "previous_mode": previous_name,
+                "mode": current_name,
+                "persistent_update_mode_change": True,
+            }
+        except Exception as exc:
+            return {"success": False, "error": f"设置 Update Mode 失败: {exc}"}
+
     # ========================================
     # 系统 Shell 沙盒执行
     # ========================================
@@ -5697,6 +5803,7 @@ class HoudiniMCP:
         "execute_python": 'execute_python(code="import hou; print(hou.node(\\"/obj\\").children())")',
         "execute_shell": 'execute_shell(command="pip list", cwd="C:/project", timeout=30)',
         "check_errors": 'check_errors(node_path="/obj/geo1/box1")',
+        "set_update_mode": 'set_update_mode(mode="auto")  # 将当前 hip 切到 Auto Update；mode 仅支持 "auto"/"manual"',
         "verify_network": 'verify_network(parent_path="/obj/geo1")  # 建完一组节点后，一次性核查整个网络（errors/warnings/flags/display 几何）',
         "search_local_doc": 'search_local_doc(query="scatter")',
         "get_houdini_node_doc": 'get_houdini_node_doc(node_type="scatter", page=1)',
@@ -5743,6 +5850,8 @@ class HoudiniMCP:
         "list_children": "_tool_list_children",
         "find_nodes": "_tool_find_nodes",
         "get_geometry_summary": "_tool_get_geometry_summary",
+        "temporary_auto_validate_geometry": "_tool_temporary_auto_validate_geometry",
+        "set_update_mode": "_tool_set_update_mode",
         "get_scene_snapshot": "_tool_get_scene_snapshot",
         # "get_geometry_info" 已移除，由 skill 替代
         "read_selection": "_tool_read_selection",

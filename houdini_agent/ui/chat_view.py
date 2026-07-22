@@ -9,11 +9,11 @@ Chat View — 对话显示和滚动逻辑
 """
 
 from houdini_agent.qt_compat import QtWidgets, QtCore, QtGui
-from .cursor_widgets import (
-    UserMessage,
+from .cursor_chat_widgets import (
     AIResponse,
-    StatusLine,
     ClickableImageLabel,
+    StatusLine,
+    UserMessage,
 )
 
 

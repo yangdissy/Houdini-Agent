@@ -46,7 +46,7 @@ class ToolMeta:
 _ASK_TOOLS = frozenset({
     'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
     'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
-    'get_geometry_summary', 'get_scene_snapshot',
+    'get_geometry_summary', 'temporary_auto_validate_geometry', 'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
     'check_errors',
     'verify_network', 'web_search', 'fetch_webpage',
@@ -60,7 +60,7 @@ _ASK_TOOLS = frozenset({
 _PLAN_PLANNING_TOOLS = frozenset({
     'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
     'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
-    'get_geometry_summary', 'get_scene_snapshot',
+    'get_geometry_summary', 'temporary_auto_validate_geometry', 'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
     'check_errors',
     'verify_network', 'web_search', 'fetch_webpage',
@@ -75,7 +75,7 @@ _PLAN_PLANNING_TOOLS = frozenset({
 _READONLY_TOOLS = frozenset({
     'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
     'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
-    'get_geometry_summary', 'get_scene_snapshot',
+    'get_geometry_summary', 'temporary_auto_validate_geometry', 'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
     'check_errors',
     'verify_network', 'web_search', 'fetch_webpage',
@@ -415,7 +415,7 @@ class ToolRegistry:
         'query': {
             'get_network_structure', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
             'suggest_connection', 'preview_node_operation', 'validate_node_network', 'find_nodes',
-            'get_geometry_summary', 'get_scene_snapshot',
+            'get_geometry_summary', 'temporary_auto_validate_geometry', 'get_scene_snapshot',
             'verify_network', 'read_selection',
             'search_memory',
             'capture_viewport',
@@ -434,12 +434,12 @@ class ToolRegistry:
             'set_node_parameter', 'set_parameter_expression', 'batch_set_parameters',
         },
         'flags': {
-            'inspect_node', 'preview_node_operation', 'set_node_flags',
+            'inspect_node', 'preview_node_operation', 'set_node_flags', 'set_update_mode',
             'validate_node_network',
         },
         'validate': {
             'inspect_node', 'get_node_connections', 'validate_node_network',
-            'verify_network', 'get_geometry_summary',
+            'verify_network', 'get_geometry_summary', 'temporary_auto_validate_geometry',
         },
         'cook': {
             'inspect_node', 'cook_node', 'verify_network', 'validate_node_network',
@@ -450,7 +450,7 @@ class ToolRegistry:
         },
         'modify': {
             'set_node_parameter', 'set_parameter_expression', 'batch_set_parameters',
-            'set_node_flags',
+            'set_node_flags', 'set_update_mode',
         },
         'operation': {
             'get_network_structure', 'inspect_node', 'get_parameter_schema',
@@ -537,6 +537,7 @@ class ToolRegistry:
         'set_node_parameter', 'batch_set_parameters', 'set_node_flags',
         'connect_nodes', 'disconnect_nodes', 'delete_node', 'rename_node',
         'layout_nodes', 'copy_node', 'create_named_null',
+        'set_update_mode',
     })
 
     _TOOL_DEPENDENCIES: Dict[str, Set[str]] = {

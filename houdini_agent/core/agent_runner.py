@@ -17,7 +17,7 @@ import threading
 import queue
 from houdini_agent.qt_compat import QtWidgets, QtCore
 from ..ui.i18n import tr, get_language
-from ..ui.cursor_widgets import VEXPreviewInline
+from ..ui.cursor_chat_widgets import VEXPreviewInline
 from .harness_policy_config import (
     CONFIRM_TOOLS,
     BG_SAFE_TOOLS,

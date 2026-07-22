@@ -69,6 +69,23 @@ class CoreToolContractTest(unittest.TestCase):
             with self.subTest(tool=name):
                 self.assertIn(name, ask_names)
 
+    def test_temporary_auto_validation_tool_is_registered_but_not_code_exec(self):
+        core_names = set(self.registry._tools)
+
+        self.assertIn("temporary_auto_validate_geometry", core_names)
+        self.assertNotIn("temporary_auto_validate_geometry", HIGH_RISK_TOOLS)
+        self.assertNotIn("temporary_auto_validate_geometry", CONFIRM_TOOLS)
+
+    def test_set_update_mode_tool_is_registered_but_not_code_exec(self):
+        core_names = set(self.registry._tools)
+
+        self.assertIn("set_update_mode", core_names)
+        self.assertNotIn("set_update_mode", HIGH_RISK_TOOLS)
+        self.assertNotIn("set_update_mode", CONFIRM_TOOLS)
+        description = self.registry._tools["set_update_mode"].schema["function"]["description"]
+        self.assertIn("agent 工具", description)
+        self.assertIn("不是 Houdini 原生 API", description)
+
     def test_node_operation_tools_are_registered(self):
         core_names = set(self.registry._tools)
         for name in (

@@ -161,6 +161,7 @@ class HarnessToolPolicyEngine:
         "get_parameter_schema": ("node_path",),
         "inspect_node": ("node_path",),
         "get_geometry_summary": ("node_path",),
+        "temporary_auto_validate_geometry": ("node_path",),
         "list_children": ("node_path",),
         "delete_node": ("node_path",),
         "rename_node": ("node_path",),
@@ -176,6 +177,7 @@ class HarnessToolPolicyEngine:
         "copy_node": ("source_path",),
         "set_display_flag": ("node_path",),
         "set_node_flags": ("node_path",),
+        "set_update_mode": ("mode",),
         "check_errors": ("node_path",),
         "read_selection": ("node_path",),
     }

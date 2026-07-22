@@ -51,7 +51,7 @@ class ToolExecutionMixin:
         mode_rule = (
             "4. 不要擅自把用户的更新模式改回 Auto——这是用户有意的设置。"
             if confirm_mode
-            else "4. 直接执行模式下，为验证真实几何结果可临时切 Auto；Agent 结束时框架会恢复用户原始更新模式，最终总结中说明曾临时切 Auto。"
+            else "4. 直接执行模式下，若 Manual 导致几何验证持续为空，可调用 set_update_mode(mode=\"auto\") 将当前 hip 切到 Auto Update 后继续验证；最终总结中说明已切到 Auto Update。"
         )
         return (
             "[Houdini 状态 — 重要] 当前 hip 文件的更新模式是 **Manual（手动）**，这是用户的持久设置。\n"
@@ -59,7 +59,7 @@ class ToolExecutionMixin:
             "set_display_flag 等）后，Houdini 不会自动 cook，视口与下游几何不会自动刷新。\n"
             "你必须遵守：\n"
             "1. 工具返回 success 只代表操作已排队，绝不能据此宣称「已生效/视口已更新/效果已完成」。\n"
-            "2. 报告完成前，必须用 verify_network / check_errors / get_network_structure 确认真实结果。\n"
+            "2. 报告完成前，必须用 verify_network / check_errors / get_network_structure 确认结构、连接与错误状态；但 verify_network / get_geometry_summary 返回的空几何在 Manual 模式下是低置信验证信号，不能单独当作拓扑或参数错误证据。\n"
             "3. 若用户期望看到结果，在总结中主动说明「当前为 Manual 模式，需手动 cook 或切回 Auto 才能看到更新」。\n"
             + mode_rule
         )
@@ -192,6 +192,10 @@ class ToolExecutionMixin:
         entry = state.setdefault(target, {'empty_count': 0, 'cook_after_empty': False})
         entry['empty_count'] = int(entry.get('empty_count', 0) or 0) + 1
         if entry['empty_count'] >= 2 and entry.get('cook_after_empty'):
+            result['validation_blocked'] = True
+            result['validation_block_reason'] = 'manual_empty_geometry_after_cook'
+            result['validation_confidence'] = 'blocked'
+            result['recommended_next_action'] = 'temporary_auto_validate'
             hint = (
                 'geometry_empty_after_cook: Manual update mode still reports empty geometry. '
                 'Follow recommended_next_action=temporary_auto_validate in Direct Execute mode; '
@@ -210,6 +214,17 @@ class ToolExecutionMixin:
                 }
             ])
         return result
+
+    def _after_tool_result(self, tool_name: str, result: dict) -> None:
+        if tool_name != 'set_update_mode' or not isinstance(result, dict) or not result.get('success'):
+            return
+        if not result.get('persistent_update_mode_change'):
+            return
+        try:
+            import hou  # type: ignore
+            self._pre_agent_update_mode = hou.updateModeSetting()
+        except Exception:
+            self._pre_agent_update_mode = None
 
     def _execute_tool_with_policy(self, tool_name: str, kwargs: dict) -> dict:
         """Harness V2 policy gate for tool execution.
@@ -276,6 +291,7 @@ class ToolExecutionMixin:
             )
             result = sanitize_tool_result(result)
             result = self._apply_geometry_validation_loop_guard(tool_name, exec_kwargs, result, mode)
+            self._after_tool_result(tool_name, result)
             self._append_session_diagnostics_records([
                 {
                     'event_type': 'tool_call',
@@ -348,6 +364,7 @@ class ToolExecutionMixin:
         result = self._execute_tool_impl(tool_name, exec_kwargs)
         result = sanitize_tool_result(result)
         result = self._apply_geometry_validation_loop_guard(tool_name, exec_kwargs, result, mode)
+        self._after_tool_result(tool_name, result)
         self._append_session_diagnostics_records([
             {
                 'event_type': 'tool_call',
@@ -414,6 +431,13 @@ class ToolExecutionMixin:
         
         # ★ 主线程忙保护：如果上一个工具超时了且主线程仍在 cook，
         #   不再堆积新的 BlockingQueuedConnection 信号（避免死锁）
+        executor = getattr(self, '_houdini_main_thread_executor', None)
+        if executor is not None and executor.is_blocked():
+            if tool_name not in self._BG_SAFE_TOOLS:
+                return {
+                    "success": False,
+                    "error": "Houdini 主线程执行器处于阻塞状态，为避免崩溃已拒绝新的 Houdini 工具执行。请重启面板后再继续。"
+                }
         if getattr(self, '_main_thread_busy', False):
             if tool_name not in self._BG_SAFE_TOOLS:
                 return {
@@ -551,6 +575,13 @@ class ToolExecutionMixin:
         阻止后续工具调用堆积 BlockingQueuedConnection 信号（避免死锁）。
         主线程槽函数执行完毕后自动清除标记。
         """
+        executor = getattr(self, '_houdini_main_thread_executor', None)
+        if executor is not None:
+            result = executor.execute(tool_name, kwargs)
+            if executor.is_blocked():
+                self._main_thread_busy = True
+            return result
+
         # 使用锁确保一次只有一个工具调用（避免并发竞争）
         with self._tool_lock:
             # 清空队列（防止残留数据）
@@ -593,6 +624,13 @@ class ToolExecutionMixin:
         Returns:
             [result_dict, ...]（与 batch 顺序一致）
         """
+        executor = getattr(self, '_houdini_main_thread_executor', None)
+        if executor is not None:
+            results = executor.execute_batch(batch)
+            if executor.is_blocked():
+                self._main_thread_busy = True
+            return results
+
         with self._tool_lock:
             while not self._tool_result_queue.empty():
                 try:
@@ -763,99 +801,32 @@ class ToolExecutionMixin:
             print(f"[⚠️ THREAD SAFETY] _on_execute_tool_main_thread 不在主线程执行! "
                   f"tool={tool_name}, current_thread={QtCore.QThread.currentThread()}")
         
-        result = {"success": False, "error": tr('ai.unknown_err')}
-        
-        # 判断是否为修改操作（需要 undo group）
-        _MUTATING_TOOLS = {
-            "create_node", "create_nodes_batch", "create_wrangle_node",
-            "delete_node", "rename_node", "set_node_parameter", "connect_nodes",
-            "copy_node", "batch_set_parameters", "set_display_flag",
-            "execute_python", "save_hip", "run_skill",
-        }
-        use_undo_group = tool_name in _MUTATING_TOOLS
-        
-        # ★ Cook 保护（v1.4.3）：对可能触发 cook 的工具，
-        # 在 Agent 运行期间保持 Manual 模式，防止 cook 阻塞主线程
-        # 模式恢复在 Agent 结束时统一处理（_restore_update_mode）
-        if tool_name in self._COOK_TRIGGERING_TOOLS:
+        executor = getattr(self, '_houdini_main_thread_executor', None)
+        if executor is not None:
+            kwargs = dict(kwargs or {})
+            operation_id = kwargs.pop('_ha_operation_id', None)
+            result = executor.run_in_main_thread(
+                tool_name=tool_name,
+                kwargs=kwargs,
+                execute_tool=self.mcp.execute_tool,
+                cook_before_read=self._cook_displayed_nodes_if_manual,
+                snapshot_network_children=self._snapshot_network_children,
+                diff_network_children=self._diff_network_children,
+                refresh_selection_baseline=self._refresh_selection_baseline,
+                self_tracking_tools=self._SELF_TRACKING_TOOLS,
+                error_formatter=lambda exc: tr('ai.tool_exec_err', str(exc)),
+            )
+        else:
             try:
-                import hou  # type: ignore
-                if hou.updateModeSetting() != hou.updateMode.Manual:
-                    hou.setUpdateMode(hou.updateMode.Manual)
-            except Exception:
-                pass
-        
-        # ★ 读取前 Cook（v1.4.4）：当 Agent 处于 Manual 保护模式下，
-        # 读取工具执行前先对当前显示节点做一次针对性 cook，
-        # 确保 AI 能看到修改后的最新结果（而非 stale 数据）
-        if tool_name in self._COOK_BEFORE_READ_TOOLS:
-            self._cook_displayed_nodes_if_manual()
-        
-        # ★ 对不自带 checkpoint 追踪的修改工具，做 before/after 快照
-        should_snapshot = (
-            tool_name in _MUTATING_TOOLS
-            and tool_name not in self._SELF_TRACKING_TOOLS
-            and tool_name != 'save_hip'  # save 无需快照
-        )
-        before_children = self._snapshot_network_children() if should_snapshot else {}
-        
-        try:
-            # 对修改操作开启 undo group
-            if use_undo_group:
-                try:
-                    import hou  # type: ignore
-                    hou.undos.beginGroup(f"AI Agent: {tool_name}")
-                except Exception:
-                    use_undo_group = False  # hou 不可用则跳过
-            
-            result = self.mcp.execute_tool(tool_name, kwargs)
-        except Exception as e:
-            result = {"success": False, "error": tr('ai.tool_exec_err', str(e))}
-        finally:
-            # ★ 执行后快照 & diff，检测节点变更
-            if should_snapshot and result.get("success"):
-                try:
-                    after_children = self._snapshot_network_children()
-                    changes = self._diff_network_children(before_children, after_children)
-                    if changes:
-                        result['_node_changes'] = changes
-                except Exception:
-                    pass  # 快照失败不影响工具结果
+                result = self.mcp.execute_tool(tool_name, kwargs)
+            except Exception as e:
+                result = {"success": False, "error": tr('ai.tool_exec_err', str(e))}
 
-            # 关闭 undo group
-            if use_undo_group:
-                try:
-                    import hou  # type: ignore
-                    hou.undos.endGroup()
-                except Exception:
-                    pass
+        # ★ 清除主线程忙标记：主线程 slot 已返回。
+        self._main_thread_busy = False
 
-            # ★ Cook 保护恢复：不在单个工具 finally 中恢复更新模式
-            # 而是在 Agent 结束时统一恢复（_restore_update_mode），
-            # 避免中间工具恢复后触发耗时 cook 阻塞主线程
-
-            # ★ 清除主线程忙标记
-            # 无论工具执行成功或失败，主线程已经空闲
-            self._main_thread_busy = False
-
-            # ★ 吸收 Agent 操作造成的选择变化：把当前选择刷新为新基线，
-            #   避免下一次 poll 把 Agent 自己改的选择误判为用户手动操作。
-            self._refresh_selection_baseline()
-
-            # ★ macOS 崩溃修复：不再在此处调用 processEvents()
-            # ─────────────────────────────────────────────────────
-            # 旧代码：QtWidgets.QApplication.processEvents()
-            #
-            # 为什么移除？
-            # 1. 此槽函数通过 BlockingQueuedConnection 从后台线程触发，
-            #    在 emit 返回前主线程事件循环不会处理新事件——这是设计意图。
-            # 2. processEvents() 会在槽函数内部递归处理事件队列，可能导致：
-            #    a) 递归触发另一个 _executeToolRequest 信号（死锁或重入）
-            #    b) 触发 Houdini 场景事件、渲染回调等（与当前 hou 操作竞争）
-            #    c) macOS Cocoa runloop 重入，导致 EXC_BAD_ACCESS 崩溃
-            # 3. BlockingQueuedConnection 返回后，主线程事件循环自然会继续
-            #    处理排队的事件——无需手动 processEvents。
-            # ─────────────────────────────────────────────────────
-
-            # 将结果放入队列（线程安全）
+        # ★ macOS 崩溃修复：不要在 BlockingQueuedConnection slot 内调用 processEvents()。
+        if executor is not None and operation_id is not None:
+            self._tool_result_queue.put(executor.attach_result(operation_id, result))
+        else:
             self._tool_result_queue.put(result)

@@ -8,14 +8,16 @@ Input Area UI 构建 — 输入区域和模式切换
 
 from houdini_agent.qt_compat import QtWidgets, QtCore
 from .i18n import tr, get_language
-from .cursor_widgets import (
-    CursorTheme,
+from .cursor_input_widgets import (
     ChatInput,
-    SendButton,
-    StopButton,
-    UnifiedStatusBar,
     NodeCompleterPopup,
     SlashCommandPopup,
+    UnifiedStatusBar,
+)
+from .cursor_theme import CursorTheme
+from .cursor_utility_widgets import (
+    SendButton,
+    StopButton,
 )
 
 

@@ -36,7 +36,7 @@ from houdini_agent.qt_compat import QtCore
 
 from ..ui.i18n import tr
 from ..utils.plan_manager import get_plan_manager
-from ..ui.cursor_widgets import AskQuestionCard, PlanViewer, StreamingPlanCard
+from ..ui.cursor_plan_widgets import AskQuestionCard, PlanViewer, StreamingPlanCard
 
 
 class PlanMixin:

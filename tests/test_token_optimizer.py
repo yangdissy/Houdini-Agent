@@ -136,6 +136,16 @@ class TokenOptimizerMessageTest(unittest.TestCase):
         out = self.opt.compress_tool_result({"success": True, "result": "ok"})
         self.assertEqual(out, "ok")
 
+    def test_compress_tool_result_structured_success(self):
+        out = self.opt.compress_tool_result({
+            "success": True,
+            "summary": "临时 Auto 验证完成: /obj/geo1/OUT points=4",
+            "result": {"node_path": "/obj/geo1/OUT", "point_count": 4},
+        })
+
+        self.assertIn("points=4", out)
+        self.assertIn("/obj/geo1/OUT", out)
+
     def test_compress_tool_result_empty(self):
         self.assertEqual(self.opt.compress_tool_result({}), "")
 

@@ -21,7 +21,7 @@ class _ModeValue:
 
 class _UpdateMode:
     Manual = _ModeValue("Manual")
-    Auto = _ModeValue("Auto")
+    AutoUpdate = _ModeValue("AutoUpdate")
 
 
 class _NodeType:
@@ -117,9 +117,14 @@ class _HouStub:
     def __init__(self, mode, nodes=None):
         self._mode = mode
         self._nodes = nodes or {}
+        self.set_modes = []
 
     def updateModeSetting(self):
         return self._mode
+
+    def setUpdateMode(self, mode):
+        self.set_modes.append(mode)
+        self._mode = mode
 
     def node(self, path):
         return self._nodes.get(path)
@@ -159,7 +164,7 @@ class GeometryValidationSignalsTest(unittest.TestCase):
         self.assertEqual(result["recommended_next_action"], "temporary_auto_validate")
 
     def test_auto_empty_geometry_does_not_recommend_auto_validation(self):
-        client = self._client_for(_UpdateMode.Auto, _Geometry())
+        client = self._client_for(_UpdateMode.AutoUpdate, _Geometry())
 
         ok, result = client.get_geometry_summary(
             "/obj/geo1/OUT",
@@ -169,7 +174,7 @@ class GeometryValidationSignalsTest(unittest.TestCase):
         )
 
         self.assertTrue(ok)
-        self.assertEqual(result["update_mode"], "Auto")
+        self.assertEqual(result["update_mode"], "AutoUpdate")
         self.assertFalse(result["manual_mode"])
         self.assertTrue(result["is_empty_geometry"])
         self.assertNotEqual(result["recommended_next_action"], "temporary_auto_validate")
@@ -205,6 +210,66 @@ class GeometryValidationSignalsTest(unittest.TestCase):
             result["validation_signal"]["recommended_next_action"],
             "temporary_auto_validate",
         )
+
+    def test_temporary_auto_validate_geometry_restores_update_mode(self):
+        hou_stub = _HouStub(_UpdateMode.Manual)
+        mcp_client.hou = hou_stub
+        client = object.__new__(mcp_client.HoudiniMCP)
+        node = _Node(_Geometry(point_count=4, primitive_count=1, vertex_count=4))
+        client._resolve_geometry_node = lambda node_path: (node, None)
+        client._jsonable_value = lambda value: value
+
+        result = client._tool_temporary_auto_validate_geometry({
+            "node_path": "/obj/geo1/OUT",
+            "max_sample_points": 0,
+        })
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["temporary_auto_validation"])
+        self.assertEqual(result["restored_update_mode"], "Manual")
+        self.assertIn("临时 Auto 验证完成", result["summary"])
+        self.assertEqual(result["result"]["point_count"], 4)
+        self.assertEqual(hou_stub.set_modes, [_UpdateMode.AutoUpdate, _UpdateMode.Manual])
+
+    def test_temporary_auto_validate_geometry_requires_target(self):
+        mcp_client.hou = _HouStub(_UpdateMode.Manual)
+        client = object.__new__(mcp_client.HoudiniMCP)
+
+        result = client._tool_temporary_auto_validate_geometry({})
+
+        self.assertFalse(result["success"])
+        self.assertIn("node_path", result["error"])
+
+    def test_set_update_mode_sets_auto_without_restore(self):
+        hou_stub = _HouStub(_UpdateMode.Manual)
+        mcp_client.hou = hou_stub
+        client = object.__new__(mcp_client.HoudiniMCP)
+
+        result = client._tool_set_update_mode({"mode": "auto"})
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["mode"], "AutoUpdate")
+        self.assertEqual(hou_stub.set_modes, [_UpdateMode.AutoUpdate])
+
+    def test_set_update_mode_accepts_auto_update_alias(self):
+        hou_stub = _HouStub(_UpdateMode.Manual)
+        mcp_client.hou = hou_stub
+        client = object.__new__(mcp_client.HoudiniMCP)
+
+        result = client._tool_set_update_mode({"mode": "Auto Update"})
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["mode"], "AutoUpdate")
+        self.assertEqual(hou_stub.set_modes, [_UpdateMode.AutoUpdate])
+
+    def test_set_update_mode_rejects_unknown_mode(self):
+        mcp_client.hou = _HouStub(_UpdateMode.Manual)
+        client = object.__new__(mcp_client.HoudiniMCP)
+
+        result = client._tool_set_update_mode({"mode": "sometimes"})
+
+        self.assertFalse(result["success"])
+        self.assertIn("mode", result["error"])
 
 
 if __name__ == "__main__":

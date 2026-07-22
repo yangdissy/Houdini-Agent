@@ -283,9 +283,12 @@ class TokenOptimizer:
             error = result.get('error', 'Unknown error')
             return f"错误: {error[:max_length]}"
         
-        result_text = result.get('result', '')
+        result_text = result.get('summary') or result.get('result', '')
         if not result_text:
             return "成功"
+        if not isinstance(result_text, str):
+            import json
+            result_text = json.dumps(result_text, ensure_ascii=False, default=str)
         
         # 如果结果很短，直接返回
         if len(result_text) <= max_length:

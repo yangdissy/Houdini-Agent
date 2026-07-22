@@ -20,7 +20,7 @@ class ContextManagerMixin:
         '|get_node_parameters|get_parameter_schema|inspect_node|set_node_parameter|create_node|create_nodes_batch'
         '|connect_nodes|cook_node|get_node_connections|suggest_connection|preview_node_operation'
         '|create_named_null|validate_node_network|delete_node|search_node_types|semantic_search_nodes'
-        '|list_children|find_nodes|get_geometry_summary|get_scene_snapshot|read_selection|set_display_flag'
+        '|list_children|find_nodes|get_geometry_summary|temporary_auto_validate_geometry|get_scene_snapshot|read_selection|set_display_flag|set_update_mode'
         '|copy_node|batch_set_parameters|save_hip|undo_redo'
         '|web_search|fetch_webpage|search_local_doc|get_houdini_node_doc'
         '|execute_python|execute_shell|check_errors|add_todo|update_todo'
@@ -389,7 +389,7 @@ class ContextManagerMixin:
     
     def _insert_compression_notice(self, removed_rounds: int):
         """在聊天区顶部（第0位）插入一条上下文压缩提示，不重建整个对话区。"""
-        from .cursor_widgets import StatusLine
+        from .cursor_chat_widgets import StatusLine
         text = f"🗜 已自动压缩 {removed_rounds} 轮旧对话以节省 Token"
         notice = StatusLine(text)
         notice.setStyleSheet("background:#1e293b; color:#64748b; font-size:11px; padding:4px 12px; border-radius:4px;")

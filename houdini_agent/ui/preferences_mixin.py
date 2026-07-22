@@ -4,7 +4,7 @@
 import json
 
 from houdini_agent.qt_compat import QtWidgets, QtGui, QSettings
-from houdini_agent.ui.cursor_widgets import CursorTheme
+from houdini_agent.ui.cursor_theme import CursorTheme
 from houdini_agent.ui.font_settings_dialog import FontSettingsDialog
 from houdini_agent.ui.i18n import tr
 from houdini_agent.utils.token_optimizer import CompressionStrategy
@@ -215,7 +215,7 @@ class PreferencesMixin:
 
     def _show_token_stats_dialog(self):
         """显示详细 Token 统计对话框（对齐 Cursor：使用 TokenAnalyticsPanel）"""
-        from houdini_agent.ui.cursor_widgets import TokenAnalyticsPanel
+        from houdini_agent.ui.cursor_analytics_widgets import TokenAnalyticsPanel
         records = getattr(self, '_call_records', []) or []
         harness_records = getattr(self, '_harness_trace_records', []) or []
         dialog = TokenAnalyticsPanel(records, self._token_stats, harness_records, parent=self)

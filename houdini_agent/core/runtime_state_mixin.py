@@ -9,10 +9,16 @@ from datetime import datetime
 
 from houdini_agent.qt_compat import QtCore
 from houdini_agent.ui.i18n import tr
+from ..utils.dev_feature_toggles import DEV_FEATURE_TOGGLES, is_toggle_enabled
 
 
 class RuntimeStateMixin:
     _TAB_RUNNING_PREFIX = "\u25cf "
+
+    @staticmethod
+    def _selection_watch_enabled() -> bool:
+        toggle = next(t for t in DEV_FEATURE_TOGGLES if t.env_name == "HOUDINI_AGENT_SELECTION_WATCH")
+        return is_toggle_enabled(toggle)
 
     def _set_running(self, running: bool):
         self._is_running = running
@@ -93,6 +99,8 @@ class RuntimeStateMixin:
         """
         self._selection_watch_cb = None
         self._agent_selection_baseline = None
+        if not self._selection_watch_enabled():
+            return
         # 启动瞬间给一个短抑制期，吸收 Agent 首个工具执行前的选择抖动
         self._selection_settle_until = time.time() + 1.0
         try:
@@ -175,6 +183,9 @@ class RuntimeStateMixin:
             self.client.request_stop()
         except (RuntimeError, AttributeError):
             pass
+        executor = getattr(self, '_houdini_main_thread_executor', None)
+        if executor is not None:
+            executor.shutdown()
         self._stop_selection_watch()
         for attr in ("_thinking_timer", "_glow_timer"):
             timer = getattr(self, attr, None)

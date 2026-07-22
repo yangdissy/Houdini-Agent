@@ -60,6 +60,30 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         self.assertEqual(missing_command.action, "deny")
         self.assertIn("command", missing_command.reason)
 
+    def test_temporary_auto_validate_requires_node_path_and_is_allowed(self):
+        missing_target = self.policy.decide("temporary_auto_validate_geometry", {}, {"mode": "agent"})
+        self.assertEqual(missing_target.action, "deny")
+        self.assertIn("node_path", missing_target.reason)
+
+        decision = self.policy.decide(
+            "temporary_auto_validate_geometry",
+            {"node_path": "/obj/geo1/OUT"},
+            {"mode": "agent", "confirm_mode": True},
+        )
+        self.assertEqual(decision.action, "allow")
+
+    def test_set_update_mode_requires_mode_and_is_allowed(self):
+        missing_mode = self.policy.decide("set_update_mode", {}, {"mode": "agent"})
+        self.assertEqual(missing_mode.action, "deny")
+        self.assertIn("mode", missing_mode.reason)
+
+        decision = self.policy.decide(
+            "set_update_mode",
+            {"mode": "auto"},
+            {"mode": "agent", "confirm_mode": True},
+        )
+        self.assertEqual(decision.action, "allow")
+
     def test_sensitive_argument_key_is_denied(self):
         decision = self.policy.decide(
             "execute_shell",

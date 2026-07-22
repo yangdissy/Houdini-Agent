@@ -33,26 +33,34 @@ from ..utils.token_optimizer import TokenOptimizer, TokenBudget, CompressionStra
 from ..utils.ultra_optimizer import UltraOptimizer
 from .theme_engine import ThemeEngine
 from .font_settings_dialog import FontSettingsDialog
-from .cursor_widgets import (
-    CursorTheme,
-    UserMessage,
+from .cursor_analytics_widgets import TodoList
+from .cursor_chat_widgets import (
     AIResponse,
+    ClickableImageLabel,
+    CollapsibleContent,
+    StatusLine,
+    UserMessage,
+)
+from .cursor_input_widgets import (
+    ChatInput,
+    NodeCompleterPopup,
+    NodeContextBar,
+    ToolStatusBar,
+)
+from .cursor_plan_widgets import (
+    AskQuestionCard,
     PlanBlock,
     PlanViewer,
     StreamingPlanCard,
-    AskQuestionCard,
-    CollapsibleContent,
-    StatusLine,
-    ChatInput,
-    SendButton,
-    StopButton,
-    TodoList,
-    NodeContextBar,
+)
+from .cursor_rich_content import (
     PythonShellWidget,
     SystemShellWidget,
-    ClickableImageLabel,
-    ToolStatusBar,
-    NodeCompleterPopup,
+)
+from .cursor_theme import CursorTheme
+from .cursor_utility_widgets import (
+    SendButton,
+    StopButton,
     UpdateNotificationBanner,
 )
 import re
@@ -61,6 +69,7 @@ import re
 from .header import HeaderMixin
 from .input_area import InputAreaMixin
 from .chat_view import ChatViewMixin
+from .history_rendering_mixin import HistoryRenderingMixin
 from .image_mixin import ImageMixin
 from .preferences_mixin import PreferencesMixin
 from .tool_result_mixin import ToolResultMixin
@@ -78,6 +87,7 @@ from ..core.cache_mixin import CacheMixin
 from ..core.update_mixin import UpdateMixin
 from ..core.tool_execution_mixin import ToolExecutionMixin
 from ..core.send_orchestrator_mixin import SendOrchestratorMixin
+from ..core.houdini_main_thread_executor import HoudiniMainThreadExecutor
 from ..core.harness_engine import (
     HarnessRuntimeState,
     HarnessToolPolicyEngine,
@@ -100,6 +110,7 @@ class AITab(
     HeaderMixin,
     InputAreaMixin,
     ChatViewMixin,
+    HistoryRenderingMixin,
     ImageMixin,
     PreferencesMixin,
     DiagnosticsMixin,
@@ -266,6 +277,7 @@ class AITab(
         self._tool_result_queue: queue.Queue = queue.Queue()
         self._tool_lock = threading.Lock()  # 确保一次只有一个工具调用
         self._main_thread_busy = False  # ★ 主线程忙标记（防止超时后堆积信号死锁）
+        self._houdini_main_thread_executor = None
         self._harness_v2_enabled = is_harness_v2_enabled(default=True)
         self._harness_state = HarnessRuntimeState(session_id=self._session_id)
         self._tool_policy_engine = HarnessToolPolicyEngine()
@@ -287,6 +299,13 @@ class AITab(
         self._addSystemShell.connect(self._on_add_system_shell)
         self._executeToolRequest.connect(self._on_execute_tool_main_thread, QtCore.Qt.BlockingQueuedConnection)
         self._executeToolBatchRequest.connect(self._on_execute_tool_batch_main_thread, QtCore.Qt.BlockingQueuedConnection)
+        self._houdini_main_thread_executor = HoudiniMainThreadExecutor(
+            emit_tool_request=self._executeToolRequest.emit,
+            emit_batch_request=self._executeToolBatchRequest.emit,
+            result_queue=self._tool_result_queue,
+            main_timeout=self._TOOL_MAIN_THREAD_TIMEOUT,
+            batch_timeout=60.0,
+        )
         self._addThinking.connect(self._on_add_thinking)
         self._finalizeThinkingSignal.connect(self._finalize_thinking_main_thread)
         self._resumeThinkingSignal.connect(self._resume_thinking_main_thread)

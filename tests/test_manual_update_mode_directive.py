@@ -13,6 +13,7 @@ from tests.test_import_smoke import (
 class _UpdateMode:
     Auto = object()
     Manual = object()
+    AlwaysUpdate = Auto
 
 
 class _HouStub:
@@ -82,6 +83,8 @@ class ManualUpdateModeDirectiveTest(unittest.TestCase):
         directive = AITab._build_manual_mode_directive(tab)
 
         self.assertIn("这是用户的持久设置", directive)
+        self.assertIn("空几何", directive)
+        self.assertIn("不能单独当作拓扑或参数错误证据", directive)
 
     def test_confirm_directive_forbids_switching_auto(self):
         sys.modules["hou"] = _HouStub(_UpdateMode.Auto)
@@ -96,9 +99,9 @@ class ManualUpdateModeDirectiveTest(unittest.TestCase):
     def test_direct_execute_prompt_allows_temporary_auto_validation(self):
         prompt = tr('ai.direct_execute_prompt')
 
-        self.assertIn("AlwaysUpdate", prompt)
-        self.assertIn("临时", prompt)
-        self.assertIn("恢复用户原始更新模式", prompt)
+        self.assertIn('set_update_mode(mode="auto")', prompt)
+        self.assertIn("不要用 `execute_python`", prompt)
+        self.assertIn("Auto Update", prompt)
 
     def test_scene_read_uses_snapshot_not_realtime_manual(self):
         sys.modules["hou"] = _HouStub(_UpdateMode.Manual)
@@ -156,6 +159,45 @@ class ManualUpdateModeDirectiveTest(unittest.TestCase):
         self.assertEqual(params["plan_data"]["title"], "Test Plan")
         # Plan 直接执行不再擅自切 Auto；保持用户/Cook Guard 的原模式。
         self.assertEqual(hou_stub.set_modes, [])
+
+    def test_set_update_mode_result_updates_restore_snapshot(self):
+        hou_stub = _HouStub(_UpdateMode.Manual)
+        sys.modules["hou"] = hou_stub
+        tab = object.__new__(AITab)
+        tab._pre_agent_update_mode = _UpdateMode.Manual
+
+        AITab._after_tool_result(tab, "set_update_mode", {"success": True, "mode": "Auto"})
+        AITab._restore_update_mode(tab)
+
+        self.assertIs(tab._pre_agent_update_mode, None)
+        self.assertEqual(hou_stub.set_modes, [])
+
+    def test_plan_confirm_hands_off_to_agent_execution(self):
+        tab = object.__new__(AITab)
+        captured = {}
+
+        class _PlanViewer:
+            def __init__(self):
+                self.confirmed = False
+
+            def set_confirmed(self):
+                self.confirmed = True
+
+        tab._active_plan_viewer = _PlanViewer()
+        tab._conversation_history = []
+        tab._start_agent_run = lambda overrides: captured.update(overrides)
+        plan_data = {"title": "Build Test Network", "steps": []}
+
+        AITab._on_plan_confirmed(tab, plan_data)
+
+        self.assertEqual(tab._plan_phase, "executing")
+        self.assertTrue(tab._active_plan_viewer.confirmed)
+        self.assertEqual(len(tab._conversation_history), 1)
+        self.assertIn("Build Test Network", tab._conversation_history[0]["content"])
+        self.assertTrue(captured["use_agent"])
+        self.assertTrue(captured["plan_mode"])
+        self.assertTrue(captured["plan_executing"])
+        self.assertIs(captured["plan_data"], plan_data)
 
 
 if __name__ == "__main__":

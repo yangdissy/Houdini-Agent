@@ -2,12 +2,12 @@ import os
 import sys
 import hou
 from houdini_agent.qt_compat import QtWidgets
+from houdini_agent.utils.dev_feature_toggles import is_dev_reload_enabled
 
 
 def _is_dev_reload_enabled():
     """Return True when development hot-reload is explicitly enabled."""
-    value = os.getenv("HOUDINI_AGENT_DEV_RELOAD", "").strip().lower()
-    return value in {"1", "true", "yes", "on"}
+    return is_dev_reload_enabled()
 
 # 开发模式下重新加载模块，避免缓存问题
 def _reload_modules():

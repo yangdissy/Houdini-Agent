@@ -13,7 +13,7 @@ from datetime import datetime
 from houdini_agent.qt_compat import QtWidgets, QtCore
 
 from ..ui.i18n import tr
-from ..ui.cursor_widgets import TodoList
+from ..ui.cursor_analytics_widgets import TodoList
 
 
 class SessionManagerMixin:

@@ -2,143 +2,206 @@
 
 **[English](README.md)** | **[中文](README_CN.md)**
 
-Houdini Agent is an AI assistant embedded in SideFX Houdini. It inspects scenes, builds and modifies node networks, runs VEX and Python, searches local documentation, plans complex work, and coordinates tools through a guarded agent loop.
-
-Aimed at Houdini TDs, technical artists, and pipeline developers who want an interactive assistant inside Houdini rather than a separate chat window.
+Houdini Agent is an AI assistant that runs inside the SideFX Houdini process. It operates directly on the scene graph: reading nodes, building networks, modifying parameters, running VEX, and searching documentation — instead of generating code for you to copy-paste.
 
 Current version: `1.5.3`
 
-## Fork Origin & Adaptations
+## What It Is
 
-This project is a fork of [Kazama-Suichiku/Houdini-Agent](https://github.com/Kazama-Suichiku/Houdini-Agent) (by KazamaSuichiku), based on the **v1.5.x embedded-in-Houdini line** (PySide UI, runs inside the Houdini process). It has **not** adopted upstream's v2.0 direction (standalone desktop app, QML/Qt Quick UI, Meshy 3D generation, socket bridge).
+An interactive agent embedded in Houdini, not a standalone chat window. You open a panel inside Houdini, describe what you need in natural language, and the agent will:
 
-On top of the upstream v1.5.x base, this fork adds the following adaptations for team production use:
+- Inspect the current scene state (selected nodes, network topology, parameter values, error messages)
+- Plan and execute node operations (create, connect, parameter setup, VEX writing)
+- Search the local documentation library to answer "how do I do X in Houdini" questions
+- For complex tasks, present a plan for your approval before executing step by step
 
-| Area | What changed |
-|------|--------------|
-| **Multi-user support** | Login dialog, user allowlist (`cache/.access`), per-user isolation of conversations / plans / memory / workspace / config / rules. SQLite memory DB stored on local disk (not SMB share) to avoid unreliable file locks. |
-| **Harness V2 governance** | Tool execution boundary hardening — model-supplied policy flags are no longer trusted; public tool calls must pass through the policy gate. Unified input guardrails (sensitive keys, dangerous Python/Shell patterns, path traversal) and output guardrails (result normalization + secret redaction). |
-| **Tool hardening** | Soft-fail → hard-fail semantics: any failure in batch operations now returns `success=False` with a full error list and did-you-mean hints. `create_node` rolls back atomically on parameter errors. New `verify_network` (one-shot network health + geometry evidence) and `get_node_card` (pre-build type inspection). `create_nodes_batch` gains Phase 1 pre-validation + `dry_run=True`. |
-| **AI behavior guidance** | "Senior Artist Discipline" rules: plan the whole graph then build atomically (batch-first), never guess parameter names, verify-then-claim. Anti-patterns explicitly forbidden in schemas. |
-| **Stability hardening** | Suppress Qt layout jitter during high-frequency batch node ops (avoids `QHeaderView`/`QLayout` SIGSEGV on Houdini 20.5). Skip forced cook of Volume/VDB display nodes to prevent GPU race crashes. Busy-state cursor warning reminds users not to touch the viewport while the agent runs. |
-| **Rules Manager hardening** | Atomic write (`.tmp` → `fsync` → `os.replace`), corrupt-file auto-backup, mtime-based file-rule cache, token budget caps, RLock concurrency protection. |
-| **Doc RAG improvements** | Multi-factor weighted scoring (title/body/coverage/source/short-fragment penalty), query-type reranking (node/vex/hom/general), diversity constraints, structured return fields. |
-
-Detailed change history is under [changelog/](changelog).
+Good use cases: batch node operations, parameter tuning, scene diagnosis, writing Wrangles, documentation lookup, multi-step workflow setup. Not a substitute for: artistic judgment, unverified production renders, or operating node types you don't understand.
 
 ## Quick Start
 
 ### Requirements
 
-- SideFX Houdini 19.5+ (primary: 20.0 / 20.5)
-- Windows, macOS, or Linux with Houdini's Python environment
-- At least one supported AI provider key (or a local Ollama model)
+- SideFX Houdini 19.5 or later (primary tested: 20.0 / 20.5)
+- Windows, macOS, or Linux
+- At least one AI provider API key (or a local Ollama instance)
 
-No `pip install` needed — runtime dependencies are bundled in `lib/`.
+No `pip install` needed — all runtime dependencies are bundled in `lib/`.
 
 ### Install & Launch
 
-Place the repository at a stable path, e.g. `C:\tools\Houdini-Agent`. Run this in Houdini's Python Shell or put it in a Shelf Tool:
+1. Place the repository at a stable path, e.g. `C:\tools\Houdini-Agent` or a fixed team share location.
+2. In Houdini, open the Python Shell (Windows → Python Shell) and run:
 
 ```python
-import sys
+import sys, os, importlib.util
 
-repo_root = r"C:\tools\Houdini-Agent"
-if repo_root not in sys.path:
-    sys.path.insert(0, repo_root)
+# Change to your actual path
+launcher_file = r"C:\tools\Houdini-Agent\houdini_agent_launcher.py"
 
-import houdini_agent_launcher as launcher
-launcher.show_tool()
+spec = importlib.util.spec_from_file_location("houdini_agent_launcher", launcher_file)
+mod = importlib.util.module_from_spec(spec)
+sys.modules["houdini_agent_launcher"] = mod
+spec.loader.exec_module(mod)
+mod.show_tool()
 ```
 
-For a shelf-ready snippet, see [houdini_agent/QUICK_SHELF_CODE.py](houdini_agent/QUICK_SHELF_CODE.py). Avoid moving the folder after creating a shelf button — the launch code references this path.
+3. On first launch, a login dialog appears — enter a username (used for per-user config isolation).
+4. Verify: the panel opens, the version number shows in the bottom-left, and typing "hello" gets a response.
+
+**Shelf button**: Save the snippet above as a Shelf Tool for one-click launch. Do not move the repo folder after creating the button — the launch code references the absolute path. A ready-made snippet is in [QUICK_SHELF_CODE.py](QUICK_SHELF_CODE.py).
 
 ### Configure API Keys
 
-Recommended: set provider keys as user environment variables before launching Houdini.
+Set user environment variables before launching Houdini (PowerShell):
 
 ```powershell
 [Environment]::SetEnvironmentVariable('DEEPSEEK_API_KEY', 'sk-xxx', 'User')
 [Environment]::SetEnvironmentVariable('GLM_API_KEY', 'xxx.xxx', 'User')
-[Environment]::SetEnvironmentVariable('OPENAI_API_KEY', 'sk-xxx', 'User')
-[Environment]::SetEnvironmentVariable('DUOJIE_API_KEY', 'xxx', 'User')
 ```
 
-Keys can also be configured in the UI overflow menu and saved to local config (`config/`).
+You can also enter keys temporarily in the panel menu → Settings → API Key (session-only unless a username is logged in). See the Provider table below for all supported environment variables.
 
 ## Agent Modes
 
-| Mode | Best for | Tool access |
-|------|----------|-------------|
-| Ask | Reading, analysis, debugging advice | Read-only and documentation tools |
-| Agent | Building and editing Houdini scenes | Full tool access, with policy checks for risky actions |
-| Plan | Multi-step work that needs review | Read-only planning first, then confirmed execution |
+| Mode | What it does | When to use |
+|------|-------------|-------------|
+| **Ask** | Reads scenes, searches docs, analyzes errors, gives advice | You only want answers, not scene changes. E.g., "Why is this foreach erroring?" |
+| **Agent** | Direct action: create nodes, modify parameters, run code, save files | You know what you want and want it done. E.g., "Convert selected nodes to polygons and add a subdivide" |
+| **Plan** | Presents a plan for approval, then executes step by step | Complex tasks that need review. E.g., "Set up a pyro sim with collision" |
 
-Use Ask mode when you want an explanation or scene diagnosis without edits. Use Agent mode when you want the assistant to act. Use Plan mode when the result matters enough to review the approach before execution.
+Switch via the mode button on the left side of the input bar.
 
-## Supported Providers
+**Ask mode is read-only** — it will refuse any mutating operation. This is a safety feature, not a bug.
 
-| Provider | Typical models | Notes |
-|----------|----------------|-------|
-| DeepSeek | `deepseek-chat`, `deepseek-reasoner` | Fast, cost-effective, supports tool calling |
-| GLM / Zhipu | `glm-4.7`, GLM relay variants | Useful for China-based workflows |
-| OpenAI | GPT tool-calling and vision-capable models | Strong general tool use and image understanding |
-| Ollama | Any local model exposed by Ollama | Local-first; capability depends on the selected model |
-| Duojie relay | Claude, Gemini, GLM, MiniMax relay models | Uses relay-specific model routing |
+## Provider Configuration
 
-Vision input is model-dependent. OpenAI vision models, Claude variants, and Gemini variants are supported where the configured provider exposes image input. Non-vision models receive text-only messages.
+| Provider | Environment Variable | Typical Models | Notes |
+|----------|---------------------|----------------|-------|
+| DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-chat`, `deepseek-reasoner` | Fast, cost-effective |
+| GLM (Zhipu) | `GLM_API_KEY` or `ZHIPU_API_KEY` | `glm-4.7` etc. | Stable for China-based networks |
+| OpenAI | `OPENAI_API_KEY` | GPT-4o, GPT-4 Turbo, etc. | Strong tool calling and vision |
+| Ollama | No key needed | Any locally deployed model | Offline-capable; capability varies by model |
+| Duojie | `DUOJIE_API_KEY` | Claude, Gemini, GLM relay | Aggregated relay, unified API |
+| OpenRouter | `OPENROUTER_API_KEY` | 200+ model routing | Pay-per-token, wide selection |
+| Kimi Coding | `KIMI_CODING_API_KEY` | `kimi-coding` series | Moonshot code-specialized |
+| SiliconFlow | `SILICONFLOW_API_KEY` | Chinese open-source model aggregation | Fast domestic access |
+| OF3D | Built-in key, no config needed | `of3d` series | Ready to use out of the box |
+| Custom | `CUSTOM_API_KEY` (optional) | Self-hosted OpenAI-compatible API | Also set `CUSTOM_API_URL` |
 
-## Main Features
+All providers also support the `DCC_AI_` prefix (e.g. `DCC_AI_DEEPSEEK_API_KEY`) to avoid conflicts with other tools.
 
-- **Node operations** — create/copy/delete/rename/connect nodes, set parameters with diff previews, create VEX Wrangles, set flags, save HIP, undo/redo
-- **Scene inspection** — read selection and children, inspect parameters/flags/errors/inputs/outputs, search node types, NetworkBox-aware topology summaries, `verify_network` health checks
-- **Code, docs, and web** — run Houdini Python (`hou`), guarded shell commands, search local Houdini/VEX/HOM/Labs/Terrain/Copernicus/ML/MPM docs, web search and page fetch
-- **Built-in skills** — pre-built Python analysis scripts for geometry attributes, normals, bounding info, connectivity, dead nodes, dependency tracing, cook performance, material assignments, LOP stage, etc. (see [houdini_agent/skills](houdini_agent/skills))
-- **Plan mode** — gather context, ask clarifying questions, create a structured plan with DAG, execute confirmed steps with auto-resume
-- **Long-term memory** — three-layer (semantic/episodic/procedural) store with reward-driven learning and reflection; per-user isolated
-- **Plugins & rules** — community plugins in `plugins/`, persistent user rules via editor or `rules/*.md`
-- **UI** — multi-session tabs, streaming responses, collapsible blocks, clickable node paths, token analytics, image paste/drag-drop/picker for vision models, bilingual CN/EN UI, font scaling
+**Vision input**: OpenAI, Claude (via Duojie/OpenRouter), and Gemini (via Duojie/OpenRouter) support image paste/drag-drop. Other providers receive text-only messages.
 
-The exact tool set is registered by `ToolRegistry` at runtime. Harness V2 adds mode checks, risk handling, retry decisions, and diagnostics. The `/diagnostics` command exports a compact JSON report (policy timeline, Harness trace, call records — no conversation content).
+## Core Features
+
+### Node Operations
+Create/copy/delete/rename/connect nodes, batch parameter setup with diff preview, VEX Wrangle creation, Display/Render flag control, HIP save, undo/redo.
+
+### Scene Inspection
+Read selection and subnetworks, inspect parameters/flags/errors/inputs/outputs, search node types, NetworkBox topology summaries, `verify_network` one-shot health checks.
+
+### Code & Documentation
+Execute Houdini Python (`hou` module), run guarded shell commands, search local doc library (Houdini nodes, VEX, HOM, Labs, Terrain, Copernicus, ML, MPM), web search.
+
+### Built-in Skills (24)
+Pre-built Python analysis scripts covering: geometry attribute analysis, normals inspection, bounding boxes, connectivity, dead node cleanup, dependency tracing, cook performance, material assignments, LOP stage inspection, Pyro/dynamics setup wizards, USD assembly, and more. Full list in [houdini_agent/skills/](houdini_agent/skills/).
+
+### Plan Mode
+Gather context → ask clarifying questions → generate a plan with DAG dependencies → you approve → execute → auto-resume interrupted steps.
+
+### Long-term Memory
+Three-layer store (semantic/episodic/procedural) with reward-driven learning and reflection. Per-user isolated, persists across Houdini restarts.
+
+### Plugins & Rules
+- `plugins/`: Community plugins that extend the tool set
+- `rules/`: Markdown files defining persistent rules that shape agent behavior
+- Built-in rules editor: GUI-based management
+
+### UI Features
+Multi-session tabs, streaming output, collapsible code blocks, clickable node paths, token usage stats, image paste/drag-drop (vision models), bilingual CN/EN UI, font scaling.
 
 ## Project Structure
 
 ```text
 Houdini-Agent/
-|-- houdini_agent_launcher.py        # Top-level launch entry
-|-- VERSION                          # Current semantic version
-|-- config/                          # Local runtime configuration
-|-- cache/                           # Conversations, plans, doc indexes, diagnostics, users/
-|-- Doc/                             # Offline Houdini and domain knowledge bases
-|-- plugins/                         # Community plugin directory
-|-- rules/                           # File-based user rules
-|-- shared/                          # Shared path/config utilities (per-user isolation)
+|-- houdini_agent_launcher.py   # Launch entry point
+|-- VERSION                     # Version number
+|-- config/                     # User config (API keys, UI settings)
+|-- cache/                      # Conversations, plans, memory, per-user data
+|-- Doc/                        # Offline documentation library
+|-- plugins/                    # Plugin directory
+|-- rules/                      # User rule files
 |-- houdini_agent/
-|   |-- main.py                      # show_tool() and window lifecycle
-|   |-- core/                        # Main window, agent runner, plans, harness
-|   |-- ui/                          # Chat UI, widgets, i18n, theme, login dialog
-|   |-- skills/                      # Built-in analysis skills
-|   `-- utils/                       # AI client, tool registry, docs, memory, plugins
-`-- tests/                           # Unit and smoke tests
+|   |-- main.py                 # Window lifecycle
+|   |-- core/                   # Agent loop, tool execution, Harness governance
+|   |-- ui/                     # Chat interface, widgets, login dialog
+|   |-- skills/                 # Built-in analysis scripts
+|   `-- utils/                  # AI client, tool registry, doc retrieval
+`-- tests/                      # Unit tests
 ```
+
+## Fork Differences
+
+This project is a fork of [Kazama-Suichiku/Houdini-Agent](https://github.com/Kazama-Suichiku/Houdini-Agent), based on its v1.5.x embedded-in-Houdini branch. It does not follow upstream's v2.0 standalone desktop app direction.
+
+Key adaptations:
+
+| Area | Difference |
+|------|-----------|
+| Multi-user support | Login isolation, user allowlist, per-user config/memory/conversations |
+| Tool governance | Harness V2 policy gate, input/output guardrails, hard-fail batch semantics |
+| Stability | Qt layout jitter suppression, GPU race protection, atomic writes |
+| Doc retrieval | Multi-factor weighted scoring, query-type reranking, diversity constraints |
+
+Full change history in [changelog/](changelog/).
 
 ## Troubleshooting
 
-- **Tool does not launch** — verify `sys.path` points to the repo root; use `houdini_agent_launcher.py`; test in Houdini Python Shell first.
-- **API key / 401 errors** — check the selected provider; re-enter the key from the overflow menu or reset the env var; restart Houdini after changing user env vars.
-- **Tool blocked** — Ask mode blocks mutating tools by design; risky tools may require confirmation or be denied by Harness policy; switch to Agent mode to modify the scene.
-- **Images ignored** — confirm the model supports vision; old images in history may be auto-stripped for context limits.
-- **Plan mode stops early** — auto-resume handles incomplete plans; if it still stops, switch to Agent mode and ask it to continue from the last completed step.
+**Panel won't open, "module not found" error**
+- Verify `sys.path` includes the repo root
+- Check the path contains no Chinese or special characters
+- Test `import houdini_agent_launcher` in the Python Shell first
+
+**"API Key not configured" or 401 errors**
+- Check environment variable spelling (case-sensitive)
+- Restart Houdini after changing env vars
+- Test the key temporarily in panel Settings to confirm it's valid
+
+**"Tool blocked" in Ask mode**
+- By design: Ask mode is read-only. Switch to Agent or Plan mode for modifications.
+
+**Model says "I can't see the image" after pasting**
+- Confirm the current provider supports vision (OpenAI, Claude/Gemini via Duojie/OpenRouter)
+- Check the model selection (e.g., `deepseek-chat` is not a vision model)
+
+**Plan mode stops mid-execution**
+- Auto-resume usually kicks in — wait a few seconds
+- If still stuck, switch to Agent mode and say "continue from the last completed step"
+
+**Houdini crashes after batch node creation**
+- Known issue: high-frequency node ops on Houdini 20.5 can trigger Qt crashes. Update to the latest version or split into smaller batches.
+
+**Memory/config not persisting**
+- Confirm you logged in with a username at startup
+- Check that `cache/users/<username>/` exists and is writable
 
 ## Development
+
+Run tests:
 
 ```powershell
 python -m pytest tests -q
 ```
 
-For Houdini-specific behavior, prefer Houdini's bundled Python or `hython`. Dev hot reload: `$env:HOUDINI_AGENT_DEV_RELOAD = "1"`.
+Use Houdini's bundled Python or `hython` for tests involving the `hou` module.
 
-The updater framework is preserved in [houdini_agent/utils/updater.py](houdini_agent/utils/updater.py) but the user-facing update UI is disabled — treat it as infrastructure, not an enabled update path.
+Dev hot reload (no Houdini restart needed after code changes):
+
+```powershell
+$env:HOUDINI_AGENT_DEV_RELOAD = "1"
+```
+
+The updater framework is preserved in [houdini_agent/utils/updater.py](houdini_agent/utils/updater.py), but the user-facing update UI is disabled.
 
 ## Author
 
