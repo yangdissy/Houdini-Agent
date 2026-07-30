@@ -952,26 +952,47 @@ QPushButton#btnKeepAll:hover {
     border-color: rgba(16,185,129,120);
 }
 
-/* Mode combo (Agent / Ask) — warm minimal */
-QComboBox#modeCombo {
-    background: transparent;
-    border: none;
-    border-radius: 4px;
-    padding: 2px 4px;
+/* Toolbar controls — compact graphite pills */
+QPushButton#btnAttach,
+QComboBox#modeCombo,
+QPushButton#chkConfirm,
+QComboBox#readCombo,
+QLabel#modeGuardLabel,
+QPushButton#policyTimelineBtn {
+    background: rgba(24,25,29,210);
+    color: #b9c0c8;
+    border: 1px solid rgba(255,255,255,18);
+    border-radius: 5px;
     font-size: {FS_XS}px;
     font-weight: bold;
-    min-height: 18px;
+    min-height: 22px;
 }
-QComboBox#modeCombo::drop-down {
+
+QPushButton#btnAttach:hover,
+QComboBox#modeCombo:hover,
+QPushButton#chkConfirm:hover,
+QComboBox#readCombo:hover,
+QPushButton#policyTimelineBtn:hover {
+    background: rgba(34,36,42,230);
+    border-color: rgba(255,255,255,34);
+    color: #edf1f5;
+}
+
+QComboBox#modeCombo {
+    padding: 1px 16px 1px 9px;
+}
+QComboBox#modeCombo::drop-down,
+QComboBox#readCombo::drop-down {
     border: none;
-    width: 12px;
+    width: 15px;
 }
-QComboBox#modeCombo QAbstractItemView {
-    background: rgba(35,30,24,248);
-    color: #d4c5b0;
-    border: 1px solid rgba(180,160,130,15);
-    selection-background-color: rgba(212,165,116,40);
-    selection-color: #f0e6d6;
+QComboBox#modeCombo QAbstractItemView,
+QComboBox#readCombo QAbstractItemView {
+    background: rgba(22,24,28,248);
+    color: #d7dde5;
+    border: 1px solid rgba(255,255,255,24);
+    selection-background-color: rgba(212,165,116,54);
+    selection-color: #ffffff;
     font-size: {FS_XS}px;
     outline: none;
     border-radius: 6px;
@@ -979,42 +1000,84 @@ QComboBox#modeCombo QAbstractItemView {
 }
 /* Agent = khaki muted */
 QComboBox#modeCombo[mode="agent"] {
-    color: #8a7e6e;
+    color: #9b9185;
 }
 QComboBox#modeCombo[mode="agent"]:hover {
-    background: rgba(180,160,130,8);
-    color: #b0a08c;
+    color: #c9bba7;
 }
 /* Ask = warm green */
 QComboBox#modeCombo[mode="ask"] {
-    color: #a3c9a8;
+    color: #86d39a;
 }
 QComboBox#modeCombo[mode="ask"]:hover {
-    background: rgba(180,160,130,8);
-    color: #c0dcc4;
+    color: #abedbb;
 }
-/* Plan = warm purple */
+/* Plan = focused amber, integrated with the toolbar */
 QComboBox#modeCombo[mode="plan"] {
-    color: #a78bfa;
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+        stop:0 rgba(72,50,20,238), stop:1 rgba(30,31,35,220));
+    color: #ffd27a;
+    border-color: rgba(245,158,11,150);
+    font-size: {FS_XS}px;
+    font-weight: bold;
 }
 QComboBox#modeCombo[mode="plan"]:hover {
-    background: rgba(167,139,250,8);
-    color: #c4b5fd;
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+        stop:0 rgba(88,61,24,245), stop:1 rgba(36,37,42,235));
+    color: #ffe1a3;
 }
 
-/* + Attach menu button */
 QPushButton#btnAttach {
-    background: transparent;
-    color: #8a7e6e;
-    border: none;
-    border-radius: 4px;
-    font-size: {FS_SM}px;
-    font-weight: bold;
+    color: #8f98a4;
     padding: 0;
 }
-QPushButton#btnAttach:hover {
-    background: rgba(180,160,130,8);
-    color: #b0a08c;
+QPushButton#chkConfirm {
+    padding: 1px 8px;
+}
+QPushButton#chkConfirm[confirm="on"] {
+    background: rgba(58,43,21,220);
+    color: #f2c572;
+    border-color: rgba(245,158,11,105);
+}
+QPushButton#chkConfirm[confirm="off"] {
+    background: rgba(56,27,29,225);
+    color: #ff9d91;
+    border-color: rgba(239,68,68,120);
+}
+
+QComboBox#readCombo {
+    padding: 1px 18px 1px 9px;
+    color: #b8c0ca;
+}
+
+QLabel#modeGuardLabel {
+    padding: 0 9px;
+    font-family: 'Consolas', 'Monaco', monospace;
+}
+QLabel#modeGuardLabel[risk="readonly"] {
+    background: rgba(22,45,32,210);
+    color: #8ee6a2;
+    border-color: rgba(16,185,129,80);
+}
+QLabel#modeGuardLabel[risk="confirm"] {
+    background: rgba(52,39,22,215);
+    color: #f6c76f;
+    border-color: rgba(245,158,11,92);
+}
+QLabel#modeGuardLabel[risk="high"] {
+    background: rgba(56,27,29,225);
+    color: #ff8d83;
+    border-color: rgba(239,68,68,120);
+}
+
+QPushButton#policyTimelineBtn {
+    padding: 1px 10px;
+    color: #9ea7b2;
+}
+QPushButton#policyTimelineBtn[failures="true"] {
+    background: rgba(56,27,29,225);
+    color: #ff8d83;
+    border-color: rgba(239,68,68,120);
 }
 
 /* Chat input (warm glass with glow on focus) */

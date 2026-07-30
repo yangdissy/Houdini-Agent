@@ -34,7 +34,10 @@ def _install_thirdparty_stubs():
     """
     for name in ("requests", "trafilatura", "numpy"):
         if name not in sys.modules:
-            sys.modules[name] = mock.MagicMock(name=name)
+            try:
+                importlib.import_module(name)
+            except Exception:
+                sys.modules[name] = mock.MagicMock(name=name)
 
 
 def _install_qt_stubs():

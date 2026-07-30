@@ -75,10 +75,10 @@ class LocalEmbedder:
         except Exception as e:
             print(f"[Embedding] sentence-transformers 加载失败: {e}")
 
-        # 2. Fallback: 双语 Unicode 分词伪向量
+        # 2. Fallback: 双语词法 + 领域别名伪向量
         self._backend = "fallback"
         self.dim = EMBEDDING_DIM
-        print(f"[Embedding] 使用 fallback 模式 (bilingual unicode, dim={self.dim})")
+        print(f"[Embedding] 使用 fallback 模式 (bilingual lexical, dim={self.dim})")
 
     @property
     def is_semantic(self) -> bool:
@@ -162,7 +162,7 @@ class LocalEmbedder:
         return np.array(vecs, dtype=np.float32)
 
     # ==========================================================
-    # Fallback: 双语 Unicode 分词向量
+    # Fallback: 双语词法向量
     # ==========================================================
 
     # CJK Unicode 区段（涵盖常用汉字、日文、韩文）
@@ -176,8 +176,115 @@ class LocalEmbedder:
     )
     _EN_WORD_RE = re.compile(r'[a-z0-9][a-z0-9_\-]*')
 
+    _BILINGUAL_ALIASES = {
+        "节点": ("node", "nodes"),
+        "网络": ("network", "networks", "graph"),
+        "场景": ("scene", "stage"),
+        "路径": ("path", "paths"),
+        "层级": ("hierarchy", "tree"),
+        "上下文": ("context", "contexts"),
+        "子网": ("subnet", "subnetwork"),
+        "数字资产": ("hda", "asset", "assets", "digital_asset"),
+        "资产": ("asset", "assets", "hda"),
+        "参数": ("parameter", "parameters", "parm", "parms"),
+        "通道": ("channel", "channels", "chop"),
+        "关键帧": ("keyframe", "keyframes", "key"),
+        "属性": ("attribute", "attributes", "attrib", "attribs"),
+        "组": ("group", "groups"),
+        "点组": ("point_group", "pointgroup", "point groups"),
+        "面组": ("primitive_group", "primgroup", "primitive groups"),
+        "法线": ("normal", "normals", "n"),
+        "切线": ("tangent", "tangents"),
+        "颜色": ("color", "colour", "cd"),
+        "位置": ("position", "pos", "p"),
+        "顶点": ("vertex", "vertices"),
+        "点云": ("pointcloud", "point_cloud", "points"),
+        "材质": ("material", "materials", "shader", "shaders"),
+        "贴图": ("texture", "textures", "map", "maps"),
+        "着色器": ("shader", "shaders", "material"),
+        "灯光": ("light", "lights", "lighting"),
+        "相机": ("camera", "cameras", "cam"),
+        "渲染": ("render", "rendering"),
+        "视口": ("viewport", "viewports"),
+        "几何": ("geometry", "geo"),
+        "曲线": ("curve", "curves", "spline", "splines"),
+        "多边形": ("polygon", "polygons", "poly", "mesh"),
+        "网格": ("mesh", "grid", "geometry"),
+        "实例": ("instance", "instances", "instancing"),
+        "复制": ("copy", "duplicate", "clone", "copytopoints"),
+        "散布": ("scatter", "scatter_points", "points"),
+        "地形": ("heightfield", "terrain"),
+        "体积": ("volume", "volumes", "vdb"),
+        "烟雾": ("smoke", "pyro", "volume"),
+        "火焰": ("fire", "flame", "pyro"),
+        "流体": ("fluid", "fluids", "flip"),
+        "粒子": ("particle", "particles", "pop"),
+        "刚体": ("rigidbody", "rigid", "rbd"),
+        "约束": ("constraint", "constraints"),
+        "碰撞": ("collision", "collider", "collisions"),
+        "模拟": ("simulation", "simulate", "sim"),
+        "解算器": ("solver", "solvers", "solve"),
+        "动画": ("animation", "animate", "anim"),
+        "表达式": ("expression", "expressions", "expr"),
+        "脚本": ("script", "scripts", "python"),
+        "代码": ("code", "script", "vex", "python"),
+        "包装盒": ("bbox", "boundingbox", "bounding_box"),
+        "变换": ("transform", "translate", "rotate", "scale"),
+        "移动": ("move", "translate", "transform"),
+        "旋转": ("rotate", "rotation", "transform"),
+        "缩放": ("scale", "scaling", "transform"),
+        "函数": ("function", "functions"),
+        "工具": ("tool", "tools"),
+        "文档": ("document", "documents", "doc", "docs"),
+        "记忆": ("memory", "memories"),
+        "搜索": ("search", "find", "query"),
+        "创建": ("create", "make", "build", "add"),
+        "删除": ("delete", "remove", "destroy"),
+        "修改": ("modify", "edit", "change", "update"),
+        "设置": ("set", "assign", "configure"),
+        "获取": ("get", "fetch", "read", "inspect"),
+        "连接": ("connect", "wire", "link"),
+        "断开": ("disconnect", "unlink", "unwire"),
+        "合并": ("merge", "combine", "join"),
+        "分离": ("split", "separate", "detach"),
+        "布局": ("layout", "arrange"),
+        "显示": ("display", "show", "visible"),
+        "隐藏": ("hide", "hidden", "invisible"),
+        "启用": ("enable", "activate", "on"),
+        "禁用": ("disable", "deactivate", "off"),
+        "导入": ("import", "load"),
+        "导出": ("export", "save", "write"),
+        "保存": ("save", "write", "export"),
+        "加载": ("load", "import", "read"),
+        "缓存": ("cache", "caching"),
+        "烘焙": ("bake", "baking"),
+        "循环": ("loop", "foreach", "for_each", "iterate"),
+        "随机": ("random", "rand", "stochastic"),
+        "噪声": ("noise", "noises", "random"),
+        "平滑": ("smooth", "smoothing", "blur"),
+        "细分": ("subdivide", "subdivision", "subdiv"),
+        "错误": ("error", "errors", "warning", "warnings"),
+        "警告": ("warning", "warnings", "warn"),
+        "日志": ("log", "logs", "logging"),
+        "诊断": ("diagnostic", "diagnostics", "debug"),
+        "测试": ("test", "tests", "testing"),
+        "规则": ("rule", "rules"),
+        "计划": ("plan", "planning"),
+        "任务": ("task", "tasks", "job", "jobs"),
+        "步骤": ("step", "steps"),
+        "结果": ("result", "results", "output"),
+        "输入": ("input", "inputs"),
+        "输出": ("output", "outputs"),
+        "模式": ("mode", "modes", "pattern", "patterns"),
+    }
+    _ALIAS_LOOKUP = {}
+    for _canonical_alias, _equivalent_aliases in _BILINGUAL_ALIASES.items():
+        _alias_group = (_canonical_alias,) + _equivalent_aliases
+        for _alias in _alias_group:
+            _ALIAS_LOOKUP[_alias] = _alias_group
+
     def _tokenize_bilingual(self, text: str) -> List[Tuple[str, float]]:
-        """双语分词：CJK 按字/双字/三字切分，英文按词+前后缀子词切分。
+        """双语分词：CJK n-gram、英文词/子词、常用中英领域别名。
 
         Returns:
             List of (token, weight) tuples
@@ -206,6 +313,11 @@ class LocalEmbedder:
                     tokens.append((seg[i:i+2], 3.0))
                 for i in range(len(seg) - 2):
                     tokens.append((seg[i:i+3], 1.5))
+
+                for alias, equivalents in self._BILINGUAL_ALIASES.items():
+                    if alias in seg:
+                        for equivalent in equivalents:
+                            tokens.append((f"alias:{equivalent}", 2.5))
             else:
                 # 非 CJK 段：完整英文词 + 前后缀子词 + 字符 bigram
                 for m in self._EN_WORD_RE.finditer(seg):
@@ -213,6 +325,8 @@ class LocalEmbedder:
                     if len(w) < 2:
                         continue
                     tokens.append((w, 3.0))
+                    for alias in self._ALIAS_LOOKUP.get(w, ())[1:]:
+                        tokens.append((f"alias:{alias}", 2.5))
                     if len(w) >= 4:
                         tokens.append((w[:3], 1.0))   # prefix
                         tokens.append((w[-3:], 1.0))  # suffix
@@ -222,10 +336,10 @@ class LocalEmbedder:
         return tokens
 
     def _encode_fallback(self, text: str) -> np.ndarray:
-        """双语 Unicode 分词哈希向量。
+        """双语词法哈希向量。
 
         使用 double hashing（MD5 + SHA1）减少碰撞，
-        CJK 字符 bigram/trigram 加权，英文完整词加权。
+        CJK n-gram、英文完整词、常用中英领域别名加权。
         """
         vec = np.zeros(self.dim, dtype=np.float32)
         text_clean = text.strip()

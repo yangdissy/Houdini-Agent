@@ -5,6 +5,13 @@ import re
 
 from houdini_agent.qt_compat import QtCore
 from houdini_agent.ui.i18n import tr
+from houdini_agent.utils.token_optimizer import (
+    assemble_context_messages,
+    compress_old_round_tool_results,
+    flatten_context_rounds,
+    plan_context_rounds,
+    prune_context_rounds_to_token_target,
+)
 
 
 class ContextManagerMixin:
@@ -292,6 +299,11 @@ class ContextManagerMixin:
                         self._addStatus.emit(
                             f"😴 深度睡眠完成: {n_rules} 条经验 + {n_strats} 条策略已写入长期记忆"
                         )
+                        try:
+                            from ..utils.team_memory_export import maybe_export_team_memory
+                            maybe_export_team_memory(self._username, self._memory_store)
+                        except Exception:
+                            pass
                 except Exception as e:
                     print(f"[Sleep] _manage_context 深度睡眠异常: {e}")
                 finally:
@@ -300,15 +312,7 @@ class ContextManagerMixin:
         old_tokens = current_tokens
         
         # --- 按 user 消息划分轮次 ---
-        rounds = []       # [[msg, msg, ...], ...]
-        current_round = []
-        for m in history:
-            if m.get('role') == 'user' and current_round:
-                rounds.append(current_round)
-                current_round = []
-            current_round.append(m)
-        if current_round:
-            rounds.append(current_round)
+        rounds = plan_context_rounds(history, protect_recent_rounds=0).rounds
         
         if len(rounds) <= 2:
             return  # 只有 1-2 轮，不裁剪
@@ -316,15 +320,11 @@ class ContextManagerMixin:
         # --- 第一遍：压缩旧轮次的 tool 结果（保留最近 60%）---
         n_rounds = len(rounds)
         protect_n = max(2, int(n_rounds * 0.6))
-        for r_idx in range(n_rounds - protect_n):
-            for m in rounds[r_idx]:
-                if m.get('role') == 'tool':
-                    c = m.get('content') or ''
-                    if len(c) > 200:
-                        m['content'] = self.client._summarize_tool_content(c, 200) if hasattr(self.client, '_summarize_tool_content') else c[:200] + '...[summary]'
+        summarize_tool_content = self.client._summarize_tool_content if hasattr(self.client, '_summarize_tool_content') else None
+        compress_old_round_tool_results(rounds, protect_n, summarize_fn=summarize_tool_content)
         
         # 重新计算
-        compressed = [m for rnd in rounds for m in rnd]
+        compressed = flatten_context_rounds(rounds)
         new_tokens = self.token_optimizer.calculate_message_tokens(compressed)
         
         if new_tokens < context_limit * self.token_optimizer.budget.compression_threshold:
@@ -350,13 +350,13 @@ class ContextManagerMixin:
         
         # --- 第二遍：删除最早的完整轮次，直到低于阈值 ---
         target = int(context_limit * 0.65)  # 目标降到 65%
-        while len(rounds) > 2:
-            # 删除最早的轮次
-            removed = rounds.pop(0)
-            compressed = [m for rnd in rounds for m in rnd]
-            new_tokens = self.token_optimizer.calculate_message_tokens(compressed)
-            if new_tokens <= target:
-                break
+        prune_context_rounds_to_token_target(
+            rounds,
+            target,
+            self.token_optimizer.calculate_message_tokens,
+            min_rounds=2,
+            check_before_pop=False,
+        )
         
         # 在头部插入摘要提示
         summary_note = {
@@ -365,8 +365,7 @@ class ContextManagerMixin:
         }
         
         history.clear()
-        history.append(summary_note)
-        history.extend([m for rnd in rounds for m in rnd])
+        history.extend(assemble_context_messages(rounds, summary_message=summary_note))
         
         saved = old_tokens - self.token_optimizer.calculate_message_tokens(history)
         if saved > 0:

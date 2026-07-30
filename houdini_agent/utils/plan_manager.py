@@ -16,6 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
+from .plan_runtime import PlanQualityGate, PlanRuntime
+
 
 class PlanManager:
     """Plan 文件管理器
@@ -60,6 +62,7 @@ class PlanManager:
             cache_dir = Path(__file__).resolve().parent.parent.parent / "cache"
         self._plans_dir = cache_dir / "plans"
         self._plans_dir.mkdir(parents=True, exist_ok=True)
+        self._runtime = PlanRuntime()
 
     # ------------------------------------------------------------------
     # 路径工具
@@ -89,14 +92,6 @@ class PlanManager:
         Returns:
             完整的 plan dict（含自动生成的 plan_id, created_at 等）
         """
-        # 归档旧 plan
-        old_path = self._plan_path(session_id)
-        if old_path.exists():
-            try:
-                old_path.rename(self._archive_path(session_id))
-            except OSError:
-                old_path.unlink(missing_ok=True)
-
         # 规范化 steps（增强版：支持子步骤/预期结果/风险/回退等）
         steps = []
         for i, s in enumerate(plan_data.get("steps", [])):
@@ -132,6 +127,23 @@ class PlanManager:
             "steps": steps,
             "architecture": plan_data.get("architecture", {}),
         }
+
+        quality_score, diagnostics = self._quality_gate().evaluate(plan)
+        plan["quality"] = {
+            "score": quality_score,
+            "diagnostics": [d.to_dict() for d in diagnostics],
+        }
+        if PlanQualityGate.has_errors(diagnostics):
+            messages = "; ".join(d.message for d in diagnostics if d.severity == "error")
+            raise ValueError(f"Plan failed quality gate: {messages}")
+
+        # 归档旧 plan。必须在新 plan 通过 quality gate 后执行，避免坏计划删除 active plan。
+        old_path = self._plan_path(session_id)
+        if old_path.exists():
+            try:
+                old_path.rename(self._archive_path(session_id))
+            except OSError:
+                old_path.unlink(missing_ok=True)
 
         self._save(session_id, plan)
         return plan
@@ -172,6 +184,10 @@ class PlanManager:
         plan = self.load_plan(session_id)
         if not plan:
             return None
+
+        can_transition, reason = self._runtime.can_transition(plan, step_id, status)
+        if not can_transition:
+            raise ValueError(reason)
 
         for step in plan["steps"]:
             if step["id"] == step_id:
@@ -260,15 +276,14 @@ class PlanManager:
                 break
 
         # 下一个待执行的步骤
-        for s in steps:
-            if s["status"] == "pending":
-                deps = s.get("depends_on", [])
-                title = s.get("title", s.get("description", s["id"]))
-                line = f'Next: {s["id"]} "{title}"'
-                if deps:
-                    line += f" (depends_on: {', '.join(deps)})"
-                lines.append(line)
-                break
+        ready_steps = self._runtime.next_ready_steps(plan)
+        if ready_steps:
+            s = ready_steps[0]
+            title = s.get("title", s.get("description", s["id"]))
+            lines.append(f'Ready next: {s["id"]} "{title}"')
+        frontier = self._runtime.frontier_context(plan)
+        if frontier:
+            lines.append(frontier)
 
         # 剩余未完成步骤数量
         remaining = [s for s in steps if s["status"] == "pending"]
@@ -301,6 +316,16 @@ class PlanManager:
                 json.dump(plan, f, ensure_ascii=False, indent=2)
         except OSError as e:
             print(f"[PlanManager] Save error: {e}")
+
+    def _quality_gate(self) -> PlanQualityGate:
+        try:
+            from .tool_registry import get_tool_registry
+
+            registry = get_tool_registry()
+            known_tools = [item.get("name", "") for item in registry.list_all()]
+        except Exception:
+            known_tools = []
+        return PlanQualityGate(known_tools=known_tools)
 
 
 # ======================================================================

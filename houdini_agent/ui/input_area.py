@@ -87,7 +87,7 @@ class InputAreaMixin:
         
         # -------- 工具栏第一行：+ | Mode | Cfm | Read | plugins --------
         toolbar_top = QtWidgets.QHBoxLayout()
-        toolbar_top.setSpacing(6)
+        toolbar_top.setSpacing(5)
         toolbar_top.setContentsMargins(0, 0, 0, 0)
 
         self._agent_mode = False
@@ -114,7 +114,7 @@ class InputAreaMixin:
         self.mode_combo.setProperty("mode", "ask")
         self.mode_combo.setCursor(QtCore.Qt.PointingHandCursor)
         self.mode_combo.setToolTip(tr('mode.tooltip'))
-        self.mode_combo.setFixedWidth(58)
+        self.mode_combo.setFixedSize(72, 24)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         toolbar_top.addWidget(self.mode_combo)
 
@@ -123,19 +123,10 @@ class InputAreaMixin:
         self.chk_confirm_mode.setObjectName("chkConfirm")
         self.chk_confirm_mode.setCheckable(True)
         self.chk_confirm_mode.setChecked(True)
+        self.chk_confirm_mode.setProperty("confirm", "on")
         self.chk_confirm_mode.setCursor(QtCore.Qt.PointingHandCursor)
         self.chk_confirm_mode.setToolTip(tr('confirm.tooltip'))
-        self.chk_confirm_mode.setFixedHeight(22)
-        self.chk_confirm_mode.setStyleSheet(
-            "QPushButton#chkConfirm:checked {"
-            "  background:#f59e0b; color:#000; font-weight:700;"
-            "  border:1px solid #d97706; border-radius:3px; padding:0 6px;"
-            "}"
-            "QPushButton#chkConfirm:!checked {"
-            "  background:#374151; color:#9ca3af; font-weight:400;"
-            "  border:1px solid #4b5563; border-radius:3px; padding:0 6px;"
-            "}"
-        )
+        self.chk_confirm_mode.setFixedSize(86, 24)
         self.chk_confirm_mode.toggled.connect(self._on_confirm_mode_toggled)
         toolbar_top.addWidget(self.chk_confirm_mode)
 
@@ -148,21 +139,27 @@ class InputAreaMixin:
         self.read_combo.setCurrentIndex(1)
         self.read_combo.setCursor(QtCore.Qt.PointingHandCursor)
         self.read_combo.setToolTip("每次发送消息时自动读取节点信息注入上下文\nOff: 不自动读取\nSelection: 自动读取选中节点\nNetwork: 自动读取网络结构")
+        self.read_combo.setFixedHeight(24)
         self.read_combo.setMinimumWidth(110)
+        self.read_combo.setVisible(False)
         self.read_combo.currentIndexChanged.connect(self._on_auto_read_changed)
-        toolbar_top.addWidget(self.read_combo)
 
         # 模式风险徽标（持续可见）
         self.mode_guard_label = QtWidgets.QLabel("ASK | RO")
         self.mode_guard_label.setObjectName("modeGuardLabel")
+        self.mode_guard_label.setProperty("risk", "readonly")
+        self.mode_guard_label.setFixedHeight(24)
+        self.mode_guard_label.setMinimumWidth(92)
         self.mode_guard_label.setToolTip("当前模式与权限风险")
         toolbar_top.addWidget(self.mode_guard_label)
 
         # 策略/诊断入口（点击弹出菜单）
         self.policy_timeline_btn = QtWidgets.QPushButton("Policy 0")
         self.policy_timeline_btn.setObjectName("policyTimelineBtn")
+        self.policy_timeline_btn.setProperty("failures", False)
         self.policy_timeline_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.policy_timeline_btn.setFixedHeight(20)
+        self.policy_timeline_btn.setFixedHeight(24)
+        self.policy_timeline_btn.setMinimumWidth(72)
         if hasattr(self, '_show_policy_menu'):
             self.policy_timeline_btn.clicked.connect(self._show_policy_menu)
         toolbar_top.addWidget(self.policy_timeline_btn)
@@ -263,6 +260,17 @@ class InputAreaMixin:
         menu.addAction("Attach Image", self.btn_attach_image.click)
         menu.addAction("Read Network", self.btn_network.click)
         menu.addAction("Read Selection", self.btn_selection.click)
+        auto_read_menu = menu.addMenu("Auto Read")
+        current_read_index = self.read_combo.currentIndex()
+        for label, index in (
+            ("Off", 0),
+            ("Selection", 1),
+            ("Network", 2),
+        ):
+            action = auto_read_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(current_read_index == index)
+            action.triggered.connect(lambda checked=False, i=index: self.read_combo.setCurrentIndex(i))
         menu.addSeparator()
         menu.addAction("Export Train", self.btn_export_train.click)
         menu.exec_(self.btn_attach_menu.mapToGlobal(
@@ -276,8 +284,12 @@ class InputAreaMixin:
         btn = self.chk_confirm_mode
         if checked:
             btn.setText("✔ 逐步确认")
+            btn.setProperty("confirm", "on")
         else:
             btn.setText("⚡ 直接执行")
+            btn.setProperty("confirm", "off")
+        btn.style().unpolish(btn)
+        btn.style().polish(btn)
         if hasattr(self, '_refresh_mode_guard_ui'):
             self._refresh_mode_guard_ui()
 

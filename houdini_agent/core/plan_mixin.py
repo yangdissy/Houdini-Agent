@@ -36,6 +36,7 @@ from houdini_agent.qt_compat import QtCore
 
 from ..ui.i18n import tr
 from ..utils.plan_manager import get_plan_manager
+from ..utils.plan_runtime import PlanRuntime
 from ..ui.cursor_plan_widgets import AskQuestionCard, PlanViewer, StreamingPlanCard
 
 
@@ -96,10 +97,10 @@ class PlanMixin:
                 }
 
             # 返回进度信息，让 AI 知道还有多少步骤要做
-            pending_steps = [s for s in all_steps if s.get('status') == 'pending']
+            ready_steps = PlanRuntime().next_ready_steps(plan)
             next_step_info = ""
-            if pending_steps:
-                ns = pending_steps[0]
+            if ready_steps:
+                ns = ready_steps[0]
                 next_step_info = f" Next: {ns['id']} \"{ns.get('title', ns.get('description', ns['id']))}\""
 
             return {
@@ -389,7 +390,10 @@ class PlanMixin:
                 return None
             self._last_resume_done_count = done_count
 
-            pending_steps = [s for s in steps if s.get('status') in ('pending', 'running')]
+            runtime = PlanRuntime()
+            ready_steps = runtime.next_ready_steps(plan)
+            running_steps = [s for s in steps if s.get('status') == 'running']
+            pending_steps = running_steps or ready_steps
             if not pending_steps:
                 return None
 

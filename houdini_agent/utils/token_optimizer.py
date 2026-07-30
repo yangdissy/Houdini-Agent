@@ -11,7 +11,7 @@ Token 优化管理器
 
 import json
 import re
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -224,6 +224,203 @@ class TokenBudget:
     strategy: CompressionStrategy = CompressionStrategy.BALANCED
 
 
+@dataclass
+class TokenEstimate:
+    """消息 token 估算分解。"""
+    text_tokens: int = 0
+    image_tokens: int = 0
+    tool_call_tokens: int = 0
+    message_overhead_tokens: int = 0
+    tool_definition_tokens: int = 0
+
+    @property
+    def total(self) -> int:
+        return (
+            self.text_tokens
+            + self.image_tokens
+            + self.tool_call_tokens
+            + self.message_overhead_tokens
+            + self.tool_definition_tokens
+        )
+
+
+@dataclass
+class CompressionStats:
+    """消息压缩统计。"""
+    compressed: int = 0
+    kept: int = 0
+    original_tokens: int = 0
+    compressed_tokens: int = 0
+    saved_tokens: int = 0
+    saved_percent: float = 0.0
+    strategy: str = ''
+
+    @classmethod
+    def from_counts(
+        cls,
+        compressed: int,
+        kept: int,
+        original_tokens: int,
+        compressed_tokens: int,
+        strategy: str = '',
+    ) -> 'CompressionStats':
+        saved_tokens = original_tokens - compressed_tokens
+        saved_percent = (saved_tokens / original_tokens * 100) if original_tokens > 0 else 0.0
+        return cls(
+            compressed=compressed,
+            kept=kept,
+            original_tokens=original_tokens,
+            compressed_tokens=compressed_tokens,
+            saved_tokens=saved_tokens,
+            saved_percent=saved_percent,
+            strategy=strategy,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'compressed': self.compressed,
+            'kept': self.kept,
+            'original_tokens': self.original_tokens,
+            'compressed_tokens': self.compressed_tokens,
+            'saved_tokens': self.saved_tokens,
+            'saved_percent': self.saved_percent,
+            'strategy': self.strategy,
+        }
+
+
+@dataclass
+class ContextRoundPlan:
+    """按 user 消息切分后的上下文轮次计划。"""
+    old_rounds: List[List[Dict[str, Any]]] = field(default_factory=list)
+    protected_rounds: List[List[Dict[str, Any]]] = field(default_factory=list)
+
+    @property
+    def rounds(self) -> List[List[Dict[str, Any]]]:
+        return self.old_rounds + self.protected_rounds
+
+    @property
+    def messages(self) -> List[Dict[str, Any]]:
+        return [msg for round_messages in self.rounds for msg in round_messages]
+
+    @property
+    def old_messages(self) -> List[Dict[str, Any]]:
+        return [msg for round_messages in self.old_rounds for msg in round_messages]
+
+    @property
+    def protected_messages(self) -> List[Dict[str, Any]]:
+        return [msg for round_messages in self.protected_rounds for msg in round_messages]
+
+    @property
+    def old_round_count(self) -> int:
+        return len(self.old_rounds)
+
+    @property
+    def protected_round_count(self) -> int:
+        return len(self.protected_rounds)
+
+
+def plan_context_rounds(
+    messages: List[Dict[str, Any]],
+    protect_recent_rounds: int = 2,
+) -> ContextRoundPlan:
+    """按 user 消息切分上下文，并保护最近 N 个 round。"""
+    if not messages:
+        return ContextRoundPlan()
+
+    rounds: List[List[Dict[str, Any]]] = []
+    current_round: List[Dict[str, Any]] = []
+    for msg in messages:
+        if msg.get('role') == 'user' and current_round:
+            rounds.append(current_round)
+            current_round = []
+        current_round.append(msg)
+    if current_round:
+        rounds.append(current_round)
+
+    protect_recent_rounds = max(0, protect_recent_rounds)
+    if protect_recent_rounds == 0:
+        return ContextRoundPlan(old_rounds=rounds, protected_rounds=[])
+
+    return ContextRoundPlan(
+        old_rounds=rounds[:-protect_recent_rounds],
+        protected_rounds=rounds[-protect_recent_rounds:],
+    )
+
+
+def flatten_context_rounds(rounds: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """将上下文 round 列表还原为消息列表。"""
+    return [msg for round_messages in rounds for msg in round_messages]
+
+
+def prune_context_rounds_to_token_target(
+    rounds: List[List[Dict[str, Any]]],
+    target_tokens: int,
+    count_tokens_fn: Callable[[List[Dict[str, Any]]], int],
+    prefix_messages: Optional[List[Dict[str, Any]]] = None,
+    suffix_messages: Optional[List[Dict[str, Any]]] = None,
+    min_rounds: int = 2,
+    check_before_pop: bool = True,
+) -> int:
+    """删除最早 round 直到消息低于目标 token，原地修改 rounds。"""
+    prefix_messages = prefix_messages or []
+    suffix_messages = suffix_messages or []
+
+    def current_messages() -> List[Dict[str, Any]]:
+        return prefix_messages + flatten_context_rounds(rounds) + suffix_messages
+
+    removed_count = 0
+    while len(rounds) > min_rounds:
+        if check_before_pop and count_tokens_fn(current_messages()) <= target_tokens:
+            break
+        rounds.pop(0)
+        removed_count += 1
+        if not check_before_pop and count_tokens_fn(current_messages()) <= target_tokens:
+            break
+    return removed_count
+
+
+def assemble_context_messages(
+    rounds: List[List[Dict[str, Any]]],
+    prefix_messages: Optional[List[Dict[str, Any]]] = None,
+    summary_message: Optional[Dict[str, Any]] = None,
+    suffix_messages: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """按 prefix、summary、rounds、suffix 组装上下文消息。"""
+    assembled: List[Dict[str, Any]] = []
+    if prefix_messages:
+        assembled.extend(prefix_messages)
+    if summary_message:
+        assembled.append(summary_message)
+    assembled.extend(flatten_context_rounds(rounds))
+    if suffix_messages:
+        assembled.extend(suffix_messages)
+    return assembled
+
+
+def compress_old_round_tool_results(
+    rounds: List[List[Dict[str, Any]]],
+    protect_recent_rounds: int,
+    max_content_length: int = 200,
+    summarize_fn: Optional[Callable[[str, int], str]] = None,
+) -> int:
+    """压缩受保护 round 之前的旧 tool 结果，原地修改 rounds。"""
+    old_round_count = max(0, len(rounds) - max(0, protect_recent_rounds))
+    compressed_count = 0
+    for round_messages in rounds[:old_round_count]:
+        for msg in round_messages:
+            if msg.get('role') != 'tool':
+                continue
+            content = msg.get('content') or ''
+            if len(content) <= max_content_length:
+                continue
+            if summarize_fn:
+                msg['content'] = summarize_fn(content, max_content_length)
+            else:
+                msg['content'] = content[:max_content_length] + '...[summary]'
+            compressed_count += 1
+    return compressed_count
+
+
 class TokenOptimizer:
     """Token 优化器 - 系统化减少 token 消耗"""
     
@@ -235,10 +432,14 @@ class TokenOptimizer:
     def estimate_tokens(self, text: str) -> int:
         """估算文本的 token 数量（优先 tiktoken）"""
         return count_tokens(text, self.model)
-    
-    def calculate_message_tokens(self, messages: List[Dict[str, Any]]) -> int:
-        """计算消息列表的总 token 数（含 tool_calls、多模态内容）"""
-        total = 0
+
+    def estimate_message_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> TokenEstimate:
+        """估算消息 token，并按来源返回分解。"""
+        estimate = TokenEstimate()
         for msg in messages:
             content = msg.get('content', '') or ''
             if isinstance(content, list):
@@ -246,24 +447,42 @@ class TokenOptimizer:
                 for part in content:
                     if isinstance(part, dict):
                         if part.get('type') == 'text':
-                            total += self.estimate_tokens(part.get('text', ''))
+                            estimate.text_tokens += self.estimate_tokens(part.get('text', ''))
                         elif part.get('type') == 'image_url':
-                            total += 765  # 图片固定约 765 token（低分辨率模式）
+                            estimate.image_tokens += 765  # 图片固定约 765 token（低分辨率模式）
                     elif isinstance(part, str):
-                        total += self.estimate_tokens(part)
+                        estimate.text_tokens += self.estimate_tokens(part)
             else:
-                total += self.estimate_tokens(content)
+                estimate.text_tokens += self.estimate_tokens(content)
             # tool_calls 中的函数名和参数也占 token
             tool_calls = msg.get('tool_calls')
             if tool_calls:
                 for tc in tool_calls:
                     fn = tc.get('function', {})
-                    total += self.estimate_tokens(fn.get('name', ''))
-                    total += self.estimate_tokens(fn.get('arguments', ''))
-                    total += 8  # tool_call 结构开销（id, type, function wrapper）
+                    estimate.tool_call_tokens += self.estimate_tokens(fn.get('name', ''))
+                    estimate.tool_call_tokens += self.estimate_tokens(fn.get('arguments', ''))
+                    estimate.tool_call_tokens += 8  # tool_call 结构开销（id, type, function wrapper）
             # 消息格式开销（role, 格式字符等）
-            total += 4
-        return total
+            estimate.message_overhead_tokens += 4
+
+        # API 请求中的工具定义也会进入上下文窗口。
+        if tools:
+            for tool in tools:
+                fn = tool.get('function', {})
+                estimate.tool_definition_tokens += self.estimate_tokens(fn.get('description', ''))
+                params = fn.get('parameters', {})
+                if params:
+                    estimate.tool_definition_tokens += self.estimate_tokens(json.dumps(params))
+                estimate.tool_definition_tokens += 30  # 函数定义结构开销
+        return estimate
+    
+    def calculate_message_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> int:
+        """计算消息列表的总 token 数（含 tool_calls、多模态内容、工具定义）"""
+        return self.estimate_message_tokens(messages, tools=tools).total
     
     def compress_tool_result(self, result: Dict[str, Any], max_length: int = 200) -> str:
         """压缩工具调用结果
@@ -306,6 +525,79 @@ class TokenOptimizer:
             summary = f"{result_text[:max_length]}..."
         
         return summary
+
+    def _convert_tool_messages_for_compression(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        converted_messages = []
+        for msg in messages:
+            if msg.get('role') == 'tool':
+                tool_name = msg.get('name', 'unknown')
+                content = msg.get('content', '')
+                converted_messages.append({
+                    'role': 'assistant',
+                    'content': f"[工具结果] {tool_name}: {content}"
+                })
+            else:
+                converted_messages.append(msg)
+        return converted_messages
+
+    def _generate_summary_for_strategy(
+        self,
+        messages: List[Dict[str, Any]],
+        strategy: CompressionStrategy,
+    ) -> str:
+        if strategy == CompressionStrategy.AGGRESSIVE:
+            return self._generate_aggressive_summary(messages)
+        if strategy == CompressionStrategy.CONSERVATIVE:
+            return self._generate_conservative_summary(messages)
+        return self._generate_balanced_summary(messages)
+
+    def compress_context_rounds(
+        self,
+        messages: List[Dict[str, Any]],
+        protect_recent_rounds: int = 2,
+        strategy: Optional[CompressionStrategy] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """按 user round 压缩旧上下文，保留最近 N 个 round。"""
+        if not messages:
+            return [], CompressionStats().to_dict()
+
+        strategy = strategy or self.budget.strategy
+        converted_messages = self._convert_tool_messages_for_compression(messages)
+        plan = plan_context_rounds(converted_messages, protect_recent_rounds=protect_recent_rounds)
+
+        if not plan.old_messages:
+            current_tokens = self.calculate_message_tokens(messages)
+            stats = CompressionStats.from_counts(
+                compressed=0,
+                kept=len(plan.protected_messages),
+                original_tokens=current_tokens,
+                compressed_tokens=current_tokens,
+                strategy=strategy.value,
+            )
+            return converted_messages, stats.to_dict()
+
+        original_tokens = self.calculate_message_tokens(messages)
+        compressed_messages: List[Dict[str, Any]] = []
+        summary = self._generate_summary_for_strategy(plan.old_messages, strategy)
+        if summary:
+            compressed_messages.append({
+                'role': 'system',
+                'content': summary
+            })
+        compressed_messages.extend(plan.protected_messages)
+
+        compressed_tokens = self.calculate_message_tokens(compressed_messages)
+        stats = CompressionStats.from_counts(
+            compressed=len(plan.old_messages),
+            kept=len(plan.protected_messages),
+            original_tokens=original_tokens,
+            compressed_tokens=compressed_tokens,
+            strategy=strategy.value,
+        )
+        return compressed_messages, stats.to_dict()
     
     def compress_messages(
         self,
@@ -324,26 +616,24 @@ class TokenOptimizer:
             (压缩后的消息列表, 压缩统计信息)
         """
         if not messages:
-            return [], {'compressed': 0, 'saved_tokens': 0}
+            return [], CompressionStats().to_dict()
         
         keep_recent = keep_recent or self.budget.keep_recent_messages
         strategy = strategy or self.budget.strategy
         
         if len(messages) <= keep_recent:
-            return messages, {'compressed': 0, 'saved_tokens': 0}
+            current_tokens = self.calculate_message_tokens(messages)
+            stats = CompressionStats.from_counts(
+                compressed=0,
+                kept=len(messages),
+                original_tokens=current_tokens,
+                compressed_tokens=current_tokens,
+                strategy=strategy.value,
+            )
+            return messages, stats.to_dict()
         
         # ⚠️ 将 role="tool" 消息转换为 assistant 格式（避免 API 400 错误）
-        converted_messages = []
-        for m in messages:
-            if m.get('role') == 'tool':
-                tool_name = m.get('name', 'unknown')
-                content = m.get('content', '')
-                converted_messages.append({
-                    'role': 'assistant',
-                    'content': f"[工具结果] {tool_name}: {content}"
-                })
-            else:
-                converted_messages.append(m)
+        converted_messages = self._convert_tool_messages_for_compression(messages)
         
         # 分离旧消息和新消息
         old_messages = converted_messages[:-keep_recent] if len(converted_messages) > keep_recent else []
@@ -355,12 +645,7 @@ class TokenOptimizer:
         # 根据策略压缩
         compressed_messages = []
         if old_messages:
-            if strategy == CompressionStrategy.AGGRESSIVE:
-                summary = self._generate_aggressive_summary(old_messages)
-            elif strategy == CompressionStrategy.CONSERVATIVE:
-                summary = self._generate_conservative_summary(old_messages)
-            else:  # BALANCED
-                summary = self._generate_balanced_summary(old_messages)
+            summary = self._generate_summary_for_strategy(old_messages, strategy)
             
             if summary:
                 compressed_messages.append({
@@ -373,18 +658,15 @@ class TokenOptimizer:
         
         # 计算节省的 token
         compressed_tokens = self.calculate_message_tokens(compressed_messages)
-        saved_tokens = original_tokens - compressed_tokens
+        stats = CompressionStats.from_counts(
+            compressed=len(old_messages),
+            kept=len(recent_messages),
+            original_tokens=original_tokens,
+            compressed_tokens=compressed_tokens,
+            strategy=strategy.value,
+        )
         
-        stats = {
-            'compressed': len(old_messages),
-            'kept': len(recent_messages),
-            'original_tokens': original_tokens,
-            'compressed_tokens': compressed_tokens,
-            'saved_tokens': saved_tokens,
-            'saved_percent': (saved_tokens / original_tokens * 100) if original_tokens > 0 else 0
-        }
-        
-        return compressed_messages, stats
+        return compressed_messages, stats.to_dict()
     
     def _generate_balanced_summary(self, messages: List[Dict[str, Any]]) -> str:
         """生成平衡摘要（默认策略）"""

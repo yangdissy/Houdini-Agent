@@ -5,6 +5,7 @@ import unittest
 
 from houdini_agent.core.harness_engine import (
     HarnessToolPolicyEngine,
+    ToolArgumentValidator,
     build_tool_retry_key,
     sanitize_tool_result,
 )
@@ -50,6 +51,9 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         )
         self.assertEqual(decision.action, "ask")
         self.assertIn("requires confirmation", decision.reason)
+        self.assertGreater(decision.risk_score, 0.0)
+        self.assertIn("high_risk_confirmation", decision.matched_rules)
+        self.assertEqual(decision.required_control, "confirm")
 
     def test_execute_tools_require_code_or_command(self):
         missing_code = self.policy.decide("execute_python", {}, {"mode": "agent"})
@@ -119,6 +123,8 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         )
         self.assertEqual(decision.action, "deny")
         self.assertIn("dangerous shell", decision.reason)
+        self.assertIn("dangerous_shell", decision.matched_rules)
+        self.assertEqual(decision.required_control, "deny")
 
     def test_path_traversal_is_denied(self):
         decision = self.policy.decide(
@@ -268,11 +274,36 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         )
         self.assertEqual(decision.action, "retry")
         self.assertEqual(decision.patched_args["output_path"], "/tmp/shot_v001.hip")
+        self.assertIn("retry_patch_output_extension", decision.matched_rules)
 
     def test_retry_key_is_stable_for_equal_args(self):
         left = build_tool_retry_key("set_node_parameter", {"b": 2, "a": 1})
         right = build_tool_retry_key("set_node_parameter", {"a": 1, "b": 2})
         self.assertEqual(left, right)
+
+
+class ToolArgumentValidatorTest(unittest.TestCase):
+    def setUp(self):
+        self.validator = ToolArgumentValidator()
+
+    def test_validator_normalizes_paths_and_reports_missing_args(self):
+        result = self.validator.validate("get_node_parameters", {"node_path": " //obj//geo1 "})
+        self.assertTrue(result.ok)
+        self.assertEqual(result.args["node_path"], "/obj/geo1")
+
+        missing = self.validator.validate("get_node_parameters", {})
+        self.assertFalse(missing.ok)
+        self.assertEqual(missing.issues[0].code, "missing_required_arg")
+
+    def test_validator_reports_sensitive_and_command_issues_structurally(self):
+        result = self.validator.validate(
+            "execute_shell",
+            {"command": "Remove-Item C:/tmp/demo -Recurse", "token": "secret"},
+        )
+
+        codes = [issue.code for issue in result.issues]
+        self.assertIn("sensitive_input", codes)
+        self.assertIn("dangerous_shell", codes)
 
 
 class HarnessToolOutputGuardrailTest(unittest.TestCase):

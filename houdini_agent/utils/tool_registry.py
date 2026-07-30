@@ -100,6 +100,56 @@ _ASYNC_PREFERRED_TOOLS = frozenset({
     'execute_shell',
 })
 
+_DEFAULT_HISTORY_QUERY_TOOLS = frozenset({
+    'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'inspect_node',
+    'get_node_connections', 'suggest_connection', 'preview_node_operation', 'validate_node_network',
+    'list_children', 'find_nodes', 'get_geometry_summary', 'get_scene_snapshot',
+    'read_selection', 'search_node_types',
+    'semantic_search_nodes', 'check_errors', 'verify_network',
+    'search_local_doc', 'get_houdini_node_doc',
+    'execute_python', 'execute_shell', 'web_search', 'fetch_webpage',
+    'run_skill', 'list_skills',
+    'capture_viewport',
+})
+
+_DEFAULT_COMPRESSION_OPERATION_TOOLS = frozenset({
+    'create_node', 'create_nodes_batch', 'create_named_null', 'connect_nodes', 'cook_node',
+    'set_node_parameter', 'create_wrangle_node',
+})
+
+_DEFAULT_THINKING_SIMPLE_SUCCESS_TOOLS = frozenset({
+    'create_node', 'get_node_parameters', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
+    'suggest_connection', 'preview_node_operation', 'validate_node_network',
+    'list_children', 'find_nodes', 'get_geometry_summary', 'get_scene_snapshot',
+    'read_selection', 'check_errors', 'verify_network',
+})
+
+_DEFAULT_THINKING_DEEP_TOOLS = frozenset({
+    'connect_nodes', 'cook_node', 'create_named_null', 'delete_node', 'disconnect_nodes', 'rename_node', 'preview_layout_nodes',
+    'set_node_parameter', 'batch_set_parameters', 'create_nodes_batch',
+    'create_wrangle_node', 'copy_node', 'set_display_flag', 'set_node_flags',
+    'execute_python', 'execute_shell', 'save_hip', 'run_skill',
+})
+
+_DEFAULT_LOOP_GUIDANCE_QUERY_TOOLS = frozenset({
+    'get_parameter_schema', 'search_node_types', 'search_local_doc',
+    'list_node_parameters', 'get_node_info', 'search_parameters',
+})
+
+
+def build_default_tool_execution_profile() -> Dict[str, Set[str]]:
+    """Return fallback runtime classifications used before registry metadata is ready."""
+    return {
+        "async_tools": set(_ASYNC_PREFERRED_TOOLS),
+        "batch_readonly_tools": set(_READONLY_TOOLS),
+        "history_query_tools": set(_DEFAULT_HISTORY_QUERY_TOOLS),
+        "compression_query_tools": set(_DEFAULT_HISTORY_QUERY_TOOLS),
+        "compression_operation_tools": set(_DEFAULT_COMPRESSION_OPERATION_TOOLS),
+        "thinking_simple_success_tools": set(_DEFAULT_THINKING_SIMPLE_SUCCESS_TOOLS),
+        "thinking_deep_tools": set(_DEFAULT_THINKING_DEEP_TOOLS),
+        "loop_guidance_query_tools": set(_DEFAULT_LOOP_GUIDANCE_QUERY_TOOLS),
+    }
+
 
 def _infer_modes(name: str) -> Set[str]:
     """根据工具名自动推断适用模式"""
@@ -287,6 +337,12 @@ class ToolRegistry:
             batch_readonly_tools: Set[str] = set()
             network_mutating_tools: Set[str] = set()
             cache_invalidate_tools: Set[str] = set()
+            history_query_tools: Set[str] = set()
+            compression_query_tools: Set[str] = set()
+            compression_operation_tools: Set[str] = set()
+            thinking_simple_success_tools: Set[str] = set()
+            thinking_deep_tools: Set[str] = set()
+            loop_guidance_query_tools: Set[str] = set()
 
             for meta in self._tools.values():
                 if not meta.enabled:
@@ -296,6 +352,10 @@ class ToolRegistry:
                 readonly = "readonly" in tags
                 is_async = "async" in tags
                 is_network = "network" in tags
+
+                if readonly or is_async or "system" in tags or "skill" in tags or "task" in tags:
+                    history_query_tools.add(meta.name)
+                    compression_query_tools.add(meta.name)
 
                 if is_async:
                     async_tools.add(meta.name)
@@ -311,6 +371,37 @@ class ToolRegistry:
                 if is_network and not readonly:
                     network_mutating_tools.add(meta.name)
 
+                if meta.name in {
+                    "create_node", "create_nodes_batch", "create_named_null",
+                    "connect_nodes", "cook_node", "set_node_parameter",
+                    "create_wrangle_node",
+                }:
+                    compression_operation_tools.add(meta.name)
+
+                if meta.name in {
+                    "create_node", "get_node_parameters", "get_parameter_schema",
+                    "inspect_node", "get_node_connections", "suggest_connection",
+                    "preview_node_operation", "validate_node_network", "list_children",
+                    "find_nodes", "get_geometry_summary", "get_scene_snapshot",
+                    "read_selection", "check_errors", "verify_network",
+                }:
+                    thinking_simple_success_tools.add(meta.name)
+
+                if meta.name in {
+                    "connect_nodes", "cook_node", "create_named_null", "delete_node",
+                    "disconnect_nodes", "rename_node", "preview_layout_nodes",
+                    "set_node_parameter", "batch_set_parameters", "create_nodes_batch",
+                    "create_wrangle_node", "copy_node", "set_display_flag", "set_node_flags",
+                    "execute_python", "execute_shell", "save_hip", "run_skill",
+                }:
+                    thinking_deep_tools.add(meta.name)
+
+                if meta.name in {
+                    "get_parameter_schema", "search_node_types", "search_local_doc",
+                    "list_node_parameters", "get_node_info", "search_parameters",
+                }:
+                    loop_guidance_query_tools.add(meta.name)
+
             # 兼容旧行为：部分只读工具并非 network 标签，但应参与失效清理。
             if "check_errors" in dedup_tools:
                 cache_invalidate_tools.add("check_errors")
@@ -321,6 +412,12 @@ class ToolRegistry:
                 "batch_readonly_tools": batch_readonly_tools,
                 "network_mutating_tools": network_mutating_tools,
                 "cache_invalidate_tools": cache_invalidate_tools,
+                "history_query_tools": history_query_tools,
+                "compression_query_tools": compression_query_tools,
+                "compression_operation_tools": compression_operation_tools,
+                "thinking_simple_success_tools": thinking_simple_success_tools,
+                "thinking_deep_tools": thinking_deep_tools,
+                "loop_guidance_query_tools": loop_guidance_query_tools,
             }
 
     # ---------- 执行 ----------

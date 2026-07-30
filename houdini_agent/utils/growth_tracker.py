@@ -133,8 +133,15 @@ class GrowthTracker:
                 "error_rate_trend": float,      # 错误率趋势 (负 = 改善)
                 "success_rate": float,          # 当前成功率
                 "success_rate_trend": float,    # 成功率趋势 (正 = 改善)
+                "avg_reward": float,             # 平均 reward
+                "reward_trend": float,           # reward 趋势 (正 = 改善)
+                "error_density": float,          # 每任务平均错误次数
+                "error_density_trend": float,    # 错误密度趋势 (负 = 改善)
                 "avg_tool_calls": float,        # 平均工具调用次数
+                "tool_efficiency": float,        # 工具效率分 (高 = 更高效)
+                "tool_efficiency_trend": float,  # 工具效率趋势 (正 = 改善)
                 "avg_retries": float,           # 平均重试次数
+                "retry_trend": float,            # 重试趋势 (负 = 改善)
                 "growth_score": float,          # 综合成长分数
                 "total_tasks": int,             # 总任务数
             }
@@ -145,8 +152,15 @@ class GrowthTracker:
                 "error_rate_trend": 0.0,
                 "success_rate": 1.0,
                 "success_rate_trend": 0.0,
+                "avg_reward": 0.0,
+                "reward_trend": 0.0,
+                "error_density": 0.0,
+                "error_density_trend": 0.0,
                 "avg_tool_calls": 0.0,
+                "tool_efficiency": 1.0,
+                "tool_efficiency_trend": 0.0,
                 "avg_retries": 0.0,
+                "retry_trend": 0.0,
                 "growth_score": 0.0,
                 "total_tasks": self._total_tasks,
             }
@@ -163,32 +177,69 @@ class GrowthTracker:
         # 当前指标
         error_rate = sum(1 for m in recent if m.error_count > 0) / max(len(recent), 1)
         success_rate = sum(1 for m in recent if m.success) / max(len(recent), 1)
+        avg_reward = sum(m.reward for m in recent) / max(len(recent), 1)
+        error_density = sum(m.error_count for m in recent) / max(len(recent), 1)
         avg_tool_calls = sum(m.tool_call_count for m in recent) / max(len(recent), 1)
         avg_retries = sum(m.retry_count for m in recent) / max(len(recent), 1)
+        tool_efficiency = sum(self._tool_efficiency_score(m) for m in recent) / max(len(recent), 1)
 
         # 趋势 (与旧窗口对比)
         if older:
             old_error_rate = sum(1 for m in older if m.error_count > 0) / max(len(older), 1)
             old_success_rate = sum(1 for m in older if m.success) / max(len(older), 1)
+            old_avg_reward = sum(m.reward for m in older) / max(len(older), 1)
+            old_error_density = sum(m.error_count for m in older) / max(len(older), 1)
+            old_avg_retries = sum(m.retry_count for m in older) / max(len(older), 1)
+            old_tool_efficiency = sum(self._tool_efficiency_score(m) for m in older) / max(len(older), 1)
             error_rate_trend = error_rate - old_error_rate   # 负 = 改善
             success_rate_trend = success_rate - old_success_rate  # 正 = 改善
+            reward_trend = avg_reward - old_avg_reward  # 正 = 改善
+            error_density_trend = error_density - old_error_density  # 负 = 改善
+            retry_trend = avg_retries - old_avg_retries  # 负 = 改善
+            tool_efficiency_trend = tool_efficiency - old_tool_efficiency  # 正 = 改善
         else:
             error_rate_trend = 0.0
             success_rate_trend = 0.0
+            reward_trend = 0.0
+            error_density_trend = 0.0
+            retry_trend = 0.0
+            tool_efficiency_trend = 0.0
 
-        # 综合成长分数 = -d(Error)/dt (简化版)
-        growth_score = -error_rate_trend + success_rate_trend
+        # 综合成长分数 = 质量改善 + 成功改善 + 低错误/低重试/高效率改善。
+        # reward 是最接近任务质量的连续信号，因此权重最高；rate 类指标保留方向性。
+        growth_score = (
+            reward_trend * 0.45
+            + success_rate_trend * 0.25
+            - error_rate_trend * 0.15
+            - error_density_trend * 0.10
+            - retry_trend * 0.03
+            + tool_efficiency_trend * 0.02
+        )
 
         return {
             "error_rate": round(error_rate, 3),
             "error_rate_trend": round(error_rate_trend, 3),
             "success_rate": round(success_rate, 3),
             "success_rate_trend": round(success_rate_trend, 3),
+            "avg_reward": round(avg_reward, 3),
+            "reward_trend": round(reward_trend, 3),
+            "error_density": round(error_density, 3),
+            "error_density_trend": round(error_density_trend, 3),
             "avg_tool_calls": round(avg_tool_calls, 1),
+            "tool_efficiency": round(tool_efficiency, 3),
+            "tool_efficiency_trend": round(tool_efficiency_trend, 3),
             "avg_retries": round(avg_retries, 1),
+            "retry_trend": round(retry_trend, 3),
             "growth_score": round(growth_score, 3),
             "total_tasks": self._total_tasks,
         }
+
+    @staticmethod
+    def _tool_efficiency_score(metric: TaskMetric) -> float:
+        """把工具调用和重试压缩成 0..1 的效率信号。"""
+        tc = max(0, metric.tool_call_count)
+        rc = max(0, metric.retry_count)
+        return 1.0 / (1.0 + 0.35 * math.log1p(tc) + 0.3 * rc)
 
     # ==========================================================
     # 技能置信度

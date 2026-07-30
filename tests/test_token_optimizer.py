@@ -12,7 +12,14 @@ from houdini_agent.utils.token_optimizer import (
     MODEL_PRICING,
     TokenOptimizer,
     TokenBudget,
+    TokenEstimate,
+    CompressionStats,
     CompressionStrategy,
+    plan_context_rounds,
+    compress_old_round_tool_results,
+    flatten_context_rounds,
+    prune_context_rounds_to_token_target,
+    assemble_context_messages,
 )
 
 
@@ -128,6 +135,57 @@ class TokenOptimizerMessageTest(unittest.TestCase):
         }]
         self.assertGreater(self.opt.calculate_message_tokens(msgs), 0)
 
+    def test_calculate_message_tokens_includes_tools_schema(self):
+        msgs = [{"role": "user", "content": "create a box"}]
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "create_node",
+                "description": "Create a Houdini node",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"node_type": {"type": "string"}},
+                },
+            },
+        }]
+
+        without_tools = self.opt.calculate_message_tokens(msgs)
+        with_tools = self.opt.calculate_message_tokens(msgs, tools=tools)
+
+        self.assertGreater(with_tools, without_tools)
+
+    def test_estimate_message_tokens_breakdown_matches_total(self):
+        msgs = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": "data:..."}},
+            ],
+        }, {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "create_node", "arguments": '{"type":"box"}'}}
+            ],
+        }]
+        tools = [{
+            "type": "function",
+            "function": {
+                "description": "Create a Houdini node",
+                "parameters": {"type": "object"},
+            },
+        }]
+
+        estimate = self.opt.estimate_message_tokens(msgs, tools=tools)
+
+        self.assertIsInstance(estimate, TokenEstimate)
+        self.assertEqual(estimate.total, self.opt.calculate_message_tokens(msgs, tools=tools))
+        self.assertGreater(estimate.text_tokens, 0)
+        self.assertGreaterEqual(estimate.image_tokens, 765)
+        self.assertGreater(estimate.tool_call_tokens, 0)
+        self.assertGreater(estimate.message_overhead_tokens, 0)
+        self.assertGreater(estimate.tool_definition_tokens, 0)
+
     def test_compress_tool_result_error(self):
         out = self.opt.compress_tool_result({"success": False, "error": "boom"})
         self.assertIn("boom", out)
@@ -171,6 +229,159 @@ class CompressMessagesTest(unittest.TestCase):
         out, stats = self.opt.compress_messages(msgs, keep_recent=4)
         self.assertEqual(out, msgs)
         self.assertEqual(stats["compressed"], 0)
+        self.assertEqual(stats["kept"], 1)
+        self.assertEqual(stats["original_tokens"], stats["compressed_tokens"])
+        self.assertEqual(stats["saved_percent"], 0.0)
+
+    def test_compression_stats_to_dict(self):
+        stats = CompressionStats.from_counts(
+            compressed=3,
+            kept=2,
+            original_tokens=100,
+            compressed_tokens=40,
+            strategy=CompressionStrategy.BALANCED.value,
+        )
+
+        self.assertEqual(stats.saved_tokens, 60)
+        self.assertEqual(stats.saved_percent, 60.0)
+        self.assertEqual(stats.to_dict()["strategy"], "balanced")
+
+    def test_compress_context_rounds_keeps_recent_rounds(self):
+        messages = [
+            {"role": "user", "content": "first request"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "second request"},
+            {"role": "assistant", "content": "second answer"},
+            {"role": "user", "content": "third request"},
+            {"role": "assistant", "content": "third answer"},
+            {"role": "user", "content": "fourth request"},
+        ]
+
+        compressed, stats = self.opt.compress_context_rounds(messages, protect_recent_rounds=2)
+
+        self.assertEqual(compressed[0]["role"], "system")
+        self.assertIn("历史对话摘要", compressed[0]["content"])
+        self.assertEqual([msg["content"] for msg in compressed[1:]], [
+            "third request",
+            "third answer",
+            "fourth request",
+        ])
+        self.assertEqual(stats["compressed"], 4)
+        self.assertEqual(stats["kept"], 3)
+        self.assertEqual(stats["strategy"], "balanced")
+
+
+class ContextRoundPlanTest(unittest.TestCase):
+    def test_plan_context_rounds_splits_on_user_messages(self):
+        messages = [
+            {"role": "system", "content": "rules"},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "done"},
+            {"role": "tool", "content": "result"},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "done again"},
+            {"role": "user", "content": "third"},
+        ]
+
+        plan = plan_context_rounds(messages, protect_recent_rounds=2)
+
+        self.assertEqual(plan.old_round_count, 2)
+        self.assertEqual(plan.protected_round_count, 2)
+        self.assertEqual(plan.old_rounds[0][0]["role"], "system")
+        self.assertEqual(plan.old_rounds[1][0]["content"], "first")
+        self.assertEqual(plan.protected_rounds[0][0]["content"], "second")
+        self.assertEqual(plan.protected_rounds[1][0]["content"], "third")
+        self.assertEqual(plan.messages, messages)
+
+    def test_plan_context_rounds_can_protect_none(self):
+        messages = [
+            {"role": "user", "content": "first"},
+            {"role": "user", "content": "second"},
+        ]
+
+        plan = plan_context_rounds(messages, protect_recent_rounds=0)
+
+        self.assertEqual(plan.old_round_count, 2)
+        self.assertEqual(plan.protected_round_count, 0)
+        self.assertEqual(plan.old_messages, messages)
+        self.assertEqual(plan.protected_messages, [])
+
+    def test_flatten_context_rounds_preserves_order(self):
+        rounds = [[
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "one"},
+        ], [
+            {"role": "user", "content": "second"},
+        ]]
+
+        self.assertEqual([msg["content"] for msg in flatten_context_rounds(rounds)], [
+            "first",
+            "one",
+            "second",
+        ])
+
+    def test_compress_old_round_tool_results_only_mutates_unprotected_tools(self):
+        rounds = [[
+            {"role": "user", "content": "old"},
+            {"role": "tool", "content": "x" * 250},
+        ], [
+            {"role": "user", "content": "recent"},
+            {"role": "tool", "content": "y" * 250},
+        ]]
+
+        count = compress_old_round_tool_results(
+            rounds,
+            protect_recent_rounds=1,
+            summarize_fn=lambda content, limit: content[:limit] + "...[custom]",
+        )
+
+        self.assertEqual(count, 1)
+        self.assertTrue(rounds[0][1]["content"].endswith("...[custom]"))
+        self.assertEqual(rounds[1][1]["content"], "y" * 250)
+
+    def test_prune_context_rounds_check_before_pop(self):
+        rounds = [[{"role": "user", "content": "one"}], [{"role": "user", "content": "two"}]]
+
+        removed = prune_context_rounds_to_token_target(
+            rounds,
+            target_tokens=10,
+            count_tokens_fn=lambda messages: len(messages),
+            min_rounds=1,
+            check_before_pop=True,
+        )
+
+        self.assertEqual(removed, 0)
+        self.assertEqual(len(rounds), 2)
+
+    def test_prune_context_rounds_pop_before_check(self):
+        rounds = [[{"role": "user", "content": "one"}], [{"role": "user", "content": "two"}]]
+
+        removed = prune_context_rounds_to_token_target(
+            rounds,
+            target_tokens=10,
+            count_tokens_fn=lambda messages: len(messages),
+            min_rounds=1,
+            check_before_pop=False,
+        )
+
+        self.assertEqual(removed, 1)
+        self.assertEqual([round_messages[0]["content"] for round_messages in rounds], ["two"])
+
+    def test_assemble_context_messages_preserves_sections(self):
+        rounds = [[{"role": "user", "content": "body"}]]
+        assembled = assemble_context_messages(
+            rounds,
+            prefix_messages=[{"role": "system", "content": "prefix"}],
+            summary_message={"role": "system", "content": "summary"},
+            suffix_messages=[{"role": "user", "content": "suffix"}],
+        )
+
+        self.assertEqual([msg["content"] for msg in assembled], [
+            "prefix",
+            "summary",
+            "body",
+            "suffix",
+        ])
 
 
 class TokenBudgetTest(unittest.TestCase):

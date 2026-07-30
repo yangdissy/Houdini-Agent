@@ -628,8 +628,8 @@ class ChatInput(QtWidgets.QPlainTextEdit):
     atTriggered = QtCore.Signal(str, QtCore.QRect)  # @ 触发补全: (当前前缀, 光标矩形)
     slashTriggered = QtCore.Signal(str, QtCore.QRect)  # / 触发补全: (当前前缀, 光标矩形)
     
-    _MIN_H = 44
-    _MAX_H = 220
+    _MIN_H = 92
+    _MAX_H = 320
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -683,6 +683,7 @@ class ChatInput(QtWidgets.QPlainTextEdit):
         self._slash_popup: 'SlashCommandPopup | None' = None
         # ★ IME 预编辑状态追踪
         self._ime_composing = False
+        self.setFixedHeight(self._MIN_H)
     
     def set_completer_popup(self, popup: 'NodeCompleterPopup'):
         """设置节点补全弹出框引用，用于键盘导航和自动关闭"""

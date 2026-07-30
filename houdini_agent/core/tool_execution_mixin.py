@@ -10,6 +10,7 @@ import traceback
 from houdini_agent.qt_compat import QtCore, QtWidgets
 from houdini_agent.ui.i18n import tr
 from houdini_agent.core.harness_engine import build_tool_retry_key, sanitize_tool_result
+from houdini_agent.core.houdini_main_thread_executor import OPERATION_ID_KEY
 
 
 class ToolExecutionMixin:
@@ -429,21 +430,14 @@ class ToolExecutionMixin:
         if self.client.is_stop_requested():
             return {"success": False, "error": "用户已请求停止"}
         
-        # ★ 主线程忙保护：如果上一个工具超时了且主线程仍在 cook，
-        #   不再堆积新的 BlockingQueuedConnection 信号（避免死锁）
+        # ★ 主线程执行器保护：timeout/shutdown 后由 executor fail closed，
+        #   避免新的 Houdini 工具信号与迟到主线程操作重叠。
         executor = getattr(self, '_houdini_main_thread_executor', None)
         if executor is not None and executor.is_blocked():
             if tool_name not in self._BG_SAFE_TOOLS:
                 return {
                     "success": False,
                     "error": "Houdini 主线程执行器处于阻塞状态，为避免崩溃已拒绝新的 Houdini 工具执行。请重启面板后再继续。"
-                }
-        if getattr(self, '_main_thread_busy', False):
-            if tool_name not in self._BG_SAFE_TOOLS:
-                return {
-                    "success": False,
-                    "error": "主线程正忙（可能在进行耗时计算），请等待完成后重试。"
-                            "建议：按停止按钮中断当前操作。"
                 }
         
         # ★ Ask 模式安全守卫：拦截任何不在白名单的工具
@@ -559,21 +553,8 @@ class ToolExecutionMixin:
     def _execute_tool_in_main_thread(self, tool_name: str, kwargs: dict) -> dict:
         """在主线程执行工具（线程安全）
         
-        使用 BlockingQueuedConnection + Queue 确保：
-        1. Houdini 操作在主线程执行（hou 模块非线程安全，macOS 尤其严格）
-        2. 多个工具调用不会竞争
-        3. 结果安全传递回调用线程
-        
-        ★ macOS 崩溃修复说明：
-        Houdini 嵌入 Qt 时，macOS 的 Cocoa 事件循环比 Windows 更严格。
-        所有 hou API 调用必须在主线程执行，否则会导致段错误或 EXC_BAD_ACCESS。
-        BlockingQueuedConnection 保证信号在目标线程（主线程）的事件循环中执行，
-        且 emit 会阻塞调用线程直到槽函数返回，实现了线程安全的同步调用。
-        
-        ★ 防卡死机制（v1.4.3）：
-        当 Houdini cook 耗时导致超时后，标记 _main_thread_busy，
-        阻止后续工具调用堆积 BlockingQueuedConnection 信号（避免死锁）。
-        主线程槽函数执行完毕后自动清除标记。
+        Houdini 主线程 queue、timeout、blocked 和 operation envelope 由
+        HoudiniMainThreadExecutor 统一管理；如果 executor 缺失，fail closed。
         """
         executor = getattr(self, '_houdini_main_thread_executor', None)
         if executor is not None:
@@ -582,38 +563,7 @@ class ToolExecutionMixin:
                 self._main_thread_busy = True
             return result
 
-        # 使用锁确保一次只有一个工具调用（避免并发竞争）
-        with self._tool_lock:
-            # 清空队列（防止残留数据）
-            while not self._tool_result_queue.empty():
-                try:
-                    self._tool_result_queue.get_nowait()
-                except queue.Empty:
-                    break
-            
-            # 发送信号到主线程执行
-            # BlockingQueuedConnection 会阻塞直到槽函数执行完成
-            self._executeToolRequest.emit(tool_name, kwargs)
-            
-            # 从队列获取结果（有超时保护）
-            # ★ 超时设为 120s，因为某些 Houdini 操作（如创建复杂节点、cook 高面数模型）
-            #   可能需要较长时间。超时后标记主线程忙，防止后续信号堆积。
-            try:
-                result = self._tool_result_queue.get(timeout=self._TOOL_MAIN_THREAD_TIMEOUT)
-                # 主线程正常返回 → 清除忙标记
-                self._main_thread_busy = False
-                return result
-            except queue.Empty:
-                # ★ 超时：主线程可能仍在执行 cook，标记为忙
-                self._main_thread_busy = True
-                print(f"[⚠️ TIMEOUT] 工具 {tool_name} 主线程执行超时 "
-                      f"({self._TOOL_MAIN_THREAD_TIMEOUT}s)，"
-                      f"可能 Houdini 正在进行耗时计算。后续工具调用将被暂停。")
-                return {
-                    "success": False,
-                    "error": f"操作超时（{int(self._TOOL_MAIN_THREAD_TIMEOUT)}秒）：Houdini 主线程可能正在进行耗时计算（如 cook/渲染）。"
-                             f"操作 {tool_name} 仍在后台执行中，请等待完成或按停止按钮中断。"
-                }
+        return {"success": False, "error": f"Houdini 主线程执行器不可用，拒绝执行 {tool_name}"}
 
     def _execute_tools_batch_in_main_thread(self, batch: list) -> list:
         """在主线程批量执行只读工具（减少 N 次信号往返为 1 次）
@@ -631,20 +581,10 @@ class ToolExecutionMixin:
                 self._main_thread_busy = True
             return results
 
-        with self._tool_lock:
-            while not self._tool_result_queue.empty():
-                try:
-                    self._tool_result_queue.get_nowait()
-                except queue.Empty:
-                    break
-
-            self._executeToolBatchRequest.emit(batch)
-
-            try:
-                results = self._tool_result_queue.get(timeout=60.0)
-                return results if isinstance(results, list) else [results]
-            except queue.Empty:
-                return [{"success": False, "error": tr('ai.main_exec_timeout')}] * len(batch)
+        return [
+            {"success": False, "error": "Houdini 主线程执行器不可用，拒绝执行 batch"}
+            for _ in batch
+        ]
 
     def _on_execute_tool_batch_main_thread(self, batch: list):
         """在主线程批量执行只读工具的槽函数
@@ -652,19 +592,32 @@ class ToolExecutionMixin:
         所有工具在主线程依次执行（它们是快速的只读查询），
         然后将结果列表一次性放入队列返回给调用线程。
         """
+        executor = getattr(self, '_houdini_main_thread_executor', None)
+        operation_id = None
+        request_batch = []
+        for tool_name, kwargs in batch:
+            request_kwargs = dict(kwargs or {})
+            item_operation_id = request_kwargs.pop(OPERATION_ID_KEY, None)
+            if operation_id is None:
+                operation_id = item_operation_id
+            request_batch.append((tool_name, request_kwargs))
+
         # ★ 读取前 Cook（v1.4.4）：批量读取也需要确保数据新鲜
-        needs_cook = any(tn in self._COOK_BEFORE_READ_TOOLS for tn, _ in batch)
+        needs_cook = any(tn in self._COOK_BEFORE_READ_TOOLS for tn, _ in request_batch)
         if needs_cook:
             self._cook_displayed_nodes_if_manual()
         
         results = []
-        for tool_name, kwargs in batch:
+        for tool_name, kwargs in request_batch:
             try:
                 result = self.mcp.execute_tool(tool_name, kwargs)
             except Exception as e:
                 result = {"success": False, "error": str(e)}
             results.append(result)
-        self._tool_result_queue.put(results)
+        if executor is not None and operation_id is not None:
+            self._tool_result_queue.put(executor.attach_result(operation_id, results))
+        else:
+            self._tool_result_queue.put(results)
         # ★ 吸收 Agent 操作造成的选择变化（与单工具执行同理）
         self._refresh_selection_baseline()
     # ------------------------------------------------------------------

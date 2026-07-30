@@ -14,6 +14,7 @@ from ..utils.dev_feature_toggles import (
     is_toggle_enabled,
     set_toggle_enabled,
 )
+from ..utils.team_memory_settings import is_team_export_enabled, set_team_export_enabled
 
 
 class HeaderMixin:
@@ -345,8 +346,10 @@ class HeaderMixin:
         if hasattr(self, "_request_user_switch"):
             menu.addAction("Switch User", self._request_user_switch)
         menu.addSeparator()
+        self._add_team_memory_sharing_action(menu)
         if is_dev_reload_enabled():
             self._add_dev_feature_toggle_menu(menu)
+            menu.addAction("Rebuild Team Memory", self._rebuild_team_memory_from_menu)
             menu.addSeparator()
         
         # 语言子菜单
@@ -368,8 +371,11 @@ class HeaderMixin:
 
     def _add_dev_feature_toggle_menu(self, menu):
         dev_menu = menu.addMenu("Dev Feature Toggles")
+        self._dev_toggle_menu_ref = dev_menu  # ★ 持久引用，排除 QAction 被提前 GC 的可能
+        self._dev_toggle_action_refs = []
         for toggle in DEV_FEATURE_TOGGLES:
             action = dev_menu.addAction(toggle.label)
+            self._dev_toggle_action_refs.append(action)
             action.setCheckable(True)
             action.setChecked(is_toggle_enabled(toggle))
             if toggle.description:
@@ -378,8 +384,82 @@ class HeaderMixin:
                 except Exception:
                     pass
             action.triggered.connect(
-                lambda checked=False, t=toggle: set_toggle_enabled(t, bool(checked))
+                lambda checked=False, t=toggle: self._toggle_dev_toggle(t)
             )
+
+    def _toggle_dev_toggle(self, toggle):
+        """不信任 Qt 传入的 checked 参数（实测在本机上连续两次点击都传入 False，
+        导致取消后无法再次打开），改为自己重新读现持久化值并取反。
+        因为整个菜单每次打开都会重建，下次打开时 checkbox 会重新从持久化值同步，
+        不依赖 Qt 自己的 checked 状态追踪也能正确工作。"""
+        self._set_dev_toggle(toggle, not is_toggle_enabled(toggle))
+
+    def _set_dev_toggle(self, toggle, enabled: bool):
+        """写入开发者功能开关；写入失败时弹窗提示。
+
+        ★ 不用 self._addStatus.emit：那是挂在"当前活跃的对话消息气泡"上的，
+        没有正在进行的 Agent 回复时会被静默丢弃（菜单动作常常在无活跃会话时触发）。
+        """
+        try:
+            set_toggle_enabled(toggle, enabled)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, toggle.label, f"设置保存失败，请重试: {e}")
+
+    def _add_team_memory_sharing_action(self, menu):
+        """常驻开关：是否把本用户的技术类长期记忆同步给团队共享库（默认开启，可随时关闭）。"""
+        uname = getattr(self, "_username", "")
+        if not uname:
+            return
+        action = menu.addAction("Team Memory Sharing")
+        self._team_memory_action_ref = action  # ★ 持久引用，排除 QAction 被提前 GC 的可能
+        action.setCheckable(True)
+        try:
+            action.setChecked(is_team_export_enabled(uname))
+        except Exception:
+            action.setChecked(True)
+        action.setToolTip(
+            "睡眠维护时是否把技术类经验（不含个人偏好/身份信息）同步一份到共享盘，供团队记忆库使用。"
+        )
+        action.triggered.connect(
+            lambda checked=False, u=uname: self._toggle_team_memory_sharing(u)
+        )
+
+    def _toggle_team_memory_sharing(self, username: str):
+        """不信任 Qt 传入的 checked 参数（同样的不可靠问题），改为自己重新读现
+        持久化值并取反。"""
+        self._set_team_memory_sharing(username, not is_team_export_enabled(username))
+
+    def _set_team_memory_sharing(self, username: str, enabled: bool):
+        """写入开关；写入失败时弹窗提示，而不是被 Qt 静默吞掉。
+
+        ★ 不用 self._addStatus.emit：那是挂在"当前活跃的对话消息气泡"上的，
+        没有正在进行的 Agent 回复时会被静默丢弃（菜单动作常常在无活跃会话时触发）。
+        """
+        try:
+            set_team_export_enabled(username, enabled)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Team Memory Sharing", f"设置保存失败，请重试: {e}")
+
+    def _rebuild_team_memory_from_menu(self):
+        """开发模式动作：全量扫描所有成员的 team_export.json，去重合并写入团队记忆库。
+
+        ★ 用 QMessageBox 而不是 self._addStatus.emit：后者挂在"当前活跃的对话消息
+        气泡"上，这个动作常常是在没有正在进行的 Agent 回复时点击的（刚打开面板就
+        点菜单），此时 _addStatus 会被静默丢弃，看起来像"点了没反应"。
+        """
+        try:
+            from ..utils.team_memory_store import rebuild_team_memory
+            stats = rebuild_team_memory()
+            QtWidgets.QMessageBox.information(
+                self,
+                "团队记忆库",
+                "团队记忆库已重建：\n"
+                f"扫描 {stats['scanned_users']} 名成员\n"
+                f"合并 semantic {stats['semantic_merged']}/{stats['semantic_raw']}\n"
+                f"合并 procedural {stats['procedural_merged']}/{stats['procedural_raw']}",
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "团队记忆库", f"重建失败: {e}")
 
     def _open_rules_editor(self):
         """打开用户自定义规则编辑器"""

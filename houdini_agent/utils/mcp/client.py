@@ -4036,8 +4036,44 @@ class HoudiniMCP:
     # ========================================
     
     class _ExecInterrupt(Exception):
-        """execute_python 超时或用户停止时抛出的中断异常"""
+        """execute_python / run_skill 超时或用户停止时抛出的中断异常"""
         pass
+
+    @contextlib.contextmanager
+    def _timeout_guard(self, timeout: float, check_interval: float = 0.5):
+        """在代码块执行期间安装超时/停止监控（sys.settrace 逐行检查）。
+
+        用于保护在 Houdini 主线程上执行、可能挂起的纯 Python 代码路径
+        （execute_python / run_skill）。超时或用户点击停止时抛出
+        HoudiniMCP._ExecInterrupt 中断执行，避免无限期卡住主线程。
+
+        ★ 局限：仅能在下一条 Python 字节码执行前中断，无法中断 C 扩展
+        内部的阻塞调用（如 hou.node().cook()、网络请求的底层 socket 等待）。
+        """
+        start_time = time.time()
+        deadline = start_time + max(timeout, 5)
+        stop_event = self._stop_event
+        last_check = [start_time]
+
+        def _trace_timeout(frame, event, arg):
+            now = time.time()
+            if now - last_check[0] < check_interval:
+                return _trace_timeout
+            last_check[0] = now
+            if stop_event and stop_event.is_set():
+                raise HoudiniMCP._ExecInterrupt("用户已停止执行")
+            if now > deadline:
+                raise HoudiniMCP._ExecInterrupt(
+                    f"代码执行超时（{timeout}s），已中断。如需更长时间，请增加 timeout 参数。"
+                )
+            return _trace_timeout
+
+        old_trace = sys.gettrace()
+        sys.settrace(_trace_timeout)
+        try:
+            yield
+        finally:
+            sys.settrace(old_trace)
 
     def execute_python(self, code: str, timeout: int = 30) -> Tuple[bool, Dict[str, Any]]:
         """在 Houdini Python 环境中执行代码
@@ -4074,38 +4110,13 @@ class HoudiniMCP:
             return False, {"error": "代码为空"}
         
         import io
-        import sys
         import traceback
-        import threading
         
         start_time = time.time()
-        _stop_event = self._stop_event  # 缓存引用
-        _deadline = start_time + max(timeout, 5)  # 最少 5 秒
-        _check_interval = 0.5  # 每 0.5s 检查一次（避免过于频繁）
-        _last_check = [start_time]  # 用列表以便在闭包中修改
-        
-        def _trace_timeout(frame, event, arg):
-            """sys.settrace 回调：每行代码执行前检查超时和停止标志"""
-            now = time.time()
-            # 降低检查频率：距上次检查不足 _check_interval 则跳过
-            if now - _last_check[0] < _check_interval:
-                return _trace_timeout
-            _last_check[0] = now
-            # 检查停止标志
-            if _stop_event and _stop_event.is_set():
-                raise HoudiniMCP._ExecInterrupt("用户已停止执行")
-            # 检查超时
-            if now > _deadline:
-                raise HoudiniMCP._ExecInterrupt(
-                    f"代码执行超时（{timeout}s），已中断。"
-                    f"如需更长时间，请增加 timeout 参数。"
-                )
-            return _trace_timeout
         
         # 捕获输出
         old_stdout = sys.stdout
         old_stderr = sys.stderr
-        old_trace = sys.gettrace()
         captured_output = io.StringIO()
         captured_error = io.StringIO()
         
@@ -4127,23 +4138,22 @@ class HoudiniMCP:
             }
             exec_locals = {}
             
-            # ★ 安装超时 trace
-            sys.settrace(_trace_timeout)
-            
-            # 尝试作为表达式求值（返回最后一个值）
-            try:
-                # 先尝试 eval（单个表达式）
-                return_value = eval(code.strip(), exec_globals, exec_locals)
-                result["return_value"] = self._safe_repr(return_value)
-            except SyntaxError:
-                # 不是单个表达式，用 exec 执行
-                exec(code, exec_globals, exec_locals)
-                
-                # 尝试获取最后一个赋值的值
-                if exec_locals:
-                    last_var = list(exec_locals.keys())[-1]
-                    if not last_var.startswith('_'):
-                        result["return_value"] = self._safe_repr(exec_locals[last_var])
+            # ★ 安装超时/停止监控，再执行代码
+            with self._timeout_guard(timeout):
+                # 尝试作为表达式求值（返回最后一个值）
+                try:
+                    # 先尝试 eval（单个表达式）
+                    return_value = eval(code.strip(), exec_globals, exec_locals)
+                    result["return_value"] = self._safe_repr(return_value)
+                except SyntaxError:
+                    # 不是单个表达式，用 exec 执行
+                    exec(code, exec_globals, exec_locals)
+                    
+                    # 尝试获取最后一个赋值的值
+                    if exec_locals:
+                        last_var = list(exec_locals.keys())[-1]
+                        if not last_var.startswith('_'):
+                            result["return_value"] = self._safe_repr(exec_locals[last_var])
             
             result["output"] = captured_output.getvalue()
             
@@ -4168,8 +4178,6 @@ class HoudiniMCP:
             return False, result
             
         finally:
-            # ★ 必须恢复原始 trace，否则影响后续所有 Python 执行
-            sys.settrace(old_trace)
             sys.stdout = old_stdout
             sys.stderr = old_stderr
     
@@ -5476,7 +5484,14 @@ class HoudiniMCP:
             return {"success": False, "error": f"列出 Skill 失败: {e}"}
 
     def _tool_run_skill(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """执行指定 Skill"""
+        """执行指定 Skill
+
+        ★ 超时保护（与 execute_python 共用 _timeout_guard）：
+        Skill 代码同样运行在 Houdini 主线程上，一旦其中出现死循环/挂起
+        （包括第三方/用户自定义 skill），此前完全没有超时保护，会导致
+        主线程一直卡死直到用户强杀 Houdini。现在与 execute_python 一样
+        通过 sys.settrace 逐行检查超时/停止标志来尽快中断纯 Python 代码。
+        """
         if not HAS_SKILLS or _run_skill is None:
             return {"success": False, "error": "Skill 系统未加载"}
 
@@ -5492,7 +5507,14 @@ class HoudiniMCP:
                 return {"success": False, "error": "params 必须是 JSON 对象"}
 
         try:
-            result = _run_skill(skill_name, params)
+            timeout = int(args.get("timeout", 60))
+        except (TypeError, ValueError):
+            timeout = 60
+        timeout = max(5, min(timeout, 300))
+
+        try:
+            with self._timeout_guard(timeout):
+                result = _run_skill(skill_name, params)
             if "error" in result:
                 return {"success": False, "error": result["error"]}
 
@@ -5500,6 +5522,8 @@ class HoudiniMCP:
             import json as _json
             formatted = _json.dumps(result, ensure_ascii=False, indent=2)
             return {"success": True, "result": formatted}
+        except HoudiniMCP._ExecInterrupt as e:
+            return {"success": False, "error": f"Skill '{skill_name}' 执行被中断：{e}"}
         except Exception as e:
             import traceback
             return {"success": False, "error": f"Skill 执行异常: {e}\n{traceback.format_exc()[:500]}"}
@@ -6142,6 +6166,7 @@ class HoudiniMCP:
                 level_name = ABSTRACTION_LEVELS.get(rec.abstraction_level, "unknown")
                 semantic_memories.append({
                     "type": "semantic",
+                    "source": "personal",
                     "rule": rec.rule,
                     "category": rec.category,
                     "abstraction_level": rec.abstraction_level,
@@ -6172,6 +6197,7 @@ class HoudiniMCP:
                     continue
                 procedural_memories.append({
                     "type": "procedural",
+                    "source": "personal",
                     "strategy_name": rec.strategy_name,
                     "description": rec.description,
                     "priority": round(rec.priority, 2),
@@ -6179,6 +6205,41 @@ class HoudiniMCP:
                     "usage_count": rec.usage_count,
                     "relevance": round(score, 3),
                 })
+
+            # ★ 团队记忆（只读）：与个人库联合检索，结果标注 source=team + contributors。
+            try:
+                from ..team_memory_store import get_team_memory_store
+                team_store = get_team_memory_store()
+                for rec, score in team_store.search_semantic(query=query, top_k=min(3, top_k), category=category):
+                    if score < epi_threshold:
+                        continue
+                    level_name = ABSTRACTION_LEVELS.get(rec.abstraction_level, "unknown")
+                    semantic_memories.append({
+                        "type": "semantic",
+                        "source": "team",
+                        "rule": rec.rule,
+                        "category": rec.category,
+                        "abstraction_level": rec.abstraction_level,
+                        "level_name": level_name,
+                        "confidence": round(rec.confidence, 2),
+                        "relevance": round(score, 3),
+                        "contributors": rec.source_users,
+                    })
+                for rec, score in team_store.search_procedural(query=query, top_k=min(2, top_k)):
+                    if score < proc_threshold:
+                        continue
+                    procedural_memories.append({
+                        "type": "procedural",
+                        "source": "team",
+                        "strategy_name": rec.strategy_name,
+                        "description": rec.description,
+                        "priority": round(rec.priority, 2),
+                        "success_rate": round(rec.success_rate, 2),
+                        "relevance": round(score, 3),
+                        "contributors": rec.source_users,
+                    })
+            except Exception as e:
+                print(f"[search_memory] 团队记忆检索跳过 (非致命): {e}")
 
             total_found = len(semantic_memories) + len(episodic_memories) + len(procedural_memories)
             print(

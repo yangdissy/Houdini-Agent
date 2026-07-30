@@ -22,6 +22,7 @@ from ..utils.memory_store import get_memory_store
 from ..utils.reward_engine import get_reward_engine
 from ..utils.reflection import get_reflection_module
 from ..utils.growth_tracker import get_growth_tracker, TaskMetric
+from ..utils.memory_activation import MemoryActivationCandidate, MemoryActivationSelector
 
 
 class MemoryMixin:
@@ -41,12 +42,30 @@ class MemoryMixin:
                 self._growth_tracker = get_growth_tracker(self._username)
                 self._memory_initialized = True
                 print(f"[Memory] 长期记忆系统已初始化: {self._memory_store.get_stats()}")
+                self._maybe_notify_team_memory_export()
             except Exception as e:
                 print(f"[Memory] 初始化失败 (非致命): {e}")
                 self._memory_initialized = False
 
         thread = threading.Thread(target=_init, daemon=True)
         thread.start()
+
+    def _maybe_notify_team_memory_export(self):
+        """首次初始化记忆系统时，告知一次「团队记忆共享」（默认开启，可关闭）。"""
+        try:
+            from ..utils.team_memory_settings import (
+                has_shown_team_export_notice,
+                mark_team_export_notice_shown,
+            )
+            if has_shown_team_export_notice(self._username):
+                return
+            mark_team_export_notice_shown(self._username)
+            self._addStatus.emit(
+                "ℹ️ 已默认开启「团队记忆共享」：睡眠维护时会把技术类经验（不含个人偏好/身份信息）"
+                "同步一份到共享盘，供团队记忆库使用；可在顶部溢出菜单「Team Memory Sharing」随时关闭。"
+            )
+        except Exception:
+            pass
 
     def _activate_long_term_memory(self, user_message: str, scene_context: dict = None) -> str:
         """动态记忆激活 — 分层 chunk 检索
@@ -83,52 +102,96 @@ class MemoryMixin:
             _ep_threshold = 0.3 if _is_semantic else 0.05
             _proc_threshold = 0.25 if _is_semantic else 0.04
 
-            parts = []
+            candidates = []
 
             # ── L1: 核心偏好 (top_k=3, threshold=0.15) ──
             l1_results = store.search_by_level(query, level=1, top_k=3, threshold=0.15)
             for rec, score in l1_results:
-                parts.append(f"[L1 Preference] (conf={rec.confidence:.2f}) {rec.rule[:120]}")
-                store.increment_semantic_activation(rec.id)
+                candidates.append(MemoryActivationCandidate(
+                    kind="semantic",
+                    text=f"[L1 Preference] (conf={rec.confidence:.2f}) {rec.rule[:120]}",
+                    score=score,
+                    priority=1.20,
+                    confidence=rec.confidence,
+                    record_id=rec.id,
+                    source=rec,
+                ))
 
             # ── L2: 经验规则 (top_k=3, threshold=0.25) ──
             l2_results = store.search_by_level(query, level=2, top_k=3, threshold=0.25)
             for rec, score in l2_results:
-                parts.append(f"[L2 Rule] (conf={rec.confidence:.2f}) {rec.rule[:120]}")
-                store.increment_semantic_activation(rec.id)
+                candidates.append(MemoryActivationCandidate(
+                    kind="semantic",
+                    text=f"[L2 Rule] (conf={rec.confidence:.2f}) {rec.rule[:120]}",
+                    score=score,
+                    priority=1.00,
+                    confidence=rec.confidence,
+                    record_id=rec.id,
+                    source=rec,
+                ))
 
             # ── L3: 工作流模式 (top_k=2, threshold=0.35) ──
             l3_results = store.search_by_level(query, level=3, top_k=2, threshold=0.35)
             for rec, score in l3_results:
-                parts.append(f"[L3 Workflow] (conf={rec.confidence:.2f}) {rec.rule[:120]}")
-                store.increment_semantic_activation(rec.id)
+                candidates.append(MemoryActivationCandidate(
+                    kind="semantic",
+                    text=f"[L3 Workflow] (conf={rec.confidence:.2f}) {rec.rule[:120]}",
+                    score=score,
+                    priority=0.92,
+                    confidence=rec.confidence,
+                    record_id=rec.id,
+                    source=rec,
+                ))
 
             # ── Episodic: 相关经历 (top_k=2) ──
             episodes = store.search_episodic(query, top_k=2, min_importance=0.3)
             for ep, score in episodes:
                 if score > _ep_threshold:
                     status = "✅" if ep.success else "❌"
-                    parts.append(
-                        f"[Past Experience] {status} {ep.task_description[:80]} "
-                        f"→ {ep.result_summary[:60]}"
-                    )
-                    try:
-                        new_imp = min(5.0, ep.importance * 1.05)
-                        store.update_episodic_importance(ep.id, new_imp)
-                    except Exception:
-                        pass
+                    candidates.append(MemoryActivationCandidate(
+                        kind="episodic",
+                        text=(
+                            f"[Past Experience] {status} {ep.task_description[:80]} "
+                            f"→ {ep.result_summary[:60]}"
+                        ),
+                        score=score,
+                        priority=min(1.0, ep.importance / 2.0),
+                        confidence=0.75 if ep.success else 0.45,
+                        record_id=ep.id,
+                        source=ep,
+                    ))
 
             # ── Procedural: 适用策略 (top_k=2) ──
             strategies = store.search_procedural(query, top_k=2)
             for strat, score in strategies:
                 if score > _proc_threshold:
-                    parts.append(f"[Strategy] {strat.description[:80]}")
+                    candidates.append(MemoryActivationCandidate(
+                        kind="procedural",
+                        text=f"[Strategy] {strat.description[:80]}",
+                        score=score,
+                        priority=strat.priority,
+                        confidence=strat.success_rate,
+                        record_id=strat.id,
+                        source=strat,
+                    ))
 
-            if not parts:
+            selected = MemoryActivationSelector(max_chars=900).select(candidates)
+
+            for item in selected:
+                if item.kind == "semantic" and item.record_id:
+                    store.increment_semantic_activation(item.record_id)
+                elif item.kind == "episodic" and item.source:
+                    try:
+                        new_imp = min(5.0, item.source.importance * 1.05)
+                        store.update_episodic_importance(item.record_id, new_imp)
+                    except Exception:
+                        pass
+
+            if not selected:
                 return ""
 
             header = "[Long-Term Memory — 历史经验仅供参考，请结合当前上下文判断]"
-            result = header + "\n" + "\n".join(parts)
+            result = header + "\n" + "\n".join(item.text for item in selected)
             return result
 
         except Exception as e:

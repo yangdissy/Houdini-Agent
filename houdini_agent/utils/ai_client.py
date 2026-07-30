@@ -16,6 +16,8 @@ from urllib.parse import quote_plus
 from shared.common_utils import load_config, save_config, load_user_config, save_user_config
 from ..core.harness_engine import is_harness_v2_enabled, sanitize_tool_result
 from ..core.streaming_tool_executor import StreamingToolExecutor
+from ..utils.token_optimizer import TokenOptimizer
+from houdini_agent.utils.provider_adapters import AnthropicRequestAdapter, AnthropicStreamEventParser
 
 # 强制使用本地 lib 目录中的依赖库
 _lib_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'lib')
@@ -1690,11 +1692,7 @@ class AIClient:
 
     def _get_streaming_tool_executor(self) -> StreamingToolExecutor:
         def _runtime_profile_provider() -> Dict[str, set]:
-            try:
-                from .tool_registry import get_tool_registry
-                return get_tool_registry().build_streaming_executor_profile()
-            except Exception:
-                return {}
+            return self._build_tool_execution_profile()
 
         if self._streaming_tool_executor is None:
             self._streaming_tool_executor = StreamingToolExecutor(
@@ -1709,38 +1707,47 @@ class AIClient:
             self._streaming_tool_executor.update_runtime_profile_provider(_runtime_profile_provider)
         return self._streaming_tool_executor
 
+    @staticmethod
+    def _build_tool_execution_profile() -> Dict[str, set]:
+        try:
+            from .tool_registry import build_default_tool_execution_profile, get_tool_registry
+            merged_profile = build_default_tool_execution_profile()
+            profile = get_tool_registry().build_streaming_executor_profile()
+            if profile:
+                for key, value in profile.items():
+                    merged_profile[key] = set(value or [])
+            return merged_profile
+        except Exception:
+            from .tool_registry import build_default_tool_execution_profile
+            return build_default_tool_execution_profile()
+
+    @classmethod
+    def _history_query_tools(cls) -> set:
+        profile = cls._build_tool_execution_profile()
+        return set(profile.get("history_query_tools") or [])
+
+    @classmethod
+    def _compression_tool_groups(cls) -> Tuple[set, set]:
+        profile = cls._build_tool_execution_profile()
+        query_tools = set(profile.get("compression_query_tools") or [])
+        operation_tools = set(profile.get("compression_operation_tools") or [])
+        return query_tools, operation_tools
+
+    @classmethod
+    def _thinking_tool_groups(cls) -> Tuple[set, set]:
+        profile = cls._build_tool_execution_profile()
+        simple_success_tools = set(profile.get("thinking_simple_success_tools") or [])
+        deep_think_tools = set(profile.get("thinking_deep_tools") or [])
+        return simple_success_tools, deep_think_tools
+
+    @classmethod
+    def _loop_guidance_query_tools(cls) -> set:
+        profile = cls._build_tool_execution_profile()
+        return set(profile.get("loop_guidance_query_tools") or [])
+
     # ----------------------------------------------------------
     # 工具结果分页：按行分段，让 AI 自主判断是否需要更多
     # ----------------------------------------------------------
-
-    # 查询型工具 & 操作型工具分类（共用常量）
-    _QUERY_TOOLS = frozenset({
-        'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'inspect_node',
-        'get_node_connections', 'suggest_connection', 'preview_node_operation', 'validate_node_network',
-        'list_children', 'find_nodes', 'get_geometry_summary', 'get_scene_snapshot',
-        'read_selection', 'search_node_types',
-        'semantic_search_nodes', 'check_errors', 'verify_network',
-        'search_local_doc', 'get_houdini_node_doc',
-        'execute_python', 'execute_shell', 'web_search', 'fetch_webpage',
-        'run_skill', 'list_skills',
-        'capture_viewport',
-    })
-    _OP_TOOLS = frozenset({
-        'create_node', 'create_nodes_batch', 'create_named_null', 'connect_nodes', 'cook_node',
-        'set_node_parameter', 'create_wrangle_node',
-    })
-    _SIMPLE_SUCCESS_TOOLS = frozenset({
-        'create_node', 'get_node_parameters', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
-        'suggest_connection', 'preview_node_operation', 'validate_node_network',
-        'list_children', 'find_nodes', 'get_geometry_summary', 'get_scene_snapshot',
-        'read_selection', 'check_errors', 'verify_network',
-    })
-    _DEEP_THINK_TOOLS = frozenset({
-        'connect_nodes', 'cook_node', 'create_named_null', 'delete_node', 'disconnect_nodes', 'rename_node', 'preview_layout_nodes',
-        'set_node_parameter', 'batch_set_parameters', 'create_nodes_batch',
-        'create_wrangle_node', 'copy_node', 'set_display_flag', 'set_node_flags',
-        'execute_python', 'execute_shell', 'save_hip', 'run_skill',
-    })
 
     @classmethod
     def _thinking_followup_hint(
@@ -1761,6 +1768,7 @@ class AIClient:
 
         tool_names = [call[1] for call in parsed_calls if len(call) > 1]
         tool_count = len(tool_names)
+        simple_success_tools, deep_think_tools = cls._thinking_tool_groups()
 
         if round_failed:
             return (
@@ -1771,13 +1779,13 @@ class AIClient:
                 "不要为了格式输出冗长复盘。]"
             )
 
-        if tool_count == 1 and tool_names[0] in cls._SIMPLE_SUCCESS_TOOLS and iteration <= 1:
+        if tool_count == 1 and tool_names[0] in simple_success_tools and iteration <= 1:
             return (
                 "\n\n[提示：工具已成功。如果用户请求已经满足，请直接简短总结；"
                 "不要为了格式而输出 <think>。只有还需要继续操作时才用简短 <think> 说明下一步。]"
             )
 
-        if tool_count > 1 or any(name in cls._DEEP_THINK_TOOLS for name in tool_names):
+        if tool_count > 1 or any(name in deep_think_tools for name in tool_names):
             return (
                 "\n\n[提示：工具已成功。如还需继续执行，请最多用 1-3 行简短 <think> 说明状态和下一步；"
                 "只有在连接、删除、代码执行、失败恢复或多步网络规划时才使用完整深度思考。"
@@ -2096,8 +2104,9 @@ class AIClient:
         # 恢复提示
         history_summary = ""
         if tool_calls_history:
+            history_query_tools = self._history_query_tools()
             op_history = [h for h in tool_calls_history
-                          if h['tool_name'] not in self._QUERY_TOOLS]
+                          if h['tool_name'] not in history_query_tools]
             if op_history:
                 recent = op_history[-8:]
                 lines = []
@@ -2218,9 +2227,10 @@ class AIClient:
             # 已自带分页逻辑的工具：软上限截断 + 引导用 offset 翻页
             if tool_name in self._SELF_PAGED_TOOLS:
                 return self._soft_cap_with_offset_hint(tool_name, content)
-            if tool_name in self._QUERY_TOOLS:
+            compression_query_tools, compression_operation_tools = self._compression_tool_groups()
+            if tool_name in compression_query_tools:
                 return self._paginate_result(content, max_lines=50)
-            elif tool_name in self._OP_TOOLS:
+            elif tool_name in compression_operation_tools:
                 if len(content) > 300:
                     import re
                     paths = re.findall(r'[/\w]+(?:/[\w]+)+', content)
@@ -2421,59 +2431,13 @@ class AIClient:
 
     @staticmethod
     def _count_tokens_for_text(text: str) -> int:
-        """对单段纯文本做中英混合 token 估算。
-
-        规则：
-          - 中文字符（U+4E00–U+9FFF）：约 1 字符 / token（实测 ~1.0–1.3）
-          - 其余字符（英文、数字、标点等）：约 4 字符 / token
-        用整数运算替代浮点除，避免精度噪声。
-        """
-        if not text:
-            return 0
-        chinese = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
-        other = len(text) - chinese
-        # chinese * 1 token/char，other / 4 chars/token
-        return chinese + other // 4
+        """兼容旧调用：委托给 TokenOptimizer 的统一 token 估算。"""
+        return TokenOptimizer().estimate_tokens(text)
 
     @classmethod
     def _estimate_messages_tokens(cls, messages: list, tools: Optional[list] = None) -> int:
-        """快速估算消息列表 + 工具定义的 token 数。
-
-        使用启发式方法，避免每轮都调用 tiktoken（性能开销）。
-        中英混合文本通过 _count_tokens_for_text 分别计算，修正了
-        纯 // 3 对中文内容约 30% 的低估问题。
-        """
-        total = 0
-        for msg in messages:
-            content = msg.get('content') or ''
-            if isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get('type') == 'text':
-                        total += cls._count_tokens_for_text(part.get('text', ''))
-                    elif isinstance(part, dict) and part.get('type') == 'image_url':
-                        total += 765
-                    elif isinstance(part, str):
-                        total += cls._count_tokens_for_text(part)
-            else:
-                total += cls._count_tokens_for_text(content)
-            # tool_calls 开销
-            tcs = msg.get('tool_calls')
-            if tcs:
-                for tc in tcs:
-                    fn = tc.get('function', {})
-                    total += len(fn.get('name', '')) + cls._count_tokens_for_text(fn.get('arguments', '')) + 8
-            total += 4  # 消息格式开销
-
-        # 工具定义 token（每个工具 ~100-200 tokens）
-        if tools:
-            for t in tools:
-                fn = t.get('function', {})
-                total += cls._count_tokens_for_text(fn.get('description', ''))
-                params = fn.get('parameters', {})
-                total += cls._count_tokens_for_text(json.dumps(params)) if params else 0
-                total += 30  # 函数结构开销
-
-        return total
+        """估算消息列表 + 工具定义的 token 数。"""
+        return TokenOptimizer().calculate_message_tokens(messages, tools=tools)
 
     def _smart_compress_in_loop(self, working_messages: list,
                                 tool_calls_history: list,
@@ -2591,8 +2555,9 @@ class AIClient:
             # 附带操作历史摘要
             history_lines = []
             if tool_calls_history:
+                history_query_tools = self._history_query_tools()
                 op_history = [h for h in tool_calls_history
-                              if h['tool_name'] not in self._QUERY_TOOLS]
+                              if h['tool_name'] not in history_query_tools]
                 for h in op_history[-6:]:
                     r = h.get('result', {})
                     status = 'ok' if (isinstance(r, dict) and r.get('success')) else 'err'
@@ -3132,124 +3097,7 @@ class AIClient:
             - system_text: 系统提示（Anthropic 要求单独传 system 参数）
             - anthropic_messages: Anthropic 格式的 messages 列表
         """
-        system_text = ""
-        anthropic_msgs: List[Dict[str, Any]] = []
-        
-        for msg in messages:
-            role = msg.get('role', '')
-            
-            if role == 'system':
-                # Anthropic 的 system 不在 messages 里，单独传
-                system_text += (("\n\n" if system_text else "") + (msg.get('content', '') or ''))
-                continue
-            
-            if role == 'user':
-                content = msg.get('content', '')
-                # 支持 OpenAI 多模态格式: content 可能是 list
-                if isinstance(content, list):
-                    # 转换 OpenAI 多模态格式 → Anthropic 格式
-                    anth_content = []
-                    for part in content:
-                        if part.get('type') == 'text':
-                            anth_content.append({'type': 'text', 'text': part['text']})
-                        elif part.get('type') == 'image_url':
-                            url = part.get('image_url', {}).get('url', '')
-                            if url.startswith('data:'):
-                                # data:image/png;base64,xxxx
-                                import re as _re
-                                m = _re.match(r'data:(image/\w+);base64,(.+)', url, _re.DOTALL)
-                                if m:
-                                    anth_content.append({
-                                        'type': 'image',
-                                        'source': {
-                                            'type': 'base64',
-                                            'media_type': m.group(1),
-                                            'data': m.group(2),
-                                        }
-                                    })
-                            else:
-                                anth_content.append({
-                                    'type': 'image',
-                                    'source': {'type': 'url', 'url': url}
-                                })
-                    anthropic_msgs.append({'role': 'user', 'content': anth_content})
-                else:
-                    anthropic_msgs.append({'role': 'user', 'content': str(content or '')})
-                continue
-            
-            if role == 'assistant':
-                content_blocks: List[Dict[str, Any]] = []
-                text = msg.get('content')
-                if text:
-                    content_blocks.append({'type': 'text', 'text': str(text)})
-                # tool_calls → tool_use blocks
-                for tc in (msg.get('tool_calls') or []):
-                    func = tc.get('function', {})
-                    try:
-                        input_obj = json.loads(func.get('arguments', '{}'))
-                    except (json.JSONDecodeError, ValueError):
-                        input_obj = {}
-                    content_blocks.append({
-                        'type': 'tool_use',
-                        'id': tc.get('id', ''),
-                        'name': func.get('name', ''),
-                        'input': input_obj,
-                    })
-                if not content_blocks:
-                    content_blocks.append({'type': 'text', 'text': ''})
-                anthropic_msgs.append({'role': 'assistant', 'content': content_blocks})
-                continue
-            
-            if role == 'tool':
-                # OpenAI tool result → Anthropic tool_result (放在 user 消息中)
-                tool_result_block = {
-                    'type': 'tool_result',
-                    'tool_use_id': msg.get('tool_call_id', ''),
-                    'content': str(msg.get('content', '')),
-                }
-                # 如果上一条也是 user（连续的 tool results），合并到同一条 user 消息
-                if anthropic_msgs and anthropic_msgs[-1]['role'] == 'user':
-                    last_content = anthropic_msgs[-1]['content']
-                    if isinstance(last_content, list):
-                        last_content.append(tool_result_block)
-                    else:
-                        anthropic_msgs[-1]['content'] = [
-                            {'type': 'text', 'text': last_content},
-                            tool_result_block,
-                        ]
-                else:
-                    anthropic_msgs.append({
-                        'role': 'user',
-                        'content': [tool_result_block],
-                    })
-                continue
-        
-        # Anthropic 要求消息以 user 开头，如果第一条是 assistant 则补一条 user
-        if anthropic_msgs and anthropic_msgs[0]['role'] == 'assistant':
-            anthropic_msgs.insert(0, {'role': 'user', 'content': '请继续。'})
-        
-        # Anthropic 要求角色严格交替（user/assistant/user/...）
-        # 合并连续相同角色的消息
-        merged: List[Dict[str, Any]] = []
-        for m in anthropic_msgs:
-            if merged and merged[-1]['role'] == m['role']:
-                # 合并内容
-                prev_content = merged[-1]['content']
-                curr_content = m['content']
-                # 统一为 list 格式
-                if isinstance(prev_content, str):
-                    prev_content = [{'type': 'text', 'text': prev_content}]
-                if isinstance(curr_content, str):
-                    curr_content = [{'type': 'text', 'text': curr_content}]
-                if not isinstance(prev_content, list):
-                    prev_content = [prev_content]
-                if not isinstance(curr_content, list):
-                    curr_content = [curr_content]
-                merged[-1]['content'] = prev_content + curr_content
-            else:
-                merged.append(m)
-        
-        return system_text, merged
+        return AnthropicRequestAdapter(AIClient.requires_temperature_one).convert_messages(messages)
 
     @staticmethod
     def _convert_tools_to_anthropic(tools: List[dict]) -> List[dict]:
@@ -3260,15 +3108,7 @@ class AIClient:
         """
         if not tools:
             return []
-        anthropic_tools = []
-        for tool in tools:
-            func = tool.get('function', tool)  # 兼容裸 function dict
-            anthropic_tools.append({
-                'name': func.get('name', ''),
-                'description': func.get('description', ''),
-                'input_schema': func.get('parameters', {'type': 'object', 'properties': {}}),
-            })
-        return anthropic_tools
+        return AnthropicRequestAdapter.convert_tools(tools)
 
     def _chat_stream_anthropic(self,
                                 messages: List[Dict[str, Any]],
@@ -3286,57 +3126,14 @@ class AIClient:
         解析 Anthropic SSE 事件流，yield 与 OpenAI 分支相同的内部 chunk 格式。
         """
         api_url = self._get_api_url(provider, model)
-        
-        # 消息转换
-        system_text, anth_messages = self._convert_messages_to_anthropic(messages)
-        
-        payload: Dict[str, Any] = {
-            'model': model,
-            'messages': anth_messages,
-            'max_tokens': max_tokens or 16384,
-            'stream': True,
-        }
-        # temperature（Anthropic 范围 0-1）
-        # 部分模型（kimi-k2 等）只支持默认值 1，直接固定，避免报错重试
-        if self.requires_temperature_one(model):
-            payload['temperature'] = 1
-        elif temperature is not None:
-            payload['temperature'] = min(max(temperature, 0.0), 1.0)
-        
-        if system_text:
-            payload['system'] = system_text
-        
-        # 思考模式
-        # Kimi Code 说明（https://www.kimi.com/code/docs/kimi-code/models）：
-        #   - K3（k3）默认已开启深度思考，effort 缺省即映射为 max，无需显式传 thinking
-        #   - K2.7 Code（kimi-for-coding / -highspeed）需开启 Thinking，否则会被降级路由到 K2.6
-        if enable_thinking:
-            if provider == 'kimi_coding':
-                model_lc = (model or '').lower()
-                if model_lc.startswith('kimi-for-coding'):
-                    payload['thinking'] = {'type': 'enabled', 'budget_tokens': min(max_tokens or 16384, 10000)}
-            else:
-                payload['thinking'] = {'type': 'enabled', 'budget_tokens': min(max_tokens or 16384, 10000)}
-        
-        # 工具
-        if tools:
-            payload['tools'] = self._convert_tools_to_anthropic(tools)
-            if tool_choice == 'auto':
-                payload['tool_choice'] = {'type': 'auto'}
-            elif tool_choice == 'none':
-                payload['tool_choice'] = {'type': 'none'}
-            elif tool_choice == 'required':
-                payload['tool_choice'] = {'type': 'any'}
-        
-        # 请求头（Anthropic 格式）
-        headers = {
-            'Content-Type': 'application/json',
-            'Accept': 'text/event-stream',
-            'x-api-key': api_key,
-            'anthropic-version': '2023-06-01',
-        }
-        if provider == 'kimi_coding':
-            headers['User-Agent'] = 'claude-code/0.1.0'
+        adapter = AnthropicRequestAdapter(self.requires_temperature_one)
+        payload = adapter.build_payload(
+            messages=messages, model=model, provider=provider,
+            temperature=temperature, max_tokens=max_tokens,
+            tools=tools, tool_choice=tool_choice,
+            enable_thinking=enable_thinking, stream=True,
+        )
+        headers = adapter.build_headers(api_key=api_key, provider=provider, stream=True)
         
         print(f"[AI Client] Anthropic protocol: {api_url} model={model}")
         
@@ -3371,132 +3168,12 @@ class AIClient:
                         return
                     
                     # ── 解析 Anthropic SSE 事件流 ──
-                    # 状态
-                    _content_blocks: Dict[int, Dict[str, Any]] = {}  # index → block info
-                    _tool_args_acc: Dict[int, str] = {}  # index → accumulated JSON args
-                    _pending_usage: Dict[str, Any] = {}
-                    _last_stop_reason = None
-                    _got_thinking = False
-                    _enable_thinking_flag = enable_thinking  # 闭包变量
+                    event_parser = AnthropicStreamEventParser(self._parse_usage, enable_thinking)
                     
                     import codecs
                     _utf8_decoder = codecs.getincrementaldecoder('utf-8')(errors='ignore')
                     _line_buf = ""
                     _event_type = ""  # 当前 SSE event 类型
-                    
-                    def _process_anthropic_event(event_type: str, data_str: str):
-                        """处理单个 Anthropic SSE 事件，返回要 yield 的 dict 列表"""
-                        nonlocal _content_blocks, _tool_args_acc, _pending_usage, _last_stop_reason, _got_thinking
-                        results = []
-                        
-                        try:
-                            data = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            return results
-                        
-                        ev_type = data.get('type', event_type)
-                        
-                        if ev_type == 'message_start':
-                            msg = data.get('message', {})
-                            usage = msg.get('usage', {})
-                            if usage:
-                                _pending_usage = self._parse_usage(usage)
-                        
-                        elif ev_type == 'content_block_start':
-                            idx = data.get('index', 0)
-                            block = data.get('content_block', {})
-                            _content_blocks[idx] = {
-                                'type': block.get('type', 'text'),
-                                'id': block.get('id', ''),
-                                'name': block.get('name', ''),
-                            }
-                            if block.get('type') == 'tool_use':
-                                _tool_args_acc[idx] = ''
-                        
-                        elif ev_type == 'content_block_delta':
-                            idx = data.get('index', 0)
-                            delta = data.get('delta', {})
-                            delta_type = delta.get('type', '')
-                            block_info = _content_blocks.get(idx, {})
-                            
-                            if delta_type == 'text_delta':
-                                text = delta.get('text', '')
-                                if text:
-                                    results.append({"type": "content", "content": text})
-                            
-                            elif delta_type == 'thinking_delta':
-                                thinking = delta.get('thinking', '')
-                                if thinking:
-                                    if not _got_thinking:
-                                        _got_thinking = True
-                                        print(f"[AI Client] 🧠 Anthropic thinking (首个 chunk, len={len(thinking)}, enable={_enable_thinking_flag})")
-                                    if _enable_thinking_flag:
-                                        results.append({"type": "thinking", "content": thinking})
-                            
-                            elif delta_type == 'input_json_delta':
-                                partial = delta.get('partial_json', '')
-                                if partial and idx in _tool_args_acc:
-                                    _tool_args_acc[idx] += partial
-                                    # 广播 tool_args_delta → UI 流式预览
-                                    tool_name = block_info.get('name', '')
-                                    if tool_name:
-                                        results.append({
-                                            "type": "tool_args_delta",
-                                            "index": idx,
-                                            "name": tool_name,
-                                            "delta": partial,
-                                            "accumulated": _tool_args_acc[idx],
-                                        })
-                        
-                        elif ev_type == 'content_block_stop':
-                            idx = data.get('index', 0)
-                            block_info = _content_blocks.get(idx, {})
-                            if block_info.get('type') == 'tool_use':
-                                # 工具调用完成 → 转换为 OpenAI 格式的 tool_call
-                                tool_id = block_info.get('id', '')
-                                tool_name = block_info.get('name', '')
-                                args_str = _tool_args_acc.get(idx, '{}')
-                                results.append({
-                                    "type": "tool_call",
-                                    "tool_call": {
-                                        'id': tool_id,
-                                        'type': 'function',
-                                        'function': {
-                                            'name': tool_name,
-                                            'arguments': args_str,
-                                        }
-                                    }
-                                })
-                        
-                        elif ev_type == 'message_delta':
-                            delta = data.get('delta', {})
-                            _last_stop_reason = delta.get('stop_reason')
-                            usage = data.get('usage', {})
-                            if usage:
-                                # 合并 usage
-                                parsed = self._parse_usage(usage)
-                                for k, v in parsed.items():
-                                    if isinstance(v, (int, float)):
-                                        _pending_usage[k] = _pending_usage.get(k, 0) + v
-                        
-                        elif ev_type == 'message_stop':
-                            # 映射 stop_reason: end_turn → stop, tool_use → tool_calls
-                            finish = 'stop'
-                            if _last_stop_reason == 'tool_use':
-                                finish = 'tool_calls'
-                            elif _last_stop_reason == 'max_tokens':
-                                finish = 'length'
-                            results.append({
-                                "type": "done",
-                                "finish_reason": finish,
-                                "usage": _pending_usage,
-                            })
-                        
-                        elif ev_type == 'error':
-                            err_msg = data.get('error', {}).get('message', str(data))
-                            results.append({"type": "error", "error": err_msg})
-                        
-                        return results
                     
                     # ── 主循环 ──
                     _should_return = False
@@ -3524,7 +3201,7 @@ class AIClient:
                             
                             if one_line.startswith('data:'):
                                 data_str = one_line[5:].lstrip(' ')
-                                for item in _process_anthropic_event(_event_type, data_str):
+                                for item in event_parser.process_event(_event_type, data_str):
                                     yield item
                                     if item.get('type') in ('done', 'error'):
                                         _should_return = True
@@ -3541,14 +3218,14 @@ class AIClient:
                             if line.startswith('event:'):
                                 _event_type = line[6:].strip()
                             elif line.startswith('data:'):
-                                for item in _process_anthropic_event(_event_type, line[5:].lstrip(' ')):
+                                for item in event_parser.process_event(_event_type, line[5:].lstrip(' ')):
                                     yield item
                                     if item.get('type') in ('done', 'error'):
                                         return
                     
                     # 流结束但未收到 message_stop
                     if not _should_return:
-                        yield {"type": "done", "finish_reason": _last_stop_reason or "stop", "usage": _pending_usage}
+                        yield {"type": "done", "finish_reason": event_parser.last_stop_reason or "stop", "usage": event_parser.pending_usage}
                     return
                     
             except requests.exceptions.Timeout:
@@ -3590,29 +3267,14 @@ class AIClient:
                         timeout: int = 60) -> Dict[str, Any]:
         """Anthropic Messages 协议的非流式 Chat。"""
         api_url = self._get_api_url(provider, model)
-        system_text, anth_messages = self._convert_messages_to_anthropic(messages)
-        
-        payload: Dict[str, Any] = {
-            'model': model,
-            'messages': anth_messages,
-            'max_tokens': max_tokens,
-        }
-        if temperature is not None:
-            payload['temperature'] = min(max(temperature, 0.0), 1.0)
-        if system_text:
-            payload['system'] = system_text
-        if tools:
-            payload['tools'] = self._convert_tools_to_anthropic(tools)
-            if tool_choice == 'auto':
-                payload['tool_choice'] = {'type': 'auto'}
-        
-        headers = {
-            'Content-Type': 'application/json',
-            'x-api-key': api_key,
-            'anthropic-version': '2023-06-01',
-        }
-        if provider == 'kimi_coding':
-            headers['User-Agent'] = 'claude-code/0.1.0'
+        adapter = AnthropicRequestAdapter(self.requires_temperature_one)
+        payload = adapter.build_payload(
+            messages=messages, model=model, provider=provider,
+            temperature=temperature, max_tokens=max_tokens,
+            tools=tools, tool_choice=tool_choice,
+            enable_thinking=False, stream=False,
+        )
+        headers = adapter.build_headers(api_key=api_key, provider=provider, stream=False)
         
         for attempt in range(self._max_retries):
             try:
@@ -3622,34 +3284,7 @@ class AIClient:
                 )
                 response.raise_for_status()
                 obj = response.json()
-                
-                # 解析 Anthropic 响应 → OpenAI 统一格式
-                content_text = ''
-                tool_calls_list = []
-                for block in obj.get('content', []):
-                    if block.get('type') == 'text':
-                        content_text += block.get('text', '')
-                    elif block.get('type') == 'tool_use':
-                        tool_calls_list.append({
-                            'id': block.get('id', ''),
-                            'type': 'function',
-                            'function': {
-                                'name': block.get('name', ''),
-                                'arguments': json.dumps(block.get('input', {}), ensure_ascii=False),
-                            }
-                        })
-                
-                stop_reason = obj.get('stop_reason', 'end_turn')
-                finish = 'stop' if stop_reason == 'end_turn' else ('tool_calls' if stop_reason == 'tool_use' else stop_reason)
-                
-                return {
-                    'ok': True,
-                    'content': content_text or None,
-                    'tool_calls': tool_calls_list or None,
-                    'finish_reason': finish,
-                    'usage': self._parse_usage(obj.get('usage', {})),
-                    'raw': obj,
-                }
+                return adapter.normalize_response(obj, self._parse_usage)
             except requests.exceptions.Timeout:
                 if attempt < self._max_retries - 1:
                     time.sleep(self._retry_delay)
@@ -4850,9 +4485,7 @@ class AIClient:
                     elif consecutive_same_tool >= _LOOP_SAME_TOOL_SOFT_HINT:
                         print(f"[AI Client] ⚠️ 循环检测：{tool_name} 已连续 {consecutive_same_tool} 次调用（参数在变），注入换策略提示")
                         # 区分查询类和写操作类工具，给不同的引导文案
-                        _query_tools = {'get_parameter_schema', 'search_node_types', 'search_local_doc',
-                                        'list_node_parameters', 'get_node_info', 'search_parameters'}
-                        if tool_name in _query_tools:
+                        if tool_name in self._loop_guidance_query_tools():
                             _loop_hint = (
                                 f"\n\n[循环检测] 你已连续 {consecutive_same_tool} 次调用 {tool_name}（参数在变化但工具没换）。"
                                 "反复用不同参数查同一工具通常说明返回结果被截断或方向有误。"
@@ -5527,9 +5160,11 @@ class AIClient:
             # 执行工具调用（web 工具并行，Houdini 工具串行）
             tool_results = []
 
-            _ASYNC_TOOL_NAMES_JSON = frozenset({'web_search', 'fetch_webpage', 'execute_shell'})
-            async_tc = [(i, tc) for i, tc in enumerate(tool_calls) if tc['name'] in _ASYNC_TOOL_NAMES_JSON]
-            houdini_tc = [(i, tc) for i, tc in enumerate(tool_calls) if tc['name'] not in _ASYNC_TOOL_NAMES_JSON]
+            _json_execution_profile = self._build_tool_execution_profile()
+            _async_tools_json = set(_json_execution_profile.get('async_tools') or [])
+            _batch_readonly_json = set(_json_execution_profile.get('batch_readonly_tools') or [])
+            async_tc = [(i, tc) for i, tc in enumerate(tool_calls) if tc['name'] in _async_tools_json]
+            houdini_tc = [(i, tc) for i, tc in enumerate(tool_calls) if tc['name'] not in _async_tools_json]
 
             # 结果槽位
             exec_results = [None] * len(tool_calls)
@@ -5560,15 +5195,8 @@ class AIClient:
                     exec_results[idx] = self._tool_executor(tname, **targs)
 
             # Houdini 工具（只读批量 / 写入串行）
-            _BATCH_READONLY_JSON = frozenset({
-                'get_network_structure', 'get_node_parameters', 'list_children',
-                'read_selection', 'search_node_types', 'semantic_search_nodes',
-                'check_errors',
-                'search_local_doc', 'get_houdini_node_doc', 'list_skills',
-                'perf_start_profile', 'perf_stop_and_report',
-            })
-            readonly_batch_j = [(i, tc) for i, tc in houdini_tc if tc['name'] in _BATCH_READONLY_JSON]
-            mutating_calls_j = [(i, tc) for i, tc in houdini_tc if tc['name'] not in _BATCH_READONLY_JSON]
+            readonly_batch_j = [(i, tc) for i, tc in houdini_tc if tc['name'] in _batch_readonly_json]
+            mutating_calls_j = [(i, tc) for i, tc in houdini_tc if tc['name'] not in _batch_readonly_json]
 
             if len(readonly_batch_j) > 1 and self._batch_tool_executor:
                 batch_input = [(tc['name'], tc['arguments']) for _, tc in readonly_batch_j]
@@ -5664,9 +5292,7 @@ class AIClient:
                 elif consecutive_same_tool >= _LOOP_SAME_TOOL_SOFT_HINT:
                     print(f"[AI Client] ⚠️ JSON模式循环检测：{tool_name} 已连续 {consecutive_same_tool} 次调用（参数在变），注入换策略提示")
                     # 区分查询类和写操作类工具，给不同的引导文案
-                    _query_tools = {'get_parameter_schema', 'search_node_types', 'search_local_doc',
-                                    'list_node_parameters', 'get_node_info', 'search_parameters'}
-                    if tool_name in _query_tools:
+                    if tool_name in self._loop_guidance_query_tools():
                         _json_loop_hint = (
                             f"[循环检测] 你已连续 {consecutive_same_tool} 次调用 {tool_name}（参数在变化但工具没换）。"
                             "反复用不同参数查同一工具通常说明返回结果被截断或方向有误。"

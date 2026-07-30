@@ -88,6 +88,11 @@ from ..core.update_mixin import UpdateMixin
 from ..core.tool_execution_mixin import ToolExecutionMixin
 from ..core.send_orchestrator_mixin import SendOrchestratorMixin
 from ..core.houdini_main_thread_executor import HoudiniMainThreadExecutor
+from ..core.diagnostics_retention import (
+    cleanup_diagnostics_retention,
+    is_retention_cleanup_enabled,
+    retention_days_from_env,
+)
 from ..core.harness_engine import (
     HarnessRuntimeState,
     HarnessToolPolicyEngine,
@@ -305,6 +310,7 @@ class AITab(
             result_queue=self._tool_result_queue,
             main_timeout=self._TOOL_MAIN_THREAD_TIMEOUT,
             batch_timeout=60.0,
+            record_event=lambda event: self._append_session_diagnostics_records([event]),
         )
         self._addThinking.connect(self._on_add_thinking)
         self._finalizeThinkingSignal.connect(self._finalize_thinking_main_thread)
@@ -355,6 +361,7 @@ class AITab(
         
         # ★ 启动时自动恢复上次的会话（从 sessions_manifest.json）
         self._restore_all_sessions()
+        QtCore.QTimer.singleShot(5000, self._run_diagnostics_retention_cleanup)
         
         # 定期自动保存（每 60 秒），防止 Houdini 退出时丢失会话
         self._auto_save_timer = QtCore.QTimer(self)
@@ -377,6 +384,24 @@ class AITab(
         from .i18n import language_changed
         language_changed.changed.connect(self._rebuild_system_prompts)
         language_changed.changed.connect(self._retranslateUi)
+
+    def _run_diagnostics_retention_cleanup(self):
+        if not is_retention_cleanup_enabled():
+            return
+        try:
+            summary = cleanup_diagnostics_retention(
+                self._cache_dir,
+                retention_days=retention_days_from_env(),
+                current_session_id=self._session_id,
+            )
+            if summary.get('deleted') or summary.get('errors'):
+                print(
+                    "[Diagnostics Retention] "
+                    f"deleted={summary.get('deleted', 0)} "
+                    f"errors={summary.get('errors', 0)}"
+                )
+        except Exception as exc:
+            print(f"[Diagnostics Retention] cleanup failed: {exc}")
 
     def _rebuild_system_prompts(self, _lang: str = ''):
         """语言切换后重建系统提示词（含 Ask/Agent 模式强制语言规则）"""

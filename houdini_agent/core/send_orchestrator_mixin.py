@@ -12,6 +12,12 @@ from houdini_agent.ui.i18n import tr
 from houdini_agent.core.harness_engine import HarnessRuntimeState
 from houdini_agent.utils.ai_client import AIClient, HOUDINI_TOOLS
 from houdini_agent.utils.ultra_optimizer import UltraOptimizer
+from houdini_agent.utils.token_optimizer import (
+    assemble_context_messages,
+    compress_old_round_tool_results,
+    plan_context_rounds,
+    prune_context_rounds_to_token_target,
+)
 from houdini_agent.utils.plan_manager import (
     PLAN_TOOL_CREATE,
     PLAN_TOOL_UPDATE_STEP,
@@ -394,6 +400,11 @@ class SendOrchestratorMixin:
                                 )
                                 if result.get("success"):
                                     self._addStatus.emit("💤 浅睡眠完成，经验已写入长期记忆")
+                                    try:
+                                        from ..utils.team_memory_export import maybe_export_team_memory
+                                        maybe_export_team_memory(self._username, self._memory_store)
+                                    except Exception:
+                                        pass
                             finally:
                                 self._sleep_in_progress = False
                         sleep_thread = threading.Thread(target=_do_light_sleep, daemon=True)
@@ -423,6 +434,11 @@ class SendOrchestratorMixin:
                                 self._addStatus.emit(
                                     f"😴 深度睡眠完成: {n_rules} 条经验 + {n_strats} 条策略已写入长期记忆"
                                 )
+                                try:
+                                    from ..utils.team_memory_export import maybe_export_team_memory
+                                    maybe_export_team_memory(self._username, self._memory_store)
+                                except Exception:
+                                    pass
                         except Exception as e:
                             print(f"[Sleep] 深度睡眠异常: {e}")
                         finally:
@@ -437,51 +453,39 @@ class SendOrchestratorMixin:
                     body = messages[start_idx:end_idx] if end_idx != len(messages) else messages[start_idx:]
                     
                     # 按 user 消息划分轮次
-                    rounds = []
-                    cur_rnd = []
-                    for m in body:
-                        if m.get('role') == 'user' and cur_rnd:
-                            rounds.append(cur_rnd)
-                            cur_rnd = []
-                        cur_rnd.append(m)
-                    if cur_rnd:
-                        rounds.append(cur_rnd)
+                    rounds = plan_context_rounds(body, protect_recent_rounds=0).rounds
                     
                     # 第一遍：压缩旧轮次 tool 结果
                     n_rounds = len(rounds)
                     protect_n = max(2, int(n_rounds * 0.6))
-                    for r_idx in range(n_rounds - protect_n):
-                        for m in rounds[r_idx]:
-                            if m.get('role') == 'tool':
-                                c = m.get('content') or ''
-                                if len(c) > 200:
-                                    m['content'] = self.client._summarize_tool_content(c, 200) if hasattr(self.client, '_summarize_tool_content') else c[:200] + '...[summary]'
-                    
-                    compressed_body = [m for rnd in rounds for m in rnd]
+                    summarize_tool_content = self.client._summarize_tool_content if hasattr(self.client, '_summarize_tool_content') else None
+                    compress_old_round_tool_results(rounds, protect_n, summarize_fn=summarize_tool_content)
                     
                     # 如果仍超限，删除最早轮次
                     target = int(context_limit * 0.7)
-                    while len(rounds) > 2:
-                        test_body = [m for rnd in rounds for m in rnd]
-                        test_msgs = ([first_system] if first_system else []) + test_body + ([last_context] if last_context else [])
-                        if self.token_optimizer.calculate_message_tokens(test_msgs) <= target:
-                            break
-                        rounds.pop(0)
-                    
-                    compressed_body = [m for rnd in rounds for m in rnd]
+                    prune_context_rounds_to_token_target(
+                        rounds,
+                        target,
+                        self.token_optimizer.calculate_message_tokens,
+                        prefix_messages=[first_system] if first_system else [],
+                        suffix_messages=[last_context] if last_context else [],
+                        min_rounds=2,
+                        check_before_pop=True,
+                    )
                     
                     # 重组
-                    messages = []
-                    if first_system:
-                        messages.append(first_system)
+                    summary_message = None
                     if n_rounds - len(rounds) > 0:
-                        messages.append({
+                        summary_message = {
                             'role': 'system',
                             'content': tr('ai.old_rounds', n_rounds - len(rounds))
-                        })
-                    messages.extend(compressed_body)
-                    if last_context:
-                        messages.append(last_context)
+                        }
+                    messages = assemble_context_messages(
+                        rounds,
+                        prefix_messages=[first_system] if first_system else [],
+                        summary_message=summary_message,
+                        suffix_messages=[last_context] if last_context else [],
+                    )
                     
                     new_tokens = self.token_optimizer.calculate_message_tokens(messages)
                     saved = old_tokens - new_tokens

@@ -121,6 +121,76 @@ class AIClientThinkingHintTest(unittest.TestCase):
         self.assertIn("points=4", compressed)
         self.assertIn("/obj/geo1/OUT", compressed)
 
+    def test_json_execution_profile_uses_tool_registry(self):
+        registry_profile = {
+            "async_tools": {"web_search", "custom_async"},
+            "batch_readonly_tools": {"inspect_node", "custom_readonly"},
+        }
+        with mock.patch("houdini_agent.utils.tool_registry.get_tool_registry") as get_registry:
+            get_registry.return_value.build_streaming_executor_profile.return_value = registry_profile
+
+            profile = AIClient._build_tool_execution_profile()
+
+        self.assertEqual(profile["async_tools"], {"web_search", "custom_async"})
+        self.assertEqual(profile["batch_readonly_tools"], {"inspect_node", "custom_readonly"})
+        self.assertIn("history_query_tools", profile)
+
+    def test_json_execution_profile_falls_back_without_registry(self):
+        with mock.patch("houdini_agent.utils.tool_registry.get_tool_registry", side_effect=RuntimeError("boom")):
+            profile = AIClient._build_tool_execution_profile()
+
+        self.assertIn("web_search", profile["async_tools"])
+        self.assertIn("execute_shell", profile["async_tools"])
+        self.assertIn("get_node_parameters", profile["batch_readonly_tools"])
+
+    def test_history_query_tools_use_execution_profile(self):
+        registry_profile = {
+            "history_query_tools": {"inspect_node", "web_search"},
+        }
+        with mock.patch("houdini_agent.utils.tool_registry.get_tool_registry") as get_registry:
+            get_registry.return_value.build_streaming_executor_profile.return_value = registry_profile
+
+            query_tools = AIClient._history_query_tools()
+
+        self.assertEqual(query_tools, {"inspect_node", "web_search"})
+
+    def test_compression_tool_groups_use_execution_profile(self):
+        registry_profile = {
+            "compression_query_tools": {"inspect_node"},
+            "compression_operation_tools": {"create_node"},
+        }
+        with mock.patch("houdini_agent.utils.tool_registry.get_tool_registry") as get_registry:
+            get_registry.return_value.build_streaming_executor_profile.return_value = registry_profile
+
+            query_tools, operation_tools = AIClient._compression_tool_groups()
+
+        self.assertEqual(query_tools, {"inspect_node"})
+        self.assertEqual(operation_tools, {"create_node"})
+
+    def test_thinking_tool_groups_use_execution_profile(self):
+        registry_profile = {
+            "thinking_simple_success_tools": {"inspect_node"},
+            "thinking_deep_tools": {"connect_nodes"},
+        }
+        with mock.patch("houdini_agent.utils.tool_registry.get_tool_registry") as get_registry:
+            get_registry.return_value.build_streaming_executor_profile.return_value = registry_profile
+
+            simple_tools, deep_tools = AIClient._thinking_tool_groups()
+
+        self.assertEqual(simple_tools, {"inspect_node"})
+        self.assertEqual(deep_tools, {"connect_nodes"})
+
+    def test_loop_guidance_query_tools_use_execution_profile(self):
+        registry_profile = {
+            "loop_guidance_query_tools": {"get_parameter_schema"},
+        }
+        with mock.patch("houdini_agent.utils.tool_registry.get_tool_registry") as get_registry:
+            get_registry.return_value.build_streaming_executor_profile.return_value = registry_profile
+
+            query_tools = AIClient._loop_guidance_query_tools()
+
+        self.assertEqual(query_tools, {"get_parameter_schema"})
+
 
 if __name__ == "__main__":
     unittest.main()

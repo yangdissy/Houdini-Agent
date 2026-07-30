@@ -15,26 +15,27 @@ class DiagnosticsMixin:
         mode = 'PLAN' if self._plan_mode else ('AGENT' if self._agent_mode else 'ASK')
         if mode == 'ASK':
             guard = 'RO'
-            color = '#10b981'
+            risk = 'readonly'
         elif self._confirm_mode:
             guard = 'CONFIRM'
-            color = '#f59e0b'
+            risk = 'confirm'
         else:
             guard = 'HIGH-RISK'
-            color = '#ef4444'
+            risk = 'high'
 
         hint = f"{mode} | {guard}"
         # 状态快照去重:避免 Qt setStyleSheet/setText 在值未变时仍触发全树样式重算 —
         # 是 Houdini 20.5 QHeaderView race 的高频源头之一。
         cache = self.__dict__.setdefault('_mode_guard_cache', {})
         if hasattr(self, 'mode_guard_label') and self.mode_guard_label:
-            style = f"color:{color}; font-weight:600;"
             if cache.get('hint') != hint:
                 self.mode_guard_label.setText(hint)
                 cache['hint'] = hint
-            if cache.get('style') != style:
-                self.mode_guard_label.setStyleSheet(style)
-                cache['style'] = style
+            if cache.get('risk') != risk:
+                self.mode_guard_label.setProperty('risk', risk)
+                self.mode_guard_label.style().unpolish(self.mode_guard_label)
+                self.mode_guard_label.style().polish(self.mode_guard_label)
+                cache['risk'] = risk
 
             lines = [
                 f"当前模式: {mode}",
@@ -53,13 +54,15 @@ class DiagnosticsMixin:
         if hasattr(self, 'policy_timeline_btn') and self.policy_timeline_btn:
             n = len(self._policy_timeline_records)
             text = f"Policy {n}"
-            btn_style = "color:#ef4444;" if self._policy_failure_count > 0 else ""
+            has_failures = self._policy_failure_count > 0
             if cache.get('btn_text') != text:
                 self.policy_timeline_btn.setText(text)
                 cache['btn_text'] = text
-            if cache.get('btn_style') != btn_style:
-                self.policy_timeline_btn.setStyleSheet(btn_style)
-                cache['btn_style'] = btn_style
+            if cache.get('btn_failures') != has_failures:
+                self.policy_timeline_btn.setProperty('failures', has_failures)
+                self.policy_timeline_btn.style().unpolish(self.policy_timeline_btn)
+                self.policy_timeline_btn.style().polish(self.policy_timeline_btn)
+                cache['btn_failures'] = has_failures
 
     def _append_policy_timeline(self, tool_name: str, action: str, reason: str = ""):
         item = {

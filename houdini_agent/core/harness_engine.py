@@ -111,6 +111,45 @@ def sanitize_tool_result(result: Any) -> Dict[str, Any]:
 
 
 @dataclass
+class ToolValidationIssue:
+    """Structured argument validation issue."""
+
+    severity: str
+    code: str
+    message: str
+    key: str = ""
+
+
+@dataclass
+class ToolValidationResult:
+    """Normalized tool arguments plus structured validation findings."""
+
+    args: Dict[str, Any]
+    issues: List[ToolValidationIssue] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not any(issue.severity == "error" for issue in self.issues)
+
+    @property
+    def first_error(self) -> str:
+        for issue in self.issues:
+            if issue.severity == "error":
+                return issue.message
+        return ""
+
+
+@dataclass
+class RiskFactor:
+    """One structured signal contributing to a policy decision."""
+
+    code: str
+    severity: str
+    message: str
+    score: float = 0.0
+
+
+@dataclass
 class ToolPolicyDecision:
     """Policy output for a single tool call.
 
@@ -125,6 +164,10 @@ class ToolPolicyDecision:
     reason: str = ""
     patched_args: Optional[Dict[str, Any]] = None
     retry_key: str = ""
+    risk_score: float = 0.0
+    risk_factors: List[RiskFactor] = field(default_factory=list)
+    matched_rules: List[str] = field(default_factory=list)
+    required_control: str = ""
 
 
 @dataclass
@@ -146,13 +189,8 @@ class HarnessRuntimeState:
             self.trace = self.trace[-300:]
 
 
-class HarnessToolPolicyEngine:
-    """Centralized tool policy checks.
-
-    The default policy is conservative and only blocks obviously invalid calls.
-    """
-
-    _DANGEROUS_TOOLS = HIGH_RISK_TOOLS
+class ToolArgumentValidator:
+    """Validate and normalize tool arguments before policy scoring."""
 
     _REQUIRED_ARG_KEYS = {
         "execute_python": ("code",),
@@ -207,68 +245,255 @@ class HarnessToolPolicyEngine:
         "/cop",
     })
 
-    def decide(self, tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> ToolPolicyDecision:
-        safe_args = self._normalize_args(args)
+    def _normalize_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for key, value in (args or {}).items():
+            if isinstance(value, str):
+                v = value.strip()
+                if key in self._NORMALIZE_KEYS and v:
+                    v = self._normalize_path(v)
+                out[key] = v
+            else:
+                out[key] = value
+        return out
 
-        input_violation = self._check_input_guardrails(tool_name, safe_args)
-        if input_violation:
-            return ToolPolicyDecision(action="deny", reason=input_violation)
+    def validate(self, tool_name: str, args: Dict[str, Any]) -> ToolValidationResult:
+        safe_args = self._normalize_args(args)
+        issues: List[ToolValidationIssue] = []
+
+        for key in self._REQUIRED_ARG_KEYS.get(tool_name, ()):
+            if not str(safe_args.get(key, "")).strip():
+                issues.append(
+                    ToolValidationIssue(
+                        severity="error",
+                        code="missing_required_arg",
+                        message=f"Missing required {key} for tool: {tool_name}",
+                        key=key,
+                    )
+                )
+
+        sensitive_reason = self._check_sensitive_args(safe_args)
+        if sensitive_reason:
+            issues.append(ToolValidationIssue(severity="error", code="sensitive_input", message=sensitive_reason))
+
+        path_reason = self._check_path_args(safe_args)
+        if path_reason:
+            issues.append(ToolValidationIssue(severity="error", code="invalid_path", message=path_reason))
+
+        if tool_name == "execute_python":
+            reason = self._match_patterns(
+                str(safe_args.get("code") or ""),
+                PYTHON_DANGEROUS_PATTERNS,
+                "Tool input guardrail blocked dangerous Python",
+            )
+            if reason:
+                issues.append(
+                    ToolValidationIssue(severity="error", code="dangerous_python", message=reason, key="code")
+                )
+
+        if tool_name == "execute_shell":
+            reason = self._match_patterns(
+                str(safe_args.get("command") or ""),
+                SHELL_DANGEROUS_PATTERNS,
+                "Tool input guardrail blocked dangerous shell command",
+                flags=re.IGNORECASE,
+            )
+            if reason:
+                issues.append(
+                    ToolValidationIssue(severity="error", code="dangerous_shell", message=reason, key="command")
+                )
+
+        return ToolValidationResult(args=safe_args, issues=issues)
+
+    def _check_sensitive_args(self, args: Dict[str, Any]) -> str:
+        for key, value in self._walk_args(args):
+            key_text = str(key or "").strip().lower()
+            if key_text in SENSITIVE_ARG_KEYS or key_text.endswith(("_api_key", "_token", "_password", "_secret")):
+                return f"Tool input guardrail blocked sensitive argument: {key}"
+            if isinstance(value, str):
+                reason = self._match_patterns(
+                    value,
+                    SENSITIVE_VALUE_PATTERNS,
+                    "Tool input guardrail blocked sensitive value",
+                    flags=re.IGNORECASE,
+                )
+                if reason:
+                    return reason
+        return ""
+
+    def _check_path_args(self, args: Dict[str, Any]) -> str:
+        for key in self._NORMALIZE_KEYS:
+            value = args.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            reason = self._validate_path_arg(key, value.strip())
+            if reason:
+                return reason
+        return ""
+
+    def _validate_path_arg(self, key: str, path: str) -> str:
+        normalized = path.replace("\\", "/")
+        parts = [part for part in normalized.split("/") if part]
+        if ".." in parts:
+            return f"Tool input guardrail blocked path traversal in {key}"
+        if "\x00" in normalized:
+            return f"Tool input guardrail blocked invalid path in {key}"
+
+        if key == "output_path":
+            return ""
+
+        if normalized.startswith("/") and not any(
+            normalized == root or normalized.startswith(root + "/") for root in self._HOUDINI_ROOTS
+        ):
+            return f"Tool input guardrail blocked unsupported Houdini path root in {key}: {path}"
+
+        return ""
+
+    @staticmethod
+    def _match_patterns(
+        text: str,
+        patterns: Iterable[Tuple[str, str]],
+        prefix: str,
+        flags: int = 0,
+    ) -> str:
+        for pattern, rule_id in patterns:
+            if re.search(pattern, text or "", flags):
+                return f"{prefix}: {rule_id}"
+        return ""
+
+    @classmethod
+    def _walk_args(cls, value: Any, key: str = ""):
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                yield from cls._walk_args(child_value, str(child_key))
+        elif isinstance(value, list):
+            for child_value in value:
+                yield from cls._walk_args(child_value, key)
+        else:
+            yield key, value
+
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        # Keep Houdini path semantics while removing duplicated slashes.
+        if not path:
+            return path
+        while "//" in path:
+            path = path.replace("//", "/")
+        return path
+
+
+class HarnessToolPolicyEngine:
+    """Centralized tool policy checks.
+
+    The default policy is conservative and only blocks obviously invalid calls.
+    """
+
+    _DANGEROUS_TOOLS = HIGH_RISK_TOOLS
+
+    def __init__(self, validator: Optional[ToolArgumentValidator] = None):
+        self.validator = validator or ToolArgumentValidator()
+
+    def decide(self, tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> ToolPolicyDecision:
+        validation = self.validator.validate(tool_name, args)
+        safe_args = validation.args
+
+        if not validation.ok:
+            return self._decision(
+                "deny",
+                validation.first_error,
+                risk_factors=self._validation_risk_factors(validation),
+                required_control="deny",
+            )
 
         mode = context.get("mode", "agent")
         confirm_mode = bool(context.get("confirm_mode", False))
         if mode == "ask" and tool_name in self._DANGEROUS_TOOLS:
-            return ToolPolicyDecision(
-                action="deny",
-                reason=f"Ask mode blocked tool: {tool_name}",
+            return self._decision(
+                "deny",
+                f"Ask mode blocked tool: {tool_name}",
+                risk_factors=[RiskFactor("ask_mode_high_risk", "error", f"Ask mode blocked tool: {tool_name}", 1.0)],
+                required_control="deny",
             )
 
         # confirm_mode=True means Step Confirm is enabled: high-risk tools must
         # ask the user before execution. confirm_mode=False is Direct Execute
         # (HIGH-RISK), where the user has opted out of confirmation prompts.
         if mode in {"agent", "plan"} and tool_name in self._DANGEROUS_TOOLS and confirm_mode:
-            return ToolPolicyDecision(
-                action="ask",
-                reason=f"Dangerous tool requires confirmation: {tool_name}",
+            return self._decision(
+                "ask",
+                f"Dangerous tool requires confirmation: {tool_name}",
+                risk_factors=[RiskFactor("high_risk_confirmation", "warning", f"Dangerous tool requires confirmation: {tool_name}", 0.7)],
+                required_control="confirm",
             )
-
-        required_keys = self._REQUIRED_ARG_KEYS.get(tool_name, ())
-        for key in required_keys:
-            if not str(safe_args.get(key, "")).strip():
-                return ToolPolicyDecision(
-                    action="deny",
-                    reason=f"Missing required {key} for tool: {tool_name}",
-                )
 
         if tool_name == "save_hip":
             out = str(safe_args.get("output_path") or "").strip()
             if out and not os.path.splitext(out)[1]:
                 patched = dict(safe_args)
                 patched["output_path"] = out + ".hip"
-                return ToolPolicyDecision(
-                    action="retry",
-                    reason="Auto-fix save_hip output_path extension to .hip",
+                return self._decision(
+                    "retry",
+                    "Auto-fix save_hip output_path extension to .hip",
                     patched_args=patched,
                     retry_key=f"{tool_name}:output_path_ext",
+                    risk_factors=[RiskFactor("retry_patch_output_extension", "info", "Auto-fix save_hip output_path extension to .hip", 0.1)],
+                    required_control="retry",
                 )
 
         # cook_node force=true 触发硬复位（bypass 切换 + 清 cache + 强制 cook），
         # 可能长时间阻塞 Houdini 主线程。无论是否开启 confirm_mode，都要求用户确认，
         # 防止模型绕过工具描述直接硬 cook 导致界面卡死。
         if tool_name == "cook_node" and bool(safe_args.get("force")) and mode in {"agent", "plan"}:
-            return ToolPolicyDecision(
-                action="ask",
-                reason="cook_node force=true may block Houdini; requires confirmation",
+            return self._decision(
+                "ask",
+                "cook_node force=true may block Houdini; requires confirmation",
                 patched_args=safe_args if safe_args != args else None,
+                risk_factors=[RiskFactor("cook_force_confirmation", "warning", "cook_node force=true may block Houdini", 0.8)],
+                required_control="confirm",
             )
 
         if safe_args != args:
-            return ToolPolicyDecision(
+            return self._decision(
                 action="allow",
                 reason="Arguments normalized",
                 patched_args=safe_args,
+                risk_factors=[RiskFactor("args_normalized", "info", "Arguments normalized", 0.0)],
             )
 
-        return ToolPolicyDecision(action="allow")
+        return self._decision("allow")
+
+    @staticmethod
+    def _validation_risk_factors(validation: ToolValidationResult) -> List[RiskFactor]:
+        factors = []
+        for issue in validation.issues:
+            score = 1.0 if issue.severity == "error" else 0.2
+            factors.append(RiskFactor(issue.code, issue.severity, issue.message, score))
+        return factors
+
+    @staticmethod
+    def _decision(
+        action: str,
+        reason: str = "",
+        patched_args: Optional[Dict[str, Any]] = None,
+        retry_key: str = "",
+        risk_factors: Optional[List[RiskFactor]] = None,
+        required_control: str = "",
+    ) -> ToolPolicyDecision:
+        factors = risk_factors or []
+        return ToolPolicyDecision(
+            action=action,
+            reason=reason,
+            patched_args=patched_args,
+            retry_key=retry_key,
+            risk_score=round(sum(f.score for f in factors), 3),
+            risk_factors=factors,
+            matched_rules=[f.code for f in factors],
+            required_control=required_control or (action if action in {"ask", "deny", "retry"} else ""),
+        )
+
+    def _check_input_guardrails(self, tool_name: str, args: Dict[str, Any]) -> str:
+        validation = self.validator.validate(tool_name, args)
+        return validation.first_error
 
     def _check_input_guardrails(self, tool_name: str, args: Dict[str, Any]) -> str:
         sensitive_reason = self._check_sensitive_args(args)

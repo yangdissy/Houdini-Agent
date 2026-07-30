@@ -5,6 +5,7 @@ import unittest
 
 from houdini_agent.utils.tool_registry import (
     ToolRegistry,
+    build_default_tool_execution_profile,
     _infer_modes,
     _infer_tags,
     _infer_concurrency_safe,
@@ -80,6 +81,17 @@ class InferHelpersTest(unittest.TestCase):
         self.assertEqual(_infer_risk_level("delete_node"), "high")
         self.assertEqual(_infer_risk_level("get_network_structure"), "low")
         self.assertEqual(_infer_risk_level("create_node"), "normal")
+
+    def test_default_execution_profile_contains_fallback_classifications(self):
+        profile = build_default_tool_execution_profile()
+
+        self.assertIn("web_search", profile["async_tools"])
+        self.assertIn("get_node_parameters", profile["batch_readonly_tools"])
+        self.assertIn("get_node_parameters", profile["history_query_tools"])
+        self.assertIn("create_node", profile["compression_operation_tools"])
+        self.assertIn("inspect_node", profile["thinking_simple_success_tools"])
+        self.assertIn("connect_nodes", profile["thinking_deep_tools"])
+        self.assertIn("get_parameter_schema", profile["loop_guidance_query_tools"])
 
 
 class RegisterAndQueryTest(unittest.TestCase):
@@ -410,6 +422,73 @@ class StreamingProfileTest(unittest.TestCase):
         prof = self.reg.build_streaming_executor_profile()
         self.assertIn("web_search", prof["async_tools"])
         self.assertNotIn("web_search", prof["dedup_tools"])
+
+    def test_history_query_tools_include_non_operation_tools(self):
+        self.reg.register(
+            "get_node_parameters", _schema("get_node_parameters"),
+            tags={"readonly", "network"}, modes={"agent"},
+        )
+        self.reg.register(
+            "execute_shell", _schema("execute_shell"),
+            tags={"system", "async"}, modes={"agent"},
+        )
+        self.reg.register(
+            "create_node", _schema("create_node"),
+            tags={"network"}, modes={"agent"},
+        )
+
+        prof = self.reg.build_streaming_executor_profile()
+
+        self.assertIn("get_node_parameters", prof["history_query_tools"])
+        self.assertIn("execute_shell", prof["history_query_tools"])
+        self.assertNotIn("create_node", prof["history_query_tools"])
+
+    def test_compression_profile_keeps_query_and_operation_roles_separate(self):
+        self.reg.register(
+            "get_node_parameters", _schema("get_node_parameters"),
+            tags={"readonly", "network"}, modes={"agent"},
+        )
+        self.reg.register(
+            "create_node", _schema("create_node"),
+            tags={"network"}, modes={"agent"},
+        )
+
+        prof = self.reg.build_streaming_executor_profile()
+
+        self.assertIn("get_node_parameters", prof["compression_query_tools"])
+        self.assertNotIn("get_node_parameters", prof["compression_operation_tools"])
+        self.assertIn("create_node", prof["compression_operation_tools"])
+        self.assertNotIn("create_node", prof["compression_query_tools"])
+
+    def test_thinking_profile_classifies_simple_and_deep_tools(self):
+        for name, tags in (
+            ("inspect_node", {"readonly", "network"}),
+            ("connect_nodes", {"network"}),
+            ("execute_shell", {"system", "async"}),
+        ):
+            self.reg.register(name, _schema(name), tags=tags, modes={"agent"})
+
+        prof = self.reg.build_streaming_executor_profile()
+
+        self.assertIn("inspect_node", prof["thinking_simple_success_tools"])
+        self.assertNotIn("inspect_node", prof["thinking_deep_tools"])
+        self.assertIn("connect_nodes", prof["thinking_deep_tools"])
+        self.assertIn("execute_shell", prof["thinking_deep_tools"])
+
+    def test_loop_guidance_query_tools_are_profiled(self):
+        self.reg.register(
+            "get_parameter_schema", _schema("get_parameter_schema"),
+            tags={"readonly", "network"}, modes={"agent"},
+        )
+        self.reg.register(
+            "set_node_parameter", _schema("set_node_parameter"),
+            tags={"network"}, modes={"agent"},
+        )
+
+        prof = self.reg.build_streaming_executor_profile()
+
+        self.assertIn("get_parameter_schema", prof["loop_guidance_query_tools"])
+        self.assertNotIn("set_node_parameter", prof["loop_guidance_query_tools"])
 
     def test_disabled_tool_excluded_from_profile(self):
         self.reg.register(
