@@ -12,6 +12,7 @@
 
 import json
 import math
+import shutil
 import sqlite3
 import threading
 import time
@@ -23,6 +24,13 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from .embedding import get_embedder, LocalEmbedder
+from .memory_sqlite import (
+    embedding_metadata,
+    metadata_diagnostic,
+    open_sqlite,
+    read_embedding_metadata,
+    write_embedding_metadata,
+)
 from shared.user_paths import UserPaths, normalize_username
 
 # ============================================================
@@ -142,6 +150,7 @@ class MemoryStore:
         self.embedder = embedder or get_embedder()
         self._conn: Optional[sqlite3.Connection] = None
         self._force_delete = False  # 网络盘 fallback: 跳过 WAL，直接用 DELETE 模式
+        self.embedding_diagnostic: Optional[str] = None
         # 单连接多线程共享时，必须由上层显式串行化访问。
         self._db_lock = threading.RLock()
         self._init_db()
@@ -152,41 +161,9 @@ class MemoryStore:
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            conn = sqlite3.connect(
-                str(self.db_path),
-                check_same_thread=False,
-                timeout=30.0,
-            )
-            if self._force_delete:
-                # 已知网络盘，直接跳过 WAL 尝试
-                conn.execute("PRAGMA journal_mode=DELETE")
-                conn.execute("PRAGMA synchronous=FULL")
-                print("[Memory] 使用 DELETE 模式（网络盘兼容）")
-            else:
-                try:
-                    result = conn.execute("PRAGMA journal_mode=WAL").fetchone()
-                    if result and result[0] == "wal":
-                        conn.execute("PRAGMA synchronous=NORMAL")
-                    else:
-                        # WAL 未生效（如网络盘），回退 DELETE 模式
-                        conn.execute("PRAGMA journal_mode=DELETE")
-                        conn.execute("PRAGMA synchronous=FULL")
-                        print("[Memory] WAL 不可用，使用 DELETE 模式（网络盘兼容）")
-                except sqlite3.DatabaseError:
-                    # WAL 锁协议失败（SMB/NFS），关闭损坏连接并重建
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                    conn = sqlite3.connect(
-                        str(self.db_path),
-                        check_same_thread=False,
-                        timeout=30.0,
-                    )
-                    conn.execute("PRAGMA journal_mode=DELETE")
-                    conn.execute("PRAGMA synchronous=FULL")
-                    print("[Memory] WAL 不可用，使用 DELETE 模式（网络盘兼容）")
-            conn.execute("PRAGMA busy_timeout=30000")
+            conn, used_delete = open_sqlite(self.db_path, self._force_delete)
+            if used_delete:
+                print("[Memory] WAL 不可用，使用 DELETE 模式（网络盘兼容）")
             self._conn = conn
         return self._conn
 
@@ -222,6 +199,9 @@ class MemoryStore:
         weight_fn(sim, weight) -> combined_score
         Returns: [(id, sim, combined), ...] 按 combined 降序
         """
+        if self.embedding_diagnostic:
+            print(f"[MemoryStore] {self.embedding_diagnostic}")
+            return []
         query_vec = self.embedder.encode(query)
         sql = f"SELECT id, embedding, {weight_col} FROM {table} WHERE {where_sql}"
         rows = self._fetchall(sql, where_params)
@@ -312,6 +292,53 @@ class MemoryStore:
             conn.commit()
             # ── DB migration: 添加 abstraction_level 列（兼容旧数据库） ──
             self._migrate_add_abstraction_level(conn)
+            self._validate_embedding_metadata(conn)
+
+    def _validate_embedding_metadata(self, conn: sqlite3.Connection) -> None:
+        current = embedding_metadata(self.embedder)
+        stored = read_embedding_metadata(conn)
+        has_vectors = any(
+            conn.execute(f"SELECT 1 FROM {table} WHERE embedding IS NOT NULL AND length(embedding) > 0 LIMIT 1").fetchone()
+            for table in ("episodic_memory", "semantic_memory", "procedural_memory")
+        )
+        if not has_vectors and not stored:
+            write_embedding_metadata(conn, current)
+            conn.commit()
+            self.embedding_diagnostic = None
+        else:
+            self.embedding_diagnostic = metadata_diagnostic(stored, current)
+
+    def migrate_embeddings(self) -> Optional[Path]:
+        """Re-embed all persisted text transactionally after retaining a backup."""
+        backup_path = self.db_path.with_name(self.db_path.name + f".bak.{int(time.time() * 1000)}")
+        with self._db_lock:
+            conn = self._get_conn()
+            conn.commit()
+            shutil.copy2(str(self.db_path), str(backup_path))
+            try:
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
+                for rec_id, task, summary in conn.execute(
+                    "SELECT id, task_description, result_summary FROM episodic_memory"
+                ).fetchall():
+                    vector = self.embedder.encode(f"{task or ''} {summary or ''}")
+                    conn.execute("UPDATE episodic_memory SET embedding=? WHERE id=?", (self.embedder.to_bytes(vector), rec_id))
+                for rec_id, rule in conn.execute("SELECT id, rule FROM semantic_memory").fetchall():
+                    vector = self.embedder.encode(rule or "")
+                    conn.execute("UPDATE semantic_memory SET embedding=? WHERE id=?", (self.embedder.to_bytes(vector), rec_id))
+                for rec_id, name, description in conn.execute(
+                    "SELECT id, strategy_name, description FROM procedural_memory"
+                ).fetchall():
+                    vector = self.embedder.encode(f"{name or ''}: {description or ''}")
+                    conn.execute("UPDATE procedural_memory SET embedding=? WHERE id=?", (self.embedder.to_bytes(vector), rec_id))
+                write_embedding_metadata(conn, embedding_metadata(self.embedder))
+                conn.commit()
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            self.embedding_diagnostic = None
+        return backup_path
 
     @staticmethod
     def _migrate_add_abstraction_level(conn: sqlite3.Connection):
@@ -561,6 +588,9 @@ class MemoryStore:
         注意：去重必须用纯相似度 sim，不能用 search_semantic 返回的 combined
         （combined = sim * (0.5 + 0.5*confidence) 会被低置信度压低，导致漏判重复）。
         """
+        if self.embedding_diagnostic:
+            print(f"[MemoryStore] {self.embedding_diagnostic}")
+            return None
         query_vec = self.embedder.encode(rule_text)
         rows = self._fetchall("SELECT id, embedding FROM semantic_memory")
         if not rows:
@@ -1045,6 +1075,7 @@ class MemoryStore:
             "procedural_count": self.count_procedural(),
             "backend": self.embedder._backend,
             "embedding_dim": self.embedder.dim,
+            "embedding_diagnostic": self.embedding_diagnostic,
         }
 
     # ==========================================================

@@ -319,6 +319,116 @@ class ContextRoundPlan:
         return len(self.protected_rounds)
 
 
+@dataclass
+class DynamicContextSection:
+    """命名的动态上下文 section，数字越小越先在预算压力下降级。"""
+    name: str
+    messages: List[Dict[str, Any]] = field(default_factory=list)
+    degrade_priority: int = 0
+
+
+@dataclass
+class ContextAssembly:
+    """可发送上下文的唯一结构：稳定 prefix、history rounds、命名 suffix。"""
+    prefix_messages: List[Dict[str, Any]] = field(default_factory=list)
+    history_rounds: List[List[Dict[str, Any]]] = field(default_factory=list)
+    dynamic_sections: List[DynamicContextSection] = field(default_factory=list)
+    summary_message: Optional[Dict[str, Any]] = None
+
+    def suffix_messages(self) -> List[Dict[str, Any]]:
+        return [msg for section in self.dynamic_sections for msg in section.messages]
+
+    def messages(self) -> List[Dict[str, Any]]:
+        return assemble_context_messages(
+            self.history_rounds,
+            prefix_messages=self.prefix_messages,
+            summary_message=self.summary_message,
+            suffix_messages=self.suffix_messages(),
+        )
+
+
+@dataclass
+class ContextPruneResult:
+    removed_rounds: int
+    final_tokens: int
+    target_tokens: int
+
+    @property
+    def within_budget(self) -> bool:
+        return self.final_tokens <= self.target_tokens
+
+
+def build_context_assembly(
+    prefix_messages: Optional[List[Dict[str, Any]]] = None,
+    history_messages: Optional[List[Dict[str, Any]]] = None,
+    dynamic_sections: Optional[List[DynamicContextSection]] = None,
+) -> ContextAssembly:
+    """从三个显式输入构建上下文，dynamic section 不参与 history round 规划。"""
+    return ContextAssembly(
+        prefix_messages=list(prefix_messages or []),
+        history_rounds=plan_context_rounds(list(history_messages or []), 0).rounds,
+        dynamic_sections=list(dynamic_sections or []),
+    )
+
+
+def prune_context_assembly_to_token_target(
+    assembly: ContextAssembly,
+    target_tokens: int,
+    count_tokens_fn: Callable[[List[Dict[str, Any]], Optional[List[Dict[str, Any]]]], int],
+    tools: Optional[List[Dict[str, Any]]] = None,
+    min_rounds: int = 2,
+    summarize_fn: Optional[Callable[[str, int], str]] = None,
+    keep_current_image: bool = True,
+) -> ContextPruneResult:
+    """统一退化：旧图片→旧 tool 结果→旧 rounds→按优先级删除 dynamic sections。"""
+    tools = tools or []
+
+    def count() -> int:
+        return count_tokens_fn(assembly.messages(), tools)
+
+    messages = flatten_context_rounds(assembly.history_rounds)
+    user_indices = [i for i, msg in enumerate(messages) if msg.get('role') == 'user']
+    protected_image_index = user_indices[-1] if keep_current_image and user_indices else -1
+    for idx, msg in enumerate(messages):
+        content = msg.get('content')
+        if not isinstance(content, list) or idx == protected_image_index:
+            continue
+        text_parts = [
+            part.get('text', '') for part in content
+            if isinstance(part, dict) and part.get('type') == 'text'
+        ]
+        if any(isinstance(part, dict) and part.get('type') == 'image_url' for part in content):
+            msg['content'] = '\n'.join(part for part in text_parts if part) or '[图片已移除]'
+
+    if count() <= target_tokens:
+        return ContextPruneResult(0, count(), target_tokens)
+
+    protect_n = max(min_rounds, int(len(assembly.history_rounds) * 0.6))
+    compress_old_round_tool_results(
+        assembly.history_rounds,
+        protect_n,
+        summarize_fn=summarize_fn,
+    )
+    removed = prune_context_rounds_to_token_target(
+        assembly.history_rounds,
+        target_tokens,
+        lambda _: count(),
+        min_rounds=min_rounds,
+        check_before_pop=True,
+    )
+    if removed:
+        assembly.summary_message = {
+            'role': 'system',
+            'content': f'[Context] 已自动压缩 {removed} 个早期对话轮次。',
+        }
+
+    for section in sorted(assembly.dynamic_sections, key=lambda item: item.degrade_priority):
+        if count() <= target_tokens:
+            break
+        section.messages.clear()
+    return ContextPruneResult(removed, count(), target_tokens)
+
+
 def plan_context_rounds(
     messages: List[Dict[str, Any]],
     protect_recent_rounds: int = 2,
@@ -416,7 +526,7 @@ def compress_old_round_tool_results(
             if summarize_fn:
                 msg['content'] = summarize_fn(content, max_content_length)
             else:
-                msg['content'] = content[:max_content_length] + '...[summary]'
+                continue
             compressed_count += 1
     return compressed_count
 
@@ -565,8 +675,7 @@ class TokenOptimizer:
             return [], CompressionStats().to_dict()
 
         strategy = strategy or self.budget.strategy
-        converted_messages = self._convert_tool_messages_for_compression(messages)
-        plan = plan_context_rounds(converted_messages, protect_recent_rounds=protect_recent_rounds)
+        plan = plan_context_rounds(messages, protect_recent_rounds=protect_recent_rounds)
 
         if not plan.old_messages:
             current_tokens = self.calculate_message_tokens(messages)
@@ -577,7 +686,7 @@ class TokenOptimizer:
                 compressed_tokens=current_tokens,
                 strategy=strategy.value,
             )
-            return converted_messages, stats.to_dict()
+            return messages, stats.to_dict()
 
         original_tokens = self.calculate_message_tokens(messages)
         compressed_messages: List[Dict[str, Any]] = []
@@ -617,56 +726,14 @@ class TokenOptimizer:
         """
         if not messages:
             return [], CompressionStats().to_dict()
-        
-        keep_recent = keep_recent or self.budget.keep_recent_messages
-        strategy = strategy or self.budget.strategy
-        
-        if len(messages) <= keep_recent:
-            current_tokens = self.calculate_message_tokens(messages)
-            stats = CompressionStats.from_counts(
-                compressed=0,
-                kept=len(messages),
-                original_tokens=current_tokens,
-                compressed_tokens=current_tokens,
-                strategy=strategy.value,
-            )
-            return messages, stats.to_dict()
-        
-        # ⚠️ 将 role="tool" 消息转换为 assistant 格式（避免 API 400 错误）
-        converted_messages = self._convert_tool_messages_for_compression(messages)
-        
-        # 分离旧消息和新消息
-        old_messages = converted_messages[:-keep_recent] if len(converted_messages) > keep_recent else []
-        recent_messages = converted_messages[-keep_recent:] if len(converted_messages) >= keep_recent else converted_messages
-        
-        # 计算原始 token
-        original_tokens = self.calculate_message_tokens(messages)
-        
-        # 根据策略压缩
-        compressed_messages = []
-        if old_messages:
-            summary = self._generate_summary_for_strategy(old_messages, strategy)
-            
-            if summary:
-                compressed_messages.append({
-                    'role': 'system',
-                    'content': summary
-                })
-        
-        # 保留最近的消息
-        compressed_messages.extend(recent_messages)
-        
-        # 计算节省的 token
-        compressed_tokens = self.calculate_message_tokens(compressed_messages)
-        stats = CompressionStats.from_counts(
-            compressed=len(old_messages),
-            kept=len(recent_messages),
-            original_tokens=original_tokens,
-            compressed_tokens=compressed_tokens,
-            strategy=strategy.value,
+
+        # 兼容旧 API，但边界必须是完整 user round；不能按消息数拆断 tool chain。
+        protect_rounds = max(1, (keep_recent or self.budget.keep_recent_messages) // 2)
+        return self.compress_context_rounds(
+            messages,
+            protect_recent_rounds=protect_rounds,
+            strategy=strategy,
         )
-        
-        return compressed_messages, stats.to_dict()
     
     def _generate_balanced_summary(self, messages: List[Dict[str, Any]]) -> str:
         """生成平衡摘要（默认策略）"""

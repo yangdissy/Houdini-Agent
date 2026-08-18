@@ -5,7 +5,11 @@ import unittest
 import sys
 from unittest import mock
 
-from houdini_agent.core.harness_policy_config import CONFIRM_TOOLS, HIGH_RISK_TOOLS
+from houdini_agent.core.harness_policy_config import (
+    CONFIRM_TOOLS,
+    HIGH_RISK_TOOLS,
+    SCENE_MUTATION_TOOLS,
+)
 
 for name in ("requests", "trafilatura"):
     if name not in sys.modules:
@@ -13,6 +17,7 @@ for name in ("requests", "trafilatura"):
 
 from houdini_agent.utils.ai_client import HOUDINI_TOOLS
 from houdini_agent.utils.tool_registry import ToolRegistry
+from houdini_agent.utils.mcp.client import HoudiniMCP
 
 
 class CoreToolContractTest(unittest.TestCase):
@@ -94,6 +99,52 @@ class CoreToolContractTest(unittest.TestCase):
         ):
             with self.subTest(tool=name):
                 self.assertIn(name, core_names)
+
+    def test_schema_and_dispatch_contracts_model_internal_tools_explicitly(self):
+        core_names = set(self.registry._tools)
+        dispatch_names = set(HoudiniMCP._TOOL_DISPATCH)
+        ai_internal_tools = {"web_search", "fetch_webpage", "add_todo", "update_todo"}
+        non_mcp_internal_dispatch = {
+            "set_display_flag", "get_node_inputs", "list_network_boxes",
+            "get_node_positions", "get_node_card", "check_errors",
+            "find_nodes_by_param", "list_children", "get_node_parameters",
+        }
+
+        self.assertEqual(core_names - dispatch_names, ai_internal_tools)
+        self.assertEqual(dispatch_names - core_names, non_mcp_internal_dispatch)
+        for name, handler_name in HoudiniMCP._TOOL_DISPATCH.items():
+            with self.subTest(tool=name):
+                self.assertTrue(callable(getattr(HoudiniMCP, handler_name, None)))
+
+    def test_harness_mutations_are_registered_as_mutating_with_undo(self):
+        core_names = set(self.registry._tools)
+        for name in SCENE_MUTATION_TOOLS & core_names:
+            with self.subTest(tool=name):
+                semantics = self.registry.get_execution_semantics(name)
+                self.assertTrue(semantics["mutating"])
+                self.assertTrue(semantics["undo"])
+
+    def test_plugins_cannot_replace_or_downgrade_core_metadata(self):
+        before = self.registry.get_meta("delete_node")
+        with self.assertRaises(Exception):
+            self.registry.register(
+                "delete_node",
+                before.schema,
+                source="plugin",
+                plugin_name="downgrade",
+                modes={"ask"},
+                risk_level="low",
+                mutating=False,
+                undo=False,
+            )
+
+        after = self.registry.get_meta("delete_node")
+        self.assertIs(after, before)
+        self.assertEqual(after.risk_level, "high")
+        self.assertTrue(after.mutating)
+        self.assertTrue(after.undo)
+        self.assertIn("delete_node", HIGH_RISK_TOOLS)
+        self.assertIn("delete_node", CONFIRM_TOOLS)
 
 
 if __name__ == "__main__":

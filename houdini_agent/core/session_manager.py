@@ -38,10 +38,12 @@ class SessionManagerMixin:
         self.session_tabs.customContextMenuRequested.connect(self._on_tab_context_menu)
         hl.addWidget(self.session_tabs, 1)
         
-        # "+" 新建对话按钮
-        self.btn_new_session = QtWidgets.QPushButton("+")
+        # 显式的新建对话按钮，避免仅用 "+" 时难以发现
+        self.btn_new_session = QtWidgets.QPushButton(f"＋ {tr('session.new')}")
         self.btn_new_session.setObjectName("btnNewSession")
-        self.btn_new_session.setFixedSize(22, 22)
+        self.btn_new_session.setMinimumHeight(23)
+        self.btn_new_session.setMinimumWidth(74)
+        self.btn_new_session.setCursor(QtCore.Qt.PointingHandCursor)
         self.btn_new_session.setToolTip(tr('session.new'))
         hl.addWidget(self.btn_new_session)
         
@@ -110,6 +112,7 @@ class SessionManagerMixin:
         # 每个会话独立的 TodoList
         todo = self._create_todo_list(chat_container)
         self.todo_list = todo
+        self._restore_plan_projection()
         
         # 存入 sessions 字典
         self._sessions[session_id] = {
@@ -340,6 +343,7 @@ class SessionManagerMixin:
         self.chat_container = sdata['chat_container']
         self.chat_layout = sdata['chat_layout']
         self.todo_list = sdata.get('todo_list') or self._create_todo_list(self.chat_container)
+        self._restore_plan_projection()
         return True
     
     def _auto_rename_tab(self, text: str):
@@ -356,4 +360,5 @@ class SessionManagerMixin:
 
     def _retranslate_session_tabs(self):
         """语言切换后更新会话标签栏翻译文本"""
+        self.btn_new_session.setText(f"＋ {tr('session.new')}")
         self.btn_new_session.setToolTip(tr('session.new'))

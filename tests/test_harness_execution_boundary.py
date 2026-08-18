@@ -13,7 +13,11 @@ _install_hou_stub()
 _install_thirdparty_stubs()
 _install_qt_stubs()
 
-from houdini_agent.core.harness_engine import HarnessToolPolicyEngine
+from houdini_agent.core.harness_engine import (
+    GovernedToolExecutor,
+    HarnessToolPolicyEngine,
+    ToolPolicyDecision,
+)
 from houdini_agent.ui.ai_tab import AITab
 
 
@@ -137,6 +141,101 @@ class HarnessExecutionBoundaryTest(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["mode"], "Auto")
         self.assertNotEqual(tab._pre_agent_update_mode, "Manual")
+
+    def test_batch_items_each_pass_through_harness(self):
+        tab = self._make_tab()
+        tab._houdini_main_thread_executor = object()
+        calls = []
+        tab._execute_tool_impl = lambda name, args, **kwargs: calls.append((name, args)) or {
+            "success": True, "result": name,
+        }
+
+        results = AITab._execute_tools_batch_in_main_thread(tab, [
+            ("get_network_structure", {"network_path": "/obj"}),
+            ("execute_python", {"code": "print(1)"}),
+        ])
+
+        self.assertTrue(results[0]["success"])
+        self.assertFalse(results[1]["success"])
+        self.assertEqual([name for name, _ in calls], ["get_network_structure"])
+
+
+class GovernedToolExecutorTest(unittest.TestCase):
+    def test_allow_sanitizes_result_and_audits_metadata_only(self):
+        audits = []
+        calls = []
+        owner = GovernedToolExecutor(
+            HarnessToolPolicyEngine(),
+            lambda name, args, confirmed: calls.append(args) or {
+                "success": True, "result": "api_key=sk-testsecret1234567890",
+            },
+            audit=audits.append,
+        )
+
+        result = owner.execute("get_network_structure", {"network_path": "/obj"}, {"mode": "agent"})
+
+        self.assertTrue(result["success"])
+        self.assertIn("[REDACTED]", result["result"])
+        self.assertEqual(calls, [{"network_path": "/obj"}])
+        self.assertEqual([r.get("phase") for r in audits if r["event_type"] == "tool_call"], ["start", "result"])
+        self.assertNotIn("/obj", str(audits))
+
+    def test_policy_and_confirmation_errors_fail_closed(self):
+        class BrokenPolicy:
+            def decide(self, *args):
+                raise RuntimeError("secret policy detail")
+
+        calls = []
+        broken = GovernedToolExecutor(BrokenPolicy(), lambda *args: calls.append(args))
+        result = broken.execute("anything", {}, {"mode": "agent"})
+        self.assertFalse(result["success"])
+        self.assertEqual(calls, [])
+        self.assertNotIn("secret", result["error"])
+
+        asking = GovernedToolExecutor(
+            type("AskPolicy", (), {"decide": lambda self, *args: ToolPolicyDecision(action="ask")})(),
+            lambda *args: calls.append(args),
+            confirm=lambda *args: (_ for _ in ()).throw(RuntimeError("dialog failed")),
+        )
+        result = asking.execute("anything", {}, {"mode": "agent"})
+        self.assertFalse(result["success"])
+        self.assertEqual(calls, [])
+
+    def test_retry_uses_only_patched_args_and_exhausts_closed(self):
+        decision = ToolPolicyDecision(
+            action="retry", patched_args={"file_path": "safe.hip"}, retry_key="save",
+        )
+        policy = type("RetryPolicy", (), {"decide": lambda self, *args: decision})()
+        calls = []
+        retry_counts = {}
+        owner = GovernedToolExecutor(
+            policy,
+            lambda name, args, confirmed: calls.append(args) or {"success": False, "error": "again"},
+            retry_counts=retry_counts,
+            retry_limit=1,
+        )
+
+        first = owner.execute("save_hip", {"file_path": "unsafe"}, {"mode": "agent"})
+        second = owner.execute("save_hip", {"file_path": "unsafe"}, {"mode": "agent"})
+
+        self.assertFalse(first["success"])
+        self.assertFalse(second["success"])
+        self.assertEqual(calls, [{"file_path": "safe.hip"}])
+
+    def test_adapter_exception_becomes_safe_audited_result(self):
+        audits = []
+        owner = GovernedToolExecutor(
+            HarnessToolPolicyEngine(),
+            lambda *args: (_ for _ in ()).throw(RuntimeError("password=topsecret")),
+            audit=audits.append,
+        )
+
+        result = owner.execute("get_network_structure", {"network_path": "/obj"}, {"mode": "agent"})
+
+        self.assertFalse(result["success"])
+        self.assertNotIn("topsecret", str(result))
+        self.assertEqual(audits[-1]["error_code"], "tool_execution_failed")
+        self.assertNotIn("topsecret", str(audits))
 
 
 if __name__ == "__main__":

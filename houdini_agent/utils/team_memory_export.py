@@ -74,7 +74,7 @@ def _procedural_export_entry(record) -> Optional[dict]:
     }
 
 
-def build_team_export_payload(store: MemoryStore) -> Dict[str, List[dict]]:
+def build_team_export_payload(store: MemoryStore) -> Dict:
     """从个人 MemoryStore 里筛出符合团队共享条件的记录（供导出/测试复用）。"""
     semantic_entries = []
     for record in store.get_all_semantic():
@@ -89,13 +89,30 @@ def build_team_export_payload(store: MemoryStore) -> Dict[str, List[dict]]:
             procedural_entries.append(entry)
 
     # 记录 embedding 后端：不同后端的向量不在同一语义空间，合并去重时需要区分。
-    backend = "semantic" if store.embedder.is_semantic else "fallback"
+    backend = str(getattr(store.embedder, "_backend", "unknown"))
+    model = str(getattr(store.embedder, "model_name", "unknown"))
+    dimension = int(getattr(store.embedder, "dim", 0))
     for entry in semantic_entries:
         entry["embedding_backend"] = backend
+        entry["embedding_model"] = model
+        entry["embedding_dimension"] = dimension
+        entry["embedding_format_version"] = 1
     for entry in procedural_entries:
         entry["embedding_backend"] = backend
+        entry["embedding_model"] = model
+        entry["embedding_dimension"] = dimension
+        entry["embedding_format_version"] = 1
 
-    return {"semantic": semantic_entries, "procedural": procedural_entries}
+    return {
+        "embedding_provenance": {
+            "backend": backend,
+            "model": model,
+            "dimension": dimension,
+            "format_version": 1,
+        },
+        "semantic": semantic_entries,
+        "procedural": procedural_entries,
+    }
 
 
 def export_team_memory(username: str, store: MemoryStore) -> Optional[Path]:

@@ -102,18 +102,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 替换 AITab
         if hasattr(self, 'ai_tab') and self.ai_tab:
+            old_tab = self.ai_tab
             try:
-                self.ai_tab.cleanup()
+                old_tab._auto_save_timer.stop()
+            except Exception:
+                pass
+            old_tab._ai_tab_active = False
+            try:
+                old_tab.cleanup()
             except Exception:
                 pass
             # ★ 先隐藏再从父布局摘除，避免已 deleteLater 的旧 AITab 继续参与
             #   布局/绘制事件，导致对半销毁 widget 计算 sizeHint 崩溃。
             try:
-                self.ai_tab.hide()
+                old_tab.hide()
             except Exception:
                 pass
-            self.ai_tab.setParent(None)
-            self.ai_tab.deleteLater()
+            old_tab.setParent(None)
+            old_tab.deleteLater()
         self.ai_tab = AITab(workspace_dir=self._workspace_dir, username=self._username)
         self._central_layout.addWidget(self.ai_tab)
 

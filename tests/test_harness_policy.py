@@ -29,6 +29,23 @@ class HarnessPolicyConfigTest(unittest.TestCase):
         self.assertIn("create_node", SCENE_MUTATION_TOOLS)
         self.assertNotIn("create_node", HIGH_RISK_TOOLS)
 
+    def test_registry_metadata_cannot_reduce_harness_policy_sets(self):
+        from houdini_agent.utils.tool_registry import ToolRegistry
+
+        schema = {
+            "type": "function",
+            "function": {"name": "plugin_probe", "description": "probe", "parameters": {}},
+        }
+        registry = ToolRegistry()
+        registry.register(
+            "plugin_probe", schema, source="plugin", plugin_name="policy-test",
+            modes={"ask", "agent"}, risk_level="low", mutating=False, undo=False,
+        )
+
+        self.assertNotIn("plugin_probe", CONFIRM_TOOLS)
+        self.assertIn("delete_node", CONFIRM_TOOLS)
+        self.assertIn("execute_shell", HIGH_RISK_TOOLS)
+
 
 class HarnessToolPolicyEngineTest(unittest.TestCase):
     def setUp(self):
@@ -269,11 +286,11 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
     def test_save_hip_path_gets_extension_retry(self):
         decision = self.policy.decide(
             "save_hip",
-            {"output_path": "/tmp/shot_v001"},
+            {"file_path": "/tmp/shot_v001"},
             {"mode": "agent"},
         )
         self.assertEqual(decision.action, "retry")
-        self.assertEqual(decision.patched_args["output_path"], "/tmp/shot_v001.hip")
+        self.assertEqual(decision.patched_args["file_path"], "/tmp/shot_v001.hip")
         self.assertIn("retry_patch_output_extension", decision.matched_rules)
 
     def test_retry_key_is_stable_for_equal_args(self):

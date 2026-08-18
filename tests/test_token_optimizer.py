@@ -20,6 +20,9 @@ from houdini_agent.utils.token_optimizer import (
     flatten_context_rounds,
     prune_context_rounds_to_token_target,
     assemble_context_messages,
+    DynamicContextSection,
+    build_context_assembly,
+    prune_context_assembly_to_token_target,
 )
 
 
@@ -272,6 +275,93 @@ class CompressMessagesTest(unittest.TestCase):
 
 
 class ContextRoundPlanTest(unittest.TestCase):
+    def test_structured_assembly_keeps_named_suffix_order(self):
+        assembly = build_context_assembly(
+            [{"role": "system", "content": "prefix"}],
+            [{"role": "user", "content": "history"}],
+            [
+                DynamicContextSection("rag", [{"role": "system", "content": "rag"}], 0),
+                DynamicContextSection("memory", [{"role": "system", "content": "memory"}], 1),
+                DynamicContextSection("plan", [{"role": "system", "content": "plan"}], 2),
+                DynamicContextSection("reminder", [{"role": "system", "content": "reminder"}], 3),
+            ],
+        )
+
+        self.assertEqual([m["content"] for m in assembly.messages()], [
+            "prefix", "history", "rag", "memory", "plan", "reminder",
+        ])
+
+    def test_pruner_counts_tools_and_degrades_dynamic_sections_in_order(self):
+        assembly = build_context_assembly(
+            [{"role": "system", "content": "prefix"}],
+            [{"role": "user", "content": "current body"}],
+            [
+                DynamicContextSection("rag", [{"role": "system", "content": "rag"}], 0),
+                DynamicContextSection("plan", [{"role": "system", "content": "plan"}], 2),
+            ],
+        )
+        tools = [{"type": "function", "function": {"description": "x" * 1000}}]
+        seen_tools = []
+
+        def count(messages, actual_tools):
+            seen_tools.append(actual_tools)
+            return len(messages) * 10 + (100 if actual_tools else 0)
+
+        prune_context_assembly_to_token_target(assembly, 130, count, tools=tools, min_rounds=1)
+
+        self.assertTrue(all(item is tools for item in seen_tools))
+        self.assertEqual(assembly.dynamic_sections[0].messages, [])
+        self.assertNotEqual(assembly.dynamic_sections[1].messages, [])
+
+    def test_pruner_preserves_current_image_and_complete_tool_chain(self):
+        old_image = [{"type": "text", "text": "old"}, {"type": "image_url", "image_url": {"url": "old"}}]
+        current_image = [{"type": "text", "text": "current"}, {"type": "image_url", "image_url": {"url": "current"}}]
+        assembly = build_context_assembly(history_messages=[
+            {"role": "user", "content": old_image},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "function": {"name": "x", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "user", "content": current_image},
+        ])
+
+        prune_context_assembly_to_token_target(
+            assembly, 1000, lambda messages, tools: len(messages), min_rounds=1,
+        )
+        result = assembly.messages()
+
+        self.assertIsInstance(result[0]["content"], str)
+        self.assertEqual(result[-1]["content"], current_image)
+        self.assertEqual(result[1]["tool_calls"][0]["id"], result[2]["tool_call_id"])
+
+    def test_pruner_reports_budget_unsatisfied_without_truncating_body(self):
+        body = "x" * 1000
+        assembly = build_context_assembly(
+            [{"role": "system", "content": "required prefix"}],
+            [{"role": "user", "content": body}],
+        )
+        result = prune_context_assembly_to_token_target(
+            assembly,
+            10,
+            lambda messages, tools: sum(len(str(m.get("content", ""))) for m in messages),
+            min_rounds=1,
+        )
+        self.assertFalse(result.within_budget)
+        self.assertGreater(result.final_tokens, result.target_tokens)
+        self.assertEqual(assembly.history_rounds[0][0]["content"], body)
+
+    def test_manual_compression_keeps_recent_complete_round(self):
+        opt = TokenOptimizer(TokenBudget(keep_recent_messages=2))
+        messages = [
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "current"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c", "function": {"name": "x", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c", "content": "result"},
+        ]
+
+        compressed, _ = opt.compress_messages(messages, keep_recent=2)
+
+        self.assertEqual([m.get("role") for m in compressed[-3:]], ["user", "assistant", "tool"])
+
     def test_plan_context_rounds_splits_on_user_messages(self):
         messages = [
             {"role": "system", "content": "rules"},
@@ -338,6 +428,18 @@ class ContextRoundPlanTest(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertTrue(rounds[0][1]["content"].endswith("...[custom]"))
         self.assertEqual(rounds[1][1]["content"], "y" * 250)
+
+    def test_compress_old_round_tool_results_without_summarizer_does_not_character_truncate(self):
+        content = "x" * 250
+        rounds = [[
+            {"role": "user", "content": "old"},
+            {"role": "tool", "content": content},
+        ]]
+
+        count = compress_old_round_tool_results(rounds, protect_recent_rounds=0)
+
+        self.assertEqual(count, 0)
+        self.assertEqual(rounds[0][1]["content"], content)
 
     def test_prune_context_rounds_check_before_pop(self):
         rounds = [[{"role": "user", "content": "one"}], [{"role": "user", "content": "two"}]]

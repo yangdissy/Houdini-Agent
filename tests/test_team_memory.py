@@ -2,6 +2,7 @@
 """Team memory sharing: export eligibility, opt-out toggle, and rebuild/dedup tests."""
 
 import json
+import sqlite3
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -17,6 +18,33 @@ from houdini_agent.utils.team_memory_settings import (
     set_team_export_enabled,
 )
 from houdini_agent.utils.team_memory_store import TeamMemoryStore, rebuild_team_memory
+
+
+class FakeEmbedder:
+    def __init__(self, backend="fake", model_name="fake-model", dim=4):
+        self._backend = backend
+        self.model_name = model_name
+        self.dim = dim
+        self.is_semantic = backend != "fallback"
+        self.encoded_texts = []
+
+    def encode(self, text):
+        self.encoded_texts.append(text)
+        return _vec(float(len(text) or 1), 1.0, 0.0, 0.0)[:self.dim]
+
+    @staticmethod
+    def to_bytes(vector):
+        return vector.astype("float32").tobytes()
+
+    @staticmethod
+    def from_bytes(data):
+        import numpy as np
+        return np.frombuffer(data, dtype=np.float32).copy()
+
+    @staticmethod
+    def cosine_similarity(left, right):
+        from houdini_agent.utils.embedding import LocalEmbedder
+        return LocalEmbedder.cosine_similarity(left, right)
 
 
 def _vec(*values):
@@ -84,6 +112,10 @@ class BuildTeamExportPayloadTest(unittest.TestCase):
             # embedding 序列化为 list，且带上后端标签
             self.assertIsInstance(payload["semantic"][0]["embedding"], list)
             self.assertIn("embedding_backend", payload["semantic"][0])
+            self.assertEqual(payload["semantic"][0]["embedding_model"], store.embedder.model_name)
+            self.assertEqual(payload["semantic"][0]["embedding_dimension"], store.embedder.dim)
+            self.assertEqual(payload["semantic"][0]["embedding_format_version"], 1)
+            store.close()
 
 
 class ExportTeamMemoryToggleTest(unittest.TestCase):
@@ -273,6 +305,93 @@ class RebuildTeamMemoryTest(unittest.TestCase):
                 self.assertEqual(proc_results[0][0].source_users, ["bob"])
             finally:
                 store.close()
+
+    def test_team_backend_model_and_dimension_mismatch_disable_scoring(self):
+        with TemporaryDirectory() as db_dir:
+            path = Path(db_dir) / "team_memory.db"
+            original = FakeEmbedder("backend-a", "model-a", 4)
+            store = TeamMemoryStore(path, original)
+            from houdini_agent.utils.team_memory_store import TeamSemanticRecord
+            store.replace_all([TeamSemanticRecord(rule="kept text", embedding=original.encode("kept text"))], [])
+            store.close()
+
+            for changed in (
+                FakeEmbedder("backend-b", "model-a", 4),
+                FakeEmbedder("backend-a", "model-b", 4),
+                FakeEmbedder("backend-a", "model-a", 3),
+            ):
+                mismatched = TeamMemoryStore(path, changed)
+                self.assertIsNotNone(mismatched.embedding_diagnostic)
+                self.assertEqual(mismatched.search_semantic("query"), [])
+                self.assertNotIn("query", changed.encoded_texts)
+                mismatched.close()
+
+    def test_rebuild_reembeds_final_text_and_replace_failure_preserves_live_db(self):
+        with TemporaryDirectory() as export_dir, TemporaryDirectory() as db_dir:
+            path = Path(db_dir) / "team_memory.db"
+            path.write_bytes(b"old-live-db")
+            payload = {
+                "semantic": [{
+                    "rule": "final team text", "category": "knowledge", "abstraction_level": 2,
+                    "confidence": 0.9, "embedding": _vec(1, 0, 0, 0).tolist(),
+                    "embedding_backend": "old", "embedding_model": "old-model",
+                    "embedding_dimension": 4, "embedding_format_version": 1,
+                }],
+                "procedural": [],
+            }
+            export_path = self._write_export(export_dir, "alice", payload)
+            embedder = FakeEmbedder()
+            with mock.patch("houdini_agent.utils.team_memory_store.os.replace", side_effect=OSError("locked")):
+                with self.assertRaises(OSError):
+                    rebuild_team_memory(embedder, path, [("alice", export_path)])
+            self.assertEqual(path.read_bytes(), b"old-live-db")
+            self.assertIn("final team text", embedder.encoded_texts)
+
+    def test_rebuild_refreshes_default_singleton(self):
+        import houdini_agent.utils.team_memory_store as module
+        with TemporaryDirectory() as export_dir:
+            payload = {"semantic": [], "procedural": []}
+            export_path = self._write_export(export_dir, "alice", payload)
+            old_path = module._TEAM_DB_PATH
+            old_instance = module._team_store_instance
+            try:
+                module._TEAM_DB_PATH = Path(export_dir) / "live.db"
+                module._team_store_instance = TeamMemoryStore(module._TEAM_DB_PATH, FakeEmbedder())
+                previous = module._team_store_instance
+                rebuild_team_memory(FakeEmbedder(), export_files=[("alice", export_path)])
+                self.assertIsNot(module._team_store_instance, previous)
+                self.assertEqual(module._team_store_instance.db_path, module._TEAM_DB_PATH)
+            finally:
+                if module._team_store_instance:
+                    module._team_store_instance.close()
+                module._team_store_instance = old_instance
+                module._TEAM_DB_PATH = old_path
+
+
+class PersonalMemoryProvenanceTest(unittest.TestCase):
+    def test_legacy_database_disables_scoring_until_backed_up_migration(self):
+        with TemporaryDirectory() as db_dir:
+            path = Path(db_dir) / "personal.db"
+            embedder = FakeEmbedder()
+            store = MemoryStore(path, embedder)
+            store.add_semantic(SemanticRecord(rule="text survives", confidence=0.9))
+            store.close()
+            conn = sqlite3.connect(str(path))
+            try:
+                conn.execute("DELETE FROM embedding_metadata")
+                conn.commit()
+            finally:
+                conn.close()
+
+            legacy = MemoryStore(path, embedder)
+            self.assertIn("legacy", legacy.embedding_diagnostic)
+            self.assertEqual(legacy.search_semantic("query"), [])
+            self.assertNotIn("query", embedder.encoded_texts)
+            backup = legacy.migrate_embeddings()
+            self.assertTrue(backup.exists())
+            self.assertIsNone(legacy.embedding_diagnostic)
+            self.assertEqual(legacy.get_all_semantic()[0].rule, "text survives")
+            legacy.close()
 
 
 if __name__ == "__main__":

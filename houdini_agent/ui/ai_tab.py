@@ -11,7 +11,6 @@ Agent loop, multi-turn tool calling, streaming UI
   core/session_manager.py — SessionManagerMixin: 多会话管理和缓存
 """
 
-import atexit
 import copy
 import json
 import math
@@ -220,6 +219,7 @@ class AITab(
         self._session_counter = 0               # 用于生成 tab 标签
         # ★ 纯 Python 备份：tab 顺序和标签名（atexit 时 Qt widget 可能已销毁）
         self._tabs_backup: list = []  # [(session_id, tab_label), ...]
+        self._ai_tab_active = True
         
         # 静态内容缓存（只计算一次，节省 token 和计算时间）
         self._cached_optimized_system_prompt: Optional[str] = None
@@ -262,9 +262,7 @@ class AITab(
         self._output_token_warning = float('inf')
         self._current_output_tokens = 0
         
-        # <think> 标签流式解析状态
-        self._in_think_block = False
-        self._tag_parse_buf = ""
+        # <think> 标签流式解析状态（运行开始时创建纯 Python parser）
         self._thinking_needs_finalize = False  # 标记是否需要 finalize 思考区块
         self._think_enabled = True  # 当前会话是否启用思考显示（由 Think 开关控制）
         
@@ -359,20 +357,12 @@ class AITab(
         self._update_context_stats()
         self._refresh_mode_guard_ui()
         
-        # ★ 启动时自动恢复上次的会话（从 sessions_manifest.json）
-        self._restore_all_sessions()
         QtCore.QTimer.singleShot(5000, self._run_diagnostics_retention_cleanup)
         
         # 定期自动保存（每 60 秒），防止 Houdini 退出时丢失会话
         self._auto_save_timer = QtCore.QTimer(self)
         self._auto_save_timer.timeout.connect(self._periodic_save_all)
         self._auto_save_timer.start(60_000)  # 60 秒
-        
-        # 注册 atexit 回调和 QApplication.aboutToQuit 信号
-        atexit.register(self._atexit_save)
-        app = QtWidgets.QApplication.instance()
-        if app:
-            app.aboutToQuit.connect(self._periodic_save_all)
         
         # ★ 启动时静默检查更新（延迟 5 秒，不阻塞初始化）— 已关闭
         # QtCore.QTimer.singleShot(5000, self._silent_update_check)

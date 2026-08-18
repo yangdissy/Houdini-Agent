@@ -92,15 +92,15 @@ class InputAreaMixin:
 
         self._agent_mode = False
         self._plan_mode = False
-        self._confirm_mode = False
+        self._confirm_mode = True
         self._auto_read_mode = 'sel'  # 'off' | 'sel' | 'net'
 
-        # + 附件弹出菜单
-        self.btn_attach_menu = QtWidgets.QPushButton("+")
+        # 添加图片或场景上下文
+        self.btn_attach_menu = QtWidgets.QPushButton("＋⌄")
         self.btn_attach_menu.setObjectName("btnAttach")
-        self.btn_attach_menu.setFixedSize(18, 18)
+        self.btn_attach_menu.setFixedSize(28, 24)
         self.btn_attach_menu.setCursor(QtCore.Qt.PointingHandCursor)
-        self.btn_attach_menu.setToolTip("Attach / Actions")
+        self.btn_attach_menu.setToolTip(tr('context.add.tooltip'))
         self.btn_attach_menu.clicked.connect(self._show_attach_menu)
         toolbar_top.addWidget(self.btn_attach_menu)
 
@@ -119,14 +119,15 @@ class InputAreaMixin:
         toolbar_top.addWidget(self.mode_combo)
 
         # 确认模式开关（toggle button，颜色直观区分状态）
-        self.chk_confirm_mode = QtWidgets.QPushButton("✔ 逐步确认")
+        self.chk_confirm_mode = QtWidgets.QPushButton(tr('confirm.enabled'))
         self.chk_confirm_mode.setObjectName("chkConfirm")
         self.chk_confirm_mode.setCheckable(True)
         self.chk_confirm_mode.setChecked(True)
         self.chk_confirm_mode.setProperty("confirm", "on")
         self.chk_confirm_mode.setCursor(QtCore.Qt.PointingHandCursor)
         self.chk_confirm_mode.setToolTip(tr('confirm.tooltip'))
-        self.chk_confirm_mode.setFixedSize(86, 24)
+        self.chk_confirm_mode.setFixedHeight(24)
+        self.chk_confirm_mode.setMinimumWidth(92)
         self.chk_confirm_mode.toggled.connect(self._on_confirm_mode_toggled)
         toolbar_top.addWidget(self.chk_confirm_mode)
 
@@ -145,21 +146,22 @@ class InputAreaMixin:
         self.read_combo.currentIndexChanged.connect(self._on_auto_read_changed)
 
         # 模式风险徽标（持续可见）
-        self.mode_guard_label = QtWidgets.QLabel("ASK | RO")
+        self.mode_guard_label = QtWidgets.QLabel(tr('guard.readonly'))
         self.mode_guard_label.setObjectName("modeGuardLabel")
         self.mode_guard_label.setProperty("risk", "readonly")
         self.mode_guard_label.setFixedHeight(24)
-        self.mode_guard_label.setMinimumWidth(92)
-        self.mode_guard_label.setToolTip("当前模式与权限风险")
+        self.mode_guard_label.setMinimumWidth(58)
+        self.mode_guard_label.setToolTip(tr('guard.readonly.tooltip'))
         toolbar_top.addWidget(self.mode_guard_label)
 
         # 策略/诊断入口（点击弹出菜单）
-        self.policy_timeline_btn = QtWidgets.QPushButton("Policy 0")
+        self.policy_timeline_btn = QtWidgets.QPushButton(tr('safety.records', 0))
         self.policy_timeline_btn.setObjectName("policyTimelineBtn")
         self.policy_timeline_btn.setProperty("failures", False)
         self.policy_timeline_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.policy_timeline_btn.setFixedHeight(24)
-        self.policy_timeline_btn.setMinimumWidth(72)
+        self.policy_timeline_btn.setMinimumWidth(82)
+        self.policy_timeline_btn.setToolTip(tr('safety.tooltip'))
         if hasattr(self, '_show_policy_menu'):
             self.policy_timeline_btn.clicked.connect(self._show_policy_menu)
         toolbar_top.addWidget(self.policy_timeline_btn)
@@ -255,24 +257,23 @@ class InputAreaMixin:
     # -------- + 菜单弹出 --------
 
     def _show_attach_menu(self):
-        """弹出附件/低频操作菜单"""
+        """弹出图片和场景上下文菜单。"""
         menu = QtWidgets.QMenu(self)
-        menu.addAction("Attach Image", self.btn_attach_image.click)
-        menu.addAction("Read Network", self.btn_network.click)
-        menu.addAction("Read Selection", self.btn_selection.click)
-        auto_read_menu = menu.addMenu("Auto Read")
+        menu.addAction(tr('context.attach_image'), self.btn_attach_image.click)
+        menu.addSeparator()
+        menu.addAction(tr('context.read_selection'), self.btn_selection.click)
+        menu.addAction(tr('context.read_network'), self.btn_network.click)
+        auto_read_menu = menu.addMenu(tr('context.auto_read'))
         current_read_index = self.read_combo.currentIndex()
         for label, index in (
-            ("Off", 0),
-            ("Selection", 1),
-            ("Network", 2),
+            (tr('context.auto_read.off'), 0),
+            (tr('context.auto_read.selection'), 1),
+            (tr('context.auto_read.network'), 2),
         ):
             action = auto_read_menu.addAction(label)
             action.setCheckable(True)
             action.setChecked(current_read_index == index)
             action.triggered.connect(lambda checked=False, i=index: self.read_combo.setCurrentIndex(i))
-        menu.addSeparator()
-        menu.addAction("Export Train", self.btn_export_train.click)
         menu.exec_(self.btn_attach_menu.mapToGlobal(
             QtCore.QPoint(0, -menu.sizeHint().height())
         ))
@@ -283,10 +284,10 @@ class InputAreaMixin:
         self._confirm_mode = checked
         btn = self.chk_confirm_mode
         if checked:
-            btn.setText("✔ 逐步确认")
+            btn.setText(tr('confirm.enabled'))
             btn.setProperty("confirm", "on")
         else:
-            btn.setText("⚡ 直接执行")
+            btn.setText(tr('confirm.disabled'))
             btn.setProperty("confirm", "off")
         btn.style().unpolish(btn)
         btn.style().polish(btn)
@@ -308,6 +309,7 @@ class InputAreaMixin:
         mode = _MODE_MAP.get(index, "agent")
         self._agent_mode = (mode == "agent")
         self._plan_mode = (mode == "plan")
+        self.chk_confirm_mode.setVisible(mode != "ask")
         self.mode_combo.setProperty("mode", mode)
         self.mode_combo.style().unpolish(self.mode_combo)
         self.mode_combo.style().polish(self.mode_combo)
@@ -418,9 +420,17 @@ class InputAreaMixin:
 
     def _retranslate_input_area(self):
         """语言切换后更新输入区域所有翻译文本"""
+        self.btn_attach_menu.setToolTip(tr('context.add.tooltip'))
         self.mode_combo.setToolTip(tr('mode.tooltip'))
         self.chk_confirm_mode.setToolTip(tr('confirm.tooltip'))
+        self.chk_confirm_mode.setText(
+            tr('confirm.enabled') if self._confirm_mode else tr('confirm.disabled')
+        )
         self.input_edit.setPlaceholderText(tr('placeholder'))
         self.btn_attach_image.setToolTip(tr('attach_image.tooltip'))
         self.btn_export_train.setToolTip(tr('train.tooltip'))
         self.token_stats_btn.setToolTip(tr('header.token_stats.tooltip'))
+        if hasattr(self, '_mode_guard_cache'):
+            self._mode_guard_cache.clear()
+        if hasattr(self, '_refresh_mode_guard_ui'):
+            self._refresh_mode_guard_ui()

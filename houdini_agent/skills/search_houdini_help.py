@@ -10,12 +10,11 @@ Two modes (merged into one skill via the ``mode`` param to avoid AI mis-routing)
     title + zip-relative path + snippet.
   - ``page``:  retrieve the plain-text body of one help page by its path.
 
-Read-only. Reuses ``HoudiniDocIndex._resolve_help_dir`` / ``_parse_wiki`` from
-``doc_rag`` for path discovery and wiki parsing. Does not import ``hou``.
+Read-only. Uses ``houdini_agent.utils.help_source`` for path discovery,
+wiki parsing, and ZIP page iteration. Does not import ``hou``.
 """
 
 import re
-import zipfile
 
 SKILL_INFO = {
     "name": "search_houdini_help",
@@ -55,10 +54,6 @@ SKILL_INFO = {
     },
 }
 
-# All help archives that ship with Houdini. _resolve_help_dir only requires one
-# to exist; we search whichever are present.
-_HELP_ZIPS = ("nodes.zip", "vex.zip", "hom.zip")
-
 # Cap scanned pages per archive to keep a single call responsive on huge manuals.
 _MAX_SCAN_PER_ZIP = 20000
 # Cap total bytes decoded per page to avoid pathological large files.
@@ -68,38 +63,29 @@ _MAX_PAGE_BYTES = 512 * 1024
 def _resolve():
     """Locate the help dir and return (help_dir_path, parse_wiki_fn) or (None, None)."""
     try:
-        from houdini_agent.utils.doc_rag import HoudiniDocIndex
+        from houdini_agent.utils import help_source
     except Exception:
         try:
-            from ..utils.doc_rag import HoudiniDocIndex  # type: ignore
+            from ..utils import help_source  # type: ignore
         except Exception:
             return None, None
-    help_dir = HoudiniDocIndex._resolve_help_dir(None)
-    return help_dir, HoudiniDocIndex._parse_wiki
+    return help_source.find_help_dir(None), help_source.parse_wiki
 
 
 def _iter_pages(help_dir):
     """Yield (zip_name, entry_name, raw_text) for every .txt help page present."""
-    for zip_name in _HELP_ZIPS:
+    try:
+        from houdini_agent.utils.help_source import HELP_ZIPS, iter_pages
+    except Exception:
+        from ..utils.help_source import HELP_ZIPS, iter_pages  # type: ignore
+    for zip_name in HELP_ZIPS:
         zp = help_dir / zip_name
         if not zp.exists():
             continue
         try:
-            with zipfile.ZipFile(zp, "r") as zf:
-                scanned = 0
-                for name in zf.namelist():
-                    if not name.endswith(".txt"):
-                        continue
-                    if "/_" in name or name.startswith("_"):
-                        continue
-                    scanned += 1
-                    if scanned > _MAX_SCAN_PER_ZIP:
-                        break
-                    try:
-                        raw = zf.read(name)[:_MAX_PAGE_BYTES].decode("utf-8", errors="ignore")
-                    except Exception:
-                        continue
-                    yield zip_name, name, raw
+            for name, raw in iter_pages(zp, max_scan=_MAX_SCAN_PER_ZIP,
+                                        max_bytes=_MAX_PAGE_BYTES):
+                yield zip_name, name, raw
         except Exception:
             continue
 
@@ -164,18 +150,13 @@ def _page(help_dir, parse_wiki, path):
     if not path:
         return {"error": "mode='page' requires a 'path' (from a search hit)."}
     norm = path.replace("\\", "/").strip("/")
-    for zip_name in _HELP_ZIPS:
-        zp = help_dir / zip_name
-        if not zp.exists():
-            continue
-        try:
-            with zipfile.ZipFile(zp, "r") as zf:
-                names = set(zf.namelist())
-                if norm not in names:
-                    continue
-                raw = zf.read(norm)[:_MAX_PAGE_BYTES].decode("utf-8", errors="ignore")
-        except Exception:
-            continue
+    try:
+        from houdini_agent.utils.help_source import get_page
+    except Exception:
+        from ..utils.help_source import get_page  # type: ignore
+    page = get_page(help_dir, norm, max_bytes=_MAX_PAGE_BYTES)
+    if page is not None:
+        _archive_name, raw = page
         doc = parse_wiki(raw)
         return {
             "mode": "page",

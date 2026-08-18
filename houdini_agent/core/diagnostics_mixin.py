@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from houdini_agent.qt_compat import QtWidgets, QtCore
+from ..ui.i18n import tr
 
 
 class DiagnosticsMixin:
@@ -14,16 +15,15 @@ class DiagnosticsMixin:
         """刷新输入区模式风险提示与策略时间线入口。"""
         mode = 'PLAN' if self._plan_mode else ('AGENT' if self._agent_mode else 'ASK')
         if mode == 'ASK':
-            guard = 'RO'
+            hint = tr('guard.readonly')
             risk = 'readonly'
         elif self._confirm_mode:
-            guard = 'CONFIRM'
+            hint = tr('guard.confirm')
             risk = 'confirm'
         else:
-            guard = 'HIGH-RISK'
+            hint = tr('guard.high_risk')
             risk = 'high'
 
-        hint = f"{mode} | {guard}"
         # 状态快照去重:避免 Qt setStyleSheet/setText 在值未变时仍触发全树样式重算 —
         # 是 Houdini 20.5 QHeaderView race 的高频源头之一。
         cache = self.__dict__.setdefault('_mode_guard_cache', {})
@@ -37,11 +37,12 @@ class DiagnosticsMixin:
                 self.mode_guard_label.style().polish(self.mode_guard_label)
                 cache['risk'] = risk
 
-            lines = [
-                f"当前模式: {mode}",
-                f"确认开关: {'ON' if self._confirm_mode else 'OFF'}",
-                f"策略失败次数: {self._policy_failure_count}",
-            ]
+            if mode == 'ASK':
+                lines = [tr('guard.readonly.tooltip')]
+            elif self._confirm_mode:
+                lines = [tr('guard.confirm.tooltip')]
+            else:
+                lines = [tr('guard.high_risk.tooltip')]
             for item in self._policy_timeline_records[-5:]:
                 lines.append(
                     f"{item.get('time', '')} {item.get('tool', '')} -> {item.get('action', '')}"
@@ -53,8 +54,11 @@ class DiagnosticsMixin:
 
         if hasattr(self, 'policy_timeline_btn') and self.policy_timeline_btn:
             n = len(self._policy_timeline_records)
-            text = f"Policy {n}"
             has_failures = self._policy_failure_count > 0
+            text = (
+                tr('safety.attention', self._policy_failure_count)
+                if has_failures else tr('safety.records', n)
+            )
             if cache.get('btn_text') != text:
                 self.policy_timeline_btn.setText(text)
                 cache['btn_text'] = text
@@ -63,6 +67,10 @@ class DiagnosticsMixin:
                 self.policy_timeline_btn.style().unpolish(self.policy_timeline_btn)
                 self.policy_timeline_btn.style().polish(self.policy_timeline_btn)
                 cache['btn_failures'] = has_failures
+            safety_tip = tr('safety.tooltip')
+            if cache.get('btn_tip') != safety_tip:
+                self.policy_timeline_btn.setToolTip(safety_tip)
+                cache['btn_tip'] = safety_tip
 
     def _append_policy_timeline(self, tool_name: str, action: str, reason: str = ""):
         item = {

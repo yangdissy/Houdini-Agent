@@ -139,13 +139,19 @@ class PlanManager:
 
         # 归档旧 plan。必须在新 plan 通过 quality gate 后执行，避免坏计划删除 active plan。
         old_path = self._plan_path(session_id)
+        archive_path = None
         if old_path.exists():
-            try:
-                old_path.rename(self._archive_path(session_id))
-            except OSError:
-                old_path.unlink(missing_ok=True)
+            archive_path = self._archive_path(session_id)
+            old_path.rename(archive_path)
 
-        self._save(session_id, plan)
+        try:
+            self._save(session_id, plan)
+        except Exception:
+            if archive_path is not None and archive_path.exists():
+                if old_path.exists():
+                    old_path.unlink()
+                archive_path.rename(old_path)
+            raise
         return plan
 
     def load_plan(self, session_id: str) -> Optional[dict]:
@@ -196,12 +202,7 @@ class PlanManager:
                     step["result_summary"] = result_summary
                 break
 
-        # 检查是否全部完成
-        all_done = all(s["status"] in ("done", "error") for s in plan["steps"])
-        if all_done:
-            plan["status"] = "completed"
-        elif any(s["status"] == "running" for s in plan["steps"]):
-            plan["status"] = "executing"
+        plan["status"] = self._runtime.plan_status(plan)
 
         self._save(session_id, plan)
         return plan
@@ -210,6 +211,16 @@ class PlanManager:
         """将 plan 状态设为 confirmed"""
         plan = self.load_plan(session_id)
         if plan:
+            if plan.get("status", "draft") != "draft":
+                raise ValueError(f"Plan cannot be confirmed from status '{plan.get('status')}'.")
+            quality_score, diagnostics = self._quality_gate().evaluate(plan)
+            plan["quality"] = {
+                "score": quality_score,
+                "diagnostics": [d.to_dict() for d in diagnostics],
+            }
+            if PlanQualityGate.has_errors(diagnostics):
+                messages = "; ".join(d.message for d in diagnostics if d.severity == "error")
+                raise ValueError(f"Plan failed quality gate: {messages}")
             plan["status"] = "confirmed"
             self._save(session_id, plan)
         return plan
@@ -218,6 +229,8 @@ class PlanManager:
         """将 plan 状态设为 rejected"""
         plan = self.load_plan(session_id)
         if plan:
+            if plan.get("status", "draft") not in ("draft", "confirmed"):
+                raise ValueError(f"Plan cannot be rejected from status '{plan.get('status')}'.")
             plan["status"] = "rejected"
             self._save(session_id, plan)
         return plan
@@ -225,7 +238,8 @@ class PlanManager:
     def delete_plan(self, session_id: str):
         """删除该 session 的 plan 文件"""
         path = self._plan_path(session_id)
-        path.unlink(missing_ok=True)
+        if path.exists():
+            path.unlink()
 
     # ------------------------------------------------------------------
     # 上下文注入（精简版）
@@ -311,20 +325,26 @@ class PlanManager:
 
     def _save(self, session_id: str, plan: dict):
         path = self._plan_path(session_id)
+        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            with open(temp_path, "w", encoding="utf-8") as f:
                 json.dump(plan, f, ensure_ascii=False, indent=2)
-        except OSError as e:
-            print(f"[PlanManager] Save error: {e}")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(str(temp_path), str(path))
+        except Exception:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise
 
     def _quality_gate(self) -> PlanQualityGate:
         try:
             from .tool_registry import get_tool_registry
 
             registry = get_tool_registry()
-            known_tools = [item.get("name", "") for item in registry.list_all()]
-        except Exception:
-            known_tools = []
+            known_tools = registry.get_executable_tool_names("plan_executing")
+        except Exception as exc:
+            raise RuntimeError("Plan tool registry is unavailable") from exc
         return PlanQualityGate(known_tools=known_tools)
 
 

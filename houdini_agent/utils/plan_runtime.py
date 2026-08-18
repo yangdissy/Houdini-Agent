@@ -171,7 +171,7 @@ class PlanQualityGate:
                 unknown = [t for t in tools if t not in self.known_tools]
                 if unknown:
                     diagnostics.append(
-                        PlanDiagnostic("warning", "unknown_tool", "Unknown tools: " + ", ".join(unknown), step_id)
+                        PlanDiagnostic("error", "unavailable_tool", "Unavailable tools: " + ", ".join(unknown), step_id)
                     )
         return diagnostics
 
@@ -208,6 +208,17 @@ class PlanRuntime:
             if all(status_by_id.get(dep) == "done" for dep in deps):
                 ready.append(step)
         return ready
+
+    def plan_status(self, plan: dict) -> str:
+        """Derive the aggregate status without treating failures as completion."""
+        statuses = [s.get("status", "pending") for s in (plan.get("steps", []) or [])]
+        if statuses and all(status == "done" for status in statuses):
+            return "completed"
+        if any(status in ("error", "blocked") for status in statuses):
+            return "blocked"
+        if any(status == "running" for status in statuses):
+            return "executing"
+        return plan.get("status", "draft")
 
     def blocked_steps(self, plan: dict) -> List[dict]:
         steps = plan.get("steps", []) or []

@@ -15,6 +15,8 @@ vs fallback n-gram 哈希）的向量不在同一语义空间，因此只在同�
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -26,6 +28,13 @@ import numpy as np
 
 from shared.user_paths import get_repo_root
 from .embedding import LocalEmbedder, get_embedder
+from .memory_sqlite import (
+    embedding_metadata,
+    metadata_diagnostic,
+    open_sqlite,
+    read_embedding_metadata,
+    write_embedding_metadata,
+)
 from .team_memory_export import (
     ELIGIBLE_SEMANTIC_CATEGORIES,
     ELIGIBLE_ABSTRACTION_LEVELS,
@@ -80,25 +89,24 @@ class TeamProceduralRecord:
 class TeamMemoryStore:
     """团队共享记忆 SQLite 存储。写入仅通过 rebuild_team_memory() 全量重建。"""
 
-    def __init__(self, db_path: Optional[Path] = None, embedder: Optional[LocalEmbedder] = None):
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        embedder: Optional[LocalEmbedder] = None,
+        force_delete: bool = False,
+    ):
         self.db_path = db_path or _TEAM_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.embedder = embedder or get_embedder()
+        self._force_delete = force_delete
         self._conn = None
+        self.embedding_diagnostic: Optional[str] = None
         self._db_lock = threading.RLock()
         self._init_db()
 
     def _get_conn(self):
-        import sqlite3
         if self._conn is None:
-            conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30.0)
-            try:
-                result = conn.execute("PRAGMA journal_mode=WAL").fetchone()
-                if not result or result[0] != "wal":
-                    conn.execute("PRAGMA journal_mode=DELETE")
-            except Exception:
-                conn.execute("PRAGMA journal_mode=DELETE")
-            conn.execute("PRAGMA busy_timeout=30000")
+            conn, _used_delete = open_sqlite(self.db_path, self._force_delete)
             self._conn = conn
         return self._conn
 
@@ -132,6 +140,17 @@ class TeamMemoryStore:
                 """
             )
             conn.commit()
+            current = embedding_metadata(self.embedder)
+            stored = read_embedding_metadata(conn)
+            has_vectors = any(
+                conn.execute(f"SELECT 1 FROM {table} WHERE embedding IS NOT NULL AND length(embedding) > 0 LIMIT 1").fetchone()
+                for table in ("team_semantic_memory", "team_procedural_memory")
+            )
+            if not has_vectors and not stored:
+                write_embedding_metadata(conn, current)
+                conn.commit()
+            else:
+                self.embedding_diagnostic = metadata_diagnostic(stored, current)
 
     def close(self):
         with self._db_lock:
@@ -173,7 +192,9 @@ class TeamMemoryStore:
                         rec.merged_at,
                     ),
                 )
+            write_embedding_metadata(conn, embedding_metadata(self.embedder))
             conn.commit()
+            self.embedding_diagnostic = None
 
     def count_semantic(self) -> int:
         row = self._get_conn().execute("SELECT COUNT(*) FROM team_semantic_memory").fetchone()
@@ -186,6 +207,9 @@ class TeamMemoryStore:
     def search_semantic(
         self, query: str, top_k: int = 5, category: Optional[str] = None,
     ) -> List[Tuple[TeamSemanticRecord, float]]:
+        if self.embedding_diagnostic:
+            print(f"[TeamMemoryStore] {self.embedding_diagnostic}")
+            return []
         query_vec = self.embedder.encode(query)
         with self._db_lock:
             conn = self._get_conn()
@@ -220,6 +244,9 @@ class TeamMemoryStore:
         return results
 
     def search_procedural(self, query: str, top_k: int = 3) -> List[Tuple[TeamProceduralRecord, float]]:
+        if self.embedding_diagnostic:
+            print(f"[TeamMemoryStore] {self.embedding_diagnostic}")
+            return []
         query_vec = self.embedder.encode(query)
         with self._db_lock:
             rows = self._get_conn().execute(
@@ -260,6 +287,29 @@ def get_team_memory_store() -> TeamMemoryStore:
         if _team_store_instance is None:
             _team_store_instance = TeamMemoryStore()
         return _team_store_instance
+
+
+def _refresh_team_memory_singleton(db_path: Path, embedder: LocalEmbedder) -> None:
+    global _team_store_instance
+    if Path(db_path) != _TEAM_DB_PATH:
+        return
+    with _team_store_lock:
+        old_store = _team_store_instance
+        _team_store_instance = TeamMemoryStore(db_path=db_path, embedder=embedder)
+        if old_store is not None:
+            old_store.close()
+
+
+def _close_live_team_singleton(db_path: Path) -> bool:
+    global _team_store_instance
+    if Path(db_path) != _TEAM_DB_PATH:
+        return False
+    with _team_store_lock:
+        if _team_store_instance is None:
+            return False
+        _team_store_instance.close()
+        _team_store_instance = None
+        return True
 
 
 # ============================================================
@@ -304,11 +354,16 @@ def _dedup_semantic(raw_items: List[dict]) -> List[TeamSemanticRecord]:
             continue
         if not item.get("rule"):
             continue
-        backend = item.get("embedding_backend", "unknown")
-        buckets.setdefault((category, backend), []).append(item)
+        provenance = (
+            item.get("embedding_backend", "unknown"),
+            item.get("embedding_model", "unknown"),
+            item.get("embedding_dimension"),
+            item.get("embedding_format_version"),
+        )
+        buckets.setdefault((category, provenance), []).append(item)
 
     merged: List[TeamSemanticRecord] = []
-    for (category, _backend), items in buckets.items():
+    for (category, _provenance), items in buckets.items():
         items.sort(key=lambda x: float(x.get("confidence", 0.0)), reverse=True)
         used = [False] * len(items)
         for i, base in enumerate(items):
@@ -359,11 +414,16 @@ def _dedup_procedural(raw_items: List[dict]) -> List[TeamProceduralRecord]:
             continue
         if success_rate < MIN_PROCEDURAL_SUCCESS_RATE or usage_count < MIN_PROCEDURAL_USAGE:
             continue
-        backend = item.get("embedding_backend", "unknown")
-        buckets.setdefault(backend, []).append(item)
+        provenance = (
+            item.get("embedding_backend", "unknown"),
+            item.get("embedding_model", "unknown"),
+            item.get("embedding_dimension"),
+            item.get("embedding_format_version"),
+        )
+        buckets.setdefault(provenance, []).append(item)
 
     merged: List[TeamProceduralRecord] = []
-    for _backend, items in buckets.items():
+    for _provenance, items in buckets.items():
         items.sort(key=lambda x: float(x.get("success_rate", 0.0)), reverse=True)
         used = [False] * len(items)
         for i, base in enumerate(items):
@@ -442,12 +502,37 @@ def rebuild_team_memory(
 
     merged_semantic = _dedup_semantic(raw_semantic)
     merged_procedural = _dedup_procedural(raw_procedural)
+    for record in merged_semantic:
+        record.embedding = embedder.encode(record.rule)
+    for record in merged_procedural:
+        record.embedding = embedder.encode(f"{record.strategy_name}: {record.description}")
 
-    store = TeamMemoryStore(db_path=db_path, embedder=embedder)
+    live_path = Path(db_path) if db_path is not None else _TEAM_DB_PATH
+    live_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = live_path.with_name(f".{live_path.name}.{uuid.uuid4().hex}.tmp")
+    store = TeamMemoryStore(db_path=temp_path, embedder=embedder, force_delete=True)
     try:
         store.replace_all(merged_semantic, merged_procedural)
+        if store.embedding_diagnostic:
+            raise RuntimeError(store.embedding_diagnostic)
+        if store.count_semantic() != len(merged_semantic) or store.count_procedural() != len(merged_procedural):
+            raise RuntimeError("Team Memory shadow database record-count validation failed")
+        if store._get_conn().execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise RuntimeError("Team Memory shadow database integrity validation failed")
     finally:
         store.close()
+    closed_singleton = _close_live_team_singleton(live_path)
+    try:
+        os.replace(str(temp_path), str(live_path))
+    except Exception:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        if closed_singleton:
+            _refresh_team_memory_singleton(live_path, embedder)
+        raise
+    _refresh_team_memory_singleton(live_path, embedder)
 
     return {
         "scanned_users": scanned_users,

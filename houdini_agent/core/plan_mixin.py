@@ -50,6 +50,23 @@ class PlanMixin:
             self._plan_manager = get_plan_manager(cache_root)
         return self._plan_manager
 
+    def _restore_plan_projection(self):
+        """Derive the UI phase and projection from the current session's Plan file."""
+        plan = self._get_plan_manager().load_plan(self._session_id)
+        status = plan.get('status', 'draft') if plan else ''
+        phase_by_status = {
+            'draft': 'awaiting_confirmation',
+            'confirmed': 'executing',
+            'executing': 'executing',
+            'completed': 'completed',
+            'blocked': 'blocked',
+        }
+        self._plan_phase = phase_by_status.get(status, 'idle')
+        self._active_plan_viewer = None
+        if plan and status != 'rejected' and hasattr(self, '_renderPlanViewer'):
+            self._renderPlanViewer.emit(plan)
+        return plan
+
     # ------------------------------------------------------------------
     # Plan 模式工具处理
     # ------------------------------------------------------------------
@@ -58,11 +75,9 @@ class PlanMixin:
         """处理 create_plan 工具调用（后台线程）"""
         try:
             plan_data = self._get_plan_manager().create_plan(self._session_id, kwargs)
-            self._plan_phase = 'awaiting_confirmation'
+            self._restore_plan_projection()
             # 切换状态：Planning → Generating（Plan 已完成构建）
             self._showGenerating.emit()
-            # 通过信号在主线程渲染 PlanViewer 卡片
-            self._renderPlanViewer.emit(plan_data)
             return {
                 "success": True,
                 "result": f"Plan '{plan_data.get('title', '')}' created with {len(plan_data.get('steps', []))} steps. Waiting for user confirmation."
@@ -89,8 +104,8 @@ class PlanMixin:
             error_count = sum(1 for s in all_steps if s.get('status') == 'error')
             total = len(all_steps)
 
+            self._restore_plan_projection()
             if plan.get('status') == 'completed':
-                self._plan_phase = 'completed'
                 return {
                     "success": True,
                     "result": f"Step {step_id} updated to '{status}'. Plan complete! ({done_count}/{total} done, {error_count} errors)"
@@ -296,6 +311,14 @@ class PlanMixin:
 
     def _on_plan_confirmed(self, plan_data: dict):
         """用户点击 Confirm 按钮 → 启动执行阶段"""
+        try:
+            plan_data = self._get_plan_manager().confirm_plan(self._session_id)
+        except Exception as exc:
+            if hasattr(self, '_addStatus'):
+                self._addStatus.emit(f"Plan confirm failed: {exc}")
+            return
+        if not plan_data:
+            return
         self._plan_phase = 'executing'
         # 禁用 PlanViewer 按钮（防止重复点击）
         if self._active_plan_viewer:
@@ -315,12 +338,16 @@ class PlanMixin:
         })
 
     def _on_plan_rejected(self):
-        """用户点击 Reject 按钮 → 丢弃 Plan"""
-        self._plan_phase = 'idle'
+        """用户点击 Reject 按钮 → 持久化拒绝并保留 Plan 文件"""
         try:
-            self._get_plan_manager().delete_plan(self._session_id)
-        except Exception:
-            pass
+            plan = self._get_plan_manager().reject_plan(self._session_id)
+        except Exception as exc:
+            if hasattr(self, '_addStatus'):
+                self._addStatus.emit(f"Plan reject failed: {exc}")
+            return
+        if not plan:
+            return
+        self._plan_phase = 'idle'
         if self._active_plan_viewer:
             self._active_plan_viewer.set_rejected()
         self._active_plan_viewer = None
@@ -350,9 +377,7 @@ class PlanMixin:
           - done_count 未增长（AI 卡死，防死循环）
           - 无 pending/running 步骤
 
-        副作用：
-          - 自动将 running 状态步骤推进为 done（AI 忘调
-            update_plan_step 时代劳），并重新加载 plan
+                running 步骤只用于续接提示；没有工具结果证据时绝不自动完成。
         """
         if self._plan_resume_count >= self._MAX_PLAN_RESUMES:
             print(f"[Plan] 续接次数已达上限 ({self._MAX_PLAN_RESUMES})，停止续接")
@@ -365,18 +390,6 @@ class PlanMixin:
             steps = plan.get('steps', [])
             if not steps:
                 return None
-
-            # 自动推进 running → done（AI 执行完但忘调 update_plan_step）
-            running_steps = [s for s in steps if s.get('status') == 'running']
-            if running_steps:
-                for s in running_steps:
-                    print(f"[Plan] 自动标记 running 步骤为 done: {s['id']}")
-                    plan_manager.update_step(
-                        self._session_id, s['id'], 'done',
-                        '(auto-completed: AI finished but did not call update_plan_step)'
-                    )
-                plan = plan_manager.load_plan(self._session_id)
-                steps = plan.get('steps', [])
 
             done_count = sum(1 for s in steps if s.get('status') == 'done')
             total = len(steps)

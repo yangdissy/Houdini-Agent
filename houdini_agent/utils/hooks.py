@@ -66,7 +66,7 @@ class HookManager:
     - register / unregister: 注册 / 注销事件钩子
     - fire:        触发事件（通知型，不修改数据）
     - fire_filter: 管道式过滤（每个回调可修改并返回值）
-    - register_tool / get_external_tools / execute_external_tool: 外部工具管理
+    Tool lifecycle is delegated exclusively to ToolRegistry.
     """
 
     _instance: Optional[HookManager] = None
@@ -80,8 +80,6 @@ class HookManager:
     def _init(self):
         # event_name -> [(priority, callback), ...]  按 priority 升序
         self._hooks: Dict[str, List[Tuple[int, Callable]]] = {e: [] for e in ALL_EVENTS}
-        # 外部工具: tool_name -> {"schema": {...}, "handler": callable, "plugin": str}
-        self._external_tools: Dict[str, Dict[str, Any]] = {}
         # UI 按钮: [(plugin_name, icon, tooltip, callback), ...]
         self._ui_buttons: List[Tuple[str, str, str, Callable]] = []
         # UI Bridge 引用（由 AITab 初始化时设置）
@@ -185,71 +183,28 @@ class HookManager:
                 "parameters": schema,
             }
         }
-        self._external_tools[name] = {
-            "schema": full_schema,
-            "handler": handler,
-            "plugin": plugin_name,
-        }
-        # ★ 同步注册到 ToolRegistry
-        try:
-            from .tool_registry import get_tool_registry
-            get_tool_registry().register(
-                name=name,
-                schema=full_schema,
-                handler=handler,
-                source="plugin",
-                plugin_name=plugin_name,
-                tags=set(),
-                modes={"agent", "ask", "plan_executing"},
-            )
-        except Exception:
-            pass
+        from .tool_registry import get_tool_registry
+        get_tool_registry().register(
+            name=name,
+            schema=full_schema,
+            handler=handler,
+            source="plugin",
+            plugin_name=plugin_name,
+            tags=set(),
+            modes={"agent", "ask", "plan_executing"},
+            runtime="houdini",
+        )
         print(f"[Hook] 注册外部工具: {name} (from {plugin_name or 'unknown'})")
 
     def unregister_tool(self, name: str):
         """注销外部工具"""
-        if name in self._external_tools:
-            del self._external_tools[name]
-            # ★ 同步从 ToolRegistry 注销
-            try:
-                from .tool_registry import get_tool_registry
-                get_tool_registry().unregister(name)
-            except Exception:
-                pass
+        from .tool_registry import get_tool_registry
+        get_tool_registry().unregister(name)
 
     def unregister_tools_by_plugin(self, plugin_name: str):
         """注销指定插件的所有工具"""
-        to_remove = [n for n, v in self._external_tools.items()
-                     if v.get("plugin") == plugin_name]
-        for n in to_remove:
-            del self._external_tools[n]
-        # ★ 同步从 ToolRegistry 注销
-        try:
-            from .tool_registry import get_tool_registry
-            get_tool_registry().unregister_by_source("plugin", plugin_name)
-        except Exception:
-            pass
-
-    def get_external_tools(self) -> List[dict]:
-        """获取所有外部工具的 OpenAI schema 列表"""
-        return [v["schema"] for v in self._external_tools.values()]
-
-    def has_external_tool(self, name: str) -> bool:
-        """检查是否存在指定外部工具"""
-        return name in self._external_tools
-
-    def execute_external_tool(self, name: str, args: dict) -> dict:
-        """执行外部工具"""
-        tool_info = self._external_tools.get(name)
-        if not tool_info:
-            return {"success": False, "error": f"外部工具不存在: {name}"}
-        try:
-            result = tool_info["handler"](args)
-            if not isinstance(result, dict):
-                result = {"success": True, "result": str(result)}
-            return result
-        except Exception as e:
-            return {"success": False, "error": f"外部工具 {name} 执行失败: {e}"}
+        from .tool_registry import get_tool_registry
+        get_tool_registry().unregister_by_source("plugin", plugin_name)
 
     # ---------- UI 按钮管理 ----------
 
@@ -538,7 +493,15 @@ def _load_single_plugin(filepath: Path, module_name: str,
     spec = importlib.util.spec_from_file_location(
         f"houdini_plugins.{module_name}", str(filepath))
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    try:
+        spec.loader.exec_module(mod)
+        decorator_specs = (
+            list(_pending_hooks), list(_pending_tools), list(_pending_buttons)
+        )
+    finally:
+        _pending_hooks.clear()
+        _pending_tools.clear()
+        _pending_buttons.clear()
 
     info = getattr(mod, "PLUGIN_INFO", None)
     register_fn = getattr(mod, "register", None)
@@ -577,6 +540,7 @@ def _load_single_plugin(filepath: Path, module_name: str,
         "ctx": ctx,
         "enabled": is_enabled,
         "file": filepath,
+        "decorators": decorator_specs,
     }
 
     # 如果启用，调用 register
@@ -584,11 +548,12 @@ def _load_single_plugin(filepath: Path, module_name: str,
         try:
             register_fn(ctx)
             # ★ 应用装饰器收集的钩子/工具/按钮
-            _apply_decorators(ctx)
+            _apply_decorators(ctx, decorator_specs)
             print(f"[Hook] ✔ 插件 {plugin_name} v{info.get('version', '?')} 已加载")
         except Exception as e:
             print(f"[Hook] ✖ 插件 {plugin_name} register() 失败: {e}")
             traceback.print_exc()
+            ctx._cleanup()
             _loaded_plugins[plugin_name]["enabled"] = False
 
 
@@ -643,6 +608,7 @@ def enable_plugin(plugin_name: str) -> bool:
     if register_fn:
         try:
             register_fn(ctx)
+            _apply_decorators(ctx, plugin_data.get("decorators"))
             plugin_data["enabled"] = True
             # 更新配置
             disabled = _plugin_config.get("disabled", [])
@@ -657,6 +623,7 @@ def enable_plugin(plugin_name: str) -> bool:
             print(f"[Hook] ✔ 插件 {plugin_name} 已启用")
             return True
         except Exception as e:
+            ctx._cleanup()
             print(f"[Hook] ✖ 启用插件 {plugin_name} 失败: {e}")
             return False
     return False
@@ -803,16 +770,19 @@ def ui_button(icon: str, tooltip: str):
     return decorator
 
 
-def _apply_decorators(ctx: PluginContext):
+def _apply_decorators(ctx: PluginContext, decorator_specs=None):
     """将装饰器收集的钩子/工具/按钮注册到 ctx"""
-    for event, callback, priority in _pending_hooks:
+    hooks, tools, buttons = decorator_specs or (
+        _pending_hooks, _pending_tools, _pending_buttons
+    )
+    for event, callback, priority in hooks:
         ctx.on(event, callback, priority)
-    for t in _pending_tools:
+    for t in tools:
         ctx.register_tool(
             name=t["name"], description=t["description"],
             schema=t["parameters"], handler=t["handler"],
         )
-    for b in _pending_buttons:
+    for b in buttons:
         ctx.register_button(
             icon=b["icon"], tooltip=b["tooltip"], callback=b["callback"],
         )

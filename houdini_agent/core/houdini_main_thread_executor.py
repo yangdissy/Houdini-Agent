@@ -20,23 +20,6 @@ OPERATION_ID_KEY = "_ha_operation_id"
 class HoudiniMainThreadExecutor:
     """Owns queueing state for Houdini tools dispatched to the Qt main thread."""
 
-    _MUTATING_TOOLS = frozenset({
-        "create_node", "create_nodes_batch", "create_wrangle_node",
-        "delete_node", "rename_node", "set_node_parameter", "connect_nodes",
-        "copy_node", "batch_set_parameters", "set_display_flag",
-        "execute_python", "save_hip", "run_skill",
-    })
-
-    _COOK_TRIGGERING_TOOLS = frozenset({
-        "connect_nodes", "set_display_flag", "set_node_parameter",
-        "batch_set_parameters", "execute_python", "run_skill",
-    })
-
-    _COOK_BEFORE_READ_TOOLS = frozenset({
-        "get_network_structure", "get_node_parameters", "list_children",
-        "check_errors", "verify_network", "capture_viewport",
-    })
-
     def __init__(
         self,
         emit_tool_request: Callable[[str, dict], None],
@@ -207,15 +190,16 @@ class HoudiniMainThreadExecutor:
         error_formatter: Callable[[Exception], str],
     ) -> ToolResult:
         result: ToolResult = {"success": False, "error": "Unknown error"}
-        use_undo_group = tool_name in self._MUTATING_TOOLS
+        semantics = self._tool_semantics(tool_name)
+        use_undo_group = semantics["undo"]
 
-        self._set_manual_mode_for_cook_guard(tool_name)
+        self._set_manual_mode_for_cook_guard(tool_name, semantics["cook_triggering"])
 
-        if tool_name in self._COOK_BEFORE_READ_TOOLS:
+        if semantics["cook_before_read"]:
             cook_before_read()
 
         should_snapshot = (
-            tool_name in self._MUTATING_TOOLS
+            semantics["mutating"]
             and tool_name not in self_tracking_tools
             and tool_name != "save_hip"
         )
@@ -323,8 +307,24 @@ class HoudiniMainThreadExecutor:
                 return item.get("result")
             return item
 
-    def _set_manual_mode_for_cook_guard(self, tool_name: str):
-        if tool_name not in self._COOK_TRIGGERING_TOOLS:
+    @staticmethod
+    def _tool_semantics(tool_name: str) -> Dict[str, bool]:
+        try:
+            from ..utils.tool_registry import get_tool_registry
+            semantics = get_tool_registry().get_execution_semantics(tool_name)
+            if semantics is not None:
+                return semantics
+        except Exception:
+            pass
+        return {
+            "mutating": False,
+            "undo": False,
+            "cook_triggering": False,
+            "cook_before_read": False,
+        }
+
+    def _set_manual_mode_for_cook_guard(self, tool_name: str, cook_triggering: bool = False):
+        if not cook_triggering:
             return
         try:
             import hou  # type: ignore

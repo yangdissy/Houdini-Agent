@@ -9,6 +9,7 @@ from datetime import datetime
 
 from houdini_agent.qt_compat import QtCore
 from houdini_agent.ui.i18n import tr
+from .thinking_stream_parser import ThinkingStreamParser
 from ..utils.dev_feature_toggles import DEV_FEATURE_TOGGLES, is_toggle_enabled
 
 
@@ -35,8 +36,7 @@ class RuntimeStateMixin:
             self._thinking_buffer = ""
             self._content_buffer = ""
             self._current_output_tokens = 0
-            self._in_think_block = False
-            self._tag_parse_buf = ""
+            self._thinking_stream_parser = ThinkingStreamParser()
             self._fake_warned = False
             self._output_buffer = ""
             self._last_flush_time = time.time()
@@ -300,14 +300,7 @@ class RuntimeStateMixin:
         history = self._agent_history if self._agent_history is not None else self._conversation_history
         stats = self._agent_token_stats or self._token_stats
 
-        if self._tag_parse_buf:
-            if self._in_think_block:
-                if self._think_enabled:
-                    self._addThinking.emit(self._tag_parse_buf)
-            else:
-                self._emit_normal_content(self._tag_parse_buf)
-            self._tag_parse_buf = ""
-            self._in_think_block = False
+        self._finish_thinking_stream()
 
         if hasattr(self, '_output_buffer') and self._output_buffer:
             self._on_append_content(self._output_buffer)
@@ -524,15 +517,7 @@ class RuntimeStateMixin:
             self.thinking_bar.stop()
         except (RuntimeError, AttributeError):
             pass
-        if self._tag_parse_buf:
-            if self._in_think_block and self._think_enabled:
-                self._addThinking.emit(self._tag_parse_buf)
-            elif not self._in_think_block:
-                self._emit_normal_content(self._tag_parse_buf)
-            self._tag_parse_buf = ""
-        if self._in_think_block:
-            self._in_think_block = False
-            self._finalizeThinkingSignal.emit()
+        self._finish_thinking_stream()
         if hasattr(self, '_output_buffer') and self._output_buffer:
             self._on_append_content(self._output_buffer)
             self._output_buffer = ""
@@ -555,15 +540,7 @@ class RuntimeStateMixin:
             self.thinking_bar.stop()
         except (RuntimeError, AttributeError):
             pass
-        if self._tag_parse_buf:
-            if self._in_think_block and self._think_enabled:
-                self._addThinking.emit(self._tag_parse_buf)
-            elif not self._in_think_block:
-                self._emit_normal_content(self._tag_parse_buf)
-            self._tag_parse_buf = ""
-        if self._in_think_block:
-            self._in_think_block = False
-            self._finalizeThinkingSignal.emit()
+        self._finish_thinking_stream()
         if hasattr(self, '_output_buffer') and self._output_buffer:
             self._on_append_content(self._output_buffer)
             self._output_buffer = ""

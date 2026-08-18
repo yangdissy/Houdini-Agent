@@ -232,7 +232,7 @@ class HeaderMixin:
             'kimi-for-coding-highspeed':          {'supports_prompt_caching': True, 'supports_vision': False},
             # OF3D
             'chatgpt-4o-latest':                  {'supports_prompt_caching': False, 'supports_vision': True},
-            'gpt-5.5':                            {'supports_prompt_caching': False, 'supports_vision': False},
+            'gpt-5.5':                            {'supports_prompt_caching': False, 'supports_vision': True},
             # SiliconFlow
             'deepseek-ai/DeepSeek-V4-Pro':        {'supports_prompt_caching': False, 'supports_vision': False},
             'deepseek-ai/DeepSeek-V4-Flash':      {'supports_prompt_caching': False, 'supports_vision': False},
@@ -337,6 +337,7 @@ class HeaderMixin:
         menu.addAction("Clear Chat", self.btn_clear.click)
         menu.addAction("Cache", self.btn_cache.click)
         menu.addAction("Optimize", self.btn_optimize.click)
+        menu.addAction(tr('train.menu_label'), self.btn_export_train.click)
         menu.addSeparator()
         menu.addAction("Update", self.btn_update.click)
         menu.addAction("Font (Aa)", self.btn_font_scale.click)

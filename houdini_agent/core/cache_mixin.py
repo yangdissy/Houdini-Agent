@@ -5,7 +5,19 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from houdini_agent.core.cache_records import DEFAULT_TOKEN_STATS, SessionCacheRecord, strip_images_for_cache
+from houdini_agent.core.cache_records import (
+    SessionCacheRecord,
+    build_session_cache_record,
+)
+from houdini_agent.core.session_state import SessionState
+from houdini_agent.core.workspace_persistence import (
+    active_session_id,
+    atomic_write_json,
+    load_restore_plan,
+    replace_file,
+    save_workspace,
+    write_manifest,
+)
 from houdini_agent.qt_compat import QtCore, QtGui, QtWidgets
 
 
@@ -43,29 +55,23 @@ class CacheMixin:
         # 显示菜单（btn_cache 是隐藏控件，用鼠标位置避免弹到屏幕最左边）
         menu.exec_(QtGui.QCursor.pos())
     
-    @staticmethod
-    def _strip_images_for_cache(history: list) -> list:
-        """剥离 conversation_history 中的 base64 图片数据，
-        用占位文本替代，大幅减小缓存文件体积。
-        返回一份深拷贝，不修改原始 history。
-        """
-        return strip_images_for_cache(history)
-    
     def _build_cache_data(self) -> dict:
         """构建缓存数据字典"""
         todo_data = []
         if hasattr(self, 'todo_list') and self.todo_list:
             todo_data = self.todo_list.get_todos_data()
-        return SessionCacheRecord(
-            session_id=self._session_id,
-            created_at=self._session_created_at,
-            conversation_history=self._conversation_history,
-            context_summary=self._context_summary,
+        return build_session_cache_record(
+            self._session_id,
+            {
+                'created_at': self._session_created_at,
+                'conversation_history': self._conversation_history,
+                'context_summary': self._context_summary,
+                'token_stats': self._token_stats,
+            },
             todo_data=todo_data,
-            token_stats=self._token_stats.copy(),
             estimated_tokens=self._calculate_context_tokens(),
             todo_summary=self.todo_list.get_todos_summary() if hasattr(self, 'todo_list') else "",
-        ).to_cache_data(strip_images=False)
+        )
 
     def _periodic_save_all(self):
         """定期保存所有会话（QTimer 触发 + aboutToQuit 触发）"""
@@ -80,7 +86,7 @@ class CacheMixin:
                     break
             if not has_any:
                 return
-            self._save_all_sessions()
+            self._save_session_workspace()
         except Exception as e:
             print(f"[Cache] 定期保存失败: {e}")
     
@@ -93,71 +99,7 @@ class CacheMixin:
         """
         # ★ stale 保护：新窗口创建时旧实例被标记为 inactive，
         #   此时不再写文件，避免覆盖新窗口已保存的正确数据
-        if not getattr(self, '_ai_tab_active', True):
-            return
-        try:
-            if not hasattr(self, '_sessions') or not self._sessions:
-                return
-            # ★ agent 仍在运行时，先把最新 history 刷回对应 session
-            try:
-                agent_sid = getattr(self, '_agent_session_id', None)
-                if agent_sid and agent_sid in self._sessions:
-                    if getattr(self, '_agent_history', None) is not None:
-                        self._sessions[agent_sid]['conversation_history'] = self._agent_history
-                    if getattr(self, '_agent_token_stats', None) is not None:
-                        self._sessions[agent_sid]['token_stats'] = self._agent_token_stats
-            except Exception:
-                pass
-            # 尝试同步当前状态（Qt widget 可能已销毁）
-            try:
-                if getattr(self, '_agent_session_id', None) != getattr(self, '_session_id', None):
-                    self._save_current_session_state()
-            except (RuntimeError, AttributeError):
-                pass
-            
-            # ★ 优先使用 _tabs_backup（纯 Python 数据，不依赖 Qt）
-            tabs_info = getattr(self, '_tabs_backup', [])
-            if not tabs_info:
-                # 如果备份也为空，尝试从 _sessions 字典的 key 中获取
-                tabs_info = [(sid, f"Chat") for sid in self._sessions]
-            
-            # 直接写文件，不依赖 Qt 事件循环
-            manifest_tabs = []
-            for sid, tab_label in tabs_info:
-                if not sid or sid not in self._sessions:
-                    continue
-                sdata = self._sessions[sid]
-                history = sdata.get('conversation_history', [])
-                if not history:
-                    continue
-                # 收集 todo 数据（widget 可能已销毁）
-                todo_data = []
-                try:
-                    todo_list_obj = sdata.get('todo_list')
-                    todo_data = todo_list_obj.get_todos_data() if todo_list_obj else []
-                except (RuntimeError, AttributeError, Exception):
-                    pass
-                cache_data = {
-                    'version': '1.0',
-                    'session_id': sid,
-                    'created_at': sdata.get('created_at') or datetime.now().isoformat(),
-                    'message_count': len(history),
-                    'conversation_history': self._strip_images_for_cache(history),
-                    'context_summary': sdata.get('context_summary', ''),
-                    'todo_data': todo_data,
-                    'token_stats': sdata.get('token_stats', {}),
-                }
-                session_file = self._cache_dir / f"session_{sid}.json"
-                with open(session_file, 'w', encoding='utf-8') as f:
-                    json.dump(cache_data, f, ensure_ascii=False)
-                manifest_tabs.append({
-                    'session_id': sid,
-                    'tab_label': tab_label,
-                    'file': f"session_{sid}.json",
-                })
-            self._write_manifest(manifest_tabs, indent=None)
-        except Exception:
-            pass  # atexit 中不能抛出异常
+        self._save_session_workspace(use_backup=True, quiet=True)
 
     def _save_cache(self) -> bool:
         """自动保存：覆写同 session 文件 + manifest"""
@@ -169,24 +111,7 @@ class CacheMixin:
             # ★ 同步 tab 备份
             self._sync_tabs_backup()
             
-            cache_data = self._build_cache_data()
-            # ★ 剥离 base64 图片以减小缓存文件大小
-            cache_data['conversation_history'] = self._strip_images_for_cache(
-                cache_data.get('conversation_history', [])
-            )
-
-            # 1. 覆写固定的 session 文件（一个 session 只有一个文件）
-            session_file = self._cache_dir / f"session_{self._session_id}.json"
-            with open(session_file, 'w', encoding='utf-8') as f:
-                json.dump(cache_data, f, ensure_ascii=False, indent=2)
-
-            # 2. 同步更新 sessions_manifest.json（确保所有 tab 信息都是最新的）
-            # ★ 不再写 cache_latest.json — 恢复由 sessions_manifest + session_*.json 管理
-            self._update_manifest()
-
-            if self._workspace_dir:
-                self._update_workspace_cache_info()
-            return True
+            return self._save_session_workspace()
         except Exception as e:
             print(f"[Cache] 自动保存失败: {e}")
             return False
@@ -225,41 +150,28 @@ class CacheMixin:
             print(f"[Cache] 更新 manifest 失败: {e}")
 
     def _write_manifest(self, manifest_tabs: list, indent: int = 2):
-        manifest = {
-            'version': '1.0',
-            'active_session_id': self._manifest_active_session_id(manifest_tabs),
-            'tabs': manifest_tabs,
-        }
-        manifest_file = self._cache_dir / "sessions_manifest.json"
-        with open(manifest_file, 'w', encoding='utf-8') as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=indent)
-        clear_marker = self._cache_dir / "sessions_cleared.json"
-        if manifest_tabs:
-            try:
-                if clear_marker.exists():
-                    clear_marker.unlink()
-            except Exception:
-                pass
-        else:
-            try:
-                with open(clear_marker, 'w', encoding='utf-8') as f:
-                    json.dump({
-                        'version': '1.0',
-                        'cleared_at': datetime.now().isoformat(),
-                    }, f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
+        write_manifest(self._cache_dir, manifest_tabs, getattr(self, '_session_id', ''), indent)
 
     def _manifest_active_session_id(self, manifest_tabs: list) -> str:
         """Return an active session that is actually present in the saved manifest."""
-        saved_sids = [tab.get('session_id') for tab in manifest_tabs if tab.get('session_id')]
-        session_id = getattr(self, '_session_id', '')
-        if session_id in saved_sids:
-            return session_id
-        return saved_sids[0] if saved_sids else ""
+        return active_session_id(manifest_tabs, getattr(self, '_session_id', ''))
 
     def _save_all_sessions(self) -> bool:
         """保存所有打开的会话到磁盘（关闭软件时调用）"""
+        return self._save_session_workspace()
+
+    @staticmethod
+    def _atomic_write_json(path: Path, data: dict, indent: int = 2):
+        atomic_write_json(path, data, indent)
+
+    @staticmethod
+    def _replace_file(source: Path, target: Path):
+        replace_file(source, target)
+
+    def _save_session_workspace(self, use_backup: bool = False, quiet: bool = False) -> bool:
+        """Single stale-aware owner for all normal, periodic, quit and atexit saves."""
+        if not getattr(self, '_ai_tab_active', True):
+            return False
         try:
             # ★ agent 仍在运行时，先把最新 history 刷回对应 session（防止关窗口时丢最后一轮）
             agent_sid = getattr(self, '_agent_session_id', None)
@@ -272,63 +184,33 @@ class CacheMixin:
             if agent_sid != self._session_id:
                 self._save_current_session_state()
             # ★ 同步 tab 备份（确保 atexit 时也能用）
-            self._sync_tabs_backup()
+            try:
+                self._sync_tabs_backup()
+            except (RuntimeError, AttributeError):
+                use_backup = True
 
-            manifest_tabs = []
-            for i in range(self.session_tabs.count()):
-                sid = self.session_tabs.tabData(i)
-                tab_label = self.session_tabs.tabText(i)
-                if not sid or sid not in self._sessions:
-                    continue
-
-                sdata = self._sessions[sid]
-                history = sdata.get('conversation_history', [])
-                if not history:
-                    # ★ 空会话：清理其磁盘上的旧 session 文件（防止残留）
-                    try:
-                        old_file = self._cache_dir / f"session_{sid}.json"
-                        if old_file.exists():
-                            old_file.unlink()
-                    except Exception:
-                        pass
-                    continue  # 空会话不保存
-
-                # 收集 todo 数据（防御 widget 已销毁的情况）
-                todo_data = []
+            tabs_info = getattr(self, '_tabs_backup', []) if use_backup else [
+                (self.session_tabs.tabData(i), self.session_tabs.tabText(i))
+                for i in range(self.session_tabs.count())
+            ]
+            if not tabs_info and use_backup:
+                tabs_info = [(sid, "Chat") for sid in self._sessions]
+            states = {}
+            for sid, sdata in self._sessions.items():
+                state = SessionState.from_legacy_dict(sid, sdata)
                 try:
-                    todo_list_obj = sdata.get('todo_list')
-                    todo_data = todo_list_obj.get_todos_data() if todo_list_obj else []
+                    todo = sdata.get('todo_list')
+                    state.todo_data = todo.get_todos_data() if todo else []
                 except (RuntimeError, AttributeError):
                     pass
-
-                # 写 session 文件（★ 剥离 base64 图片以减小文件大小）
-                cache_data = SessionCacheRecord(
-                    session_id=sid,
-                    created_at=sdata.get('created_at') or datetime.now().isoformat(),
-                    conversation_history=history,
-                    context_summary=sdata.get('context_summary', ''),
-                    todo_data=todo_data,
-                    token_stats=sdata.get('token_stats', {}),
-                ).to_cache_data()
-                session_file = self._cache_dir / f"session_{sid}.json"
-                with open(session_file, 'w', encoding='utf-8') as f:
-                    json.dump(cache_data, f, ensure_ascii=False, indent=2)
-
-                manifest_tabs.append({
-                    'session_id': sid,
-                    'tab_label': tab_label,
-                    'file': f"session_{sid}.json",
-                })
-
-            # 写 manifest 文件
-            self._write_manifest(manifest_tabs)
-
-            # ★ 不再写 cache_latest.json — 恢复由 sessions_manifest + session_*.json 管理
-            # print(f"[Cache] 已保存 {len(manifest_tabs)} 个会话到磁盘")
-            return bool(manifest_tabs)
+                states[sid] = state
+            return save_workspace(
+                self._cache_dir, states, tabs_info, self._session_id,
+                replace=self._replace_file,
+            )
         except Exception as e:
-            print(f"[Cache] 保存所有会话失败: {e}")
-            import traceback; traceback.print_exc()
+            if not quiet:
+                print(f"[Cache] 保存所有会话失败: {e}")
             return False
 
     def _restore_all_sessions(self) -> bool:
@@ -349,98 +231,36 @@ class CacheMixin:
         if getattr(self, '_sessions_restored', False):
             return True
         try:
-            manifest_file = self._cache_dir / "sessions_manifest.json"
-            clear_marker = self._cache_dir / "sessions_cleared.json"
-            if clear_marker.exists():
+            plan = load_restore_plan(
+                self._cache_dir,
+                orphan_scan=getattr(self, '_orphan_scan_on_restore', None),
+            )
+            if plan.cleared:
                 self._write_manifest([])
                 self._sessions_restored = True
                 self._sync_tabs_backup()
                 self._update_context_stats()
                 return True
 
-            manifest_exists = manifest_file.exists()
-
-            manifest = {}
-            tabs_info = []
-            if manifest_exists:
-                with open(manifest_file, 'r', encoding='utf-8') as f:
-                    manifest = json.load(f)
-                tabs_info = manifest.get('tabs', []) or []
-
-            # 决定是否扫盘补孤儿 session 文件
-            scan_override = getattr(self, '_orphan_scan_on_restore', None)
-            if scan_override is None:
-                should_scan_orphans = not manifest_exists
-            else:
-                should_scan_orphans = bool(scan_override)
-
-            if should_scan_orphans:
-                known_sids = {tab.get('session_id') for tab in tabs_info if tab.get('session_id')}
-                for session_file in sorted(self._cache_dir.glob("session_*.json")):
-                    sid = session_file.stem.replace("session_", "", 1)
-                    if sid in known_sids:
-                        continue
-                    try:
-                        with open(session_file, 'r', encoding='utf-8') as f:
-                            cache_data = json.load(f)
-                    except Exception:
-                        continue
-                    history = cache_data.get('conversation_history', [])
-                    if not history:
-                        continue
-                    label = "Chat"
-                    for msg in history:
-                        if msg.get('role') == 'user' and msg.get('content'):
-                            label = str(msg['content'])[:18].replace('\n', ' ').strip() or label
-                            if len(str(msg['content'])) > 18:
-                                label += "..."
-                            break
-                    tabs_info.append({
-                        'session_id': sid,
-                        'tab_label': label,
-                        'file': session_file.name,
-                    })
-                    known_sids.add(sid)
-
             # manifest 不存在且扫盘也没补到任何东西 → 没什么可恢复的
-            if not tabs_info:
-                if manifest_exists:
+            if not plan.sessions:
+                if plan.manifest_exists:
                     self._sessions_restored = True
                     self._sync_tabs_backup()
                     self._update_context_stats()
                     return True
                 return False
 
-            active_sid = manifest.get('active_session_id', '')
+            active_sid = plan.active_session_id
             active_tab_index = 0
             first_tab = True
 
-            for tab_info in tabs_info:
-                sid = tab_info.get('session_id', '')
-                tab_label = tab_info.get('tab_label', 'Chat')
-                session_file = self._cache_dir / tab_info.get('file', '')
-
-                if not session_file.exists():
-                    continue
-
-                with open(session_file, 'r', encoding='utf-8') as f:
-                    cache_data = json.load(f)
-
-                history = cache_data.get('conversation_history', [])
-                if not history:
-                    continue
-
-                context_summary = cache_data.get('context_summary', '')
-                created_at = cache_data.get('created_at') or datetime.now().isoformat()
-                todo_data = cache_data.get('todo_data', [])
-                # ★ 从缓存中恢复 token 使用统计
-                saved_token_stats = cache_data.get('token_stats', {
-                    'input_tokens': 0, 'output_tokens': 0,
-                    'reasoning_tokens': 0,
-                    'cache_read': 0, 'cache_write': 0,
-                    'total_tokens': 0, 'requests': 0,
-                    'estimated_cost': 0.0,
-                })
+            for sid, tab_label, state in plan.sessions:
+                history = state.conversation_history
+                context_summary = state.context_summary
+                created_at = state.created_at
+                todo_data = state.todo_data
+                saved_token_stats = state.token_stats
 
                 if first_tab:
                     # 第一个 tab：加载到已有的初始会话中
@@ -600,12 +420,6 @@ class CacheMixin:
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "错误", f"存档失败: {str(e)}")
             return False
-    
-    def _update_workspace_cache_info(self):
-        """更新工作区中的缓存信息（供主窗口保存工作区时使用）"""
-        # 这个方法会被主窗口调用，用于更新工作区配置
-        # 实际保存由主窗口的 _save_workspace 完成
-        pass
     
     def _load_cache(self, cache_file: Path, silent: bool = False) -> bool:
         """从缓存文件加载对话历史（在新标签页中打开）
@@ -914,58 +728,13 @@ class CacheMixin:
         if reply != QtWidgets.QMessageBox.Yes:
             return
         
-        # 执行压缩
-        old_messages = self._conversation_history[:-4]
-        recent_messages = self._conversation_history[-4:]
-        
-        # 生成详细摘要
-        summary_parts = ["[历史对话摘要 - 已压缩以节省 token]"]
-        
-        user_requests = []
-        ai_results = []
-        
-        for msg in old_messages:
-            role = msg.get('role', '')
-            content = msg.get('content', '')
-            
-            if role == 'user':
-                # 提取用户请求的核心（前200字符）
-                user_request = content[:200].replace('\n', ' ')
-                if len(content) > 200:
-                    user_request += "..."
-                user_requests.append(user_request)
-            
-            elif role == 'assistant' and content:
-                # 提取 AI 回复的关键信息
-                lines = [l.strip() for l in content.split('\n') if l.strip()]
-                if lines:
-                    # 取最后一行或前150字符
-                    result_summary = lines[-1][:150].replace('\n', ' ')
-                    if len(lines[-1]) > 150:
-                        result_summary += "..."
-                    ai_results.append(result_summary)
-        
-        # 合并摘要
-        if user_requests:
-            summary_parts.append(f"\n用户请求 ({len(user_requests)} 条):")
-            for i, req in enumerate(user_requests[:10], 1):  # 最多显示10条
-                summary_parts.append(f"  {i}. {req}")
-            if len(user_requests) > 10:
-                summary_parts.append(f"  ... 还有 {len(user_requests) - 10} 条请求")
-        
-        if ai_results:
-            summary_parts.append(f"\nAI 完成的任务 ({len(ai_results)} 条):")
-            for i, res in enumerate(ai_results[:10], 1):  # 最多显示10条
-                summary_parts.append(f"  {i}. {res}")
-            if len(ai_results) > 10:
-                summary_parts.append(f"  ... 还有 {len(ai_results) - 10} 条结果")
-        
-        summary_text = "\n".join(summary_parts)
-        
-        # 更新历史：用摘要替换旧对话
-        self._conversation_history = [
-            {'role': 'system', 'content': summary_text}
-        ] + recent_messages
+        old_tokens = self.token_optimizer.calculate_message_tokens(self._conversation_history)
+        compressed, stats = self.token_optimizer.compress_context_rounds(
+            self._conversation_history,
+            protect_recent_rounds=2,
+        )
+        self._conversation_history = compressed
+        summary_text = compressed[0].get('content', '') if compressed else ''
         
         # 更新上下文摘要
         self._context_summary = summary_text
@@ -977,8 +746,7 @@ class CacheMixin:
         self._update_context_stats()
         
         # 计算节省的 token
-        old_tokens = sum(self._estimate_tokens(json.dumps(msg)) for msg in old_messages)
-        new_tokens = self._estimate_tokens(summary_text)
+        new_tokens = stats.get('compressed_tokens', old_tokens)
         saved_tokens = old_tokens - new_tokens
         
         QtWidgets.QMessageBox.information(

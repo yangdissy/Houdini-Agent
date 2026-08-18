@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 """Send/run orchestration for AITab: _on_send, tool selection, and _run_agent."""
 
-import copy
-import re
 import threading
 import traceback
 
@@ -13,10 +11,13 @@ from houdini_agent.core.harness_engine import HarnessRuntimeState
 from houdini_agent.utils.ai_client import AIClient, HOUDINI_TOOLS
 from houdini_agent.utils.ultra_optimizer import UltraOptimizer
 from houdini_agent.utils.token_optimizer import (
-    assemble_context_messages,
-    compress_old_round_tool_results,
-    plan_context_rounds,
-    prune_context_rounds_to_token_target,
+    DynamicContextSection,
+    prune_context_assembly_to_token_target,
+)
+from houdini_agent.core.agent_request_assembly import (
+    build_context,
+    finalize_context_request,
+    normalize_history,
 )
 from houdini_agent.utils.plan_manager import (
     PLAN_TOOL_CREATE,
@@ -157,7 +158,7 @@ class SendOrchestratorMixin:
         # ★ 保存 agent_params 供反思钩子使用
         self._last_agent_params = agent_params
         
-        # ★ 存储 Think 开关状态，供 _drain_tag_buffer / _on_thinking_chunk 使用
+        # ★ 存储 Think 开关状态，供 ThinkingStreamParser 事件分发 / _on_thinking_chunk 使用
         self._think_enabled = use_think
         
         try:
@@ -231,7 +232,7 @@ class SendOrchestratorMixin:
             if manual_directive:
                 sys_prompt = sys_prompt + "\n\n" + manual_directive
             
-            messages = [{'role': 'system', 'content': sys_prompt}]
+            prefix_messages = [{'role': 'system', 'content': sys_prompt}]
             
             # ================================================================
             # 2. Cursor 风格历史消息：原生格式直通，不预压缩
@@ -243,85 +244,15 @@ class SendOrchestratorMixin:
             # - 只清理内部元数据字段（thinking, python_shells 等）
             # - 压缩只在超限时由 _progressive_trim / auto_optimize 处理
             
-            # 内部元数据字段列表（不发给 API）
-            _INTERNAL_FIELDS = frozenset({
-                '_reply_content', '_tool_summary', 'thinking',
-                'python_shells', 'system_shells',
-            })
+            history_to_send = normalize_history(
+                self._conversation_history,
+                supports_vision=supports_vision,
+                fix_alternation=self._fix_message_alternation,
+                tool_result_text=lambda name, content: tr('ai.tool_result', name, content),
+                image_placeholder=tr('ai.image_msg'),
+            )
             
-            # ★ Cursor 风格：只保留当前轮次（最后一条 user 消息）的图片
-            # 旧轮次的 image_url 剥离为纯文本，避免 base64 膨胀上下文
-            _last_user_idx = None
-            for _i in range(len(self._conversation_history) - 1, -1, -1):
-                if self._conversation_history[_i].get('role') == 'user':
-                    _last_user_idx = _i
-                    break
-            
-            history_to_send = []
-            for msg_idx, msg in enumerate(self._conversation_history):
-                role = msg.get('role', '')
-                
-                if role == 'tool':
-                    # ★ 新格式（Cursor 风格）：保留原生 tool 消息 ★
-                    # 必须有 tool_call_id 才能发给 API
-                    if msg.get('tool_call_id'):
-                        clean = {k: v for k, v in msg.items() if k not in _INTERNAL_FIELDS}
-                        history_to_send.append(clean)
-                    else:
-                        # 旧格式 tool 消息（无 tool_call_id）→ 转为 assistant 文本
-                        tool_name = msg.get('name', 'unknown')
-                        content = msg.get('content', '')
-                        history_to_send.append({
-                            'role': 'assistant',
-                            'content': tr('ai.tool_result', tool_name, content[:500])
-                        })
-                
-                elif role == 'assistant':
-                    # ★ 完整保留 assistant 消息 ★
-                    clean = {}
-                    for k, v in msg.items():
-                        if k in _INTERNAL_FIELDS:
-                            continue
-                        clean[k] = v
-                    # 如果是旧格式的 [工具执行结果] 文本，也原样保留
-                    # content 完整传递，不做任何截断
-                    # 同时保留 tool_calls（如果有的话 — 新格式）
-                    history_to_send.append(clean)
-                
-                elif role == 'user':
-                    # ★ Cursor 风格图片处理：
-                    # - 当前轮次（最后一条 user）+ 视觉模型 → 保留图片
-                    # - 旧轮次 或 非视觉模型 → 剥离 image_url，只保留文字
-                    content = msg.get('content')
-                    is_current_round = (msg_idx == _last_user_idx)
-                    
-                    if isinstance(content, list):
-                        if is_current_round and supports_vision:
-                            # 当前轮 + 视觉模型：完整保留图片
-                            history_to_send.append(msg)
-                        else:
-                            # 旧轮次 或 非视觉模型：剥离图片，只留文字
-                            text_parts = []
-                            for part in content:
-                                if isinstance(part, dict) and part.get('type') == 'text':
-                                    text_parts.append(part.get('text', ''))
-                            text_only = '\n'.join(t for t in text_parts if t)
-                            history_to_send.append({
-                                'role': 'user',
-                                'content': text_only or tr('ai.image_msg')
-                            })
-                    else:
-                        # 纯文本消息：原样保留
-                        history_to_send.append(msg)
-                
-                elif role == 'system':
-                    # 系统消息（如历史摘要）保留
-                    history_to_send.append(msg)
-            
-            # 修复 user/assistant 交替（仅处理连续的相同角色，不影响 tool 消息）
-            history_to_send = self._fix_message_alternation(history_to_send)
-            
-            messages.extend(history_to_send)
+            dynamic_sections = []
             
             # 3. 自动 RAG 注入（从用户最新消息中提取关键词，检索相关文档）
             user_last_msg = ""
@@ -344,7 +275,9 @@ class SendOrchestratorMixin:
                     conversation_len=len(self._conversation_history),
                 )
                 if rag_context:
-                    messages.append({'role': 'system', 'content': rag_context})
+                    dynamic_sections.append(DynamicContextSection(
+                        'rag', [{'role': 'system', 'content': rag_context}], 0
+                    ))
             
             # 4. ★ 长期记忆激活（"我想起来了"机制）
             # 在 RAG 文档之后、上下文提醒之前注入
@@ -353,14 +286,18 @@ class SendOrchestratorMixin:
                     user_last_msg, scene_context=scene_context
                 )
                 if memory_context:
-                    messages.append({'role': 'system', 'content': memory_context})
+                    dynamic_sections.append(DynamicContextSection(
+                        'memory', [{'role': 'system', 'content': memory_context}], 1
+                    ))
             
             # 5. ★ Plan 上下文注入（仅在 Plan 执行阶段 + 当前 session 匹配时）
             if plan_mode and plan_executing:
                 try:
                     plan_ctx = self._get_plan_manager().get_plan_for_context(self._session_id)
                     if plan_ctx:
-                        messages.append({'role': 'system', 'content': plan_ctx})
+                        dynamic_sections.append(DynamicContextSection(
+                            'plan', [{'role': 'system', 'content': plan_ctx}], 2
+                        ))
                 except Exception as e:
                     print(f"[Plan] Context injection error: {e}")
             
@@ -368,8 +305,18 @@ class SendOrchestratorMixin:
             # ⚠️ Cache 优化：动态内容放在末尾，保持前缀稳定
             context_reminder = self._get_context_reminder()
             if context_reminder:
-                # 将上下文提醒作为系统消息添加到末尾
-                messages.append({'role': 'system', 'content': f"[Context] {context_reminder}"})
+                dynamic_sections.append(DynamicContextSection(
+                    'context_reminder',
+                    [{'role': 'system', 'content': f"[Context] {context_reminder}"}],
+                    3,
+                ))
+
+            context_assembly = build_context(
+                prefix_messages=prefix_messages,
+                history_messages=history_to_send,
+                dynamic_sections=dynamic_sections,
+            )
+            messages = context_assembly.messages()
             
             # ================================================================
             # ★ 睡眠机制：浅睡眠（每 N 轮用户提问触发）
@@ -410,11 +357,31 @@ class SendOrchestratorMixin:
                         sleep_thread = threading.Thread(target=_do_light_sleep, daemon=True)
                         sleep_thread.start()
             
-            # Cursor 风格预发送压缩：只压缩 tool 结果，保留 user/assistant 完整
+            # 工具必须先选定，messages 与实际 tools 才能共同参与预算。
+            if plan_mode and not plan_executing:
+                from ..utils.tool_registry import get_tool_registry
+                plan_filtered = get_tool_registry().get_tools_for_mode("plan_planning")
+                tools = UltraOptimizer.optimize_tool_definitions(plan_filtered)
+            elif plan_mode and plan_executing:
+                exec_tools = list(HOUDINI_TOOLS)
+                exec_names = {t.get('function', {}).get('name') for t in exec_tools}
+                for plan_tool in (PLAN_TOOL_UPDATE_STEP, PLAN_TOOL_ASK_QUESTION):
+                    if plan_tool.get('function', {}).get('name') not in exec_names:
+                        exec_tools.append(plan_tool)
+                tools = UltraOptimizer.optimize_tool_definitions(exec_tools)
+            elif not use_agent:
+                from ..utils.tool_registry import get_tool_registry
+                tools = UltraOptimizer.optimize_tool_definitions(
+                    get_tool_registry().get_tools_for_mode("ask")
+                )
+            else:
+                tools = self._select_agent_tools_for_message(user_last_msg, use_web=use_web)
+            if not use_web:
+                tools = [t for t in tools if t['function']['name'] not in ('web_search', 'fetch_webpage')]
+
             if self._auto_optimize:
-                current_tokens = self.token_optimizer.calculate_message_tokens(messages)
+                current_tokens = self.token_optimizer.calculate_message_tokens(messages, tools=tools)
                 should_compress, _ = self.token_optimizer.should_compress(current_tokens, context_limit)
-                
                 if should_compress:
                     # ★ 深度睡眠：压缩前将完整上下文写入长期记忆
                     if self._memory_initialized and self._reflection_module and not self._sleep_in_progress:
@@ -445,49 +412,18 @@ class SendOrchestratorMixin:
                             self._sleep_in_progress = False
                     
                     old_tokens = current_tokens
-                    # 分离系统提示和上下文提醒
-                    first_system = messages[0] if messages and messages[0].get('role') == 'system' else None
-                    last_context = messages[-1] if messages and ('[上下文]' in messages[-1].get('content', '') or '[Context]' in messages[-1].get('content', '')) else None
-                    start_idx = 1 if first_system else 0
-                    end_idx = -1 if last_context else len(messages)
-                    body = messages[start_idx:end_idx] if end_idx != len(messages) else messages[start_idx:]
-                    
-                    # 按 user 消息划分轮次
-                    rounds = plan_context_rounds(body, protect_recent_rounds=0).rounds
-                    
-                    # 第一遍：压缩旧轮次 tool 结果
-                    n_rounds = len(rounds)
-                    protect_n = max(2, int(n_rounds * 0.6))
                     summarize_tool_content = self.client._summarize_tool_content if hasattr(self.client, '_summarize_tool_content') else None
-                    compress_old_round_tool_results(rounds, protect_n, summarize_fn=summarize_tool_content)
-                    
-                    # 如果仍超限，删除最早轮次
-                    target = int(context_limit * 0.7)
-                    prune_context_rounds_to_token_target(
-                        rounds,
-                        target,
+                    prune_context_assembly_to_token_target(
+                        context_assembly,
+                        int(context_limit * 0.7),
                         self.token_optimizer.calculate_message_tokens,
-                        prefix_messages=[first_system] if first_system else [],
-                        suffix_messages=[last_context] if last_context else [],
+                        tools=tools,
                         min_rounds=2,
-                        check_before_pop=True,
+                        summarize_fn=summarize_tool_content,
+                        keep_current_image=supports_vision,
                     )
-                    
-                    # 重组
-                    summary_message = None
-                    if n_rounds - len(rounds) > 0:
-                        summary_message = {
-                            'role': 'system',
-                            'content': tr('ai.old_rounds', n_rounds - len(rounds))
-                        }
-                    messages = assemble_context_messages(
-                        rounds,
-                        prefix_messages=[first_system] if first_system else [],
-                        summary_message=summary_message,
-                        suffix_messages=[last_context] if last_context else [],
-                    )
-                    
-                    new_tokens = self.token_optimizer.calculate_message_tokens(messages)
+                    messages = context_assembly.messages()
+                    new_tokens = self.token_optimizer.calculate_message_tokens(messages, tools=tools)
                     saved = old_tokens - new_tokens
                     if saved > 0:
                         self._addStatus.emit(tr('opt.auto_status', saved))
@@ -498,120 +434,34 @@ class SendOrchestratorMixin:
             # 调试：显示正在请求
             self._addStatus.emit(f"Requesting {provider}/{model}...")
             
-            # 推理模型兼容：清理消息格式
-            is_reasoning_model = AIClient.is_reasoning_model(model)
-            cleaned_messages = []
-            for msg in messages:
-                role = msg.get('role', 'user')
-                content = msg.get('content')
-                has_tool_calls = 'tool_calls' in msg
-                
-                clean_msg = {'role': role}
-                
-                # ★ Cursor 风格：assistant 有 tool_calls 时 content 可为 None ★
-                # Claude/Anthropic 代理拒绝 content="" + tool_calls 共存
-                if role == 'assistant' and has_tool_calls:
-                    clean_msg['content'] = content  # 保留 None（不转为空字符串）
-                else:
-                    clean_msg['content'] = content if content is not None else ''
-                
-                # 推理模型：assistant 消息需要 reasoning_content 字段
-                if is_reasoning_model and role == 'assistant':
-                    clean_msg['reasoning_content'] = msg.get('reasoning_content', '')
-                # 保留 tool_calls 字段
-                if has_tool_calls:
-                    clean_msg['tool_calls'] = msg['tool_calls']
-                # 保留 tool_call_id 字段
-                if 'tool_call_id' in msg:
-                    clean_msg['tool_call_id'] = msg['tool_call_id']
-                # 保留 name 字段（用于 tool 消息）
-                if 'name' in msg:
-                    clean_msg['name'] = msg['name']
-                
-                # ★ 清理 assistant content 中的 <think> 标签 ★
-                # 历史中的 thinking 不需要发给 API（浪费 token）
-                if role == 'assistant' and clean_msg.get('content'):
-                    c = clean_msg['content']
-                    if '<think>' in c:
-                        c = re.sub(r'<think>[\s\S]*?</think>', '', c).strip()
-                        clean_msg['content'] = c or None
-                
-                cleaned_messages.append(clean_msg)
-            messages = cleaned_messages
-            
-            # 使用缓存的优化后工具定义（只计算一次）
-            if plan_mode and not plan_executing:
-                # ★ Plan 规划阶段：只读工具 + create_plan + ask_question
-                plan_filtered = [t for t in HOUDINI_TOOLS
-                                 if t['function']['name'] in self._PLAN_PLANNING_TOOLS]
-                plan_filtered.append(PLAN_TOOL_CREATE)
-                plan_filtered.append(PLAN_TOOL_ASK_QUESTION)
-                if not use_web:
-                    plan_filtered = [t for t in plan_filtered
-                                     if t['function']['name'] not in ('web_search', 'fetch_webpage')]
-                tools = UltraOptimizer.optimize_tool_definitions(plan_filtered)
-            elif plan_mode and plan_executing:
-                # ★ Plan 执行阶段：暴露全部 Agent 工具（user_last_msg 是 "[Plan Confirmed] ..." 拼出的
-                # 占位文本，按意图筛会丢掉 create_nodes_batch 等关键工具，导致 AI 退化到逐节点单建）。
-                # 计划阶段已经在 create_plan 里规划好了每个 step 该用什么工具，执行阶段不该再过滤。
-                exec_tools = list(HOUDINI_TOOLS)
-                exec_names = {t.get('function', {}).get('name') for t in exec_tools}
-                if PLAN_TOOL_UPDATE_STEP.get('function', {}).get('name') not in exec_names:
-                    exec_tools = exec_tools + [PLAN_TOOL_UPDATE_STEP]
-                if PLAN_TOOL_ASK_QUESTION.get('function', {}).get('name') not in exec_names:
-                    exec_tools = exec_tools + [PLAN_TOOL_ASK_QUESTION]
-                if not use_web:
-                    exec_tools = [t for t in exec_tools
-                                  if t['function']['name'] not in ('web_search', 'fetch_webpage')]
-                tools = UltraOptimizer.optimize_tool_definitions(exec_tools)
-            elif not use_agent:
-                # ★ Ask 模式：只保留只读/查询工具
-                ask_filtered = [t for t in HOUDINI_TOOLS
-                                if t['function']['name'] in self._ASK_MODE_TOOLS]
-                if not use_web:
-                    ask_filtered = [t for t in ask_filtered
-                                    if t['function']['name'] not in ('web_search', 'fetch_webpage')]
-                tools = UltraOptimizer.optimize_tool_definitions(ask_filtered)
-            else:
-                # ★ Agent 模式：按本轮用户意图选择最小工具集，避免每轮暴露全量工具。
-                tools = self._select_agent_tools_for_message(user_last_msg, use_web=use_web)
-            
-            # ★ 合并外部工具（HookManager 插件工具；Skill 通过 list_skills/run_skill 元工具暴露）
-            try:
-                from ..utils.hooks import get_hook_manager as _ghm_tools
-                _ext = _ghm_tools().get_external_tools()
-                if _ext:
-                    tools = list(tools) + _ext
-            except Exception:
-                pass
+            # Registry is the sole authority for non-core tool exposure.
+            registry_tools = []
             try:
                 from ..utils.tool_registry import get_tool_registry
                 _reg = get_tool_registry()
-                # 兼容旧插件/外部工具：只合并显式注册到 ToolRegistry 的 skill 来源工具。
-                _existing_names = {t.get('function', {}).get('name', '') for t in tools}
-                for meta in _reg._tools.values():
-                    if meta.source == "skill" and meta.enabled and meta.name not in _existing_names:
-                        tools = list(tools) if not isinstance(tools, list) else tools
-                        tools.append(meta.schema)
+                _mode = "plan_executing" if plan_mode and plan_executing else (
+                    "plan_planning" if plan_mode else ("agent" if use_agent else "ask")
+                )
+                registry_tools = _reg.get_tools_for_mode(_mode)
             except Exception:
                 pass
-            
-            # ★ 非视觉模型：capture_viewport 降级为仅保存文件（不注入图片）
-            # 不再移除工具——AI 仍可截图保存让用户自行查看
-            if not supports_vision:
-                _degraded_tools = []
-                for _t in tools:
-                    if _t.get('function', {}).get('name') == 'capture_viewport':
-                        _t_copy = copy.deepcopy(_t)
-                        _t_copy['function']['description'] = (
-                            "截取当前 Houdini 3D 视口快照并保存到文件。"
-                            "当前模型不支持图片分析，截图将保存到 output_path 指定的路径供用户查看。"
-                            "必须指定 output_path 参数。"
-                        )
-                        _degraded_tools.append(_t_copy)
-                    else:
-                        _degraded_tools.append(_t)
-                tools = _degraded_tools
+            request = finalize_context_request(
+                context_assembly,
+                selected_tools=tools,
+                registry_tools=registry_tools,
+                supports_vision=supports_vision,
+                is_reasoning_model=AIClient.is_reasoning_model(model),
+                context_limit=context_limit,
+                count_tokens=self.token_optimizer.calculate_message_tokens,
+                summarize_tool_content=self.client._summarize_tool_content,
+            )
+            if not request.budget_result.within_budget:
+                raise RuntimeError(
+                    "Context cannot fit the provider budget without truncating message text or breaking a tool chain "
+                    f"({request.budget_result.final_tokens}/{request.budget_result.target_tokens} tokens)."
+                )
+            messages = request.messages
+            tools = request.tools
             
             # ★ Plan 模式的静默工具集合（不在 UI 中显示的工具）
             _silent = self._SILENT_TOOLS | self._PLAN_SILENT_TOOLS if plan_mode else self._SILENT_TOOLS

@@ -1,0 +1,26 @@
+# CONTEXT — Houdini-Agent 领域词汇
+
+项目的领域模型与通用语言（ubiquitous language）。架构讨论与代码命名以此为准。
+
+## Harness（工具治理层）
+
+- **Harness**：对 LLM 工具调用做参数校验、风险评分与策略决策（allow / deny / ask / retry）的运行时层。入口 `houdini_agent/core/harness_engine.py`。
+- **Tool Argument Validator**：`ToolArgumentValidator`，在策略评分前对工具参数做规范化（normalize）与结构化校验，产出 `ToolValidationResult`。
+- **Tool Policy Engine**：`HarnessToolPolicyEngine`，基于 validator 结果 + 上下文（mode、confirm_mode）产出 `ToolPolicyDecision`。只做策略决策，验证逻辑一律委托 validator。
+- **Node Path（节点路径）**：Houdini 场景内的节点路径，如 `/obj/geo1`。校验 traversal、null-byte，并强制落在 `_HOUDINI_ROOTS` 内。参数集合 `_NODE_PATH_KEYS`。
+- **File Path（文件系统路径）**：操作系统路径，如 HIP 保存路径、渲染输出图片路径。校验 traversal、null-byte，豁免 Houdini root。参数集合 `_FILE_PATH_KEYS = {file_path, output_path}`。
+- **Policy Decision**：`ToolPolicyDecision`，action ∈ `allow` / `deny` / `ask` / `retry`；`retry` 携带 `patched_args` 用于自动修补后重试。
+
+## 文档检索（Doc RAG）
+
+- **Help Source**：`houdini_agent/utils/help_source.py`，离线帮助数据源的底层 module。公开 `find_help_dir`（定位含 nodes.zip/vex.zip/hom.zip 的 help 目录）、`parse_wiki`（wiki 标记解析）、`iter_pages`（ZIP 页面遍历，统一过滤规则）。是 `HoudiniDocIndex` 与 `search_houdini_help` skill 共享的 seam。
+- **Doc Index**：`HoudiniDocIndex`（`houdini_agent/utils/doc_rag.py`），dict 索引 + 知识库分段检索。ZIP 索引缓存以 help_dir 路径 + 版本 + zip mtime/size 指纹失效。
+
+## 工具约定
+
+- **`save_hip`**：保存 HIP 文件，参数名为 **`file_path`**（不是 `output_path`）。harness 会为其自动补 `.hip` 扩展名。见 ADR-0001。
+- **`setup_render`**：配置渲染，其 `output_path` 是**渲染输出图片路径**（文件系统路径），与 `save_hip` 的 `file_path` 不同名。
+
+## 决策记录
+
+- 架构决策见 `docs/adr/`。

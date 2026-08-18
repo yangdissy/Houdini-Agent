@@ -5911,34 +5911,18 @@ class HoudiniMCP:
         "capture_viewport": "_tool_capture_viewport",
     }
 
-    # 写操作工具集合 —— 在 execute_tool 中自动包一层 hou.undos.group，
-    # 让用户 Ctrl+Z 可以把 agent 的整次操作当作一步撤销。
-    # 只读类（get_*/inspect_*/find_*/search_*/list_*/preview_*/check_*/cook_node 等）不在此列表。
-    _MUTATING_TOOLS: frozenset = frozenset({
-        "create_wrangle_node",
-        "set_node_parameter",
-        "create_node",
-        "create_nodes_batch",
-        "connect_nodes",
-        "disconnect_nodes",
-        "create_named_null",
-        "delete_node",
-        "rename_node",
-        "set_display_flag",
-        "set_node_flags",
-        "copy_node",
-        "batch_set_parameters",
-        "layout_nodes",
-        "create_network_box",
-        "add_nodes_to_box",
-        "execute_python",
-        "save_hip",
-    })
-
     @contextlib.contextmanager
     def _undo_group(self, tool_name: str):
         """统一为写操作包一个 undo group。读操作和无 hou 环境时直接 pass-through。"""
-        if hou is not None and tool_name in self._MUTATING_TOOLS and hasattr(hou, "undos"):
+        use_undo = False
+        try:
+            from ..tool_registry import get_tool_registry
+            use_undo = bool(
+                (get_tool_registry().get_execution_semantics(tool_name) or {}).get("undo")
+            )
+        except Exception:
+            use_undo = False
+        if hou is not None and use_undo and hasattr(hou, "undos"):
             try:
                 with hou.undos.group(f"Agent: {tool_name}"):
                     yield
@@ -6035,7 +6019,7 @@ class HoudiniMCP:
 
         return "\n\n".join(parts)
 
-    def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    def execute_tool(self, tool_name: str, arguments: Dict[str, Any], mode: str = "agent") -> Dict[str, Any]:
         """执行工具调用 - AI Agent 的统一工具入口（基于分派表）
         
         Args:
@@ -6046,6 +6030,15 @@ class HoudiniMCP:
             {"success": bool, "result": str, "error": str}
         """
         print(f"[MCP Client] 执行工具: {tool_name}, 参数: {list(arguments.keys())}")
+
+        if tool_name != "scene_info":
+            try:
+                from ..tool_registry import get_tool_registry
+                authorization = get_tool_registry().authorize_dispatch(tool_name, mode, "houdini")
+            except Exception as exc:
+                return {"success": False, "error": f"Tool Registry unavailable: {exc}"}
+            if not authorization.get("allowed"):
+                return {"success": False, "error": authorization.get("error", "Tool dispatch denied")}
         
         # ★ Hook: on_before_tool — 允许插件拦截/审计/修改参数
         try:
@@ -6057,37 +6050,22 @@ class HoudiniMCP:
         
         handler_name = self._TOOL_DISPATCH.get(tool_name)
         
-        # ★ 如果内部分派表中不存在，尝试外部工具（HookManager + ToolRegistry）
+        # Non-core tools are resolved exclusively through ToolRegistry.
         if handler_name is None:
-            try:
-                from ..hooks import get_hook_manager as _ghm
-                _hm = _ghm()
-                if _hm.has_external_tool(tool_name):
-                    result = _hm.execute_external_tool(tool_name, arguments)
-                    # ★ Hook: on_after_tool
-                    try:
-                        _hm.fire('on_after_tool', tool_name=tool_name, args=arguments, result=result)
-                    except Exception:
-                        pass
-                    return result
-            except Exception:
-                pass
-            # ★ 尝试 ToolRegistry（Skill 工具以 skill: 前缀注册）
             try:
                 from ..tool_registry import get_tool_registry
                 _reg = get_tool_registry()
-                if _reg.has_tool(tool_name):
-                    _handler = _reg.get_handler(tool_name)
-                    if _handler:
-                        result = _handler(arguments)
-                        if not isinstance(result, dict):
-                            result = {"success": True, "result": str(result)}
-                        try:
-                            _ghm_inst = _ghm()
-                            _ghm_inst.fire('on_after_tool', tool_name=tool_name, args=arguments, result=result)
-                        except Exception:
-                            pass
-                        return result
+                _handler = _reg.get_handler_for_execution(tool_name, mode, "houdini")
+                if _handler:
+                    result = _reg.execute(tool_name, arguments, mode=mode, runtime="houdini")
+                    if not isinstance(result, dict):
+                        result = {"success": True, "result": str(result)}
+                    try:
+                        from ..hooks import get_hook_manager as _ghm
+                        _ghm().fire('on_after_tool', tool_name=tool_name, args=arguments, result=result)
+                    except Exception:
+                        pass
+                    return result
             except Exception:
                 pass
             return self._tool_unknown(tool_name)

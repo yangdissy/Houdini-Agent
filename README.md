@@ -120,6 +120,9 @@ Three-layer store (semantic/episodic/procedural) with reward-driven learning and
 ### UI Features
 Multi-session tabs, streaming output, collapsible code blocks, clickable node paths, token usage stats, image paste/drag-drop (vision models), bilingual CN/EN UI, font scaling.
 
+### Reliable Session & Plan Recovery
+Session files are committed transactionally with manifest-last publication and rollback on failure. Empty-workspace markers prevent stale conversations from reappearing, stale windows cannot overwrite a newly switched user, and Plan state is restored per session without auto-completing unverified steps.
+
 ## Project Structure
 
 ```text
@@ -149,11 +152,13 @@ Key adaptations:
 | Area | Difference |
 |------|-----------|
 | Multi-user support | Login isolation, user allowlist, per-user config/memory/conversations |
-| Tool governance | Harness V2 policy gate, input/output guardrails, hard-fail batch semantics |
-| Stability | Qt layout jitter suppression, GPU race protection, atomic writes |
+| Tool governance | Registry-authorized execution, human confirmation, argument/result guardrails, per-item batch enforcement |
+| Stability | Qt/GPU race protection, transactional session workspace commits, stale-writer protection, atomic memory publication |
 | Doc retrieval | Multi-factor weighted scoring, query-type reranking, diversity constraints |
+| Context management | Round-safe compression across normal send and 413 recovery, with tool schemas included in token budgets |
+| Memory correctness | Embedding provenance checks and rollback-safe personal/team memory migration |
 
-Full change history in [changelog/](changelog/).
+Latest update: [2026-08-17–18 reliability and governance deepening](changelog/CHANGELOG_2026-08-18.md). Full change history in [changelog/](changelog/).
 
 ## Troubleshooting
 

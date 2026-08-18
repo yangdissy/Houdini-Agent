@@ -5,6 +5,7 @@ import unittest
 
 from houdini_agent.utils.tool_registry import (
     ToolRegistry,
+    ToolRegistrationError,
     build_default_tool_execution_profile,
     _infer_modes,
     _infer_tags,
@@ -94,6 +95,117 @@ class InferHelpersTest(unittest.TestCase):
         self.assertIn("get_parameter_schema", profile["loop_guidance_query_tools"])
 
 
+class ToolSemanticFactsTest(unittest.TestCase):
+    def test_execution_semantics_query_is_registry_owned(self):
+        reg = ToolRegistry()
+        reg.register_core_tools([
+            _schema("set_node_parameter"),
+            _schema("get_network_structure"),
+        ])
+
+        self.assertEqual(reg.get_execution_semantics("set_node_parameter"), {
+            "mutating": True,
+            "undo": True,
+            "cook_triggering": True,
+            "cook_before_read": False,
+        })
+        self.assertTrue(reg.get_execution_semantics("get_network_structure")["cook_before_read"])
+        self.assertIsNone(reg.get_execution_semantics("missing"))
+
+    def test_mutating_core_tools_declare_undo_semantics(self):
+        reg = ToolRegistry()
+        reg.register_core_tools([_schema(name) for name in (
+            "create_node", "connect_nodes", "execute_python", "save_hip",
+        )])
+
+        for name in reg.build_streaming_executor_profile()["network_mutating_tools"]:
+            with self.subTest(tool=name):
+                self.assertTrue(reg.get_execution_semantics(name)["undo"])
+
+    def test_representative_tool_semantic_facts_snapshot(self):
+        snapshot = {}
+        for name in ("get_network_structure", "create_node"):
+            tags = _infer_tags(name)
+            snapshot[name] = {
+                "modes": tuple(sorted(_infer_modes(name))),
+                "readonly": "readonly" in tags,
+                "network": "network" in tags,
+                "concurrency_safe": _infer_concurrency_safe(name),
+                "risk_level": _infer_risk_level(name),
+            }
+
+        self.assertEqual(
+            snapshot,
+            {
+                "get_network_structure": {
+                    "modes": ("agent", "ask", "plan_executing", "plan_planning"),
+                    "readonly": True,
+                    "network": True,
+                    "concurrency_safe": True,
+                    "risk_level": "low",
+                },
+                "create_node": {
+                    "modes": ("agent", "plan_executing"),
+                    "readonly": False,
+                    "network": True,
+                    "concurrency_safe": False,
+                    "risk_level": "normal",
+                },
+            },
+        )
+
+    def test_default_and_registry_profiles_use_consistent_semantic_facts(self):
+        names = {
+            "web_search",
+            "get_node_parameters",
+            "create_node",
+            "inspect_node",
+            "connect_nodes",
+            "get_parameter_schema",
+        }
+        reg = ToolRegistry()
+        reg.register_core_tools([_schema(name) for name in sorted(names)])
+
+        default_profile = build_default_tool_execution_profile()
+        registry_profile = reg.build_streaming_executor_profile()
+
+        for role in sorted(default_profile):
+            with self.subTest(role=role):
+                self.assertEqual(
+                    names.intersection(default_profile[role]),
+                    names.intersection(registry_profile[role]),
+                )
+
+    def test_registered_tool_metadata_updates_consumers_without_name_sets(self):
+        reg = ToolRegistry()
+        reg.register(
+            "plugin_scene_probe",
+            _schema("plugin_scene_probe"),
+            tags={"readonly", "network"},
+            modes={"agent"},
+            concurrency_safe=True,
+            risk_level="low",
+            source="plugin",
+            plugin_name="semantic-test",
+        )
+
+        profile = reg.build_streaming_executor_profile()
+
+        for role in (
+            "dedup_tools",
+            "batch_readonly_tools",
+            "cache_invalidate_tools",
+            "history_query_tools",
+            "compression_query_tools",
+        ):
+            with self.subTest(role=role):
+                self.assertIn("plugin_scene_probe", profile[role])
+        self.assertNotIn(
+            "plugin_scene_probe", profile["compression_operation_tools"]
+        )
+        self.assertNotIn("plugin_scene_probe", profile["network_mutating_tools"])
+
+
 class RegisterAndQueryTest(unittest.TestCase):
     def setUp(self):
         self.reg = ToolRegistry()
@@ -135,6 +247,35 @@ class RegisterAndQueryTest(unittest.TestCase):
         self.assertFalse(self.reg.has_tool("a"))
         self.assertTrue(self.reg.has_tool("b"))
         self.assertTrue(self.reg.has_tool("c"))
+
+    def test_same_name_different_owner_fails_closed_without_replacement(self):
+        first = lambda args: {"success": True, "owner": "p1"}
+        self.reg.register("shared", _schema("shared"), handler=first,
+                          source="plugin", plugin_name="p1", modes={"agent"})
+
+        with self.assertRaises(ToolRegistrationError):
+            self.reg.register("shared", _schema("shared"), handler=lambda args: {},
+                              source="plugin", plugin_name="p2", modes={"agent"})
+
+        self.assertIs(self.reg.get_handler("shared"), first)
+
+    def test_runtime_filters_schema_exposure(self):
+        self.reg.register("remote", _schema("remote"), modes={"agent"}, runtime="houdini")
+        self.reg.register("local", _schema("local"), modes={"agent"}, runtime="local")
+
+        names = {s["function"]["name"]
+                 for s in self.reg.get_tools_for_mode("agent", runtime="local")}
+
+        self.assertEqual(names, {"local"})
+
+    def test_tool_names_for_mode_matches_schema_query(self):
+        self.reg.register("ask_tool", _schema("ask_tool"), modes={"ask"})
+        self.reg.register("agent_tool", _schema("agent_tool"), modes={"agent"})
+
+        schema_names = {
+            schema["function"]["name"] for schema in self.reg.get_tools_for_mode("ask")
+        }
+        self.assertEqual(self.reg.get_tool_names_for_mode("ask"), schema_names)
 
 
 class EnableDisableTest(unittest.TestCase):
@@ -207,6 +348,60 @@ class ExecuteTest(unittest.TestCase):
         out = self.reg.execute("boom", {})
         self.assertFalse(out["success"])
         self.assertIn("kaboom", out["error"])
+
+    def test_execution_fails_closed_for_mode_and_runtime_mismatch(self):
+        calls = []
+        self.reg.register("guarded", _schema("guarded"),
+                          handler=lambda args: calls.append(args) or {"success": True},
+                          modes={"ask"}, runtime="local")
+
+        self.assertFalse(self.reg.execute("guarded", {}, mode="agent", runtime="local")["success"])
+        self.assertFalse(self.reg.execute("guarded", {}, mode="ask", runtime="houdini")["success"])
+        self.assertEqual(calls, [])
+
+    def test_authorize_dispatch_fails_closed_for_all_registry_constraints(self):
+        self.reg.register("core", _schema("core"), modes={"agent"}, runtime="houdini")
+        self.assertTrue(self.reg.authorize_dispatch("core", "agent", "houdini")["allowed"])
+        self.assertFalse(self.reg.authorize_dispatch("missing", "agent", "houdini")["allowed"])
+        self.reg.set_enabled("core", False)
+        self.assertFalse(self.reg.authorize_dispatch("core", "agent", "houdini")["allowed"])
+        self.reg.set_enabled("core", True)
+        self.assertFalse(self.reg.authorize_dispatch("core", "ask", "houdini")["allowed"])
+        self.assertFalse(self.reg.authorize_dispatch("core", "agent", "local")["allowed"])
+
+
+class LegacyPluginRegistrationTest(unittest.TestCase):
+    def test_legacy_hook_registration_is_registry_only_and_defaults_houdini(self):
+        from unittest import mock
+        from houdini_agent.utils.hooks import HookManager
+
+        manager = HookManager()
+        manager.reset()
+        registry = ToolRegistry()
+        with mock.patch("houdini_agent.utils.tool_registry.get_tool_registry", return_value=registry):
+            manager.register_tool("legacy", {}, "legacy tool", lambda args: {"success": True}, "old")
+            meta = registry.get_meta("legacy")
+            self.assertIsNotNone(meta)
+            self.assertEqual(meta.runtime, "houdini")
+            self.assertFalse(hasattr(manager, "_external_tools"))
+            manager.unregister_tool("legacy")
+            self.assertFalse(registry.has_tool("legacy"))
+
+    def test_failed_legacy_registration_leaves_no_hook_owner_state(self):
+        from unittest import mock
+        from houdini_agent.utils.hooks import HookManager
+
+        manager = HookManager()
+        manager.reset()
+        registry = ToolRegistry()
+        registry.register("collision", _schema("collision"), source="plugin",
+                          plugin_name="first", modes={"agent"})
+        with mock.patch("houdini_agent.utils.tool_registry.get_tool_registry", return_value=registry):
+            with self.assertRaises(ToolRegistrationError):
+                manager.register_tool("collision", {}, "other", lambda args: {}, "second")
+
+        self.assertEqual(registry.get_meta("collision").plugin_name, "first")
+        self.assertFalse(hasattr(manager, "_external_tools"))
 
 
 class IntentTest(unittest.TestCase):

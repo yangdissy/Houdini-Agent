@@ -16,8 +16,20 @@ from urllib.parse import quote_plus
 from shared.common_utils import load_config, save_config, load_user_config, save_user_config
 from ..core.harness_engine import is_harness_v2_enabled, sanitize_tool_result
 from ..core.streaming_tool_executor import StreamingToolExecutor
-from ..utils.token_optimizer import TokenOptimizer
+from ..utils.token_optimizer import (
+    TokenOptimizer,
+    build_context_assembly,
+    prune_context_assembly_to_token_target,
+)
 from houdini_agent.utils.provider_adapters import AnthropicRequestAdapter, AnthropicStreamEventParser
+from houdini_agent.utils.provider_normalization import (
+    DUOJIE_ANTHROPIC_MODELS,
+    model_capabilities,
+    normalize_model_id,
+    normalize_openai_parameters,
+    payload_temperature,
+    protocol_for,
+)
 
 # 强制使用本地 lib 目录中的依赖库
 _lib_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'lib')
@@ -1571,9 +1583,23 @@ HOUDINI_TOOLS = [
 # ★ 将核心工具注册到 ToolRegistry（模块加载时自动执行）
 try:
     from .tool_registry import get_tool_registry as _get_reg
+    from .plan_manager import PLAN_TOOL_CREATE, PLAN_TOOL_UPDATE_STEP, PLAN_TOOL_ASK_QUESTION
     _reg = _get_reg()
     if not _reg.initialized:
         _reg.register_core_tools(HOUDINI_TOOLS)
+    for _plan_tool in (PLAN_TOOL_CREATE, PLAN_TOOL_UPDATE_STEP, PLAN_TOOL_ASK_QUESTION):
+        _plan_name = _plan_tool["function"]["name"]
+        if not _reg.has_tool(_plan_name):
+            _reg.register(
+                _plan_name,
+                _plan_tool,
+                source="core",
+                modes={"plan_planning"} if _plan_name == "create_plan" else (
+                    {"plan_planning", "plan_executing"} if _plan_name == "ask_question"
+                    else {"plan_executing"}
+                ),
+                runtime="houdini",
+            )
 except Exception as _e:
     print(f"[AIClient] ToolRegistry 注册失败 (非致命): {_e}")
 
@@ -1599,7 +1625,7 @@ class AIClient:
     _OF3D_KEY_B64: str = 'c2stOHREQnptS3NYZklLcjEzdTI4NTRBMjIyOWU0OTQyQWE5MjViQTk4NjA3QTgxMzQx'
 
     # 使用 Anthropic 协议的 Duojie 模型（GLM 系等）
-    _DUOJIE_ANTHROPIC_MODELS = frozenset({'glm-4.7', 'glm-5', 'glm-5-turbo', 'glm-5.1'})
+    _DUOJIE_ANTHROPIC_MODELS = DUOJIE_ANTHROPIC_MODELS
 
     # ★ 预编译流式内容清洗正则（避免每个 SSE chunk 都重新编译）
     _RE_CLEAN_PATTERNS = [
@@ -2009,7 +2035,8 @@ class AIClient:
     # ----------------------------------------------------------
 
     def _progressive_trim(self, working_messages: list, tool_calls_history: list,
-                          trim_level: int = 1, supports_vision: bool = True) -> list:
+                          trim_level: int = 1, supports_vision: bool = True,
+                          tools: Optional[list] = None) -> list:
         """渐进式裁剪上下文，根据 trim_level 逐步加大裁剪力度
 
         Cursor 风格核心原则:
@@ -2027,109 +2054,36 @@ class AIClient:
         if not working_messages:
             return working_messages
 
-        # ── 第 0 步：剥离图片（base64 图片是 413 的主因）──
-        if not supports_vision or trim_level >= 3:
-            # 非视觉模型 或 重度裁剪：剥离所有图片
-            n_stripped = self._strip_image_content(working_messages, keep_recent_user=0)
-        elif trim_level == 2:
-            # 中度裁剪：只保留最近 1 条 user 消息的图片
-            n_stripped = self._strip_image_content(working_messages, keep_recent_user=1)
-        else:
-            # 轻度裁剪：保留最近 2 条 user 消息的图片
-            n_stripped = self._strip_image_content(working_messages, keep_recent_user=2)
-
-        if n_stripped > 0:
-            print(f"[AI Client] 裁剪: 剥离了 {n_stripped} 张图片")
-
         sys_msg = working_messages[0] if working_messages[0].get('role') == 'system' else None
         body = working_messages[1:] if sys_msg else working_messages[:]
-
         if not body:
             return working_messages
-
-        # --- 划分轮次：以 user 消息为分界 ---
-        rounds = []  # [[msg, msg, ...], ...]
-        current_round = []
-        for m in body:
-            if m.get('role') == 'user' and current_round:
-                rounds.append(current_round)
-                current_round = []
-            current_round.append(m)
-        if current_round:
-            rounds.append(current_round)
-
-        if trim_level <= 1:
-            # 轻度：只压缩非最近 30% 轮次的 tool 结果
-            n_rounds = len(rounds)
-            protect_n = max(3, int(n_rounds * 0.7))  # 保护最近 70%
-            for r_idx, rnd in enumerate(rounds):
-                if r_idx >= n_rounds - protect_n:
-                    break
-                for m in rnd:
-                    c = m.get('content') or ''
-                    if m.get('role') == 'tool' and isinstance(c, str) and len(c) > 300:
-                        m['content'] = self._summarize_tool_content(c, 300)
-                    # ★ assistant 和 user 文本完全保留 ★
-
-            keep_rounds = max(5, int(n_rounds * 0.7))
-            if n_rounds > keep_rounds:
-                rounds = rounds[-keep_rounds:]
-
-        elif trim_level == 2:
-            # 中度：保留最近 3 轮（而非 5 轮，避免 level 1 → level 2 无效裁剪）
-            rounds = rounds[-3:] if len(rounds) > 3 else rounds
-            for r_idx, rnd in enumerate(rounds):
-                if r_idx >= len(rounds) - 2:
-                    break  # 最近 2 轮的 tool 结果不压缩
-                for m in rnd:
-                    c = m.get('content') or ''
-                    if m.get('role') == 'tool' and isinstance(c, str) and len(c) > 150:
-                        m['content'] = self._summarize_tool_content(c, 150)
-                    # ★ assistant 和 user 文本完全保留 ★
-
-        else:
-            # 重度：保留最近 2 轮，激进压缩 tool 结果
-            rounds = rounds[-2:] if len(rounds) > 2 else rounds
-            for rnd in rounds[:-1]:  # 最后一轮不压缩
-                for m in rnd:
-                    c = m.get('content') or ''
-                    if m.get('role') == 'tool' and isinstance(c, str) and len(c) > 100:
-                        m['content'] = self._summarize_tool_content(c, 100)
-                    # ★ assistant 和 user 文本完全保留 ★
-
-        # 重组
-        body = [m for rnd in rounds for m in rnd]
-        result = ([sys_msg] if sys_msg else []) + body
-
-        # 恢复提示
-        history_summary = ""
-        if tool_calls_history:
-            history_query_tools = self._history_query_tools()
-            op_history = [h for h in tool_calls_history
-                          if h['tool_name'] not in history_query_tools]
-            if op_history:
-                recent = op_history[-8:]
-                lines = []
-                for h in recent:
-                    r = h.get('result', {})
-                    status = 'ok' if (isinstance(r, dict) and r.get('success')) else 'err'
-                    r_str = str(r.get('result', '') if isinstance(r, dict) else r)[:60]
-                    lines.append(f"  [{status}] {h['tool_name']}: {r_str}")
-                history_summary = "\n已完成的操作:\n" + "\n".join(lines)
-
-        result.append({
-            'role': 'system',
-            'content': (
-                f'[上下文管理] 已自动裁剪历史（级别 {trim_level}）。'
-                f'{history_summary}'
-                f'\n请继续完成当前任务。不要提及此裁剪。'
-            )
-        })
-
-        print(f"[AI Client] 渐进式裁剪: level={trim_level}, "
-              f"消息 {len(working_messages)} → {len(result)}, "
-              f"轮次 {len(rounds)}")
+        assembly = build_context_assembly(
+            prefix_messages=[sys_msg] if sys_msg else [],
+            history_messages=body,
+        )
+        target_ratio = {1: 0.75, 2: 0.65}.get(trim_level, 0.55)
+        prune_context_assembly_to_token_target(
+            assembly,
+            int(self._estimate_messages_tokens(working_messages, tools) * target_ratio),
+            self._estimate_messages_tokens,
+            tools=tools,
+            min_rounds=2,
+            summarize_fn=self._summarize_tool_content,
+            keep_current_image=supports_vision,
+        )
+        result = assembly.messages()
+        print(f"[AI Client] 渐进式裁剪: level={trim_level}, 消息 {len(working_messages)} → {len(result)}")
         return result
+
+    def _ensure_context_within_budget(self, messages: list, tools: Optional[list],
+                                      context_limit: int) -> None:
+        estimated = self._estimate_messages_tokens(messages, tools)
+        if estimated > context_limit:
+            raise RuntimeError(
+                "Context cannot fit the provider budget without truncating message text or breaking a tool chain "
+                f"({estimated}/{context_limit} tokens)."
+            )
     
     def _sanitize_working_messages(self, messages: list) -> list:
         """在发送给 API 之前清洗消息列表，修复常见格式问题
@@ -2442,7 +2396,8 @@ class AIClient:
     def _smart_compress_in_loop(self, working_messages: list,
                                 tool_calls_history: list,
                                 context_limit: int,
-                                supports_vision: bool = True) -> list:
+                                supports_vision: bool = True,
+                                tools: Optional[list] = None) -> list:
         """主动式上下文压缩，在 agent loop 内每轮迭代前调用。
 
         分层压缩策略：
@@ -2466,7 +2421,7 @@ class AIClient:
         if stale_count > 0:
             print(f"[AI Client] 🔄 标记了 {stale_count} 个过时工具结果")
 
-        current = self._estimate_messages_tokens(working_messages)
+        current = self._estimate_messages_tokens(working_messages, tools)
         if current <= target:
             return working_messages
 
@@ -2474,24 +2429,15 @@ class AIClient:
         n_stripped = self._strip_image_content(working_messages, keep_recent_user=2)
         if n_stripped > 0:
             print(f"[AI Client] 🖼 剥离了 {n_stripped} 张旧图片")
-            current = self._estimate_messages_tokens(working_messages)
+            current = self._estimate_messages_tokens(working_messages, tools)
             if current <= target:
                 return working_messages
 
         # ── 第 3 步：分级压缩旧轮次的工具结果 ──
         sys_msg = working_messages[0] if working_messages[0].get('role') == 'system' else None
         body = working_messages[1:] if sys_msg else working_messages[:]
-
-        # 划分轮次（以 user 消息为分界）
-        rounds: list = []
-        cur_round: list = []
-        for m in body:
-            if m.get('role') == 'user' and cur_round:
-                rounds.append(cur_round)
-                cur_round = []
-            cur_round.append(m)
-        if cur_round:
-            rounds.append(cur_round)
+        assembly = build_context_assembly([sys_msg] if sys_msg else [], body)
+        rounds = assembly.history_rounds
 
         n_rounds = len(rounds)
         protect_n = max(2, n_rounds // 2)  # 保护最近 50% 的轮次
@@ -2518,11 +2464,10 @@ class AIClient:
                         m['content'] = self._tiered_compress_tool(t_name, c, 200)
 
         current = self._estimate_messages_tokens(
-            ([sys_msg] if sys_msg else []) + [m for rnd in rounds for m in rnd]
+            assembly.messages(), tools
         )
         if current <= target:
-            body = [m for rnd in rounds for m in rnd]
-            return ([sys_msg] if sys_msg else []) + body
+            return assembly.messages()
 
         # ── 第 4 步：仍超限 → 尝试 LLM 摘要（如果轮次足够多） ──
         if len(rounds) >= 6:
@@ -2530,22 +2475,22 @@ class AIClient:
                 llm_result = self._llm_summarize_history(
                     ([sys_msg] if sys_msg else []) + [m for rnd in rounds for m in rnd],
                     tool_calls_history, int(target / 0.75),  # 传入原始 context_limit
+                    tools=tools,
                 )
-                llm_tokens = self._estimate_messages_tokens(llm_result)
+                llm_tokens = self._estimate_messages_tokens(llm_result, tools)
                 if llm_tokens < current:
                     return llm_result
             except Exception as e:
                 print(f"[AI Client] LLM 摘要失败，回退裁剪: {e}")
 
         # ── 第 5 步：仍超限 → 裁剪最老的轮次 ──
-        while len(rounds) > 2 and current > target:
-            rounds.pop(0)
-            current = self._estimate_messages_tokens(
-                ([sys_msg] if sys_msg else []) + [m for rnd in rounds for m in rnd]
-            )
-
-        body = [m for rnd in rounds for m in rnd]
-        result = ([sys_msg] if sys_msg else []) + body
+        prune_context_assembly_to_token_target(
+            assembly, target, self._estimate_messages_tokens,
+            tools=tools, min_rounds=2,
+            summarize_fn=self._summarize_tool_content,
+            keep_current_image=supports_vision,
+        )
+        result = assembly.messages()
 
         # 添加裁剪提示
         n_dropped = n_rounds - len(rounds)
@@ -2571,7 +2516,7 @@ class AIClient:
             result.insert(insert_idx, {'role': 'system', 'content': hint})
 
         print(f"[AI Client] 🗜️ 主动压缩: {n_rounds} 轮 → {len(rounds)} 轮, "
-              f"~{self._estimate_messages_tokens(result)} tokens (目标 {target})")
+              f"~{self._estimate_messages_tokens(result, tools)} tokens (目标 {target})")
 
         return result
 
@@ -2579,7 +2524,8 @@ class AIClient:
                                 tool_calls_history: list,
                                 context_limit: int,
                                 model: str = '',
-                                provider: str = '') -> list:
+                                provider: str = '',
+                                tools: Optional[list] = None) -> list:
         """使用 LLM 生成上下文摘要，替换旧轮次。
 
         仅在 _smart_compress_in_loop 裁剪后仍然过长时调用。
@@ -2649,7 +2595,7 @@ class AIClient:
             for rnd in to_keep:
                 result.extend(rnd)
 
-            new_tokens = self._estimate_messages_tokens(result)
+            new_tokens = self._estimate_messages_tokens(result, tools)
             print(f"[AI Client] 📝 LLM 摘要: {n_rounds} 轮 → 摘要 + {len(to_keep)} 轮, "
                   f"~{new_tokens} tokens")
 
@@ -2792,17 +2738,12 @@ class AIClient:
 
     def _is_anthropic_protocol(self, provider: str, model: str) -> bool:
         """判断是否应使用 Anthropic Messages 协议（而非 OpenAI 协议）"""
-        if provider == 'kimi_coding':
-            return True
-        return provider == 'duojie' and model.lower() in self._DUOJIE_ANTHROPIC_MODELS
+        return protocol_for(provider, model) == 'anthropic'
 
     @staticmethod
     def _normalize_model_id(model: str) -> str:
         """Normalize known legacy/display model names before sending requests."""
-        model = str(model or '').strip()
-        if model == 'k3[1m]':
-            return 'k3'
-        return model
+        return normalize_model_id(model)
 
     def _get_api_url(self, provider: str, model: str = '') -> str:
         provider = (provider or 'openai').lower()
@@ -2937,49 +2878,36 @@ class AIClient:
         DeepSeek-R1/Reasoner, GLM-4.7
         注：Duojie 模型思考模式通过系统提示词 <think> 标签实现，不依赖 API 参数
         """
-        m = model.lower()
-        return (
-            'reasoner' in m or 'r1' in m
-            or 'v4-pro' in m
-            or m == 'glm-4.7'
-        )
+        return model_capabilities(model).reasoning
 
     @staticmethod
     def _is_deepseek_v4_model(model: str) -> bool:
         """判断是否为 DeepSeek V4 模型（含 SiliconFlow 的 deepseek-ai/ 前缀）。"""
-        return 'deepseek-v4' in (model or '').lower()
+        return model_capabilities(model).deepseek_v4
 
     @staticmethod
     def _is_deepseek_v4_pro_model(model: str) -> bool:
         """判断是否为 DeepSeek V4 Pro 模型。"""
-        m = (model or '').lower()
-        return 'deepseek-v4' in m and 'v4-pro' in m
+        return model_capabilities(model).deepseek_v4_pro
     
     @staticmethod
     def is_glm47(model: str) -> bool:
         """判断是否为 GLM-4.7 模型"""
-        return model.lower() == 'glm-4.7'
+        return model_capabilities(model).glm47
 
     @staticmethod
     def requires_temperature_one(model: str) -> bool:
         """判断模型是否只支持 temperature=1（不允许自定义值）"""
-        m = model.lower()
-        # Kimi Code 模型（k3、kimi-for-coding、-highspeed）与 k2 系、gpt-5 系固定 temperature=1
-        return 'k2' in m or m.startswith('k3') or m.startswith('kimi-for-coding') or m.startswith('gpt-5')
+        return model_capabilities(model).temperature_one
 
     @staticmethod
     def uses_max_completion_tokens(model: str) -> bool:
         """OpenAI 推理模型族（gpt-5*、o1/o3/o4 系列）需用 max_completion_tokens 取代 max_tokens"""
-        m = model.lower()
-        return m.startswith('gpt-5') or m.startswith('o1') or m.startswith('o3') or m.startswith('o4')
+        return model_capabilities(model).max_tokens_parameter == 'max_completion_tokens'
 
     @classmethod
     def _payload_temperature(cls, model: str, temperature: Optional[float]) -> Optional[float]:
-        if cls.requires_temperature_one(model):
-            return 1
-        if temperature is None:
-            return None
-        return min(max(temperature, 0.0), 1.0)
+        return payload_temperature(model, temperature)
     
     # Duojie 思考模式说明：
     # 经测试 thinking/reasoningEffort API 参数对 Duojie 均无效（reasoning_tokens 始终 0）
@@ -3353,26 +3281,11 @@ class AIClient:
             # 必须加 stream_options 才能在流式响应中获取 usage 统计
             'stream_options': {'include_usage': True},
         }
-        payload_temperature = self._payload_temperature(model, temperature)
-        if payload_temperature is not None:
-            payload['temperature'] = payload_temperature
-        if max_tokens:
-            _tok_key = 'max_completion_tokens' if self.uses_max_completion_tokens(model) else 'max_tokens'
-            payload[_tok_key] = max_tokens
+        payload.update(normalize_openai_parameters(
+            provider, model, temperature, max_tokens, enable_thinking, bool(tools),
+        ))
         if response_format:
             payload['response_format'] = response_format
-        
-        # GLM-4.7 专属参数（仅原生 GLM 接口）：深度思考 + 流式工具调用
-        if self.is_glm47(model) and provider == 'glm' and enable_thinking:
-            payload['thinking'] = {'type': 'enabled'}
-            if tools:
-                payload['tool_stream'] = True
-
-        # DeepSeek V4 thinking 参数（原生 DeepSeek 与 SiliconFlow OpenAI 兼容接口）
-        if provider in ('deepseek', 'siliconflow') and enable_thinking and self._is_deepseek_v4_model(model):
-            payload['thinking'] = {'type': 'enabled'}
-            if self._is_deepseek_v4_pro_model(model):
-                payload['reasoning_effort'] = 'high'
         
         # Duojie 中转：思考模式通过系统提示词中的 <think> 标签实现
         # 经测试 thinking/reasoningEffort 参数对 Duojie API 无效（reasoning_tokens 始终为 0）
@@ -3764,24 +3677,11 @@ class AIClient:
             'model': model,
             'messages': messages,
         }
-        payload_temperature = self._payload_temperature(model, temperature)
-        if payload_temperature is not None:
-            payload['temperature'] = payload_temperature
-        if max_tokens:
-            _tok_key = 'max_completion_tokens' if self.uses_max_completion_tokens(model) else 'max_tokens'
-            payload[_tok_key] = max_tokens
+        payload.update(normalize_openai_parameters(
+            provider, model, temperature, max_tokens, True, bool(tools),
+        ))
         if response_format:
             payload['response_format'] = response_format
-        
-        # GLM-4.7 专属参数（仅原生 GLM 接口）
-        if self.is_glm47(model) and provider == 'glm':
-            payload['thinking'] = {'type': 'enabled'}
-
-        # DeepSeek V4-Pro：非流式也启用思考（原生 DeepSeek 与 SiliconFlow OpenAI 兼容接口）
-        if provider in ('deepseek', 'siliconflow') and self._is_deepseek_v4_model(model):
-            payload['thinking'] = {'type': 'enabled'}
-            if self._is_deepseek_v4_pro_model(model):
-                payload['reasoning_effort'] = 'high'
         
         # 注意：非流式 chat() 不包含 enable_thinking 参数，不做 think 模型映射
         # 思考模式仅在流式 chat_stream() / agent_loop_stream() 中通过 enable_thinking 控制
@@ -4002,13 +3902,22 @@ class AIClient:
                     print(f"[AI Client] ⚠️ 上下文 ~{est_tokens} tokens（阈值 {int(context_limit * 0.85)}），启动主动压缩")
                     working_messages = self._smart_compress_in_loop(
                         working_messages, tool_calls_history,
-                        context_limit, supports_vision
+                        context_limit, supports_vision, effective_tools
                     )
                     _needs_sanitize = True
             
             # ★ 通知 UI 新一轮 API 请求即将开始（用于显示 "Generating..." 状态）
             if on_iteration_start:
                 on_iteration_start(iteration)
+
+            try:
+                self._ensure_context_within_budget(working_messages, effective_tools, context_limit)
+            except RuntimeError as exc:
+                return {
+                    'ok': False, 'error': str(exc), 'content': full_content,
+                    'tool_calls_history': tool_calls_history, 'call_records': call_records,
+                    'iterations': iteration, 'usage': total_usage,
+                }
             
             # ★ Hook: on_before_request — 允许插件修改 messages
             try:
@@ -4127,7 +4036,7 @@ class AIClient:
                         'max_tokens', 'token limit', 'too many tokens',
                         'request too large', 'payload too large',
                         'context window', 'input too long',
-                    )) or ('HTTP 413' in error_msg)
+                    )) or ('http 413' in error_lower)
                     
                     # 2. 临时服务器错误 / 连接中断（502/503/529 / InvalidChunkLength 等）
                     is_server_transient = any(k in error_msg for k in (
@@ -4174,9 +4083,18 @@ class AIClient:
                             working_messages = self._progressive_trim(
                                 working_messages, tool_calls_history,
                                 trim_level=server_error_retries,  # 逐次加大裁剪力度
-                                supports_vision=supports_vision
+                                supports_vision=supports_vision,
+                                tools=effective_tools,
                             )
                             cleanup_count = old_len - len(working_messages)
+                            try:
+                                self._ensure_context_within_budget(
+                                    working_messages, effective_tools, context_limit
+                                )
+                            except RuntimeError as exc:
+                                should_abort = True
+                                abort_error = str(exc)
+                                break
                             
                         elif is_server_transient or is_compress_fail:
                             # ---- 临时服务器错误：先等待重试，不急着裁剪 ----
@@ -4192,7 +4110,8 @@ class AIClient:
                                 working_messages = self._progressive_trim(
                                     working_messages, tool_calls_history,
                                     trim_level=server_error_retries - 1,  # 比上下文超限更温和
-                                    supports_vision=supports_vision
+                                    supports_vision=supports_vision,
+                                    tools=effective_tools,
                                 )
                                 cleanup_count = old_len - len(working_messages)
                             
@@ -4930,22 +4849,8 @@ class AIClient:
                     print(f"[AI Client] ⚠️ JSON模式上下文 ~{est_tokens} tokens（阈值 {int(context_limit * 0.85)}），启动主动压缩")
                     working_messages = self._smart_compress_in_loop(
                         working_messages, tool_calls_history,
-                        context_limit, supports_vision
+                        context_limit, supports_vision, effective_tools
                     )
-            elif iteration > 1 and len(working_messages) > 20:
-                # 轻量级防御：仅在未触发主动压缩时做简单截断
-                protect_start = max(1, len(working_messages) - 6)
-                for i, m in enumerate(working_messages):
-                    if i == 0 or i >= protect_start:
-                        continue
-                    role = m.get('role', '')
-                    if role == 'user':
-                        continue
-                    c = m.get('content') or ''
-                    if role == 'tool' and len(c) > 400:
-                        m['content'] = self._summarize_tool_content(c, 400)
-                    elif role == 'assistant' and len(c) > 600:
-                        m['content'] = c[:600] + '...[已截断]'
             
             # ★ 通知 UI 新一轮 API 请求即将开始（用于显示 "Generating..." 状态）
             if on_iteration_start:
@@ -4993,7 +4898,7 @@ class AIClient:
                         'max_tokens', 'token limit', 'too many tokens',
                         'request too large', 'payload too large',
                         'context window', 'input too long',
-                    )) or ('HTTP 413' in err_msg)
+                    )) or ('http 413' in err_lower)
                     is_server_transient = any(k in err_msg for k in (
                         'HTTP 502', 'HTTP 503', 'HTTP 529', '压缩失败', 'no available'
                     ))
@@ -5017,7 +4922,8 @@ class AIClient:
                             working_messages = self._progressive_trim(
                                 working_messages, tool_calls_history,
                                 trim_level=server_error_retries,
-                                supports_vision=supports_vision
+                                supports_vision=supports_vision,
+                                tools=effective_tools,
                             )
                         else:
                             # 临时服务器错误：等待，第2次开始才裁剪
@@ -5029,7 +4935,8 @@ class AIClient:
                                 working_messages = self._progressive_trim(
                                     working_messages, tool_calls_history,
                                     trim_level=server_error_retries - 1,
-                                    supports_vision=supports_vision
+                                    supports_vision=supports_vision,
+                                    tools=effective_tools,
                                 )
                         break  # 退出 for，回到 while 重试
                     return {

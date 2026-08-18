@@ -7,6 +7,8 @@ import json
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from houdini_agent.utils.provider_normalization import payload_temperature
+
 
 class AnthropicRequestAdapter:
     """Build Anthropic Messages protocol requests from OpenAI-shaped inputs."""
@@ -14,7 +16,8 @@ class AnthropicRequestAdapter:
     VERSION = "2023-06-01"
     KIMI_USER_AGENT = "claude-code/0.1.0"
 
-    def __init__(self, requires_temperature_one: Callable[[str], bool]):
+    def __init__(self, requires_temperature_one: Optional[Callable[[str], bool]] = None):
+        # The optional argument is retained for caller compatibility.
         self._requires_temperature_one = requires_temperature_one
 
     def convert_messages(self, messages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
@@ -160,10 +163,9 @@ class AnthropicRequestAdapter:
         if stream:
             payload["stream"] = True
 
-        if self._requires_temperature_one(model):
-            payload["temperature"] = 1
-        elif temperature is not None:
-            payload["temperature"] = min(max(temperature, 0.0), 1.0)
+        resolved_temperature = payload_temperature(model, temperature)
+        if resolved_temperature is not None:
+            payload["temperature"] = resolved_temperature
 
         if system_text:
             payload["system"] = system_text

@@ -3,6 +3,7 @@
 
 import sys
 import unittest
+from unittest import mock
 
 from tests.test_import_smoke import (
     _install_qt_stubs,
@@ -184,14 +185,18 @@ class ManualUpdateModeDirectiveTest(unittest.TestCase):
                 self.confirmed = True
 
         tab._active_plan_viewer = _PlanViewer()
+        tab._session_id = "session"
+        tab._plan_manager = mock.Mock()
         tab._conversation_history = []
         tab._start_agent_run = lambda overrides: captured.update(overrides)
         plan_data = {"title": "Build Test Network", "steps": []}
+        tab._plan_manager.confirm_plan.return_value = plan_data
 
         AITab._on_plan_confirmed(tab, plan_data)
 
         self.assertEqual(tab._plan_phase, "executing")
         self.assertTrue(tab._active_plan_viewer.confirmed)
+        tab._plan_manager.confirm_plan.assert_called_once_with("session")
         self.assertEqual(len(tab._conversation_history), 1)
         self.assertIn("Build Test Network", tab._conversation_history[0]["content"])
         self.assertTrue(captured["use_agent"])

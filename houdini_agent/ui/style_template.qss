@@ -371,48 +371,54 @@ QComboBox#langCombo QAbstractItemView {
    ============================================================ */
 
 QFrame#sessionBar {
-    background: transparent;
-    border-bottom: none;
+    background: rgba(30,27,24,155);
+    border-bottom: 1px solid rgba(180,160,130,18);
+    min-height: 28px;
 }
 
 QTabBar#sessionTabs {
     background: transparent;
 }
 QTabBar#sessionTabs::tab {
-    background: transparent;
-    color: #8a7e6e;
+    background: rgba(45,40,32,90);
+    color: #aa9b88;
     border: none;
-    border-bottom: 2px solid transparent;
-    border-radius: 0;
-    padding: 3px 10px;
-    margin-right: 2px;
+    border-bottom: 3px solid transparent;
+    border-radius: 5px 5px 0 0;
+    padding: 3px 8px;
+    margin: 2px 2px 0 0;
     font-size: {FS_XS}px;
-    min-width: 40px;
+    min-width: 46px;
     max-width: 160px;
 }
 QTabBar#sessionTabs::tab:selected {
-    background: transparent;
-    color: #d4c5b0;
+    background: rgba(62,53,41,180);
+    color: #f0dfc9;
     border: none;
-    border-bottom: 2px solid rgba(212,165,116,180);
+    border-bottom: 3px solid #d4a574;
 }
 QTabBar#sessionTabs::tab:hover:!selected {
-    background: transparent;
-    color: #b0a08c;
-    border-bottom: 2px solid rgba(180,160,130,15);
+    background: rgba(55,48,38,130);
+    color: #d4c5b0;
+    border-bottom: 3px solid rgba(212,165,116,55);
 }
 
 QPushButton#btnNewSession {
-    background: transparent;
-    color: #8a7e6e;
-    border: none;
-    border-radius: 4px;
-    font-size: {FS_SM}px;
+    background: rgba(212,165,116,190);
+    color: #211b15;
+    border: 1px solid rgba(238,196,145,100);
+    border-radius: 6px;
+    font-size: {FS_XS}px;
     font-weight: bold;
+    padding: 2px 7px;
 }
 QPushButton#btnNewSession:hover {
-    background: rgba(180,160,130,8);
-    color: #b0a08c;
+    background: rgba(232,185,132,230);
+    color: #16110d;
+    border-color: rgba(255,220,175,160);
+}
+QPushButton#btnNewSession:pressed {
+    background: rgba(190,140,90,230);
 }
 
 /* Chat scroll area */
@@ -1028,8 +1034,21 @@ QComboBox#modeCombo[mode="plan"]:hover {
 }
 
 QPushButton#btnAttach {
-    color: #8f98a4;
+    background: rgba(38,40,46,235);
+    color: #d5dbe2;
+    border-color: rgba(255,255,255,42);
+    font-size: {FS_SM}px;
     padding: 0;
+}
+QPushButton#btnAttach:hover {
+    background: rgba(52,55,63,245);
+    color: #ffffff;
+    border-color: rgba(212,165,116,110);
+}
+QPushButton#btnAttach:pressed {
+    background: rgba(63,52,38,245);
+    color: #f2c572;
+    border-color: rgba(245,158,11,140);
 }
 QPushButton#chkConfirm {
     padding: 1px 8px;
@@ -1052,7 +1071,6 @@ QComboBox#readCombo {
 
 QLabel#modeGuardLabel {
     padding: 0 9px;
-    font-family: 'Consolas', 'Monaco', monospace;
 }
 QLabel#modeGuardLabel[risk="readonly"] {
     background: rgba(22,45,32,210);
@@ -1078,6 +1096,11 @@ QPushButton#policyTimelineBtn[failures="true"] {
     background: rgba(56,27,29,225);
     color: #ff8d83;
     border-color: rgba(239,68,68,120);
+}
+QPushButton#policyTimelineBtn[failures="true"]:hover {
+    background: rgba(72,32,34,235);
+    color: #ffb0a8;
+    border-color: rgba(239,68,68,165);
 }
 
 /* Chat input (warm glass with glow on focus) */

@@ -3,7 +3,12 @@
 
 import unittest
 
-from houdini_agent.core.cache_records import DEFAULT_TOKEN_STATS, SessionCacheRecord, strip_images_for_cache
+from houdini_agent.core.cache_records import (
+    DEFAULT_TOKEN_STATS,
+    SessionCacheRecord,
+    build_session_cache_record,
+    strip_images_for_cache,
+)
 
 
 class CacheRecordsTest(unittest.TestCase):
@@ -59,6 +64,22 @@ class CacheRecordsTest(unittest.TestCase):
         self.assertEqual(len(record.session_id), 8)
         self.assertEqual(record.conversation_history, [])
         self.assertEqual(record.token_stats, DEFAULT_TOKEN_STATS)
+
+    def test_canonical_builder_supplies_compatible_shape_and_strips_images(self):
+        data = build_session_cache_record('abc12345', {
+            'created_at': '2026-08-17T12:00:00',
+            'conversation_history': [{
+                'role': 'user',
+                'content': [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,x'}}],
+            }],
+            'context_summary': 'summary',
+            'token_stats': {},
+        })
+
+        self.assertEqual(data['session_id'], 'abc12345')
+        self.assertEqual(data['message_count'], 1)
+        self.assertEqual(data['conversation_history'][0]['content'][0]['text'], '[Image: image/png]')
+        self.assertEqual(data['token_stats'], DEFAULT_TOKEN_STATS)
 
 
 if __name__ == "__main__":

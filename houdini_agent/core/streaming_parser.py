@@ -14,6 +14,7 @@ Streaming Parser Mixin — 流式内容解析与思考区块处理
 import time
 
 from houdini_agent.qt_compat import QtCore
+from .thinking_stream_parser import ThinkingStreamParser
 from ..ui.i18n import tr
 
 
@@ -27,7 +28,7 @@ class StreamingParserMixin:
     def _on_append_content(self, text: str):
         """处理内容追加（主线程槽函数）
 
-        注意：内容已经在 _on_content_with_limit → _drain_tag_buffer →
+        注意：内容已经在 _on_content_with_limit → ThinkingStreamParser →
         _emit_normal_content 中经过了 <think> 标签过滤和伪造检测。
         这里只负责将文本交给 UI 控件显示，不做额外过滤。
         """
@@ -63,78 +64,34 @@ class StreamingParserMixin:
             self._flush_count = 0
             self._is_first_content_chunk = True
 
-        # 追加到标签解析缓冲区
-        self._tag_parse_buf += text
-        self._drain_tag_buffer()
+        if not hasattr(self, '_thinking_stream_parser'):
+            self._thinking_stream_parser = ThinkingStreamParser()
+        self._dispatch_thinking_stream_events(self._thinking_stream_parser.feed(text))
 
     # ------------------------------------------------------------------
     # <think> 标签流式解析
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _partial_tag_at_end(text: str, tag: str) -> int:
-        """检测 text 末尾是否有 tag 的不完整前缀，返回匹配长度 (0 = 无)"""
-        for i in range(min(len(tag) - 1, len(text)), 0, -1):
-            if tag[:i] == text[-i:]:
-                return i
-        return 0
-
-    def _drain_tag_buffer(self):
-        """处理 _tag_parse_buf，将内容分发到正式输出或思考面板"""
-        buf = self._tag_parse_buf
-        while buf:
-            if not self._in_think_block:
-                # ── 正常模式：寻找 <think> ──
-                pos = buf.find('<think>')
-                if pos >= 0:
-                    if pos > 0:
-                        self._emit_normal_content(buf[:pos])
-                    buf = buf[pos + 7:]          # 跳过 <think>
-                    self._in_think_block = True
-                    # ★ Think 开关打开时才显示思考面板；关闭时静默丢弃 <think> 内容
-                    if self._think_enabled:
-                        self._thinking_needs_finalize = True  # 进入思考，标记需要 finalize
-                        # 如果思考已 finalize，恢复为活跃状态并重启计时
-                        self._resume_thinking()
-                    continue
-                # 检查末尾是否有不完整的 <think>
-                hold = self._partial_tag_at_end(buf, '<think>')
-                if hold:
-                    self._emit_normal_content(buf[:-hold])
-                    self._tag_parse_buf = buf[-hold:]
-                    return
-                # 全部是正常内容
-                self._emit_normal_content(buf)
-                self._tag_parse_buf = ""
-                return
-            else:
-                # ── 思考模式：寻找 </think> ──
-                pos = buf.find('</think>')
-                if pos >= 0:
-                    if self._think_enabled and pos > 0:
-                        self._addThinking.emit(buf[:pos])
-                    buf = buf[pos + 8:]          # 跳过 </think>
-                    self._in_think_block = False
-                    # 思考结束：立即 finalize 思考区块并停止计时器
-                    if self._think_enabled:
-                        self._finalize_thinking()
-                    continue
-                # 检查末尾是否有不完整的 </think>
-                hold = self._partial_tag_at_end(buf, '</think>')
-                if hold:
-                    if self._think_enabled:
-                        safe = buf[:-hold]
-                        if safe:
-                            self._addThinking.emit(safe)
-                    self._tag_parse_buf = buf[-hold:]
-                    return
-                # 全部是思考内容
+    def _dispatch_thinking_stream_events(self, events):
+        """Translate parser events to the existing Qt/UI behavior."""
+        for event in events:
+            if event.kind == 'content':
+                self._emit_normal_content(event.text)
+            elif event.kind == 'thinking_start':
                 if self._think_enabled:
-                    self._addThinking.emit(buf)
-                # ★ Think 关闭时：静默丢弃 <think> 块内的内容
-                self._tag_parse_buf = ""
-                return
-        self._tag_parse_buf = ""
+                    self._thinking_needs_finalize = True
+                    self._resume_thinking()
+            elif event.kind == 'thinking':
+                if self._think_enabled and event.text:
+                    self._addThinking.emit(event.text)
+            elif event.kind == 'thinking_end' and self._think_enabled:
+                self._finalize_thinking()
+
+    def _finish_thinking_stream(self):
+        """Flush pending parser state when a stream completes or aborts."""
+        parser = getattr(self, '_thinking_stream_parser', None)
+        if parser is not None:
+            self._dispatch_thinking_stream_events(parser.finish())
 
     def _finalize_thinking(self):
         """思考阶段结束（线程安全：自动分派到主线程）"""
@@ -202,7 +159,8 @@ class StreamingParserMixin:
             return
         # 首次正式内容到达时，确保思考区块已 finalize（适配 DeepSeek 原生 reasoning_content）
         # 使用标志位避免从后台线程访问 Qt 控件属性
-        if self._in_think_block is False and getattr(self, '_thinking_needs_finalize', True):
+        parser = getattr(self, '_thinking_stream_parser', None)
+        if not (parser and parser.in_thinking) and getattr(self, '_thinking_needs_finalize', True):
             self._finalize_thinking()  # 通过信号分派到主线程
             self._thinking_needs_finalize = False
 

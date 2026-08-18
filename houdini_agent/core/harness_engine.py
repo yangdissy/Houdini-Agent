@@ -220,17 +220,25 @@ class ToolArgumentValidator:
         "read_selection": ("node_path",),
     }
 
-    _NORMALIZE_KEYS = frozenset({
+    # Houdini 节点路径参数：校验 traversal/null-byte，并强制落在 _HOUDINI_ROOTS 之内。
+    _NODE_PATH_KEYS = frozenset({
         "node_path",
         "source_path",
         "target_path",
         "network_path",
         "parent_path",
-        "output_path",
         "from_path",
         "to_path",
+        "input_path",
         "path",
         "root_path",
+    })
+
+    # 文件系统路径参数（HIP 保存、渲染输出等）：校验 traversal/null-byte，
+    # 但豁免 Houdini root 校验，因为它们是 OS 路径而非节点路径。
+    _FILE_PATH_KEYS = frozenset({
+        "file_path",
+        "output_path",
     })
 
     _HOUDINI_ROOTS = frozenset({
@@ -250,7 +258,7 @@ class ToolArgumentValidator:
         for key, value in (args or {}).items():
             if isinstance(value, str):
                 v = value.strip()
-                if key in self._NORMALIZE_KEYS and v:
+                if key in self._NODE_PATH_KEYS and v:
                     v = self._normalize_path(v)
                 out[key] = v
             else:
@@ -322,8 +330,7 @@ class ToolArgumentValidator:
         return ""
 
     def _check_path_args(self, args: Dict[str, Any]) -> str:
-        for key in self._NORMALIZE_KEYS:
-            value = args.get(key)
+        for key, value in (args or {}).items():
             if not isinstance(value, str) or not value.strip():
                 continue
             reason = self._validate_path_arg(key, value.strip())
@@ -332,6 +339,9 @@ class ToolArgumentValidator:
         return ""
 
     def _validate_path_arg(self, key: str, path: str) -> str:
+        if key not in self._NODE_PATH_KEYS and key not in self._FILE_PATH_KEYS:
+            return ""
+
         normalized = path.replace("\\", "/")
         parts = [part for part in normalized.split("/") if part]
         if ".." in parts:
@@ -339,7 +349,8 @@ class ToolArgumentValidator:
         if "\x00" in normalized:
             return f"Tool input guardrail blocked invalid path in {key}"
 
-        if key == "output_path":
+        # 文件系统路径（file_path/output_path）豁免 Houdini root 校验。
+        if key in self._FILE_PATH_KEYS:
             return ""
 
         if normalized.startswith("/") and not any(
@@ -427,16 +438,16 @@ class HarnessToolPolicyEngine:
             )
 
         if tool_name == "save_hip":
-            out = str(safe_args.get("output_path") or "").strip()
+            out = str(safe_args.get("file_path") or "").strip()
             if out and not os.path.splitext(out)[1]:
                 patched = dict(safe_args)
-                patched["output_path"] = out + ".hip"
+                patched["file_path"] = out + ".hip"
                 return self._decision(
                     "retry",
-                    "Auto-fix save_hip output_path extension to .hip",
+                    "Auto-fix save_hip file_path extension to .hip",
                     patched_args=patched,
-                    retry_key=f"{tool_name}:output_path_ext",
-                    risk_factors=[RiskFactor("retry_patch_output_extension", "info", "Auto-fix save_hip output_path extension to .hip", 0.1)],
+                    retry_key=f"{tool_name}:file_path_ext",
+                    risk_factors=[RiskFactor("retry_patch_output_extension", "info", "Auto-fix save_hip file_path extension to .hip", 0.1)],
                     required_control="retry",
                 )
 
@@ -491,120 +502,117 @@ class HarnessToolPolicyEngine:
             required_control=required_control or (action if action in {"ask", "deny", "retry"} else ""),
         )
 
-    def _check_input_guardrails(self, tool_name: str, args: Dict[str, Any]) -> str:
-        validation = self.validator.validate(tool_name, args)
-        return validation.first_error
 
-    def _check_input_guardrails(self, tool_name: str, args: Dict[str, Any]) -> str:
-        sensitive_reason = self._check_sensitive_args(args)
-        if sensitive_reason:
-            return sensitive_reason
+class GovernedToolExecutor:
+    """Own the fail-closed policy-to-adapter execution sequence."""
 
-        path_reason = self._check_path_args(args)
-        if path_reason:
-            return path_reason
+    def __init__(
+        self,
+        policy_engine,
+        execute,
+        confirm=None,
+        audit=None,
+        trace=None,
+        retry_counts=None,
+        retry_limit=2,
+    ):
+        self._policy_engine = policy_engine
+        self._execute = execute
+        self._confirm = confirm
+        self._audit = audit
+        self._trace = trace
+        self._retry_counts = retry_counts if retry_counts is not None else {}
+        self._retry_limit = retry_limit
 
-        if tool_name == "execute_python":
-            return self._match_patterns(
-                str(args.get("code") or ""),
-                PYTHON_DANGEROUS_PATTERNS,
-                "Tool input guardrail blocked dangerous Python",
-            )
+    def execute(self, tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        safe_args = dict(args or {})
+        try:
+            decision = self._policy_engine.decide(tool_name, safe_args, context)
+        except Exception:
+            self._record_decision(tool_name, "deny", "policy_error")
+            return {"success": False, "error": "Tool policy evaluation failed; execution denied"}
 
-        if tool_name == "execute_shell":
-            return self._match_patterns(
-                str(args.get("command") or ""),
-                SHELL_DANGEROUS_PATTERNS,
-                "Tool input guardrail blocked dangerous shell command",
-                flags=re.IGNORECASE,
-            )
+        action = decision.action
+        reason = decision.reason or ""
+        exec_args = decision.patched_args if decision.patched_args is not None else safe_args
+        self._record_decision(tool_name, action, reason)
 
-        return ""
+        if action == "deny":
+            return {"success": False, "error": reason or f"Tool blocked by policy: {tool_name}"}
 
-    def _check_sensitive_args(self, args: Dict[str, Any]) -> str:
-        for key, value in self._walk_args(args):
-            key_text = str(key or "").strip().lower()
-            if key_text in SENSITIVE_ARG_KEYS or key_text.endswith(("_api_key", "_token", "_password", "_secret")):
-                return f"Tool input guardrail blocked sensitive argument: {key}"
-            if isinstance(value, str):
-                reason = self._match_patterns(
-                    value,
-                    SENSITIVE_VALUE_PATTERNS,
-                    "Tool input guardrail blocked sensitive value",
-                    flags=re.IGNORECASE,
-                )
-                if reason:
-                    return reason
-        return ""
+        if action == "ask":
+            if self._confirm is None:
+                return {"success": False, "error": "Tool confirmation unavailable; execution denied"}
+            try:
+                confirmed = bool(self._confirm(tool_name, exec_args))
+            except Exception:
+                confirmed = False
+            self._record_trace("tool_policy_ask", tool=tool_name, confirmed=confirmed)
+            if not confirmed:
+                return {"success": False, "error": reason or f"Tool confirmation cancelled: {tool_name}"}
 
-    def _check_path_args(self, args: Dict[str, Any]) -> str:
-        for key in self._NORMALIZE_KEYS:
-            value = args.get(key)
-            if not isinstance(value, str) or not value.strip():
-                continue
-            reason = self._validate_path_arg(key, value.strip())
-            if reason:
-                return reason
-        return ""
+        if action == "retry":
+            if decision.patched_args is None:
+                return {"success": False, "error": "Policy retry did not provide patched arguments"}
+            retry_key = decision.retry_key or build_tool_retry_key(tool_name, exec_args)
+            retry_count = self._retry_counts.get(retry_key, 0)
+            if retry_count >= self._retry_limit:
+                self._record_audit({
+                    "event_type": "policy_retry", "tool": tool_name,
+                    "action": "retry_limit", "retry_key": retry_key,
+                    "retry_count": retry_count, "retry_limit": self._retry_limit,
+                })
+                return {"success": False, "error": f"Tool retry limit reached for {tool_name}"}
+            self._retry_counts[retry_key] = retry_count + 1
+            self._record_audit({
+                "event_type": "policy_retry", "tool": tool_name,
+                "action": "retry", "retry_key": retry_key,
+                "retry_count": retry_count + 1, "retry_limit": self._retry_limit,
+            })
+        elif action not in {"allow", "ask"}:
+            return {"success": False, "error": f"Unsupported policy action: {action}"}
 
-    def _validate_path_arg(self, key: str, path: str) -> str:
-        normalized = path.replace("\\", "/")
-        parts = [part for part in normalized.split("/") if part]
-        if ".." in parts:
-            return f"Tool input guardrail blocked path traversal in {key}"
-        if "\x00" in normalized:
-            return f"Tool input guardrail blocked invalid path in {key}"
+        started_at = time.time()
+        self._record_audit({
+            "event_type": "tool_call", "phase": "start", "tool": tool_name,
+            "action": action, "mode": context.get("mode", "agent"),
+            "args_keys": sorted(str(key) for key in exec_args.keys()),
+        })
+        try:
+            result = self._execute(tool_name, exec_args, action == "ask")
+        except Exception:
+            result = {"success": False, "error": "Tool execution adapter failed"}
+        result = sanitize_tool_result(result)
+        self._record_audit({
+            "event_type": "tool_call", "phase": "result", "tool": tool_name,
+            "action": action, "mode": context.get("mode", "agent"),
+            "success": bool(result.get("success")),
+            "error_code": "tool_execution_failed" if not result.get("success") else "",
+            "duration_ms": int(max(0.0, time.time() - started_at) * 1000),
+        })
 
-        if key == "output_path":
-            return ""
+        if action == "retry" and result.get("success"):
+            retry_key = decision.retry_key or build_tool_retry_key(tool_name, exec_args)
+            self._retry_counts.pop(retry_key, None)
+        return result
 
-        if normalized.startswith("/") and not any(
-            normalized == root or normalized.startswith(root + "/") for root in self._HOUDINI_ROOTS
-        ):
-            return f"Tool input guardrail blocked unsupported Houdini path root in {key}: {path}"
+    def _record_decision(self, tool_name: str, action: str, reason: str):
+        self._record_trace("tool_policy", tool=tool_name, action=action, reason=reason)
+        self._record_audit({
+            "event_type": "tool_policy", "tool": tool_name,
+            "action": action, "reason_code": reason,
+        })
 
-        return ""
+    def _record_trace(self, event: str, **fields):
+        if self._trace is not None:
+            try:
+                self._trace(event, **fields)
+            except Exception:
+                pass
 
-    @staticmethod
-    def _match_patterns(
-        text: str,
-        patterns: Iterable[Tuple[str, str]],
-        prefix: str,
-        flags: int = 0,
-    ) -> str:
-        for pattern, rule_id in patterns:
-            if re.search(pattern, text or "", flags):
-                return f"{prefix}: {rule_id}"
-        return ""
-
-    @classmethod
-    def _walk_args(cls, value: Any, key: str = ""):
-        if isinstance(value, dict):
-            for child_key, child_value in value.items():
-                yield from cls._walk_args(child_value, str(child_key))
-        elif isinstance(value, list):
-            for child_value in value:
-                yield from cls._walk_args(child_value, key)
-        else:
-            yield key, value
-
-    def _normalize_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        out: Dict[str, Any] = {}
-        for key, value in (args or {}).items():
-            if isinstance(value, str):
-                v = value.strip()
-                if key in self._NORMALIZE_KEYS and v:
-                    v = self._normalize_path(v)
-                out[key] = v
-            else:
-                out[key] = value
-        return out
-
-    @staticmethod
-    def _normalize_path(path: str) -> str:
-        # Keep Houdini path semantics while removing duplicated slashes.
-        if not path:
-            return path
-        while "//" in path:
-            path = path.replace("//", "/")
-        return path
+    def _record_audit(self, record: Dict[str, Any]):
+        if self._audit is not None:
+            try:
+                self._audit(record)
+            except Exception:
+                pass

@@ -36,6 +36,25 @@ class ToolMeta:
     enabled: bool = True                         # 是否启用
     concurrency_safe: bool = False               # 是否允许与其他工具并发执行
     risk_level: str = "normal"                  # "low" | "normal" | "high"
+    runtime: str = "houdini"                    # "houdini" | "local"
+    mutating: bool = False                       # 是否修改 Houdini/网络状态
+    undo: bool = False                           # 是否需要 Houdini undo group
+    cook_triggering: bool = False                # 是否在执行前启用 cook guard
+    cook_before_read: bool = False               # 是否在读取前定向 cook
+    cache_invalidation: bool = False             # 是否使本轮网络读取缓存失效
+
+    def execution_semantics(self) -> Dict[str, bool]:
+        """Return the Houdini runtime facts owned by this registration."""
+        return {
+            "mutating": bool(self.mutating),
+            "undo": bool(self.undo),
+            "cook_triggering": bool(self.cook_triggering),
+            "cook_before_read": bool(self.cook_before_read),
+        }
+
+
+class ToolRegistrationError(ValueError):
+    """Raised when registration would ambiguously replace another owner."""
 
 
 # ─────────────────────────────────────────────
@@ -100,6 +119,25 @@ _ASYNC_PREFERRED_TOOLS = frozenset({
     'execute_shell',
 })
 
+_MUTATING_TOOLS = frozenset({
+    'create_node', 'create_nodes_batch', 'create_named_null', 'delete_node',
+    'rename_node', 'set_node_parameter', 'set_parameter_expression',
+    'batch_set_parameters', 'connect_nodes', 'disconnect_nodes', 'copy_node',
+    'create_wrangle_node', 'set_display_flag', 'set_node_flags', 'layout_nodes',
+    'create_network_box', 'add_nodes_to_box', 'execute_python', 'save_hip',
+    'run_skill', 'undo_redo',
+})
+
+_COOK_TRIGGERING_TOOLS = frozenset({
+    'connect_nodes', 'set_display_flag', 'set_node_parameter',
+    'batch_set_parameters', 'execute_python', 'run_skill',
+})
+
+_COOK_BEFORE_READ_TOOLS = frozenset({
+    'get_network_structure', 'get_node_parameters', 'list_children',
+    'check_errors', 'verify_network', 'capture_viewport',
+})
+
 _DEFAULT_HISTORY_QUERY_TOOLS = frozenset({
     'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'inspect_node',
     'get_node_connections', 'suggest_connection', 'preview_node_operation', 'validate_node_network',
@@ -141,7 +179,7 @@ def build_default_tool_execution_profile() -> Dict[str, Set[str]]:
     """Return fallback runtime classifications used before registry metadata is ready."""
     return {
         "async_tools": set(_ASYNC_PREFERRED_TOOLS),
-        "batch_readonly_tools": set(_READONLY_TOOLS),
+        "batch_readonly_tools": set(_READONLY_TOOLS - _ASYNC_PREFERRED_TOOLS),
         "history_query_tools": set(_DEFAULT_HISTORY_QUERY_TOOLS),
         "compression_query_tools": set(_DEFAULT_HISTORY_QUERY_TOOLS),
         "compression_operation_tools": set(_DEFAULT_COMPRESSION_OPERATION_TOOLS),
@@ -239,9 +277,27 @@ class ToolRegistry:
                  modes: Optional[Set[str]] = None,
                  enabled: bool = True,
                  concurrency_safe: bool = False,
-                 risk_level: str = "normal"):
+                 risk_level: str = "normal",
+                 runtime: str = "houdini",
+                 mutating: bool = False,
+                 undo: bool = False,
+                 cook_triggering: bool = False,
+                 cook_before_read: bool = False,
+                 cache_invalidation: bool = False):
         """注册工具"""
+        if runtime not in {"houdini", "local"}:
+            raise ToolRegistrationError(f"Unsupported tool runtime: {runtime}")
+        schema_name = schema.get("function", {}).get("name") if isinstance(schema, dict) else None
+        if not name or schema_name != name:
+            raise ToolRegistrationError("Tool schema name must match registration name")
         with self._lock:
+            current = self._tools.get(name)
+            owner = (source, plugin_name)
+            if current and (current.source, current.plugin_name) != owner:
+                raise ToolRegistrationError(
+                    f"Tool '{name}' is already owned by "
+                    f"{current.plugin_name or current.source}; refusing owner {plugin_name or source}"
+                )
             meta = ToolMeta(
                 name=name,
                 schema=schema,
@@ -253,6 +309,12 @@ class ToolRegistry:
                 enabled=enabled and (name not in self._disabled_tools),
                 concurrency_safe=concurrency_safe,
                 risk_level=risk_level,
+                runtime=runtime,
+                mutating=mutating or ("network" in (tags or set()) and "readonly" not in (tags or set())),
+                undo=undo or ("network" in (tags or set()) and "readonly" not in (tags or set())),
+                cook_triggering=cook_triggering,
+                cook_before_read=cook_before_read,
+                cache_invalidation=cache_invalidation or ("network" in (tags or set()) and "readonly" in (tags or set())),
             )
             self._tools[name] = meta
 
@@ -273,7 +335,7 @@ class ToolRegistry:
 
     # ---------- 查询 ----------
 
-    def get_tools_for_mode(self, mode: str) -> List[dict]:
+    def get_tools_for_mode(self, mode: str, runtime: Optional[str] = None) -> List[dict]:
         """按模式获取工具 schema 列表（仅返回启用的工具）"""
         with self._lock:
             result = []
@@ -281,8 +343,19 @@ class ToolRegistry:
                 if not meta.enabled:
                     continue
                 if mode in meta.modes:
+                    if runtime is not None and meta.runtime != runtime:
+                        continue
                     result.append(meta.schema)
             return result
+
+    def get_executable_tool_names(self, mode: str, runtimes: Optional[Set[str]] = None) -> Set[str]:
+        """Return the enabled tools reachable in ``mode`` and the current runtime."""
+        allowed_runtimes = set(runtimes or {"houdini", "local"})
+        with self._lock:
+            return {
+                meta.name for meta in self._tools.values()
+                if meta.enabled and mode in meta.modes and meta.runtime in allowed_runtimes
+            }
 
     def get_tool_schemas(self, names: Optional[List[str]] = None) -> List[dict]:
         """获取指定工具的 schema 列表（如 names 为 None 则返回全部启用的）"""
@@ -304,9 +377,49 @@ class ToolRegistry:
         meta = self._tools.get(name)
         return meta.handler if meta else None
 
+    def get_handler_for_execution(self, name: str, mode: str,
+                                  runtime: str) -> Optional[Callable]:
+        """Return a handler only when every execution constraint is satisfied."""
+        with self._lock:
+            meta = self._tools.get(name)
+            if not meta or not meta.enabled or mode not in meta.modes:
+                return None
+            if meta.runtime != runtime:
+                return None
+            return meta.handler
+
+    def authorize_dispatch(self, name: str, mode: str, runtime: str) -> Dict[str, Any]:
+        """Authorize a dispatch against registration, enabled, mode and runtime facts."""
+        with self._lock:
+            meta = self._tools.get(name)
+            if meta is None:
+                return {"allowed": False, "error": f"工具未注册: {name}"}
+            if not meta.enabled:
+                return {"allowed": False, "error": f"工具已禁用: {name}"}
+            if mode not in meta.modes:
+                return {"allowed": False, "error": f"工具 {name} 不允许在 {mode} 模式执行"}
+            if meta.runtime != runtime:
+                return {"allowed": False, "error": f"工具 {name} runtime 不匹配"}
+            return {"allowed": True, "meta": meta}
+
     def get_meta(self, name: str) -> Optional[ToolMeta]:
         """获取工具的完整元数据（含 risk_level / tags / modes 等）"""
         return self._tools.get(name)
+
+    def get_tool_names_for_mode(self, mode: str, runtime: Optional[str] = None) -> Set[str]:
+        """Return enabled tool names for a mode without exposing schema internals."""
+        with self._lock:
+            return {
+                meta.name for meta in self._tools.values()
+                if meta.enabled and mode in meta.modes
+                and (runtime is None or meta.runtime == runtime)
+            }
+
+    def get_execution_semantics(self, name: str) -> Optional[Dict[str, bool]]:
+        """Return registered Houdini execution semantics, or None for unknown tools."""
+        with self._lock:
+            meta = self._tools.get(name)
+            return meta.execution_semantics() if meta is not None else None
 
     def list_all(self) -> List[Dict[str, Any]]:
         """列出所有工具元数据（供 UI 显示）"""
@@ -322,6 +435,12 @@ class ToolRegistry:
                     "enabled": meta.enabled,
                     "concurrency_safe": meta.concurrency_safe,
                     "risk_level": meta.risk_level,
+                    "runtime": meta.runtime,
+                    "mutating": meta.mutating,
+                    "undo": meta.undo,
+                    "cook_triggering": meta.cook_triggering,
+                    "cook_before_read": meta.cook_before_read,
+                    "cache_invalidation": meta.cache_invalidation,
                     "description": meta.schema.get("function", {}).get("description", "")[:120],
                 })
             return sorted(result, key=lambda x: (x["source"], x["name"]))
@@ -364,11 +483,11 @@ class ToolRegistry:
                 if readonly and not is_async:
                     dedup_tools.add(meta.name)
                     batch_readonly_tools.add(meta.name)
-                    if is_network:
+                    if meta.cache_invalidation:
                         cache_invalidate_tools.add(meta.name)
 
                 # 网络写操作会导致结构缓存失效。
-                if is_network and not readonly:
+                if meta.mutating:
                     network_mutating_tools.add(meta.name)
 
                 if meta.name in {
@@ -422,7 +541,8 @@ class ToolRegistry:
 
     # ---------- 执行 ----------
 
-    def execute(self, name: str, args: dict) -> dict:
+    def execute(self, name: str, args: dict, mode: Optional[str] = None,
+                runtime: Optional[str] = None) -> dict:
         """统一执行入口
 
         如果工具有 handler，直接调用。否则返回错误。
@@ -433,6 +553,10 @@ class ToolRegistry:
             return {"success": False, "error": f"工具未注册: {name}"}
         if not meta.enabled:
             return {"success": False, "error": f"工具已禁用: {name}"}
+        if mode is not None and mode not in meta.modes:
+            return {"success": False, "error": f"工具 {name} 不允许在 {mode} 模式执行"}
+        if runtime is not None and meta.runtime != runtime:
+            return {"success": False, "error": f"工具 {name} runtime 不匹配"}
         if not meta.handler:
             return {"success": False, "error": f"工具 {name} 无 handler（由 MCP Client 分派）"}
         try:
@@ -485,20 +609,35 @@ class ToolRegistry:
 
         handler 为 None — 核心工具由 MCP Client 通过 _TOOL_DISPATCH 分派。
         """
-        for tool_def in houdini_tools:
-            name = tool_def.get("function", {}).get("name", "")
-            if not name:
-                continue
-            self.register(
-                name=name,
-                schema=tool_def,
-                handler=None,
-                source="core",
-                tags=_infer_tags(name),
-                modes=_infer_modes(name),
-                concurrency_safe=_infer_concurrency_safe(name),
-                risk_level=_infer_risk_level(name),
-            )
+        registered_names = []
+        try:
+            for tool_def in houdini_tools:
+                name = tool_def.get("function", {}).get("name", "")
+                if not name:
+                    continue
+                self.register(
+                    name=name,
+                    schema=tool_def,
+                    handler=None,
+                    source="core",
+                    tags=_infer_tags(name),
+                    modes=_infer_modes(name),
+                    concurrency_safe=_infer_concurrency_safe(name),
+                    risk_level=_infer_risk_level(name),
+                    mutating=name in _MUTATING_TOOLS,
+                    undo=name in _MUTATING_TOOLS,
+                    cook_triggering=name in _COOK_TRIGGERING_TOOLS,
+                    cook_before_read=name in _COOK_BEFORE_READ_TOOLS,
+                    cache_invalidation=name in _READONLY_TOOLS and "network" in _infer_tags(name),
+                )
+                registered_names.append(name)
+        except Exception:
+            with self._lock:
+                for name in registered_names:
+                    meta = self._tools.get(name)
+                    if meta is not None and meta.source == "core":
+                        self._tools.pop(name, None)
+            raise
         self._initialized = True
 
     # ---------- 意图感知工具过滤 ----------

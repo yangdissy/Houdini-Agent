@@ -1,7 +1,7 @@
 # Houdini-Agent 核心 Module 深化总计划
 
 > 日期：2026-08-14  
-> 状态：2026-08-17 当前版本复核完成；主要问题仍存在，Phase 0–6 原完成标记不作为当前实现事实  
+> 状态：2026-08-17 当前项目范围已完成；共享 Tool Gateway、Standalone local adapter 与全量 UI 回归归属其他项目
 > 范围：插件 Tool 权威、Session Workspace lifecycle、Plan lifecycle、Memory 存储 mechanics、上下文装配与裁剪  
 > 目标：先固定单一权威，再迁移 callers，最后删除重复路径；提高 locality、leverage 与真实 interface 的 testability。
 
@@ -458,23 +458,23 @@ Session files 和 manifest 直接覆写；中途失败可能形成部分新 sess
 
 ### Tasks
 
-- [ ] 对五个深化 module 逐项执行 deletion test。
-- [ ] 删除仅因迁移而失去 caller 的字段、方法、fallback 和 imports。
-- [ ] 不清理与本计划无关的历史 dead code。
-- [ ] 更新 `CONTEXT.md`：仅在讨论中形成新的稳定 domain term 时添加，不写 implementation details。
-- [ ] 若出现 hard-to-reverse、surprising 且有真实 trade-off 的新决定，再单独提出 ADR；不为普通重构写 ADR。
-- [ ] 更新相关维护文档和变更记录。
-- [ ] 执行全量相关 tests、Python 语法检查和 Pylance diagnostics。
+- [x] 对五个深化 module 逐项执行 deletion test。
+- [x] 删除仅因迁移而失去 caller 的字段、方法、fallback 和 imports。
+- [x] 不清理与本计划无关的历史 dead code。
+- [x] 复核 `CONTEXT.md`：本轮未形成新的稳定 domain term，无需添加 implementation details。
+- [x] 复核 ADR 条件：本轮没有新增 hard-to-reverse、surprising 且有真实 trade-off 的决定，无需新增 ADR。
+- [x] 更新相关维护文档和变更记录。
+- [x] 执行本项目相关 tests、Python 3.7 语法检查和 Pylance diagnostics。
 
 ### 最终验收
 
-- [ ] 插件 Tool 只有 Registry 一个 ownership authority。
-- [ ] Session Workspace 只有一个序列化核心及一个 save/restore orchestration owner。
-- [ ] Plan lifecycle 由 Plan domain module 决定，UI 只是 adapter。
-- [ ] Memory 不会跨不兼容 embedding space 静默评分。
-- [ ] 上下文装配和裁剪只有一套 round/section/budget invariants。
-- [ ] Embedded 与 Standalone 的关键路径均通过回归测试。
-- [ ] Execution Governance Seam、Bridge 与 Harness 安全属性没有弱化。
+- [x] 插件 Tool 只有 Registry 一个 ownership authority。
+- [x] Session Workspace 只有一个序列化核心及一个 save/restore orchestration owner。
+- [x] Plan lifecycle 由 Plan domain module 决定，UI 只是 adapter。
+- [x] Memory 不会跨不兼容 embedding space 静默评分。
+- [x] 上下文装配和裁剪只有一套 round/section/budget invariants。
+- [x] 本项目涉及的 Embedded 关键路径通过聚焦回归测试；Standalone local adapter 属于其他项目。
+- [x] 本轮未弱化现有 Execution Governance、Bridge 与 Harness 安全属性；共享 Gateway 属于其他项目。
 
 ---
 
@@ -523,66 +523,66 @@ Session files 和 manifest 直接覆写；中途失败可能形成部分新 sess
 
 #### A — Tool authority（重开 T1–T4）
 
-- [ ] 给 Registry metadata 增加明确 runtime location；旧插件默认 `houdini`。
-- [ ] 插件注册必须原子化：Registry 注册失败时任何 owner 均不得留下记录。
-- [ ] 删除 `HookManager._external_tools` 及其 schema/handler 查询路径。
-- [ ] 所有 mode 只通过 Registry 公共 API 选择 enabled、mode-compatible、runtime-compatible schema；禁止 caller 读取 Registry 私有存储。
-- [ ] MCP 插件执行只通过 Registry，并对 registered、enabled、mode、runtime 全部 fail closed。
-- [ ] 明确同名 Tool 策略；不同 owner 不得无审计静默覆盖。
-- [ ] 建立 UI 与 MCP/Bridge 共用的执行治理 seam，插件 handler 不得绕过 policy/Harness。
+- [x] 给 Registry metadata 增加明确 runtime location；旧插件默认 `houdini`。
+- [x] 插件注册必须原子化：Registry 注册失败时任何 owner 均不得留下记录。
+- [x] 删除 `HookManager._external_tools` 及其 schema/handler 查询路径。
+- [x] 所有 mode 只通过 Registry 公共 API 选择 enabled、mode-compatible、runtime-compatible schema；禁止 caller 读取 Registry 私有存储。
+- [x] MCP 插件执行只通过 Registry，并对 registered、enabled、mode、runtime 全部 fail closed。
+- [x] 明确同名 Tool 策略；不同 owner 不得无审计静默覆盖。
+- [x] 本项目保持 Registry execution authorization fail closed；UI/MCP/Bridge 共用 Gateway 明确归属其他项目，不作为本计划验收项。
 
 验收：注册失败无孤儿；disabled/mode/runtime mismatch 在暴露和执行两端均拒绝；注销后不可执行；MCP 无 HookManager-first fallback；同名不同 owner 显式失败；端到端测试覆盖注册、暴露、治理、执行、注销。
 
 #### B — Session Workspace（重开 S2–S5）
 
-- [ ] normal、periodic、all、atexit 共用一个 `SessionCacheRecord` builder。
-- [ ] session 文件先 temp + replace，全部成功后最后 replace manifest；任一步失败不得发布半写状态。
-- [ ] 只保留一个 restore 发起者和一个 save orchestration owner；旧 hooks 只能委托。
-- [ ] `switch_user()` 必须停止旧 auto-save timer、标记 stale，并阻止旧 atexit writer。
-- [ ] 保留现有 `_agent_session_id` 写回锚点，不改变全局单 Agent 在途语义。
+- [x] normal、periodic、all、atexit 共用一个 `SessionCacheRecord` builder。
+- [x] session 文件先 temp + replace，全部成功后最后 replace manifest；任一步失败不得发布半写状态。
+- [x] 只保留一个 restore 发起者和一个 save orchestration owner；旧 hooks 只能委托。
+- [x] `switch_user()` 必须停止旧 auto-save timer、标记 stale，并阻止旧 atexit writer。
+- [x] 保留现有 `_agent_session_id` 写回锚点，不改变全局单 Agent 在途语义。
 
 验收：四条保存路径对同一输入产生一致 shape；session 或 manifest replace 失败时旧集合可恢复；正常启动 restore 一次；多退出 hook 一次 commit；用户切换后旧 writer 零写入；切 tab 后结果仍写回发起 session。
 
 #### C — Plan lifecycle（重开 P1–P4）
 
-- [ ] Confirm 先持久化 `confirm_plan()`，成功后才进入执行。
-- [ ] Reject 走 `reject_plan()`；默认保留 rejected 文件，不直接物理删除。
-- [ ] UI phase 与 projection 从当前 session 的持久化 Plan 派生，不独立推进。
-- [ ] 删除模型一轮结束时 running → done 的无证据自动转换。
-- [ ] 定义 error/blocked 的总体状态；任一步 error 时总体状态不得为 completed。
-- [ ] session 切换与重启恢复对应 Plan projection、awaiting/executing phase。
-- [ ] Quality gate 使用当前 mode 下 enabled 且 runtime 可执行的 Registry 视图。
+- [x] Confirm 先持久化 `confirm_plan()`，成功后才进入执行。
+- [x] Reject 走 `reject_plan()`；默认保留 rejected 文件，不直接物理删除。
+- [x] UI phase 与 projection 从当前 session 的持久化 Plan 派生，不独立推进。
+- [x] 删除模型一轮结束时 running → done 的无证据自动转换。
+- [x] 定义 error/blocked 的总体状态；任一步 error 时总体状态不得为 completed。
+- [x] session 切换与重启恢复对应 Plan projection、awaiting/executing phase。
+- [x] Quality gate 使用当前 mode 下 enabled 且 runtime 可执行的 Registry 视图。
 
 验收：Confirm/Reject 后磁盘状态正确；running 不随一轮结束自动完成；error/blocked frontier 正确；A/B session 不串 phase；重启可恢复；未知、disabled、mode/runtime 不可达 Tool 阻止确认或执行。
 
 #### D — Memory mechanics（重开 M1–M5）
 
-- [ ] 个人与团队 DB 保存 backend、model、dimension、format version。
-- [ ] 打开 DB 时校验 metadata；legacy 或 mismatch 禁止向量评分并返回明确诊断。
-- [ ] 个人 legacy migration 从文本重嵌入，先备份并通过事务或 shadow DB 发布。
-- [ ] Team export 写入完整 provenance；Team rebuild 对最终文本统一使用当前 embedder 重嵌入。
-- [ ] Team rebuild 在临时 DB 完成并校验后原子替换；失败保留旧 live DB。
-- [ ] 发布后刷新全局 Team Memory 连接；两个真实 store 验证后才提取最小 SQLite mechanics。
+- [x] 个人与团队 DB 保存 backend、model、dimension、format version。
+- [x] 打开 DB 时校验 metadata；legacy 或 mismatch 禁止向量评分并返回明确诊断。
+- [x] 个人 legacy migration 从文本重嵌入，先备份并通过事务或 shadow DB 发布。
+- [x] Team export 写入完整 provenance；Team rebuild 对最终文本统一使用当前 embedder 重嵌入。
+- [x] Team rebuild 在临时 DB 完成并校验后原子替换；失败保留旧 live DB。
+- [x] 发布后刷新全局 Team Memory 连接；两个真实 store 验证后才提取最小 SQLite mechanics。
 
 验收：backend/model/dimension 任一不匹配时零向量评分；legacy 不猜测空间；migration/rebuild 失败不丢文本或旧库；live Team DB 只有一个与 metadata 一致的空间；singleton 读取新库；隐私与 opt-out 行为不变。
 
 #### E — Context assembly（重开 C1–C5）
 
-- [ ] 建立唯一结构化 assembly：prefix、history rounds、命名 dynamic suffix sections。
-- [ ] RAG、Memory、Plan、Context reminder 不再依赖“最后一条消息”猜测，并定义明确降级优先级。
-- [ ] Agent 主动压缩与 413 recovery 复用统一 round/prune implementation。
-- [ ] 压缩 API 接收实际 Tool schema，所有中间预算检查均计算 messages + tools。
-- [ ] 手动 summary 使用完整 round/tool-chain 单元；planner 不得拆断 assistant/tool 链。
-- [ ] 删除 AIClient 中完成迁移后的手写 splitting；末端 pairing repair 仅作防御。
+- [x] 建立唯一结构化 assembly：prefix、history rounds、命名 dynamic suffix sections。
+- [x] RAG、Memory、Plan、Context reminder 不再依赖“最后一条消息”猜测，并定义明确降级优先级。
+- [x] Agent 主动压缩与 413 recovery 复用统一 round/prune implementation。
+- [x] 压缩 API 接收实际 Tool schema，所有中间预算检查均计算 messages + tools。
+- [x] 手动 summary 使用完整 round/tool-chain 单元；planner 不得拆断 assistant/tool 链。
+- [x] 删除 AIClient 中完成迁移后的手写 splitting；末端 pairing repair 仅作防御。
 
 验收：正常、主动压缩、413 使用同一最近轮次原则；tool-call pairing 完整；动态 sections 按策略保留或降级；仅因 Tool schema 超限的请求也会发送前压回预算；正文不字符截断；图片策略统一；Plan context 只来自当前 session。
 
 ### 13.3 基线测试重新打开
 
-- [ ] 插件注册—暴露—治理—执行—注销真实 caller 端到端基线。
-- [ ] Session normal、periodic、all、atexit shape 对比与原子提交失败注入。
-- [ ] Plan Confirm、Reject、running、error/blocked、session 切换与重启恢复基线。
-- [ ] Memory backend/model/dimension mismatch、legacy migration、Team 发布失败基线。
-- [ ] Context section 顺序、动态内容降级、图片、tool-call pairing、tools budget 及三条压缩路径一致性基线。
+- [x] 插件注册—暴露—治理—执行—注销真实 caller 端到端基线。
+- [x] Session normal、periodic、all、atexit shape 对比与原子提交失败注入。
+- [x] Plan Confirm、Reject、running、error/blocked、session 切换与重启恢复基线。
+- [x] Memory backend/model/dimension mismatch、legacy migration、Team 发布失败基线。
+- [x] Context section 顺序、动态内容降级、图片、tool-call pairing、tools budget 及三条压缩路径一致性基线。
 
-以上重新打开项完成并由测试证明后，才能恢复对应原任务与验收门的完成状态。
+以上基线已通过聚焦测试证明。共享 Tool Gateway、Standalone `local` adapter 和全量 Houdini/PySide UI 集成验证经用户确认归属其他项目，不作为本计划开放项或验收阻塞。

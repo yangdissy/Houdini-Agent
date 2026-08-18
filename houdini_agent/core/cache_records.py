@@ -98,3 +98,23 @@ class SessionCacheRecord:
         if self.todo_summary is not None:
             cache_data['todo_summary'] = self.todo_summary
         return cache_data
+
+
+def build_session_cache_record(
+    session_id: str,
+    session_data: Dict[str, Any],
+    todo_data: Optional[List[Dict[str, Any]]] = None,
+    estimated_tokens: Optional[int] = None,
+    todo_summary: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build the canonical on-disk record used by every session save path."""
+    return SessionCacheRecord(
+        session_id=session_id,
+        created_at=session_data.get('created_at') or datetime.now().isoformat(),
+        conversation_history=session_data.get('conversation_history', []),
+        context_summary=session_data.get('context_summary', ''),
+        todo_data=todo_data or [],
+        token_stats=session_data.get('token_stats') or DEFAULT_TOKEN_STATS.copy(),
+        estimated_tokens=estimated_tokens,
+        todo_summary=todo_summary,
+    ).to_cache_data()

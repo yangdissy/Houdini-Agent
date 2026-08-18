@@ -25,7 +25,6 @@ from .harness_policy_config import (
     PLAN_SILENT_TOOLS,
     PLAN_EXECUTION_EXTRA_TOOLS,
 )
-from ..utils.tool_registry import _ASK_TOOLS, _PLAN_PLANNING_TOOLS
 
 
 class AgentRunnerMixin:
@@ -37,8 +36,6 @@ class AgentRunnerMixin:
     _SILENT_TOOLS = SILENT_TOOLS
     _PLAN_SILENT_TOOLS = PLAN_SILENT_TOOLS
     _PLAN_EXECUTION_EXTRA_TOOLS = PLAN_EXECUTION_EXTRA_TOOLS
-    _PLAN_PLANNING_TOOLS = _PLAN_PLANNING_TOOLS
-    _ASK_MODE_TOOLS = _ASK_TOOLS
 
     # ---------- 自动 AI 标题生成 ----------
 

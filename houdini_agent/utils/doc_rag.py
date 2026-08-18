@@ -14,11 +14,12 @@ Houdini 文档轻量级索引系统（重写版）
 import os
 import re
 import json
-import zipfile
 import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Set, Tuple
 from dataclasses import dataclass
+
+from .help_source import HELP_ZIPS, find_help_dir, iter_pages, parse_wiki
 
 
 # ============================================================
@@ -75,8 +76,11 @@ class HoudiniDocIndex:
 
     _CTX_PRIORITY = {"sop": 0, "obj": 1, "dop": 2, "cop2": 3}
 
-    def __init__(self, help_dir: Optional[str] = None):
-        self._help_dir = self._resolve_help_dir(help_dir)
+    def __init__(self, help_dir: Optional[str] = None,
+                 cache_dir: Optional[str] = None,
+                 doc_dir: Optional[str] = None,
+                 load_knowledge: bool = True):
+        self._help_dir = find_help_dir(help_dir)
 
         # 三大索引
         self.node_index: Dict[str, NodeDoc] = {}
@@ -100,76 +104,37 @@ class HoudiniDocIndex:
 
         # 缓存
         project_root = Path(__file__).parent.parent.parent
-        self._cache_dir = project_root / "cache" / "doc_index"
+        self._cache_dir = Path(cache_dir) if cache_dir is not None else project_root / "cache" / "doc_index"
         self._cache_dir.mkdir(parents=True, exist_ok=True)
-        self._doc_dir = project_root / "Doc"
+        self._doc_dir = Path(doc_dir) if doc_dir is not None else project_root / "Doc"
 
         self._load_or_build()
-        self._load_knowledge_base()
-
-    # ==========================================================
-    # 帮助目录发现
-    # ==========================================================
-
-    @staticmethod
-    def _resolve_help_dir(help_dir: Optional[str]) -> Optional[Path]:
-        """自动发现文档目录（含 ZIP 文件）
-
-        查找顺序：
-        1. 显式传入的路径
-        2. 项目内置 Doc/ 目录（随项目分发，确保任何电脑可用）
-        3. 环境变量 HFS / hou 模块
-        4. 常见 Windows 安装路径
-        """
-        REQUIRED_ZIPS = ("nodes.zip", "vex.zip", "hom.zip")
-
-        def _has_zips(d: Path) -> bool:
-            return d.is_dir() and any((d / z).exists() for z in REQUIRED_ZIPS)
-
-        # 0. 显式路径
-        if help_dir:
-            p = Path(help_dir)
-            if _has_zips(p):
-                return p
-
-        # 1. 项目内置 Doc/ 目录（优先——保证跨机器可用）
-        project_root = Path(__file__).parent.parent.parent
-        bundled = project_root / "Doc"
-        if _has_zips(bundled):
-            return bundled
-
-        # 2. 环境变量 HFS（Houdini 标准）
-        hfs = os.environ.get("HFS")
-        if hfs:
-            p = Path(hfs) / "houdini" / "help"
-            if _has_zips(p):
-                return p
-
-        # 3. hou 模块获取
-        try:
-            import hou  # type: ignore
-            hfs_val = hou.getenv("HFS", "")
-            if hfs_val:
-                p = Path(hfs_val) / "houdini" / "help"
-                if _has_zips(p):
-                    return p
-        except Exception:
-            pass
-
-        # 4. 常见 Windows 安装路径
-        for drive in ("C", "D", "E"):
-            base = Path(f"{drive}:/Program Files/Side Effects Software")
-            if base.is_dir():
-                for v in sorted(base.glob("Houdini*"), reverse=True):
-                    p = v / "houdini" / "help"
-                    if _has_zips(p):
-                        return p
-
-        return None
+        if load_knowledge:
+            self._load_knowledge_base()
 
     # ==========================================================
     # 索引加载 / 构建 / 缓存
     # ==========================================================
+
+    def _zip_fingerprints(self) -> Dict[str, Dict[str, float]]:
+        """构建 help ZIP 指纹：mtime + size（zip 缺失时记录 exists=False）。
+
+        用于检测同路径下 ZIP 内容变化（Houdini 升级、刷新 Doc/*.zip），
+        避免缓存无限期服务过期索引。
+        """
+        fps: Dict[str, Dict[str, float]] = {}
+        for name in HELP_ZIPS:
+            zp = self._help_dir / name if self._help_dir else None
+            if zp is not None and zp.exists():
+                st = zp.stat()
+                fps[name] = {
+                    "exists": True,
+                    "mtime": round(float(st.st_mtime), 6),
+                    "size": float(st.st_size),
+                }
+            else:
+                fps[name] = {"exists": False}
+        return fps
 
     def _load_or_build(self):
         cache_file = self._cache_dir / "houdini_doc_index.json"
@@ -182,7 +147,8 @@ class HoudiniDocIndex:
                 cached_help_dir = data.get("help_dir")
                 if (self._help_dir is not None
                         and cached_help_dir == str(self._help_dir)
-                        and data.get("version") == 2):
+                        and data.get("version") == 2
+                        and data.get("zip_fingerprints") == self._zip_fingerprints()):
                     self._load_from_cache(data)
                     print(f"[DocIndex] 缓存加载: {len(self.node_index)} 节点, "
                           f"{len(self.vex_index)} VEX, {len(self.hom_index)} HOM")
@@ -543,6 +509,7 @@ class HoudiniDocIndex:
             # help_dir 为 None 时存空字符串，避免 "None" 字符串导致缓存判断失效
             "help_dir": str(self._help_dir) if self._help_dir is not None else "",
             "version": 2,
+            "zip_fingerprints": self._zip_fingerprints(),
             "nodes": {
                 k: {"node_type": v.node_type, "context": v.context,
                      "title": v.title, "description": v.description,
@@ -581,163 +548,49 @@ class HoudiniDocIndex:
         self._build_aliases()
 
     # ==========================================================
-    # Wiki 格式解析器
-    # ==========================================================
-
-    @staticmethod
-    def _parse_wiki(text: str) -> dict:
-        """解析 Houdini wiki 标记格式文档
-
-        格式概要::
-
-            = Title =
-            #type: homclass
-            #context: sop
-            #internal: nodename
-
-            \\"\\"\\"Brief description\\"\\"\\"
-
-            Body text ...
-
-            @parameters
-            Param Name:
-                Description
-
-            @methods
-            ::`methodName(args)`:
-                Description
-        """
-        doc: Dict[str, Any] = {
-            "title": "", "type": "", "context": "", "internal": "",
-            "description": "", "body": "", "sections": {},
-        }
-
-        lines = text.split("\n")
-        i, n = 0, len(lines)
-
-        # 跳过空行
-        while i < n and not lines[i].strip():
-            i += 1
-
-        # = Title =
-        if i < n:
-            m = re.match(r"^=\s+(.+?)\s+=\s*$", lines[i])
-            if m:
-                doc["title"] = m.group(1).strip()
-                i += 1
-
-        # #key: value 元数据
-        while i < n:
-            line = lines[i].strip()
-            if not line:
-                i += 1
-                continue
-            m = re.match(r"^#(\w+):\s*(.*)", line)
-            if m:
-                key, val = m.group(1).lower(), m.group(2).strip()
-                if key in doc:
-                    doc[key] = val
-                i += 1
-            else:
-                break
-
-        # """description"""
-        while i < n and not lines[i].strip():
-            i += 1
-        if i < n and lines[i].strip().startswith('"""'):
-            dl = lines[i].strip()
-            if dl.endswith('"""') and len(dl) > 6:
-                doc["description"] = dl[3:-3].strip()
-                i += 1
-            else:
-                parts = [dl[3:]]
-                i += 1
-                while i < n:
-                    if '"""' in lines[i]:
-                        parts.append(lines[i].split('"""')[0])
-                        i += 1
-                        break
-                    parts.append(lines[i])
-                    i += 1
-                doc["description"] = "\n".join(parts).strip()
-
-        # Body + @sections
-        cur_sec = "_body"
-        buf: List[str] = []
-        while i < n:
-            line = lines[i]
-            s = line.strip()
-            if s.startswith("@") and len(s) > 1 and s[1:].split()[0].isalpha():
-                # 保存上一段
-                text_block = "\n".join(buf).strip()
-                if text_block:
-                    if cur_sec == "_body":
-                        doc["body"] = text_block
-                    else:
-                        doc["sections"][cur_sec] = text_block
-                cur_sec = s[1:].split()[0]
-                buf = []
-            else:
-                buf.append(line)
-            i += 1
-
-        text_block = "\n".join(buf).strip()
-        if text_block:
-            if cur_sec == "_body":
-                doc["body"] = text_block
-            else:
-                doc["sections"][cur_sec] = text_block
-
-        return doc
-
-    # ==========================================================
     # 节点索引  (nodes.zip)
     # ==========================================================
 
     def _build_node_index(self, zip_path: Path):
         count = 0
         try:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                for name in zf.namelist():
-                    if not name.endswith(".txt") or "/_" in name or name.startswith("_"):
+            for name, raw in iter_pages(zip_path):
+                try:
+                    doc = parse_wiki(raw)
+
+                    internal = doc.get("internal", "")
+                    context = doc.get("context", "")
+                    if not internal:
+                        parts = name.replace("\\", "/").split("/")
+                        internal = Path(parts[-1]).stem
+                        if not context and len(parts) >= 3:
+                            context = parts[-2] if parts[-2] != "nodes" else ""
+                    if not internal:
                         continue
-                    try:
-                        raw = zf.read(name).decode("utf-8", errors="ignore")
-                        doc = self._parse_wiki(raw)
 
-                        internal = doc.get("internal", "")
-                        context = doc.get("context", "")
-                        if not internal:
-                            parts = name.replace("\\", "/").split("/")
-                            internal = Path(parts[-1]).stem
-                            if not context and len(parts) >= 3:
-                                context = parts[-2] if parts[-2] != "nodes" else ""
-                        if not internal:
-                            continue
+                    params = self._parse_parameters(
+                        doc.get("sections", {}).get("parameters", "")
+                    )
 
-                        params = self._parse_parameters(
-                            doc.get("sections", {}).get("parameters", "")
-                        )
-
-                        nd = NodeDoc(
-                            node_type=internal,
-                            context=context,
-                            title=doc.get("title", internal),
-                            description=doc.get("description", "")[:300],
-                            parameters=params[:15],
-                        )
-                        # 短名(无context前缀)优先 SOP > OBJ > DOP > 其他
-                        existing = self.node_index.get(internal)
-                        if existing is None or (
-                            self._CTX_PRIORITY.get(context, 99) <
-                            self._CTX_PRIORITY.get(existing.context, 99)
-                        ):
-                            self.node_index[internal] = nd
-                        if context:
-                            self.node_index[f"{context}/{internal}"] = nd
-                        count += 1
-                    except Exception:
-                        continue
+                    nd = NodeDoc(
+                        node_type=internal,
+                        context=context,
+                        title=doc.get("title", internal),
+                        description=doc.get("description", "")[:300],
+                        parameters=params[:15],
+                    )
+                    # 短名(无context前缀)优先 SOP > OBJ > DOP > 其他
+                    existing = self.node_index.get(internal)
+                    if existing is None or (
+                        self._CTX_PRIORITY.get(context, 99) <
+                        self._CTX_PRIORITY.get(existing.context, 99)
+                    ):
+                        self.node_index[internal] = nd
+                    if context:
+                        self.node_index[f"{context}/{internal}"] = nd
+                    count += 1
+                except Exception:
+                    continue
         except Exception as e:
             print(f"[DocIndex] nodes.zip 失败: {e}")
         print(f"[DocIndex]   -> {count} 节点文档")
@@ -749,39 +602,37 @@ class HoudiniDocIndex:
     def _build_vex_index(self, zip_path: Path):
         count = 0
         try:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                for name in zf.namelist():
-                    if not name.endswith(".txt") or "/_" in name:
+            # 保持与原实现一致：vex/hom 不跳过 "_" 开头文件，
+            # 由 builder 自身的 func_name 后过滤处理。
+            for name, raw in iter_pages(zip_path, skip_underscore=False):
+                try:
+                    doc = parse_wiki(raw)
+                    func_name = doc.get("internal", "") or Path(name).stem
+                    if not func_name or func_name.startswith("_"):
                         continue
-                    try:
-                        raw = zf.read(name).decode("utf-8", errors="ignore")
-                        doc = self._parse_wiki(raw)
-                        func_name = doc.get("internal", "") or Path(name).stem
-                        if not func_name or func_name.startswith("_"):
-                            continue
 
-                        # 从 body / usage section 提取签名
-                        sig_src = (doc.get("body", "") + "\n"
-                                   + doc.get("sections", {}).get("usage", ""))
-                        sig = ""
-                        sig_m = re.search(r"`([^`]+)`", sig_src)
-                        if sig_m:
-                            sig = sig_m.group(1)
+                    # 从 body / usage section 提取签名
+                    sig_src = (doc.get("body", "") + "\n"
+                               + doc.get("sections", {}).get("usage", ""))
+                    sig = ""
+                    sig_m = re.search(r"`([^`]+)`", sig_src)
+                    if sig_m:
+                        sig = sig_m.group(1)
 
-                        parts = name.replace("\\", "/").split("/")
-                        cat = parts[-2] if len(parts) >= 2 and parts[-2] != "vex" else ""
+                    parts = name.replace("\\", "/").split("/")
+                    cat = parts[-2] if len(parts) >= 2 and parts[-2] != "vex" else ""
 
-                        self.vex_index[func_name] = VexDoc(
-                            name=func_name,
-                            signature=sig[:200],
-                            description=doc.get("description", "")[:200],
-                            category=cat,
-                        )
-                        if cat:
-                            self._vex_categories.setdefault(cat, []).append(func_name)
-                        count += 1
-                    except Exception:
-                        continue
+                    self.vex_index[func_name] = VexDoc(
+                        name=func_name,
+                        signature=sig[:200],
+                        description=doc.get("description", "")[:200],
+                        category=cat,
+                    )
+                    if cat:
+                        self._vex_categories.setdefault(cat, []).append(func_name)
+                    count += 1
+                except Exception:
+                    continue
         except Exception as e:
             print(f"[DocIndex] vex.zip 失败: {e}")
         print(f"[DocIndex]   → {count} VEX 函数")
@@ -793,32 +644,29 @@ class HoudiniDocIndex:
     def _build_hom_index(self, zip_path: Path):
         count = 0
         try:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                for name in zf.namelist():
-                    if not name.endswith(".txt") or "/_" in name:
-                        continue
-                    try:
-                        raw = zf.read(name).decode("utf-8", errors="ignore")
-                        doc = self._parse_wiki(raw)
-                        title = doc.get("title", "")
-                        if not title:
-                            title = "hou." + Path(name).stem
+            # 同 vex：不跳过 "_" 开头文件（如 _hhp.txt），与原实现一致。
+            for name, raw in iter_pages(zip_path, skip_underscore=False):
+                try:
+                    doc = parse_wiki(raw)
+                    title = doc.get("title", "")
+                    if not title:
+                        title = "hou." + Path(name).stem
 
-                        # 主条目
-                        self.hom_index[title] = HomDoc(
-                            name=title,
-                            doc_type=doc.get("type", "") or "class",
-                            signature="",
-                            description=doc.get("description", "")[:300],
-                        )
-                        count += 1
+                    # 主条目
+                    self.hom_index[title] = HomDoc(
+                        name=title,
+                        doc_type=doc.get("type", "") or "class",
+                        signature="",
+                        description=doc.get("description", "")[:300],
+                    )
+                    count += 1
 
-                        # 提取方法
-                        methods_text = doc.get("sections", {}).get("methods", "")
-                        if methods_text:
-                            count += self._extract_hom_methods(title, methods_text)
-                    except Exception:
-                        continue
+                    # 提取方法
+                    methods_text = doc.get("sections", {}).get("methods", "")
+                    if methods_text:
+                        count += self._extract_hom_methods(title, methods_text)
+                except Exception:
+                    continue
         except Exception as e:
             print(f"[DocIndex] hom.zip 失败: {e}")
         print(f"[DocIndex]   → {count} HOM 条目")

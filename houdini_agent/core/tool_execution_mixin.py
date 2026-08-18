@@ -9,11 +9,27 @@ import traceback
 
 from houdini_agent.qt_compat import QtCore, QtWidgets
 from houdini_agent.ui.i18n import tr
-from houdini_agent.core.harness_engine import build_tool_retry_key, sanitize_tool_result
+from houdini_agent.core.harness_engine import GovernedToolExecutor
 from houdini_agent.core.houdini_main_thread_executor import OPERATION_ID_KEY
 
 
 class ToolExecutionMixin:
+    def _registry_execution_mode(self) -> str:
+        if self._plan_mode:
+            return "plan_planning" if self._plan_phase == "planning" else "plan_executing"
+        return "agent" if self._agent_mode else "ask"
+
+    def _authorize_registry_dispatch(self, tool_name: str, runtime: str = "houdini") -> dict:
+        if tool_name == "scene_info":
+            return {"allowed": True}
+        try:
+            from ..utils.tool_registry import get_tool_registry
+            return get_tool_registry().authorize_dispatch(
+                tool_name, self._registry_execution_mode(), runtime
+            )
+        except Exception as exc:
+            return {"allowed": False, "error": f"Tool Registry unavailable: {exc}"}
+
     def _capture_pre_agent_update_mode(self):
         """记录本轮 Agent 启动前的 Houdini update mode。
 
@@ -228,165 +244,42 @@ class ToolExecutionMixin:
             self._pre_agent_update_mode = None
 
     def _execute_tool_with_policy(self, tool_name: str, kwargs: dict) -> dict:
-        """Harness V2 policy gate for tool execution.
-
-        This wrapper is intentionally thin and delegates real execution to the
-        existing implementation so behavior can be migrated incrementally.
-        """
+        """Execute one tool through the shared governed execution owner."""
         mode = 'plan' if self._plan_mode else ('agent' if self._agent_mode else 'ask')
         context = {
             'mode': mode,
             'plan_phase': self._plan_phase,
             'confirm_mode': bool(getattr(self, '_confirm_mode', False)),
         }
-        decision = self._tool_policy_engine.decide(tool_name, kwargs, context)
-        self._append_policy_timeline(tool_name, decision.action, decision.reason)
+        retry_counts = self._harness_state.policy_retry_counts if self._harness_state else {}
 
-        if self._harness_state:
-            self._harness_state.add_trace(
-                'tool_policy',
-                tool=tool_name,
-                action=decision.action,
-                reason=decision.reason,
-            )
-
-        if decision.action == 'deny':
-            self._addStatus.emit(f"恢复建议: {tool_name} 被策略拒绝，可切到 Plan 或启用 Confirm")
-            return {
-                'success': False,
-                'error': decision.reason or f'Tool blocked by policy: {tool_name}',
-            }
-
-        exec_kwargs = decision.patched_args if decision.patched_args is not None else kwargs
-
-        if decision.action == 'ask':
-            confirmed = self._request_tool_confirmation(tool_name, exec_kwargs)
-            if self._harness_state:
-                self._harness_state.add_trace(
-                    'tool_policy_ask',
-                    tool=tool_name,
-                    confirmed=bool(confirmed),
-                )
-            if not confirmed:
-                self._append_policy_timeline(tool_name, 'ask_cancel', decision.reason)
-                return {
-                    'success': False,
-                    'error': decision.reason or tr('ask.user_cancel', tool_name),
-                }
-
-            self._append_session_diagnostics_records([
-                {
-                    'event_type': 'tool_call',
-                    'phase': 'start',
-                    'tool': tool_name,
-                    'action': decision.action,
-                    'mode': mode,
-                    'args_keys': sorted(list(exec_kwargs.keys())),
-                }
-            ])
-            started_at = time.time()
-            result = self._execute_tool_impl(
-                tool_name,
-                exec_kwargs,
-                skip_builtin_confirm=True,
-            )
-            result = sanitize_tool_result(result)
-            result = self._apply_geometry_validation_loop_guard(tool_name, exec_kwargs, result, mode)
-            self._after_tool_result(tool_name, result)
-            self._append_session_diagnostics_records([
-                {
-                    'event_type': 'tool_call',
-                    'phase': 'result',
-                    'tool': tool_name,
-                    'action': decision.action,
-                    'mode': mode,
-                    'success': bool(result.get('success')),
-                    'error': str(result.get('error', '')) if not result.get('success') else '',
-                    'duration_ms': int(max(0.0, time.time() - started_at) * 1000),
-                }
-            ])
+        def execute(name, args, confirmed):
+            result = self._execute_tool_impl(name, args, skip_builtin_confirm=confirmed)
+            result = self._apply_geometry_validation_loop_guard(name, args, result, mode)
+            self._after_tool_result(name, result)
             return result
 
-        if decision.action == 'retry':
-            retry_key = decision.retry_key or build_tool_retry_key(tool_name, exec_kwargs)
-            current_retry = self._harness_state.policy_retry_counts.get(retry_key, 0) if self._harness_state else 0
-            if current_retry >= self._policy_retry_limit:
-                self._append_policy_timeline(tool_name, 'retry_limit', f"limit={self._policy_retry_limit}")
-                self._append_session_diagnostics_records([
-                    {
-                        'event_type': 'policy_retry',
-                        'tool': tool_name,
-                        'action': 'retry_limit',
-                        'retry_key': retry_key,
-                        'retry_count': current_retry,
-                        'retry_limit': self._policy_retry_limit,
-                    }
-                ])
-                self._addStatus.emit(f"恢复建议: {tool_name} 达到重试上限，建议切 Ask 排查参数")
-                return {
-                    'success': False,
-                    'error': (
-                        f"Tool retry limit reached for {tool_name} "
-                        f"({self._policy_retry_limit}/{self._policy_retry_limit})."
-                    ),
-                }
+        def audit(record):
+            self._append_session_diagnostics_records([record])
+
+        def trace(event, **fields):
             if self._harness_state:
-                self._harness_state.policy_retry_counts[retry_key] = current_retry + 1
-                self._harness_state.retries += 1
-            self._append_session_diagnostics_records([
-                {
-                    'event_type': 'policy_retry',
-                    'tool': tool_name,
-                    'action': 'retry',
-                    'retry_key': retry_key,
-                    'retry_count': current_retry + 1,
-                    'retry_limit': self._policy_retry_limit,
-                    'mode': mode,
-                }
-            ])
+                self._harness_state.add_trace(event, **fields)
+            if event == 'tool_policy':
+                self._append_policy_timeline(tool_name, fields.get('action', ''), fields.get('reason', ''))
 
-        if decision.action not in {'allow', 'retry'}:
-            return {
-                'success': False,
-                'error': f"Unsupported policy action: {decision.action}",
-            }
-
-        started_at = time.time()
-        self._append_session_diagnostics_records([
-            {
-                'event_type': 'tool_call',
-                'phase': 'start',
-                'tool': tool_name,
-                'action': decision.action,
-                'mode': mode,
-                'args_keys': sorted(list(exec_kwargs.keys())),
-            }
-        ])
-        result = self._execute_tool_impl(tool_name, exec_kwargs)
-        result = sanitize_tool_result(result)
-        result = self._apply_geometry_validation_loop_guard(tool_name, exec_kwargs, result, mode)
-        self._after_tool_result(tool_name, result)
-        self._append_session_diagnostics_records([
-            {
-                'event_type': 'tool_call',
-                'phase': 'result',
-                'tool': tool_name,
-                'action': decision.action,
-                'mode': mode,
-                'success': bool(result.get('success')),
-                'error': str(result.get('error', '')) if not result.get('success') else '',
-                'duration_ms': int(max(0.0, time.time() - started_at) * 1000),
-            }
-        ])
-
-        if decision.action == 'retry' and self._harness_state and result.get('success'):
-            retry_key = decision.retry_key or build_tool_retry_key(tool_name, exec_kwargs)
-            self._harness_state.policy_retry_counts.pop(retry_key, None)
-
+        owner = GovernedToolExecutor(
+            self._tool_policy_engine,
+            execute,
+            confirm=self._request_tool_confirmation,
+            audit=audit,
+            trace=trace,
+            retry_counts=retry_counts,
+            retry_limit=self._policy_retry_limit,
+        )
+        result = owner.execute(tool_name, kwargs, context)
         if not result.get('success'):
-            self._append_policy_timeline(tool_name, 'exec_fail', str(result.get('error', '')))
-            self._addStatus.emit(f"恢复建议: {tool_name} 失败，可打开 Policy 时间线查看并切换 Plan/Ask")
-
+            self._addStatus.emit(f"恢复建议: {tool_name} 被拒绝或执行失败，可打开 Policy 时间线排查")
         return result
 
     def _execute_tool_with_todo(self, tool_name: str, **kwargs) -> dict:
@@ -426,6 +319,10 @@ class ToolExecutionMixin:
         """Execute a tool after the public harness/policy boundary has run."""
         kwargs = dict(kwargs or {})
 
+        authorization = self._authorize_registry_dispatch(tool_name, "houdini")
+        if not authorization.get("allowed"):
+            return {"success": False, "error": authorization.get("error", "Tool dispatch denied")}
+
         # ★ Stop 检测：用户请求停止时立即返回，不再排队新工具
         if self.client.is_stop_requested():
             return {"success": False, "error": "用户已请求停止"}
@@ -441,16 +338,12 @@ class ToolExecutionMixin:
                 }
         
         # ★ Ask 模式安全守卫：拦截任何不在白名单的工具
-        if not self._agent_mode and not self._plan_mode and tool_name not in self._ASK_MODE_TOOLS:
-            # 额外检查 ToolRegistry（插件/Skill 工具可能注册了 ask 模式）
-            _ask_allowed = False
+        if not self._agent_mode and not self._plan_mode:
             try:
                 from ..utils.tool_registry import get_tool_registry
-                _meta = get_tool_registry()._tools.get(tool_name)
-                if _meta and _meta.enabled and "ask" in _meta.modes:
-                    _ask_allowed = True
+                _ask_allowed = get_tool_registry().is_tool_allowed_in_mode(tool_name, "ask")
             except Exception:
-                pass
+                _ask_allowed = False
             if not _ask_allowed:
                 return {
                     "success": False,
@@ -471,22 +364,18 @@ class ToolExecutionMixin:
                                   f"仅可运行只读 skill（如 get_node_card、analyze_*、inspect_*）辅助设计计划")
                     }
             else:
-                allowed = self._PLAN_PLANNING_TOOLS | {'create_plan'}
-                if tool_name not in allowed:
-                    # 额外检查 ToolRegistry（插件/Skill 工具可能注册了 plan_planning 模式）
+                try:
+                    from ..utils.tool_registry import get_tool_registry
+                    _plan_allowed = get_tool_registry().is_tool_allowed_in_mode(
+                        tool_name, "plan_planning"
+                    )
+                except Exception:
                     _plan_allowed = False
-                    try:
-                        from ..utils.tool_registry import get_tool_registry
-                        _meta = get_tool_registry()._tools.get(tool_name)
-                        if _meta and _meta.enabled and "plan_planning" in _meta.modes:
-                            _plan_allowed = True
-                    except Exception:
-                        pass
-                    if not _plan_allowed:
-                        return {
-                            "success": False,
-                            "error": f"Plan 规划阶段不允许执行 {tool_name}，只能使用查询工具和 create_plan"
-                        }
+                if not _plan_allowed:
+                    return {
+                        "success": False,
+                        "error": f"Plan 规划阶段不允许执行 {tool_name}，只能使用查询工具和 create_plan"
+                    }
 
         
         # ★ 确认模式：对关键节点操作弹出预览确认
@@ -541,7 +430,7 @@ class ToolExecutionMixin:
         仅用于不依赖 hou 模块的工具，如 execute_shell、search_local_doc 等。
         """
         try:
-            return self.mcp.execute_tool(tool_name, kwargs)
+            return self.mcp.execute_tool(tool_name, kwargs, mode=self._registry_execution_mode())
         except Exception as e:
             import traceback
             return {"success": False, "error": tr('ai.bg_exec_err', f"{e}\n{traceback.format_exc()[:300]}")}
@@ -574,17 +463,12 @@ class ToolExecutionMixin:
         Returns:
             [result_dict, ...]（与 batch 顺序一致）
         """
-        executor = getattr(self, '_houdini_main_thread_executor', None)
-        if executor is not None:
-            results = executor.execute_batch(batch)
-            if executor.is_blocked():
-                self._main_thread_busy = True
-            return results
-
-        return [
-            {"success": False, "error": "Houdini 主线程执行器不可用，拒绝执行 batch"}
-            for _ in batch
-        ]
+        if getattr(self, '_houdini_main_thread_executor', None) is None:
+            return [
+                {"success": False, "error": "Houdini 主线程执行器不可用，拒绝执行 batch"}
+                for _ in batch
+            ]
+        return [self._execute_tool_with_todo(tool_name, **dict(kwargs or {})) for tool_name, kwargs in batch]
 
     def _on_execute_tool_batch_main_thread(self, batch: list):
         """在主线程批量执行只读工具的槽函数
@@ -603,14 +487,22 @@ class ToolExecutionMixin:
             request_batch.append((tool_name, request_kwargs))
 
         # ★ 读取前 Cook（v1.4.4）：批量读取也需要确保数据新鲜
-        needs_cook = any(tn in self._COOK_BEFORE_READ_TOOLS for tn, _ in request_batch)
+        try:
+            from ..utils.tool_registry import get_tool_registry
+            registry = get_tool_registry()
+            needs_cook = any(
+                bool((registry.get_execution_semantics(tn) or {}).get("cook_before_read"))
+                for tn, _ in request_batch
+            )
+        except Exception:
+            needs_cook = False
         if needs_cook:
             self._cook_displayed_nodes_if_manual()
         
         results = []
         for tool_name, kwargs in request_batch:
             try:
-                result = self.mcp.execute_tool(tool_name, kwargs)
+                result = self.mcp.execute_tool(tool_name, kwargs, mode=self._registry_execution_mode())
             except Exception as e:
                 result = {"success": False, "error": str(e)}
             results.append(result)
@@ -712,24 +604,6 @@ class ToolExecutionMixin:
             return None
         return {'created': created, 'deleted': deleted}
 
-    # ★ 会触发 Houdini cook 的工具集合
-    # 这些工具执行时可能导致耗时的场景计算，需要特殊保护
-    # 注意：create_node/create_nodes_batch/create_wrangle_node 已使用 run_init_scripts=False
-    # 不会在节点创建时触发 cook，因此不需要 Manual 模式保护
-    _COOK_TRIGGERING_TOOLS = frozenset({
-        'connect_nodes', 'set_display_flag', 'set_node_parameter',
-        'batch_set_parameters', 'execute_python', 'run_skill',
-    })
-
-    # ★ 需要在 Manual 保护模式下做针对性 cook 的读取工具
-    # 这些工具需要读取节点最新计算结果（几何体、错误状态等），
-    # 如果不 cook，AI 会看到 stale 数据从而误判操作结果
-    _COOK_BEFORE_READ_TOOLS = frozenset({
-        'get_network_structure', 'get_node_parameters', 'list_children',
-        'check_errors', 'verify_network',
-        'capture_viewport',  # 截图前需确保几何体已 cook
-    })
-
     @QtCore.Slot(str, dict)
     def _on_execute_tool_main_thread(self, tool_name: str, kwargs: dict):
         """在主线程执行工具（槽函数）
@@ -758,10 +632,13 @@ class ToolExecutionMixin:
         if executor is not None:
             kwargs = dict(kwargs or {})
             operation_id = kwargs.pop('_ha_operation_id', None)
+            execute_tool = lambda name, args: self.mcp.execute_tool(
+                name, args, mode=self._registry_execution_mode()
+            )
             result = executor.run_in_main_thread(
                 tool_name=tool_name,
                 kwargs=kwargs,
-                execute_tool=self.mcp.execute_tool,
+                execute_tool=execute_tool,
                 cook_before_read=self._cook_displayed_nodes_if_manual,
                 snapshot_network_children=self._snapshot_network_children,
                 diff_network_children=self._diff_network_children,
@@ -771,7 +648,9 @@ class ToolExecutionMixin:
             )
         else:
             try:
-                result = self.mcp.execute_tool(tool_name, kwargs)
+                result = self.mcp.execute_tool(
+                    tool_name, kwargs, mode=self._registry_execution_mode()
+                )
             except Exception as e:
                 result = {"success": False, "error": tr('ai.tool_exec_err', str(e))}
 

@@ -192,5 +192,95 @@ class AIClientThinkingHintTest(unittest.TestCase):
         self.assertEqual(query_tools, {"get_parameter_schema"})
 
 
+class AIClientContextTrimTest(unittest.TestCase):
+    @staticmethod
+    def _tool_round(label, call_id):
+        return [
+            {"role": "user", "content": label},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "inspect_node", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": call_id, "content": "result " + ("x" * 400)},
+            {"role": "assistant", "content": label + " complete"},
+        ]
+
+    def test_progressive_trim_keeps_recent_complete_round_and_tool_pairing(self):
+        client = object.__new__(AIClient)
+        messages = [{"role": "system", "content": "rules"}]
+        messages.extend(self._tool_round("old", "old_call"))
+        messages.extend(self._tool_round("middle", "middle_call"))
+        messages.extend(self._tool_round("current", "current_call"))
+
+        trimmed = client._progressive_trim(messages, [], trim_level=3, tools=[])
+
+        self.assertEqual(trimmed[0], {"role": "system", "content": "rules"})
+        self.assertIn("current", [m.get("content") for m in trimmed if m.get("role") == "user"])
+        call_ids = {
+            tc["id"]
+            for message in trimmed
+            for tc in message.get("tool_calls", [])
+        }
+        tool_ids = {
+            message["tool_call_id"]
+            for message in trimmed
+            if message.get("role") == "tool"
+        }
+        self.assertEqual(call_ids, tool_ids)
+
+    def test_progressive_trim_counts_tools_in_every_budget_check(self):
+        client = object.__new__(AIClient)
+        messages = [{"role": "system", "content": "rules"}]
+        messages.extend(self._tool_round("old", "old_call"))
+        messages.extend(self._tool_round("current", "current_call"))
+        tools = [{"type": "function", "function": {"description": "schema"}}]
+        seen_tools = []
+
+        def count(actual_messages, actual_tools=None):
+            seen_tools.append(actual_tools)
+            return len(actual_messages) * 100 + (500 if actual_tools else 0)
+
+        with mock.patch.object(client, "_estimate_messages_tokens", side_effect=count):
+            client._progressive_trim(messages, [], trim_level=1, tools=tools)
+
+        self.assertGreater(len(seen_tools), 1)
+        self.assertTrue(all(actual_tools is tools for actual_tools in seen_tools))
+
+    def test_agent_loop_http_413_retries_with_tools_aware_progressive_trim(self):
+        client = object.__new__(AIClient)
+        client._tool_executor = mock.Mock()
+        client._stop_event = mock.Mock()
+        client._stop_event.is_set.return_value = False
+        client._get_streaming_tool_executor = mock.Mock()
+        client._get_streaming_tool_executor.return_value.reset.return_value = None
+        client._sanitize_working_messages = lambda messages: messages
+        client._ensure_context_within_budget = lambda messages, tools, limit: None
+        client._progressive_trim = mock.Mock(side_effect=lambda messages, history, **kwargs: messages)
+        client.chat_stream = mock.Mock(side_effect=[
+            iter([{"type": "error", "error": "HTTP 413 payload too large"}]),
+            iter([{"type": "content", "content": "done"}, {"type": "done", "usage": {}}]),
+        ])
+        tools = [{"type": "function", "function": {"name": "inspect_node"}}]
+
+        result = client.agent_loop_stream(
+            messages=[{"role": "user", "content": "inspect"}],
+            model="test-model",
+            provider="test-provider",
+            tools_override=tools,
+            max_iterations=2,
+            context_limit=10000,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.chat_stream.call_count, 2)
+        self.assertIs(client._progressive_trim.call_args.kwargs["tools"], tools)
+        self.assertEqual(client._progressive_trim.call_args.kwargs["trim_level"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
