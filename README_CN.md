@@ -4,18 +4,9 @@
 
 Houdini Agent 是运行在 SideFX Houdini 进程内的 AI 助手。它直接操作场景图：读节点、建网络、改参数、跑 VEX、查文档，而不是生成一堆代码让你自己粘贴。
 
-当前版本：`1.5.3`
+## 项目定位
 
-## 它是什么
-
-这是一个嵌入 Houdini 的交互式 Agent，不是独立聊天窗口。你在 Houdini 里打开一个面板，用自然语言描述需求，Agent 会：
-
-- 检查当前场景状态（选了什么节点、网络拓扑、参数值、错误信息）
-- 规划并执行节点操作（创建、连接、参数设置、VEX 编写）
-- 调用本地文档库回答"Houdini 怎么做"类问题
-- 对复杂任务先出方案让你确认，再分步执行
-
-它适合的场景：批量节点操作、参数调优、场景诊断、写 Wrangle、查文档、多步骤流程搭建。它不适合的场景：替代你的艺术判断、处理未验证的生产渲染任务、操作你不了解的陌生节点类型。
+本仓库基于上游 v1.5.x 的 Houdini 内嵌版本，保留自然语言操作场景、节点读写、VEX、文档检索及 Ask/Agent/Plan 等基础能力。上游原始功能、使用场景和通用说明请查看 [原项目](https://github.com/Kazama-Suichiku/Houdini-Agent)。本文重点记录本 fork 的安装差异、生产增强和近期改动。
 
 ## 快速开始
 
@@ -73,44 +64,12 @@ mod.show_tool()
 
 **Ask 模式是只读的**——它会拒绝任何修改操作。这是安全特性，不是 bug。
 
-## Provider 配置
+## 本 Fork 的主要功能
 
-| Provider | 环境变量 | 常用模型 | 说明 |
-|----------|---------|---------|------|
-| DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-chat`、`deepseek-reasoner` | 响应快，成本低 |
-| GLM（智谱） | `GLM_API_KEY` 或 `ZHIPU_API_KEY` | `glm-4.7` 等 | 国内网络稳定 |
-| OpenAI | `OPENAI_API_KEY` | GPT-4o、GPT-4 Turbo 等 | 工具调用和视觉能力强 |
-| Ollama | 无需 Key | 本地部署的任意模型 | 离线可用，能力取决于模型 |
-| 多接（Duojie） | `DUOJIE_API_KEY` | Claude、Gemini、GLM 中转 | 聚合多家，统一接口 |
-| OpenRouter | `OPENROUTER_API_KEY` | 200+ 模型路由 | 按 token 计费，选择多 |
-| Kimi Coding | `KIMI_CODING_API_KEY` | `kimi-coding` 系列 | 月之暗面代码专用 |
-| SiliconFlow | `SILICONFLOW_API_KEY` | 国产开源模型聚合 | 国内访问快 |
-| OF3D | 内置 Key，无需配置 | `of3d` 系列 | 内置可用 |
-| Custom | `CUSTOM_API_KEY`（可选） | 自建 OpenAI 兼容接口 | 需同时配置 `CUSTOM_API_URL` |
-
-所有 Provider 也支持 `DCC_AI_` 前缀的环境变量（如 `DCC_AI_DEEPSEEK_API_KEY`），避免与其他工具冲突。
-
-**视觉输入**：OpenAI、Claude（通过多接/OpenRouter）、Gemini（通过多接/OpenRouter）支持图片粘贴/拖拽。其他 Provider 收到纯文本。
-
-## 核心功能
-
-### 节点操作
-创建/复制/删除/重命名/连接节点，批量设置参数（带 Diff 预览），创建 VEX Wrangle，设置 Display/Render 标志，保存 HIP，撤销/重做。
-
-### 场景检查
-读取选择集和子网络，检查参数/标志/错误/输入/输出，搜索节点类型，NetworkBox 拓扑摘要，`verify_network` 一键健康检查。
-
-### 代码与文档
-执行 Houdini Python（`hou` 模块），运行受控 Shell 命令，搜索本地文档库（Houdini 节点、VEX、HOM、Labs、Terrain、Copernicus、ML、MPM），联网搜索。
-
-### 内置 Skills（24 个）
-预置 Python 分析脚本，覆盖：几何属性分析、法线检查、包围盒、连通性、死节点清理、依赖追踪、Cook 性能、材质赋值、LOP Stage 检查、Pyro/动力学搭建向导、USD 装配等。完整列表见 [houdini_agent/skills/](houdini_agent/skills/)。
-
-### Plan 模式
-收集上下文 → 提出澄清问题 → 生成带 DAG 依赖图的计划 → 你确认后执行 → 自动续接中断的步骤。
+节点操作、场景检查、VEX/Python、内置 Skills、基础 Plan 模式、Provider 能力及视觉输入等上游通用能力不在此重复展开，详情见 [原项目说明](https://github.com/Kazama-Suichiku/Houdini-Agent)。以下是本 fork 重点维护的增强功能。
 
 ### 长期记忆
-三层存储（语义/事件/流程），带奖励驱动学习和反思。按用户隔离，重启 Houdini 后保留。
+三层存储（语义/事件/流程），带奖励驱动学习和反思，按用户隔离并跨 Houdini 重启保留。
 
 - 使用 `/remember <内容>` 显式保存偏好、规则或方法；模型也可在你明确要求“记住”时调用 `remember_memory`
 - 写入前展示待保存内容并要求人工确认；Ask 模式、普通问答和“你还记得吗”不会触发写入
@@ -124,51 +83,71 @@ mod.show_tool()
 ### 上下文压缩
 在右上角菜单 → 上下文压缩中选择 `Aggressive`、`Balanced` 或 `Conservative`。所选策略同时控制手动压缩和自动裁剪：激进策略释放更多上下文，保守策略保留更多近期对话；工具调用与返回结果会按完整轮次保护，不会被拆散。
 
-### 插件与规则
-- `plugins/`：社区插件，扩展工具集
-- `rules/`：Markdown 文件定义持久规则，影响 Agent 行为
-- 面板内规则编辑器：图形化管理
-
-### UI 特性
-多会话标签页、流式输出、代码块折叠、节点路径可点击跳转、Token 用量统计、图片粘贴/拖拽（视觉模型）、中英双语界面、字号缩放。
+### 插件、规则与界面
+支持社区插件、Markdown 持久规则及面板内规则编辑器；提供多会话、流式输出、Plan/确认卡片、节点路径跳转、Token 统计、斜杠命令补全和中英双语界面。
 
 ### 可靠的会话与 Plan 恢复
 会话文件采用事务式提交：先写各会话，最后发布 manifest，失败时回滚旧工作区。空工作区标记可防止已清空对话重新出现；用户切换后旧窗口不能覆盖新用户数据；Plan 按会话恢复，未验证的 `running` 步骤不会被自动标记完成。
-
-## 项目结构
-
-```text
-Houdini-Agent/
-|-- houdini_agent_launcher.py   # 启动入口
-|-- VERSION                     # 版本号
-|-- config/                     # 用户配置（API Key、界面设置）
-|-- cache/                      # 对话记录、计划、记忆、用户隔离数据
-|-- Doc/                        # 离线文档库
-|-- plugins/                    # 插件目录
-|-- rules/                      # 用户规则文件
-|-- houdini_agent/
-|   |-- main.py                 # 窗口生命周期
-|   |-- core/                   # Agent 循环、工具执行、Harness 治理
-|   |-- ui/                     # 聊天界面、组件、登录对话框
-|   |-- skills/                 # 内置分析脚本
-|   `-- utils/                  # AI 客户端、工具注册、文档检索
-`-- tests/                      # 单元测试
-```
 
 ## Fork 差异说明
 
 本项目 fork 自 [Kazama-Suichiku/Houdini-Agent](https://github.com/Kazama-Suichiku/Houdini-Agent)，基于其 v1.5.x 嵌入 Houdini 分支。未采用上游 v2.0 的独立桌面应用方向。
 
-主要适配：
+本 fork 保留“直接嵌入 Houdini、操作当前场景”的产品方向，并针对多人共享环境、长时间运行和生产安全持续深化。主要差异如下：
 
-| 领域 | 差异 |
-|------|------|
-| 多用户支持 | 登录隔离、用户白名单、按用户分离配置/记忆/对话 |
-| 工具治理 | Registry 授权的受治理执行、人工确认、参数/结果 guardrails、batch 逐项策略 |
-| 稳定性 | Qt/GPU 竞态防护、事务式会话工作区提交、stale writer 防护、Memory 原子发布 |
-| 文档检索 | 多因子加权、查询类型重排、多样性约束 |
-| 上下文管理 | 普通发送、手动压缩与 413 恢复使用同一轮次安全策略，压缩强度可选，工具 schema 计入 token 预算 |
-| Memory 正确性 | 显式保存需意图校验和人工确认；embedding provenance 校验；个人记忆可恢复，Team Memory 导入采用版本化文档与 fail-closed 重建 |
+### 多用户与数据隔离
+
+- 登录用户名决定配置、会话、Plan、规则和个人记忆的存储边界，并支持管理员维护用户白名单。
+- 用户切换后，旧面板实例会失去工作区写权限，避免 stale writer 覆盖新用户数据。
+- 个人记忆权威库固定在 `cache/users/<用户名>/memory/agent_memory.db`；历史错误路径中的 SQLite 数据可在启动时安全恢复，冲突时由用户选择保留哪一份。
+
+### 工具治理与执行安全
+
+- Tool Registry 是工具 schema、handler、owner、启用状态、运行模式和风险元数据的唯一权威；插件和 MCP 工具不能绕过 Registry 直接执行。
+- Harness 在执行前统一完成参数规范化、风险判定和 `allow` / `deny` / `ask` / `retry` 决策；batch 中每一项都独立经过同一治理链。
+- 修改场景、文件或长期记忆等操作支持人工确认；确认超时、回调异常、策略歧义和授权失败均 fail closed。
+- 主线程执行、Cook Guard、撤销语义、结果清洗和 append-only 审计由统一执行边界协调。
+
+### 会话与 Plan 可靠性
+
+- 会话工作区采用 staging、逐文件发布、manifest-last commit 和失败回滚，避免退出或共享盘写入失败留下部分更新状态。
+- clear marker 防止已删除会话被旧孤儿文件恢复；Agent 结果始终写回发起请求的 session。
+- Plan 的确认、拒绝、步骤状态和恢复投影均由持久化状态驱动；没有完成证据的 `running` 步骤不会自动变成 `done`。
+- Plan quality gate 只允许当前 Registry 中已启用且符合 mode/runtime 的工具。
+
+### 上下文与模型请求
+
+- 普通发送、手动压缩和 HTTP 413 恢复共用 round-safe 裁剪，不会拆散 assistant tool call 与对应 tool result。
+- `Aggressive`、`Balanced`、`Conservative` 同时控制自动裁剪目标和近期轮次保护比例，而不只是界面选项。
+- 工具 schema 计入最终 token budget；当前轮图片受保护，旧轮图片可按预算剥离。
+- 发送边界会捕获本轮用户消息快照，后台 Harness 不再从可变历史中误读上一轮意图。
+
+### 个人记忆、反馈与 Team Memory
+
+- 显式记忆提供 `/remember` 和 `remember_memory`；写入前检查用户本轮明确意图、敏感信息、重复内容和单请求调用次数，并强制人工确认。
+- L0 手动核心记忆优先于自动经验；长期记忆管理器支持 semantic、episodic、procedural 记录的查看、筛选、编辑和删除。
+- 执行过工具的回答提供“有用 / 有问题”反馈，直接调整对应 episodic memory 的 reward、importance 和标签。
+- Team Memory 使用版本化导出文档和统一共享资格策略，校验成员身份、资源上限、向量 provenance 及条目结构。
+- 全部导出无效时保留现有团队库；成员撤回所有导出时发布空库，避免旧共享经验永久残留。
+
+### 插件、规则与文档检索
+
+- 插件首次加载、重新启用和 reload 共用注册路径；失败时按 owner 回滚已注册的 hook、工具和按钮，防止半注册状态污染运行时。
+- Rules 编辑器同时管理内置用户规则和文件规则，并显示实际来源路径。
+- 离线 Houdini Help 通过统一 Help Source 读取；文档检索采用多因子评分、查询类型重排和结果多样性约束。
+- 本地文档覆盖 Houdini 节点、VEX、HOM、Labs、Terrain、Copernicus、ML 和 MPM，并支持统一缓存失效。
+
+### 宿主兼容与界面
+
+- 保持嵌入式 Qt/PySide 面板和 Houdini 主线程执行模型，未切换到上游 v2.0 独立桌面架构。
+- 针对 Houdini 宿主中的 Qt/GPU 生命周期、输入法、长 Cook、窗口销毁和热重载增加防护。
+- 提供多会话、模式切换、Plan 卡片、工具状态、确认卡片、记忆管理、斜杠命令补全和中英双语 UI。
+
+### 最近更新（2026-08）
+
+- **08-17～18**：深化事务式会话保存、Plan 生命周期、Registry/Harness 单一执行链、Memory embedding provenance、上下文预算和插件回滚。
+- **08-19～24**：加入显式核心记忆、长期记忆管理器、写入前确认、用户反馈奖惩、个人记忆数据库恢复和斜杠命令解析。
+- **08-25**：强化 Team Memory 导出文档信任边界，使自动裁剪真正服从压缩策略，并修复记忆管理器布局、规则来源路径和发送边界用户消息快照。
 
 最新更新：[2026-08-25 Team Memory、显式记忆与上下文压缩](changelog/CHANGELOG_2026-08-25.md)。详细历史见 [changelog/](changelog/)。
 
