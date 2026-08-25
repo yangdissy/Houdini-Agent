@@ -72,6 +72,23 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         self.assertIn("high_risk_confirmation", decision.matched_rules)
         self.assertEqual(decision.required_control, "confirm")
 
+    def test_remember_memory_requires_review_after_intent(self):
+        context = {"mode": "agent", "user_message": "记住：以后都用中文回答"}
+        decision = self.policy.decide("remember_memory", {"content": "用中文回答"}, context)
+        self.assertEqual(decision.action, "ask")
+        self.assertIn("explicit_memory_review", decision.matched_rules)
+        self.assertEqual(decision.required_control, "confirm")
+
+    def test_remember_memory_still_denied_in_ask_mode(self):
+        context = {"mode": "ask", "user_message": "记住：以后都用中文回答"}
+        decision = self.policy.decide("remember_memory", {"content": "用中文回答"}, context)
+        self.assertEqual(decision.action, "deny")
+
+    def test_remember_memory_still_denied_without_intent(self):
+        context = {"mode": "agent", "user_message": "帮我查一下这个节点"}
+        decision = self.policy.decide("remember_memory", {"content": "用中文回答"}, context)
+        self.assertEqual(decision.action, "deny")
+
     def test_execute_tools_require_code_or_command(self):
         missing_code = self.policy.decide("execute_python", {}, {"mode": "agent"})
         self.assertEqual(missing_code.action, "deny")
@@ -142,6 +159,36 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         self.assertIn("dangerous shell", decision.reason)
         self.assertIn("dangerous_shell", decision.matched_rules)
         self.assertEqual(decision.required_control, "deny")
+
+    def test_remember_memory_requires_explicit_save_intent(self):
+        denied = self.policy.decide(
+            "remember_memory",
+            {"content": "始终使用中文回答"},
+            {"mode": "agent", "user_message": "你还记得我的偏好吗"},
+        )
+        self.assertEqual(denied.action, "deny")
+
+        # intent 通过后经用户确认（ask）才允许写入，不再直接 allow
+        ask = self.policy.decide(
+            "remember_memory",
+            {"content": "始终使用中文回答"},
+            {"mode": "agent", "user_message": "请记住始终使用中文回答"},
+        )
+        self.assertEqual(ask.action, "ask")
+        self.assertIn("explicit_memory_review", ask.matched_rules)
+
+    def test_remember_memory_is_limited_to_one_call_per_request(self):
+        decision = self.policy.decide(
+            "remember_memory",
+            {"content": "始终使用中文回答"},
+            {
+                "mode": "agent",
+                "user_message": "请记住始终使用中文回答",
+                "remember_memory_calls": 1,
+            },
+        )
+        self.assertEqual(decision.action, "deny")
+        self.assertIn("one call", decision.reason)
 
     def test_path_traversal_is_denied(self):
         decision = self.policy.decide(

@@ -250,6 +250,8 @@ class ToolExecutionMixin:
             'mode': mode,
             'plan_phase': self._plan_phase,
             'confirm_mode': bool(getattr(self, '_confirm_mode', False)),
+            'user_message': str(getattr(self, '_current_user_message', '') or ''),
+            'remember_memory_calls': int(getattr(self, '_remember_memory_calls', 0) or 0),
         }
         retry_counts = self._harness_state.policy_retry_counts if self._harness_state else {}
 
@@ -278,6 +280,8 @@ class ToolExecutionMixin:
             retry_limit=self._policy_retry_limit,
         )
         result = owner.execute(tool_name, kwargs, context)
+        if tool_name == "remember_memory":
+            self._remember_memory_calls = int(getattr(self, "_remember_memory_calls", 0) or 0) + 1
         if not result.get('success'):
             self._addStatus.emit(f"恢复建议: {tool_name} 被拒绝或执行失败，可打开 Policy 时间线排查")
         return result

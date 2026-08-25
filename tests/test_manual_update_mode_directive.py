@@ -104,18 +104,7 @@ class ManualUpdateModeDirectiveTest(unittest.TestCase):
         self.assertIn("不要用 `execute_python`", prompt)
         self.assertIn("Auto Update", prompt)
 
-    def test_scene_read_uses_snapshot_not_realtime_manual(self):
-        sys.modules["hou"] = _HouStub(_UpdateMode.Manual)
-        tab = object.__new__(ActionCommandsMixin)
-        tab._pre_agent_update_mode = _UpdateMode.Auto
-        tab._auto_read_mode = "off"
-        tab._conversation_history = []
-
-        ActionCommandsMixin._auto_inject_scene_read(tab)
-
-        self.assertEqual(tab._conversation_history, [])
-
-    def test_scene_read_injects_when_snapshot_manual(self):
+    def test_scene_read_does_not_duplicate_manual_directive_in_history(self):
         sys.modules["hou"] = _HouStub(_UpdateMode.Auto)
         tab = object.__new__(ActionCommandsMixin)
         tab._pre_agent_update_mode = _UpdateMode.Manual
@@ -124,8 +113,7 @@ class ManualUpdateModeDirectiveTest(unittest.TestCase):
 
         ActionCommandsMixin._auto_inject_scene_read(tab)
 
-        self.assertEqual(len(tab._conversation_history), 1)
-        self.assertIn("before this Agent run", tab._conversation_history[0]["content"])
+        self.assertEqual(tab._conversation_history, [])
 
     def test_start_agent_run_captures_shared_params(self):
         sys.modules["hou"] = _HouStub(_UpdateMode.Auto)
@@ -188,7 +176,7 @@ class ManualUpdateModeDirectiveTest(unittest.TestCase):
         tab._session_id = "session"
         tab._plan_manager = mock.Mock()
         tab._conversation_history = []
-        tab._start_agent_run = lambda overrides: captured.update(overrides)
+        tab._start_agent_run = lambda overrides, **kwargs: captured.update(overrides)
         plan_data = {"title": "Build Test Network", "steps": []}
         tab._plan_manager.confirm_plan.return_value = plan_data
 

@@ -213,6 +213,13 @@ class CompressionStrategy(Enum):
     CONSERVATIVE = "conservative"  # 保守压缩（保留更多细节）
 
 
+@dataclass(frozen=True)
+class AutomaticPruningPolicy:
+    """自动压缩时的目标占用与近期轮次保护比例。"""
+    target_ratio: float
+    protect_ratio: float
+
+
 @dataclass
 class TokenBudget:
     """Token 预算配置"""
@@ -222,6 +229,18 @@ class TokenBudget:
     emergency_threshold: float = 0.9  # 紧急压缩阈值（90%）
     keep_recent_messages: int = 4  # 保留最近 N 条消息
     strategy: CompressionStrategy = CompressionStrategy.BALANCED
+
+    def automatic_pruning_policy(
+        self,
+        strategy: Optional[CompressionStrategy] = None,
+    ) -> AutomaticPruningPolicy:
+        """返回所选策略对应的自动上下文裁剪参数。"""
+        policies = {
+            CompressionStrategy.AGGRESSIVE: AutomaticPruningPolicy(0.55, 0.4),
+            CompressionStrategy.BALANCED: AutomaticPruningPolicy(0.65, 0.6),
+            CompressionStrategy.CONSERVATIVE: AutomaticPruningPolicy(0.75, 0.8),
+        }
+        return policies.get(strategy or self.strategy, policies[CompressionStrategy.BALANCED])
 
 
 @dataclass

@@ -25,28 +25,21 @@ from typing import Dict, List, Optional
 
 from shared.user_paths import UserPaths, normalize_username
 from .memory_store import MemoryStore
+from .memory_sqlite import EMBEDDING_FORMAT_VERSION
+from .team_memory_document import (
+    ELIGIBLE_ABSTRACTION_LEVELS,
+    ELIGIBLE_SEMANTIC_CATEGORIES,
+    MIN_PROCEDURAL_SUCCESS_RATE,
+    MIN_PROCEDURAL_USAGE,
+    MIN_SEMANTIC_CONFIDENCE,
+    build_export_document,
+    procedural_eligibility,
+    semantic_eligibility,
+)
 from .team_memory_settings import is_team_export_enabled
 
-# 允许进入团队共享库的 category（排除 preference / user_profile 等个人化分类）
-ELIGIBLE_SEMANTIC_CATEGORIES = frozenset({
-    "command", "debug", "pitfall", "workflow", "knowledge", "general",
-})
-# 允许进入团队共享库的抽象层级（排除 L0/L1 核心身份与偏好，排除 L5 原始细节）
-ELIGIBLE_ABSTRACTION_LEVELS = frozenset({2, 3, 4})
-
-MIN_SEMANTIC_CONFIDENCE = 0.5
-MIN_PROCEDURAL_SUCCESS_RATE = 0.55
-MIN_PROCEDURAL_USAGE = 2
-
-
 def _semantic_export_entry(record) -> Optional[dict]:
-    if record.category not in ELIGIBLE_SEMANTIC_CATEGORIES:
-        return None
-    if record.abstraction_level not in ELIGIBLE_ABSTRACTION_LEVELS:
-        return None
-    if record.confidence < MIN_SEMANTIC_CONFIDENCE:
-        return None
-    if not record.rule:
+    if not semantic_eligibility(record)[0]:
         return None
     return {
         "rule": record.rule,
@@ -58,11 +51,7 @@ def _semantic_export_entry(record) -> Optional[dict]:
 
 
 def _procedural_export_entry(record) -> Optional[dict]:
-    if record.usage_count < MIN_PROCEDURAL_USAGE:
-        return None
-    if record.success_rate < MIN_PROCEDURAL_SUCCESS_RATE:
-        return None
-    if not record.strategy_name:
+    if not procedural_eligibility(record)[0]:
         return None
     return {
         "strategy_name": record.strategy_name,
@@ -96,19 +85,19 @@ def build_team_export_payload(store: MemoryStore) -> Dict:
         entry["embedding_backend"] = backend
         entry["embedding_model"] = model
         entry["embedding_dimension"] = dimension
-        entry["embedding_format_version"] = 1
+        entry["embedding_format_version"] = EMBEDDING_FORMAT_VERSION
     for entry in procedural_entries:
         entry["embedding_backend"] = backend
         entry["embedding_model"] = model
         entry["embedding_dimension"] = dimension
-        entry["embedding_format_version"] = 1
+        entry["embedding_format_version"] = EMBEDDING_FORMAT_VERSION
 
     return {
         "embedding_provenance": {
             "backend": backend,
             "model": model,
             "dimension": dimension,
-            "format_version": 1,
+            "format_version": EMBEDDING_FORMAT_VERSION,
         },
         "semantic": semantic_entries,
         "procedural": procedural_entries,
@@ -125,8 +114,12 @@ def export_team_memory(username: str, store: MemoryStore) -> Optional[Path]:
         return None
 
     payload = build_team_export_payload(store)
-    payload["exported_at"] = time.time()
-    payload["username"] = uname
+    payload = build_export_document(
+        username=uname,
+        exported_at=time.time(),
+        semantic=payload["semantic"],
+        procedural=payload["procedural"],
+    )
 
     user_paths = UserPaths(uname)
     user_paths.ensure_dirs()

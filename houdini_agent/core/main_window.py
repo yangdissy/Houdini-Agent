@@ -35,6 +35,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # 工作区配置目录
         user_paths = UserPaths(self._username)
         user_paths.ensure_dirs()
+        self._prepare_user_memory_db(user_paths)
         self._workspace_dir = user_paths.workspace_dir()
         self._workspace_file = user_paths.workspace_file()
         
@@ -97,6 +98,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(f"Houdini Agent [{self._username}]")
         user_paths = UserPaths(self._username)
         user_paths.ensure_dirs()
+        self._prepare_user_memory_db(user_paths)
         self._workspace_dir = user_paths.workspace_dir()
         self._workspace_file = user_paths.workspace_file()
 
@@ -127,6 +129,62 @@ class MainWindow(QtWidgets.QMainWindow):
         self._maybe_offer_migration(user_paths)
         self._load_workspace()
         self._already_saved = False
+
+    def _prepare_user_memory_db(self, user_paths: UserPaths):
+        """Restore leftover local SQLite data into the user directory before opening stores."""
+        try:
+            from houdini_agent.utils.memory_sqlite import (
+                overwrite_authoritative_with_leftover,
+                restore_legacy_local_memory_db,
+            )
+            result = restore_legacy_local_memory_db(user_paths)
+        except Exception as e:
+            print(f"[MemoryRecovery] Failed: {e}")
+            return
+        if result.status == "failed":
+            QtWidgets.QMessageBox.warning(
+                self,
+                "记忆库恢复",
+                result.message or "无法自动恢复本地残留记忆库。",
+            )
+        elif result.status == "conflict":
+            self._resolve_memory_db_conflict(user_paths)
+
+    def _resolve_memory_db_conflict(self, user_paths: UserPaths):
+        """冲突时让用户选择：用本地残留库覆盖权威库，或保留权威库并删除本地残留库。"""
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle("记忆库冲突")
+        box.setText(
+            "检测到本机残留的旧记忆库（历史 bug 产物）和当前权威记忆库内容不一致。\n\n"
+            "请选择如何处理："
+        )
+        btn_upload = box.addButton("用本地库覆盖权威库", QtWidgets.QMessageBox.AcceptRole)
+        btn_keep = box.addButton("保留权威库并删除本地库", QtWidgets.QMessageBox.RejectRole)
+        box.setDefaultButton(btn_keep)
+        box.exec_()
+
+        clicked = box.clickedButton()
+        if clicked is btn_upload:
+            from houdini_agent.utils.memory_sqlite import overwrite_authoritative_with_leftover
+            res = overwrite_authoritative_with_leftover(user_paths)
+            if res.status == "restored":
+                QtWidgets.QMessageBox.information(
+                    self, "记忆库恢复",
+                    "已用本地残留库覆盖权威库。\n旧权威库已备份为 agent_memory.db.pre-overwrite-backup。",
+                )
+            elif res.status != "skipped":
+                QtWidgets.QMessageBox.warning(
+                    self, "记忆库恢复", res.message or "覆盖失败。",
+                )
+        else:
+            # 保留权威库：删除本地残留库（历史 bug 产物），并写标记不再提示
+            from houdini_agent.utils.memory_sqlite import dismiss_memory_db_conflict
+            res = dismiss_memory_db_conflict(user_paths)
+            if res.status == "failed":
+                QtWidgets.QMessageBox.warning(
+                    self, "记忆库恢复", res.message or "删除本地残留库失败。",
+                )
 
     def _maybe_offer_migration(self, user_paths: UserPaths):
         """检测旧 cache 并提示迁移（复制，不删除）。"""
@@ -178,30 +236,8 @@ class MainWindow(QtWidgets.QMainWindow):
             print(f"[Migration] Failed: {e}")
 
     def _copy_legacy_data(self, src: Path, dst: Path):
-        if not src.exists():
-            return
-        dst.mkdir(parents=True, exist_ok=True)
-        if src.is_dir():
-            for item in src.iterdir():
-                s = src / item.name
-                d = dst / item.name
-                if s.is_dir():
-                    if not d.exists():
-                        d.mkdir(parents=True, exist_ok=True)
-                    self._copy_legacy_data(s, d)
-                else:
-                    if d.exists():
-                        continue
-                    try:
-                        shutil.copy2(str(s), str(d))
-                    except Exception:
-                        pass
-        else:
-            try:
-                if not dst.exists():
-                    shutil.copy2(str(src), str(dst))
-            except Exception:
-                pass
+        from houdini_agent.utils.memory_sqlite import copy_legacy_non_sqlite
+        copy_legacy_non_sqlite(src, dst)
 
     def force_quit_application(self):
         """强制退出应用程序"""

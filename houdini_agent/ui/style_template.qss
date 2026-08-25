@@ -523,6 +523,32 @@ QPushButton#aiCopyBtn[state="copied"] {
     border-color: rgba(16,185,129,80);
 }
 
+/* 用户反馈按钮 — 与复制按钮同风格，选中态区分 */
+QPushButton#aiThumbUpBtn, QPushButton#aiThumbDownBtn {
+    color: #94a3b8;
+    background: rgba(22,24,42,160);
+    border: 1px solid rgba(255,255,255,10);
+    border-radius: 6px;
+    font-size: {FS_SM}px;
+    padding: 0 10px;
+}
+QPushButton#aiThumbUpBtn:hover, QPushButton#aiThumbDownBtn:hover {
+    color: #e2e8f0;
+    background: rgba(40,42,68,200);
+}
+QPushButton#aiThumbUpBtn:hover { border-color: rgba(16,185,129,80); }
+QPushButton#aiThumbDownBtn:hover { border-color: rgba(239,68,68,80); }
+QPushButton#aiThumbUpBtn[active="true"] {
+    color: #10b981;
+    border-color: rgba(16,185,129,80);
+    background: rgba(16,185,129,25);
+}
+QPushButton#aiThumbDownBtn[active="true"] {
+    color: #ef4444;
+    border-color: rgba(239,68,68,80);
+    background: rgba(239,68,68,25);
+}
+
 QPlainTextEdit#aiContentLabel {
     color: #e2e8f0;
     background: transparent;

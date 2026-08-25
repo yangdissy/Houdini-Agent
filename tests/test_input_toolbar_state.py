@@ -118,7 +118,11 @@ class InputToolbarStateTest(unittest.TestCase):
             "def _add_dev_feature_toggle_menu", 1
         )[0]
         self.assertIn("train.menu_label", overflow_body)
-        self.assertIn("btn_export_train.click", overflow_body)
+        self.assertIn("export_training_action.setEnabled(False)", overflow_body)
+        self.assertNotIn("btn_export_train.click", overflow_body)
+        self.assertIn('update_action = menu.addAction("Update")', overflow_body)
+        self.assertIn("update_action.setEnabled(False)", overflow_body)
+        self.assertNotIn('menu.addAction("Update", self.btn_update.click)', overflow_body)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from houdini_agent.qt_compat import QtWidgets
 from houdini_agent.ui.i18n import tr
+from houdini_agent.ui.slash_commands import SLASH_COMMANDS_WITH_ARGS, parse_slash_command
 
 
 class ActionCommandsMixin:
@@ -151,13 +152,22 @@ class ActionCommandsMixin:
     # ★ 斜杠命令执行
     # ============================================================
 
-    def _execute_slash_command(self, command: str):
+    @staticmethod
+    def _parse_slash_command(text: str):
+        return parse_slash_command(text)
+
+    def _execute_slash_command(self, command: str, args: str = ""):
         """执行斜杠命令 — 由 InputAreaMixin._on_slash_command_selected 调用"""
         handler = getattr(self, f'_slash_{command}', None)
         if handler:
-            handler()
+            if command in SLASH_COMMANDS_WITH_ARGS:
+                handler(args)
+            else:
+                handler()
+            return True
         else:
             print(f"[SlashCommand] 未知命令: /{command}")
+            return False
 
     def _slash_clear(self):
         """/ clear — 清空当前对话"""
@@ -213,55 +223,69 @@ class ActionCommandsMixin:
             resp.set_content(f"❌ 记忆系统未就绪: {e}")
             resp.finalize()
 
-    def _slash_remember(self):
-        """/remember — 弹出对话框让用户输入要记住的内容"""
-        from ..utils.memory_store import get_memory_store, SemanticRecord
+    def _slash_command_reply(self, command_text: str, content: str):
+        self._add_user_message(command_text)
+        resp = self._add_ai_response()
+        resp.set_content(content)
+        resp.finalize()
 
-        text, ok = QtWidgets.QInputDialog.getText(
-            self, "📌 记住偏好", "输入要永久记住的内容（将存为 L0 核心记忆）:"
-        )
-        if not ok or not text.strip():
-            return
+    def _slash_remember(self, args=""):
+        """/remember — 引导用户写入高优先级核心记忆（每轮对话都会注入）。"""
+        from ..utils.explicit_memory import remember_explicit_memory
 
-        try:
-            store = get_memory_store(self._username)
-            record = SemanticRecord(
-                rule=text.strip(),
-                confidence=1.0,
-                category="preference",
-                abstraction_level=0,
+        text = (args or "").strip()
+        # 无参数（从菜单选中）时弹引导对话框；手动输入 `/remember 文本` 直发时跳过。
+        if not text:
+            text, ok = QtWidgets.QInputDialog.getMultiLineText(
+                self,
+                "写入核心记忆",
+                "输入要让 AI 长期遵守的核心内容（每轮对话都会生效）：\n"
+                "例如：始终用中文注释 / 本项目 solver 命名用 sim_ 前缀 / 我偏好 VEX 而非节点",
+                "",
             )
-            rid = store.add_semantic(record)
-            self._add_user_message(f"[/remember] {text.strip()}")
-            resp = self._add_ai_response()
-            resp.set_content(f"✅ 已写入核心记忆 (L0): {text.strip()}\nID: `{rid}`")
-            resp.finalize()
-        except Exception as e:
-            self._add_user_message(f"[/remember]")
-            resp = self._add_ai_response()
-            resp.set_content(f"❌ 写入记忆失败: {e}")
-            resp.finalize()
+            if not ok:
+                return
+            text = (text or "").strip()
+            if not text:
+                self._slash_command_reply("[/remember]", "未输入内容，未保存核心记忆。")
+                return
 
-    def _slash_forget(self):
+        result = remember_explicit_memory(self._username, text)
+        if result.status == "created":
+            self._slash_command_reply(
+                f"[/remember] {text}",
+                f"✅ 已写入核心记忆（优先级高于自动记忆，每轮对话都会生效）: {text}\n"
+                f"ID: `{result.memory_id}`\n可在 `/memory` 查看、`/memories` 管理。",
+            )
+            return
+        if result.status == "already_exists":
+            self._slash_command_reply(
+                f"[/remember] {text}",
+                f"ℹ️ 该核心记忆已存在: {text}\nID: `{result.memory_id}`",
+            )
+            return
+        prefix = "⚠️" if result.status == "rejected" else "❌"
+        self._slash_command_reply(
+            f"[/remember] {text}",
+            f"{prefix} {result.message or '未保存核心记忆。'}",
+        )
+
+    def _slash_forget(self, args=""):
         """/forget — 搜索并删除记忆"""
         from ..utils.memory_store import get_memory_store
 
-        keyword, ok = QtWidgets.QInputDialog.getText(
-            self, "🧹 清除记忆", "输入关键词搜索要删除的记忆:"
-        )
-        if not ok or not keyword.strip():
+        keyword = (args or "").strip()
+        if not keyword:
+            self._slash_command_reply("[/forget]", "用法：`/forget <关键词>`")
             return
 
         try:
             store = get_memory_store(self._username)
             results = store.search_all_levels(
-                query=keyword.strip(), top_k=5, min_confidence=0.0
+                query=keyword, top_k=5, min_confidence=0.0
             )
             if not results:
-                self._add_user_message(f"[/forget] {keyword.strip()}")
-                resp = self._add_ai_response()
-                resp.set_content("未找到匹配的记忆。")
-                resp.finalize()
+                self._slash_command_reply(f"[/forget] {keyword}", "未找到匹配的记忆。")
                 return
 
             # 显示找到的记忆，让用户选择删除
@@ -280,54 +304,39 @@ class ActionCommandsMixin:
             idx = choices.index(choice)
             del_id = items[idx][0]
             store.delete_semantic(del_id)
-
-            self._add_user_message(f"[/forget] {keyword.strip()}")
-            resp = self._add_ai_response()
-            resp.set_content(f"🗑 已删除记忆: {choice}")
-            resp.finalize()
+            self._slash_command_reply(f"[/forget] {keyword}", f"🗑 已删除记忆: {choice}")
         except Exception as e:
-            self._add_user_message(f"[/forget]")
-            resp = self._add_ai_response()
-            resp.set_content(f"❌ 操作失败: {e}")
-            resp.finalize()
+            self._slash_command_reply("[/forget]", f"❌ 操作失败: {e}")
 
-    def _slash_search_mem(self):
+    def _slash_search_mem(self, args=""):
         """/search_mem — 搜索长期记忆"""
         from ..utils.memory_store import get_memory_store, ABSTRACTION_LEVELS
 
-        keyword, ok = QtWidgets.QInputDialog.getText(
-            self, "🔍 搜索记忆", "输入搜索关键词:"
-        )
-        if not ok or not keyword.strip():
+        keyword = (args or "").strip()
+        if not keyword:
+            self._slash_command_reply("[/search_mem]", "用法：`/search_mem <关键词>`")
             return
 
         try:
             store = get_memory_store(self._username)
             results = store.search_all_levels(
-                query=keyword.strip(), top_k=10, min_confidence=0.0
+                query=keyword, top_k=10, min_confidence=0.0
             )
 
-            self._add_user_message(f"[/search_mem] {keyword.strip()}")
-            resp = self._add_ai_response()
-
             if not results:
-                resp.set_content("未找到相关记忆。")
-            else:
-                lines = [f"🔍 **搜索结果** — 关键词: `{keyword.strip()}`  ({len(results)} 条)\n"]
-                for i, (rec, score) in enumerate(results, 1):
-                    level_name = ABSTRACTION_LEVELS.get(rec.abstraction_level, "unknown")
-                    lines.append(
-                        f"{i}. **[L{rec.abstraction_level} {level_name}]** [{rec.category}] "
-                        f"conf={rec.confidence:.2f}  rel={score:.3f}\n"
-                        f"   {rec.rule}"
-                    )
-                resp.set_content("\n".join(lines))
-            resp.finalize()
+                self._slash_command_reply(f"[/search_mem] {keyword}", "未找到相关记忆。")
+                return
+            lines = [f"🔍 **搜索结果** — 关键词: `{keyword}`  ({len(results)} 条)\n"]
+            for i, (rec, score) in enumerate(results, 1):
+                level_name = ABSTRACTION_LEVELS.get(rec.abstraction_level, "unknown")
+                lines.append(
+                    f"{i}. **[L{rec.abstraction_level} {level_name}]** [{rec.category}] "
+                    f"conf={rec.confidence:.2f}  rel={score:.3f}\n"
+                    f"   {rec.rule}"
+                )
+            self._slash_command_reply(f"[/search_mem] {keyword}", "\n".join(lines))
         except Exception as e:
-            self._add_user_message(f"[/search_mem]")
-            resp = self._add_ai_response()
-            resp.set_content(f"❌ 搜索失败: {e}")
-            resp.finalize()
+            self._slash_command_reply("[/search_mem]", f"❌ 搜索失败: {e}")
 
     def _slash_memories(self):
         """/memories — 打开记忆库管理窗口（情景 / 语义 / 策略 增删改查）"""
@@ -477,27 +486,6 @@ class ActionCommandsMixin:
         每次 _on_send 时调用一次，不在聊天界面中显示额外卡片。
         调用方式与手动 + 菜单中的 Read Selection / Read Network 保持一致。
         """
-        # ★ 注入 Houdini 更新模式提示。
-        # 只根据本轮启动前快照判断用户/hip 是否原始 Manual；不要读取实时状态，
-        # 因为 Agent/Cook Guard 可能已临时切到 Manual，不能把它写成用户持久偏好。
-        try:
-            import hou  # type: ignore
-            original_mode = getattr(self, '_pre_agent_update_mode', None)
-            if original_mode == hou.updateMode.Manual:
-                self._conversation_history.append({
-                    'role': 'user',
-                    'content': (
-                        "[Scene state] Houdini update mode was Manual before this Agent run. "
-                        "Modifications (create_node, set_display_flag, set_node_parameter, "
-                        "connect_nodes, etc.) will NOT auto-cook. Tool 'success' only means "
-                        "the operation was queued — do NOT assume the viewport or downstream "
-                        "geometry reflects the change. Use check_errors / get_network_structure / "
-                        "verify_network to confirm actual results before reporting completion."
-                    )
-                })
-        except Exception:
-            pass
-
         mode = getattr(self, '_auto_read_mode', 'sel')
         if mode == 'off':
             return

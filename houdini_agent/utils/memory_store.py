@@ -1197,6 +1197,11 @@ def get_memory_store(username: Optional[str] = None) -> MemoryStore:
         if uname not in _store_instances:
             user_paths = UserPaths(uname)
             user_paths.ensure_dirs()
+            try:
+                from .memory_sqlite import restore_legacy_local_memory_db
+                restore_legacy_local_memory_db(user_paths)
+            except Exception:
+                pass
             _store_instances[uname] = MemoryStore(db_path=user_paths.memory_db())
             _store_instances[uname].seed_default_strategies()
         return _store_instances[uname]

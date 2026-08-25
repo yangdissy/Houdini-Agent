@@ -157,6 +157,12 @@ _ZH = {
     'confirm.cancel': '✕ 取消',
     'confirm.execute': '↵ 确认执行',
 
+    # ===== User Feedback =====
+    'feedback.up': '有用',
+    'feedback.down': '有问题',
+    'feedback.good': '这次回答好，奖励',
+    'feedback.bad': '这次回答有问题，纠错',
+
     # ===== Node Operations =====
     'node.click_jump': '点击跳转: {}',
     'status.undone': '已撤销',
@@ -800,6 +806,12 @@ _EN = {
     'confirm.params_more': '... {} params total',
     'confirm.cancel': '✕ Cancel',
     'confirm.execute': '↵ Confirm',
+
+    # ===== User Feedback =====
+    'feedback.up': 'Good',
+    'feedback.down': 'Bad',
+    'feedback.good': 'Good answer, reward it',
+    'feedback.bad': 'Answer has issues, correct it',
 
     # ===== Node Operations =====
     'node.click_jump': 'Click to navigate: {}',

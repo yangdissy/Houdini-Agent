@@ -51,6 +51,7 @@ class ChatViewMixin:
         )
         response.createWrangleRequested.connect(self._on_create_wrangle)
         response.nodePathClicked.connect(self._navigate_to_node)
+        response.feedbackGiven.connect(self._on_user_feedback)
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, response)
         self._current_response = response
         self._scroll_to_bottom(force=True)
@@ -109,3 +110,50 @@ class ChatViewMixin:
             except RuntimeError:
                 pass
         QtCore.QTimer.singleShot(duration_ms, _remove)
+
+    # ---------- 用户反馈（👍/👎）----------
+
+    def _on_episodic_recorded(self, episodic_id: str):
+        """主线程：任务反思完成，把 episodic_id 绑到当前 AI 回复块上。"""
+        resp = getattr(self, '_current_response', None)
+        if resp is None:
+            return
+        try:
+            resp._episodic_id = episodic_id
+            # 若用户在 episodic 就绪前就点了按钮，此刻补应用
+            pending = getattr(resp, '_pending_feedback', None)
+            if pending is not None:
+                resp._pending_feedback = None
+                self._apply_user_feedback(resp, pending)
+        except RuntimeError:
+            pass
+
+    def _on_user_feedback(self, positive: bool):
+        """主线程：用户在某条 AI 回复上点了 👍/👎。"""
+        resp = getattr(self, '_current_response', None)
+        if resp is None:
+            return
+        episodic_id = getattr(resp, '_episodic_id', None)
+        if episodic_id is None:
+            # 反思尚未完成，先存 pending，等 _on_episodic_recorded 补应用
+            resp._pending_feedback = positive
+            return
+        self._apply_user_feedback(resp, positive)
+
+    def _apply_user_feedback(self, resp, positive: bool):
+        """实际调用 reward engine 修正该回复对应的 episodic 记忆。"""
+        episodic_id = getattr(resp, '_episodic_id', None)
+        if not episodic_id or not getattr(self, '_memory_initialized', False):
+            return
+        engine = getattr(self, '_reward_engine', None)
+        if engine is None:
+            return
+        try:
+            result = engine.apply_user_feedback(episodic_id, positive)
+            if result.get('error'):
+                print(f"[Feedback] 应用反馈失败: {result['error']}")
+                return
+            kind = "👍" if positive else "👎"
+            self._show_toast(f"{kind} 已记录", 1500)
+        except Exception as e:
+            print(f"[Feedback] 应用反馈异常: {e}")

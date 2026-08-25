@@ -5907,6 +5907,7 @@ class HoudiniMCP:
         "perf_stop_and_report": "_tool_perf_stop_and_report",
         # 长期记忆主动搜索
         "search_memory": "_tool_search_memory",
+        "remember_memory": "_tool_remember_memory",
         # 视口截图
         "capture_viewport": "_tool_capture_viewport",
     }
@@ -6096,6 +6097,31 @@ class HoudiniMCP:
     # ========================================
     # 长期记忆主动搜索
     # ========================================
+
+    def _tool_remember_memory(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist an explicit user-requested long-term memory."""
+        content = str(args.get("content") or "").strip()
+        if not content:
+            return {"success": False, "error": "content 参数不能为空"}
+        try:
+            from ..explicit_memory import remember_explicit_memory
+            result = remember_explicit_memory(
+                username=self._username,
+                content=content,
+                session_id=str(getattr(self, "_session_id", "") or ""),
+            )
+        except Exception as exc:
+            return {"success": False, "error": f"写入长期记忆失败: {exc}"}
+        if result.status in {"created", "already_exists"}:
+            return {
+                "success": True,
+                "result": {
+                    "status": result.status,
+                    "memory_id": result.memory_id,
+                    "message": result.message,
+                },
+            }
+        return {"success": False, "error": result.message or "未保存长期记忆。"}
 
     def _tool_search_memory(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """搜索长期记忆库 — 联合检索 semantic / episodic / procedural"""

@@ -331,6 +331,14 @@ class MemoryMixin:
                       f"tags={reflect_result.get('tags', [])}, "
                       f"deep_reflected={reflect_result.get('deep_reflected', False)}")
 
+            # ★ 通知主线程：本次任务的 episodic 记忆已写入（供用户反馈按钮定位）
+            episodic_id = reflect_result.get('episodic_id')
+            if episodic_id:
+                try:
+                    self._episodicRecorded.emit(episodic_id)
+                except Exception:
+                    pass
+
         except Exception as e:
             import traceback
             print(f"[Memory] 反思钩子异常: {e}")

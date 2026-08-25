@@ -335,7 +335,7 @@ class PlanMixin:
             'plan_mode': True,
             'plan_executing': True,     # 标记为 Plan 执行阶段
             'plan_data': plan_data,
-        })
+        }, user_message=exec_msg)
 
     def _on_plan_rejected(self):
         """用户点击 Reject 按钮 → 持久化拒绝并保留 Plan 文件"""

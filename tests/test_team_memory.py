@@ -13,6 +13,10 @@ from houdini_agent.utils.team_memory_export import (
     build_team_export_payload,
     export_team_memory,
 )
+from houdini_agent.utils.team_memory_document import (
+    MAX_EXPORT_FILE_BYTES,
+    parse_team_export_file,
+)
 from houdini_agent.utils.team_memory_settings import (
     is_team_export_enabled,
     set_team_export_enabled,
@@ -178,55 +182,70 @@ class RebuildTeamMemoryTest(unittest.TestCase):
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
+    @staticmethod
+    def _v1_payload(username: str, semantic=None, procedural=None) -> dict:
+        return {
+            "schema_version": 1,
+            "username": username,
+            "exported_at": 1.0,
+            "semantic": semantic or [],
+            "procedural": procedural or [],
+        }
+
+    @staticmethod
+    def _with_provenance(entry: dict) -> dict:
+        result = dict(entry)
+        result.update({
+            "embedding_model": "fallback-model",
+            "embedding_dimension": len(result["embedding"]),
+            "embedding_format_version": 1,
+        })
+        return result
+
     def test_rebuild_dedupes_similar_entries_and_unions_contributors(self):
         with TemporaryDirectory() as temp_dir, TemporaryDirectory() as db_dir:
             same_vec = _vec(1.0, 0.0, 0.0, 0.0).tolist()
             different_vec = _vec(0.0, 1.0, 0.0, 0.0).tolist()
 
-            payload_alice = {
-                "semantic": [
-                    {
+            payload_alice = self._v1_payload("alice", semantic=[
+                    self._with_provenance({
                         "rule": "cook 前先检查 update mode",
                         "category": "pitfall",
                         "abstraction_level": 2,
                         "confidence": 0.6,
                         "embedding": same_vec,
                         "embedding_backend": "fallback",
-                    },
-                    {
+                    }),
+                    self._with_provenance({
                         "rule": "不同的经验条目",
                         "category": "knowledge",
                         "abstraction_level": 3,
                         "confidence": 0.55,
                         "embedding": different_vec,
                         "embedding_backend": "fallback",
-                    },
-                ],
-                "procedural": [],
-            }
-            payload_bob = {
+                    }),
+                ])
+            payload_bob = self._v1_payload("bob", semantic=[
                 # 与 alice 的第一条语义近似重复（相同向量），但置信度更高，应保留 bob 这条内容
-                "semantic": [
-                    {
+                    self._with_provenance({
                         "rule": "先检查 update mode 再 cook（更完整表述）",
                         "category": "pitfall",
                         "abstraction_level": 2,
                         "confidence": 0.9,
                         "embedding": same_vec,
                         "embedding_backend": "fallback",
-                    },
+                    }),
                     # 不合格：置信度不足，应被过滤
-                    {
+                    self._with_provenance({
                         "rule": "低质量条目",
                         "category": "debug",
                         "abstraction_level": 2,
                         "confidence": 0.1,
                         "embedding": different_vec,
                         "embedding_backend": "fallback",
-                    },
-                ],
-                "procedural": [
-                    {
+                    }),
+                ], procedural=[
+                    self._with_provenance({
                         "strategy_name": "verify_before_modify",
                         "description": "改前先查现有结构",
                         "priority": 0.6,
@@ -234,9 +253,8 @@ class RebuildTeamMemoryTest(unittest.TestCase):
                         "usage_count": 4,
                         "embedding": same_vec,
                         "embedding_backend": "fallback",
-                    },
-                ],
-            }
+                    }),
+                ])
 
             path_alice = self._write_export(temp_dir, "alice", payload_alice)
             path_bob = self._write_export(temp_dir, "bob", payload_bob)
@@ -248,10 +266,11 @@ class RebuildTeamMemoryTest(unittest.TestCase):
 
             self.assertEqual(stats["scanned_users"], 2)
             self.assertEqual(stats["skipped_files"], 0)
-            # alice 2 + bob 2 = 4 条原始语义，去重后应剩 2 条（重复的 pitfall 合并，低质量的被过滤）
-            self.assertEqual(stats["semantic_raw"], 4)
+            # 4 条输入中低质量条目先由统一资格策略过滤，3 条进入去重，最终剩 2 条。
+            self.assertEqual(stats["semantic_raw"], 3)
             self.assertEqual(stats["semantic_merged"], 2)
             self.assertEqual(stats["procedural_merged"], 1)
+            self.assertEqual(stats["ineligible_entries"], 1)
 
             store = TeamMemoryStore(db_path=Path(db_dir) / "team_memory.db")
             all_rules = {
@@ -330,15 +349,12 @@ class RebuildTeamMemoryTest(unittest.TestCase):
         with TemporaryDirectory() as export_dir, TemporaryDirectory() as db_dir:
             path = Path(db_dir) / "team_memory.db"
             path.write_bytes(b"old-live-db")
-            payload = {
-                "semantic": [{
+            payload = self._v1_payload("alice", semantic=[{
                     "rule": "final team text", "category": "knowledge", "abstraction_level": 2,
                     "confidence": 0.9, "embedding": _vec(1, 0, 0, 0).tolist(),
                     "embedding_backend": "old", "embedding_model": "old-model",
                     "embedding_dimension": 4, "embedding_format_version": 1,
-                }],
-                "procedural": [],
-            }
+                }])
             export_path = self._write_export(export_dir, "alice", payload)
             embedder = FakeEmbedder()
             with mock.patch("houdini_agent.utils.team_memory_store.os.replace", side_effect=OSError("locked")):
@@ -350,7 +366,7 @@ class RebuildTeamMemoryTest(unittest.TestCase):
     def test_rebuild_refreshes_default_singleton(self):
         import houdini_agent.utils.team_memory_store as module
         with TemporaryDirectory() as export_dir:
-            payload = {"semantic": [], "procedural": []}
+            payload = self._v1_payload("alice")
             export_path = self._write_export(export_dir, "alice", payload)
             old_path = module._TEAM_DB_PATH
             old_instance = module._team_store_instance
@@ -366,6 +382,80 @@ class RebuildTeamMemoryTest(unittest.TestCase):
                     module._team_store_instance.close()
                 module._team_store_instance = old_instance
                 module._TEAM_DB_PATH = old_path
+
+    def test_parser_keeps_valid_entries_and_reports_invalid_and_ineligible(self):
+        with TemporaryDirectory() as export_dir:
+            valid = self._with_provenance({
+                "rule": "valid", "category": "knowledge", "abstraction_level": 2,
+                "confidence": 0.9, "embedding": _vec(1, 0, 0, 0).tolist(),
+                "embedding_backend": "fallback",
+            })
+            ineligible = dict(valid, rule="private", category="preference")
+            payload = self._v1_payload("alice", semantic=[valid, "bad-entry", ineligible])
+            path = self._write_export(export_dir, "alice", payload)
+            result = parse_team_export_file(path, "alice")
+            self.assertTrue(result.valid_document)
+            self.assertEqual(len(result.semantic), 1)
+            self.assertEqual(result.invalid_entries, 1)
+            self.assertEqual(result.ineligible_entries, 1)
+            self.assertEqual(result.diagnostics[0].reason, "semantic_not_object")
+            self.assertNotIn("valid", result.diagnostics[0].to_dict())
+
+    def test_parser_accepts_legacy_v0_but_rejects_unknown_version_and_username_mismatch(self):
+        with TemporaryDirectory() as export_dir:
+            legacy = {"semantic": [], "procedural": []}
+            legacy_path = self._write_export(export_dir, "alice", legacy)
+            self.assertTrue(parse_team_export_file(legacy_path, "alice").valid_document)
+
+            unknown_path = self._write_export(
+                export_dir, "unknown", {"schema_version": 99, "semantic": [], "procedural": []},
+            )
+            self.assertFalse(parse_team_export_file(unknown_path, "unknown").valid_document)
+
+            mismatch_path = self._write_export(export_dir, "bob", self._v1_payload("alice"))
+            mismatch = parse_team_export_file(mismatch_path, "bob")
+            self.assertFalse(mismatch.valid_document)
+            self.assertEqual(mismatch.diagnostics[0].reason, "username_mismatch")
+
+    def test_parser_rejects_bad_embedding_and_oversized_file(self):
+        with TemporaryDirectory() as export_dir:
+            bad = self._with_provenance({
+                "rule": "bad vector", "category": "knowledge", "abstraction_level": 2,
+                "confidence": 0.9, "embedding": [1.0, float("nan")],
+                "embedding_backend": "fallback",
+            })
+            path = self._write_export(export_dir, "alice", self._v1_payload("alice", semantic=[bad]))
+            result = parse_team_export_file(path, "alice")
+            self.assertTrue(result.valid_document)
+            self.assertEqual(result.invalid_entries, 1)
+            self.assertEqual(result.diagnostics[0].reason, "semantic_embedding_invalid")
+
+            with mock.patch.object(Path, "stat") as stat:
+                stat.return_value.st_size = MAX_EXPORT_FILE_BYTES + 1
+                oversized = parse_team_export_file(path, "alice")
+            self.assertFalse(oversized.valid_document)
+            self.assertEqual(oversized.diagnostics[0].reason, "file_too_large")
+
+    def test_rebuild_preserves_live_db_when_all_discovered_documents_are_invalid(self):
+        with TemporaryDirectory() as export_dir, TemporaryDirectory() as db_dir:
+            live_path = Path(db_dir) / "team_memory.db"
+            live_path.write_bytes(b"existing")
+            invalid_path = self._write_export(export_dir, "alice", ["not", "an", "object"])
+            with self.assertRaises(RuntimeError):
+                rebuild_team_memory(FakeEmbedder(), live_path, [("alice", invalid_path)])
+            self.assertEqual(live_path.read_bytes(), b"existing")
+
+    def test_rebuild_with_no_export_files_publishes_empty_database(self):
+        with TemporaryDirectory() as db_dir:
+            live_path = Path(db_dir) / "team_memory.db"
+            stats = rebuild_team_memory(FakeEmbedder(), live_path, [])
+            self.assertEqual(stats["scanned_users"], 0)
+            store = TeamMemoryStore(live_path, FakeEmbedder())
+            try:
+                self.assertEqual(store.count_semantic(), 0)
+                self.assertEqual(store.count_procedural(), 0)
+            finally:
+                store.close()
 
 
 class PersonalMemoryProvenanceTest(unittest.TestCase):

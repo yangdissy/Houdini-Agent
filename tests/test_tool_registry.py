@@ -75,6 +75,7 @@ class InferHelpersTest(unittest.TestCase):
         self.assertTrue(_infer_concurrency_safe("web_search"))
         self.assertTrue(_infer_concurrency_safe("get_network_structure"))
         self.assertFalse(_infer_concurrency_safe("create_node"))
+        self.assertFalse(_infer_concurrency_safe("remember_memory"))
 
     def test_risk_level(self):
         self.assertEqual(_infer_risk_level("execute_shell"), "high")
@@ -82,6 +83,8 @@ class InferHelpersTest(unittest.TestCase):
         self.assertEqual(_infer_risk_level("delete_node"), "high")
         self.assertEqual(_infer_risk_level("get_network_structure"), "low")
         self.assertEqual(_infer_risk_level("create_node"), "normal")
+        self.assertEqual(_infer_risk_level("remember_memory"), "normal")
+        self.assertNotIn("ask", _infer_modes("remember_memory"))
 
     def test_default_execution_profile_contains_fallback_classifications(self):
         profile = build_default_tool_execution_profile()

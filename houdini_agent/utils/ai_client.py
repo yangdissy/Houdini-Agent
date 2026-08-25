@@ -1552,6 +1552,23 @@ HOUDINI_TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember_memory",
+            "description": "当用户明确要求长期记住某条偏好、原则、方法，或要求“记住上面这次的回答/对话/思路”时，调用本工具把该内容写入长期记忆。调用前先把要保存的内容总结提炼成 content。普通问答和“你还记得吗”不要调用。工具成功前不得声称已记住。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "要长期保存的精炼内容：若用户说“记住上面这次的回答/对话”，就把那次回答的要点、规则、偏好总结成这段文字。不要包含密码、密钥或访问令牌。"
+                    }
+                },
+                "required": ["content"]
+            }
+        }
+    },
     # ★ 视口截图工具（视觉验证）
     {
         "type": "function",

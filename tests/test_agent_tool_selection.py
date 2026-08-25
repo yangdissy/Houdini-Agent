@@ -56,6 +56,32 @@ class AgentToolSelectionTest(unittest.TestCase):
         self.assertIn("get_network_structure", names)
         self.assertNotIn("save_hip", names)
 
+    def test_explicit_remember_request_exposes_write_tool(self):
+        tab = object.__new__(AITab)
+
+        tools = AITab._select_agent_tools_for_message(
+            tab,
+            "请记住始终使用中文回答",
+            use_web=False,
+        )
+        names = _tool_names(tools)
+
+        self.assertIn("remember_memory", names)
+        self.assertIn("search_memory", names)
+
+    def test_recall_request_does_not_expose_write_tool(self):
+        tab = object.__new__(AITab)
+
+        tools = AITab._select_agent_tools_for_message(
+            tab,
+            "你还记得我的偏好吗",
+            use_web=False,
+        )
+        names = _tool_names(tools)
+
+        self.assertIn("search_memory", names)
+        self.assertNotIn("remember_memory", names)
+
 
 if __name__ == "__main__":
     unittest.main()

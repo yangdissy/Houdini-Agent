@@ -319,7 +319,10 @@ class ContextManagerMixin:
         
         # --- 第一遍：压缩旧轮次的 tool 结果（保留最近 60%）---
         n_rounds = len(rounds)
-        protect_n = max(2, int(n_rounds * 0.6))
+        pruning_policy = self.token_optimizer.budget.automatic_pruning_policy(
+            self._optimization_strategy
+        )
+        protect_n = max(2, int(n_rounds * pruning_policy.protect_ratio))
         summarize_tool_content = self.client._summarize_tool_content if hasattr(self.client, '_summarize_tool_content') else None
         compress_old_round_tool_results(rounds, protect_n, summarize_fn=summarize_tool_content)
         
@@ -349,7 +352,7 @@ class ContextManagerMixin:
             return
         
         # --- 第二遍：删除最早的完整轮次，直到低于阈值 ---
-        target = int(context_limit * 0.65)  # 目标降到 65%
+        target = int(context_limit * pruning_policy.target_ratio)
         prune_context_rounds_to_token_target(
             rounds,
             target,

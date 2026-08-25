@@ -112,6 +112,18 @@ Gather context → ask clarifying questions → generate a plan with DAG depende
 ### Long-term Memory
 Three-layer store (semantic/episodic/procedural) with reward-driven learning and reflection. Per-user isolated, persists across Houdini restarts.
 
+- Use `/remember <content>` to explicitly save a preference, rule, or method; the model may also call `remember_memory` when you clearly ask it to remember something
+- The proposed content is shown for human confirmation before writing; Ask mode, ordinary Q&A, and recall questions do not trigger writes
+- `/memory` shows memory status, while `/memories` opens the long-term memory manager for filtering, editing, and deleting records
+- Responses that executed tools offer Good/Bad feedback to strengthen or weaken the corresponding task experience
+- The authoritative personal database is `cache/users/<username>/memory/agent_memory.db`; legacy leftovers are safely restored or surfaced as conflicts
+
+### Team Memory
+Members can explicitly publish eligible semantic/procedural experience for an administrator to rebuild into the shared knowledge base. Imports validate document version, contributor identity, resource limits, embedding metadata, and sharing eligibility. Corrupt or entirely invalid exports cannot replace an existing team database, while rebuilding after all exports are withdrawn correctly clears stale shared data.
+
+### Context Compression
+Choose `Aggressive`, `Balanced`, or `Conservative` from the top-right menu → Context Compression. The selected strategy controls both manual compression and automatic pruning: aggressive mode frees more context, while conservative mode preserves more recent conversation. Tool calls and their results remain protected as complete rounds.
+
 ### Plugins & Rules
 - `plugins/`: Community plugins that extend the tool set
 - `rules/`: Markdown files defining persistent rules that shape agent behavior
@@ -155,10 +167,10 @@ Key adaptations:
 | Tool governance | Registry-authorized execution, human confirmation, argument/result guardrails, per-item batch enforcement |
 | Stability | Qt/GPU race protection, transactional session workspace commits, stale-writer protection, atomic memory publication |
 | Doc retrieval | Multi-factor weighted scoring, query-type reranking, diversity constraints |
-| Context management | Round-safe compression across normal send and 413 recovery, with tool schemas included in token budgets |
-| Memory correctness | Embedding provenance checks and rollback-safe personal/team memory migration |
+| Context management | Strategy-aware, round-safe compression across normal send, manual compression, and 413 recovery, with tool schemas included in token budgets |
+| Memory correctness | Intent checks and confirmation for explicit saves; embedding provenance validation; recoverable personal memory and versioned, fail-closed Team Memory imports |
 
-Latest update: [2026-08-17–18 reliability and governance deepening](changelog/CHANGELOG_2026-08-18.md). Full change history in [changelog/](changelog/).
+Latest update: [2026-08-25 Team Memory, explicit memory, and context compression](changelog/CHANGELOG_2026-08-25.md). Full change history in [changelog/](changelog/).
 
 ## Troubleshooting
 
@@ -189,6 +201,13 @@ Latest update: [2026-08-17–18 reliability and governance deepening](changelog/
 **Memory/config not persisting**
 - Confirm you logged in with a username at startup
 - Check that `cache/users/<username>/` exists and is writable
+- Explicit saves require `/remember <content>` or a clear request to remember/save permanently, followed by approval in the confirmation card
+- The personal memory database should be at `cache/users/<username>/memory/agent_memory.db`
+
+**Team Memory rebuild fails**
+- Check that member exports use a supported schema and that each document username matches its scanned contributor
+- If export files are found but all are invalid, the existing Team Memory database is preserved by design
+- The rebuild result dialog reports rejected files, invalid entries, and entries that are valid but ineligible for sharing
 
 ## Development
 

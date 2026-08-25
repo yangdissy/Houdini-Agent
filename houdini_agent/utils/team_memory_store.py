@@ -22,7 +22,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -35,13 +35,7 @@ from .memory_sqlite import (
     read_embedding_metadata,
     write_embedding_metadata,
 )
-from .team_memory_export import (
-    ELIGIBLE_SEMANTIC_CATEGORIES,
-    ELIGIBLE_ABSTRACTION_LEVELS,
-    MIN_SEMANTIC_CONFIDENCE,
-    MIN_PROCEDURAL_SUCCESS_RATE,
-    MIN_PROCEDURAL_USAGE,
-)
+from .team_memory_document import MAX_DIAGNOSTICS, parse_team_export_file
 
 _TEAM_DB_DIR = Path(__file__).parent.parent.parent / "cache" / "memory" / "team"
 _TEAM_DB_PATH = _TEAM_DB_DIR / "team_memory.db"
@@ -342,18 +336,6 @@ def _dedup_semantic(raw_items: List[dict]) -> List[TeamSemanticRecord]:
     buckets: Dict[Tuple[str, str], List[dict]] = {}
     for item in raw_items:
         category = item.get("category")
-        if category not in ELIGIBLE_SEMANTIC_CATEGORIES:
-            continue
-        if item.get("abstraction_level") not in ELIGIBLE_ABSTRACTION_LEVELS:
-            continue
-        try:
-            confidence = float(item.get("confidence", 0.0))
-        except (TypeError, ValueError):
-            continue
-        if confidence < MIN_SEMANTIC_CONFIDENCE:
-            continue
-        if not item.get("rule"):
-            continue
         provenance = (
             item.get("embedding_backend", "unknown"),
             item.get("embedding_model", "unknown"),
@@ -405,15 +387,6 @@ def _dedup_semantic(raw_items: List[dict]) -> List[TeamSemanticRecord]:
 def _dedup_procedural(raw_items: List[dict]) -> List[TeamProceduralRecord]:
     buckets: Dict[str, List[dict]] = {}
     for item in raw_items:
-        if not item.get("strategy_name"):
-            continue
-        try:
-            success_rate = float(item.get("success_rate", 0.0))
-            usage_count = int(item.get("usage_count", 0))
-        except (TypeError, ValueError):
-            continue
-        if success_rate < MIN_PROCEDURAL_SUCCESS_RATE or usage_count < MIN_PROCEDURAL_USAGE:
-            continue
         provenance = (
             item.get("embedding_backend", "unknown"),
             item.get("embedding_model", "unknown"),
@@ -468,7 +441,7 @@ def rebuild_team_memory(
     embedder: Optional[LocalEmbedder] = None,
     db_path: Optional[Path] = None,
     export_files: Optional[List[Tuple[str, Path]]] = None,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
     """开发模式手动触发：全量扫描所有 team_export.json，去重合并写入 team_memory.db。
 
     Args:
@@ -482,23 +455,31 @@ def rebuild_team_memory(
     raw_procedural: List[dict] = []
     scanned_users = 0
     skipped_files = 0
+    valid_documents = 0
+    invalid_entries = 0
+    ineligible_entries = 0
+    ineligible_reasons: Dict[str, int] = {}
+    diagnostics = []
 
     files = export_files if export_files is not None else list(_iter_export_files())
     for username, export_path in files:
-        try:
-            data = json.loads(Path(export_path).read_text(encoding="utf-8"))
-        except Exception:
+        parsed = parse_team_export_file(Path(export_path), username)
+        if not parsed.valid_document:
             skipped_files += 1
+            diagnostics.extend(d.to_dict() for d in parsed.diagnostics[:MAX_DIAGNOSTICS - len(diagnostics)])
             continue
         scanned_users += 1
-        for item in data.get("semantic", []) or []:
-            item = dict(item)
-            item["_source_user"] = username
-            raw_semantic.append(item)
-        for item in data.get("procedural", []) or []:
-            item = dict(item)
-            item["_source_user"] = username
-            raw_procedural.append(item)
+        valid_documents += 1
+        invalid_entries += parsed.invalid_entries
+        ineligible_entries += parsed.ineligible_entries
+        for reason, count in parsed.ineligible_reasons.items():
+            ineligible_reasons[reason] = ineligible_reasons.get(reason, 0) + count
+        diagnostics.extend(d.to_dict() for d in parsed.diagnostics[:MAX_DIAGNOSTICS - len(diagnostics)])
+        raw_semantic.extend(parsed.semantic)
+        raw_procedural.extend(parsed.procedural)
+
+    if files and valid_documents == 0:
+        raise RuntimeError("No valid Team Memory export documents; existing database was preserved")
 
     merged_semantic = _dedup_semantic(raw_semantic)
     merged_procedural = _dedup_procedural(raw_procedural)
@@ -537,6 +518,11 @@ def rebuild_team_memory(
     return {
         "scanned_users": scanned_users,
         "skipped_files": skipped_files,
+        "valid_documents": valid_documents,
+        "invalid_entries": invalid_entries,
+        "ineligible_entries": ineligible_entries,
+        "ineligible_reasons": ineligible_reasons,
+        "diagnostics": diagnostics,
         "semantic_raw": len(raw_semantic),
         "procedural_raw": len(raw_procedural),
         "semantic_merged": len(merged_semantic),

@@ -195,6 +195,7 @@ class ToolArgumentValidator:
     _REQUIRED_ARG_KEYS = {
         "execute_python": ("code",),
         "execute_shell": ("command",),
+        "remember_memory": ("content",),
         "get_node_parameters": ("node_path",),
         "get_parameter_schema": ("node_path",),
         "inspect_node": ("node_path",),
@@ -418,6 +419,61 @@ class HarnessToolPolicyEngine:
 
         mode = context.get("mode", "agent")
         confirm_mode = bool(context.get("confirm_mode", False))
+        if tool_name == "remember_memory":
+            if int(context.get("remember_memory_calls") or 0) >= 1:
+                return self._decision(
+                    "deny",
+                    "remember_memory is limited to one call per request",
+                    risk_factors=[RiskFactor(
+                        "explicit_memory_once_per_request",
+                        "error",
+                        "remember_memory is limited to one call per request",
+                        1.0,
+                    )],
+                    required_control="deny",
+                )
+            user_message = str(context.get("user_message") or "")
+            from houdini_agent.utils.explicit_memory import ExplicitMemoryService
+            intent_ok = ExplicitMemoryService.has_explicit_save_intent(user_message)
+            if not intent_ok:
+                return self._decision(
+                    "deny",
+                    "remember_memory requires an explicit save request",
+                    risk_factors=[RiskFactor(
+                        "explicit_memory_intent_required",
+                        "error",
+                        "remember_memory requires an explicit save request",
+                        1.0,
+                    )],
+                    required_control="deny",
+                )
+            if mode == "ask":
+                return self._decision(
+                    "deny",
+                    "Ask mode blocked tool: remember_memory",
+                    risk_factors=[RiskFactor(
+                        "ask_mode_memory_write",
+                        "error",
+                        "Ask mode blocked tool: remember_memory",
+                        1.0,
+                    )],
+                    required_control="deny",
+                )
+            # ★ 写长期记忆前必须经用户确认：确认框会展示 LLM 总结的 content
+            #   （长度上限由 explicit_memory._MAX_CONTENT_LENGTH 保证），
+            #   用户可核对内容是否准确后再放行写入。
+            return self._decision(
+                "ask",
+                "remember_memory writes long-term memory; review summarized content before confirming",
+                risk_factors=[RiskFactor(
+                    "explicit_memory_review",
+                    "info",
+                    "review summarized memory content before writing",
+                    0.3,
+                )],
+                required_control="confirm",
+            )
+
         if mode == "ask" and tool_name in self._DANGEROUS_TOOLS:
             return self._decision(
                 "deny",
@@ -546,6 +602,8 @@ class GovernedToolExecutor:
             try:
                 confirmed = bool(self._confirm(tool_name, exec_args))
             except Exception:
+                import traceback
+                print(f"[Harness] confirm callback raised for {tool_name}:\n{traceback.format_exc()}")
                 confirmed = False
             self._record_trace("tool_policy_ask", tool=tool_name, confirmed=confirmed)
             if not confirmed:

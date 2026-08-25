@@ -195,4 +195,6 @@ class AgentRunnerMixin:
         try:
             return self._confirm_result_queue.get(timeout=120.0)
         except queue.Empty:
+            # 超时通常意味着主线程槽函数未执行（事件循环阻塞或信号未分发）
+            print(f"[ConfirmMode] ✗ 确认超时(120s): {tool_name}")
             return False

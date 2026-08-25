@@ -131,12 +131,12 @@ class UserPaths:
         return self.memory_dir() / "embeddings"
 
     def memory_db(self) -> Path:
-        # SQLite 在 SMB 网络盘上文件锁不可靠，将 .db 存到本地磁盘
-        # 优先 %LOCALAPPDATA%，回退到系统临时目录
+        return self.memory_dir() / "agent_memory.db"
+
+    def legacy_local_memory_db(self) -> Path:
+        """Return the former local DB path, used only as a recovery source."""
         local_base = Path(os.environ.get("LOCALAPPDATA") or os.environ.get("TMPDIR") or os.path.expanduser("~"))
-        local_db_dir = local_base / "HoudiniAgent" / "memory" / self.username
-        local_db_dir.mkdir(parents=True, exist_ok=True)
-        return local_db_dir / "agent_memory.db"
+        return local_base / "HoudiniAgent" / "memory" / self.username / "agent_memory.db"
 
     def growth_profile_path(self) -> Path:
         return self.memory_dir() / "growth_profile.json"

@@ -16,6 +16,13 @@
 - **Help Source**：`houdini_agent/utils/help_source.py`，离线帮助数据源的底层 module。公开 `find_help_dir`（定位含 nodes.zip/vex.zip/hom.zip 的 help 目录）、`parse_wiki`（wiki 标记解析）、`iter_pages`（ZIP 页面遍历，统一过滤规则）。是 `HoudiniDocIndex` 与 `search_houdini_help` skill 共享的 seam。
 - **Doc Index**：`HoudiniDocIndex`（`houdini_agent/utils/doc_rag.py`），dict 索引 + 知识库分段检索。ZIP 索引缓存以 help_dir 路径 + 版本 + zip mtime/size 指纹失效。
 
+## 团队记忆（Team Memory）
+
+- **Team Memory Export Document（团队记忆导出文档）**：成员主动发布、供团队记忆重建消费的版本化文档。扫描来源决定贡献者身份；文档必须通过 schema、资源限制及共享资格检查。
+- **Team Memory Eligibility Policy（团队记忆共享资格策略）**：决定一条长期记忆是否可以进入团队共享层的统一规则。结构或安全无效与正常但不合共享资格是两种不同结果。
+- **Invalid Entry（无效条目）**：违反导出文档 schema、类型、资源限制或向量一致性的条目；拒绝并产生不含记忆正文的有限诊断。
+- **Ineligible Entry（不合共享资格条目）**：结构合法，但未达到 Team Memory Eligibility Policy 的条目；属于预期隐私或质量过滤，仅聚合计数。
+
 ## 工具约定
 
 - **`save_hip`**：保存 HIP 文件，参数名为 **`file_path`**（不是 `output_path`）。harness 会为其自动补 `.hip` 扩展名。见 ADR-0001。

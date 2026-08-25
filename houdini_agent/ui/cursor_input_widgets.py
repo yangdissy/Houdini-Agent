@@ -459,8 +459,8 @@ SLASH_COMMANDS = [
     # ── 记忆系统 ──
     ("memory",    "🧠",  "记忆状态",     "Memory Status",    "查看长期记忆统计和核心记忆", "View memory stats & core memories", "memory"),
     ("remember",  "📌",  "记住偏好",     "Remember",         "将内容写入核心记忆",         "Save content to core memory",  "memory"),
-    ("forget",    "🧹",  "清除记忆",     "Forget",           "搜索并删除指定记忆",         "Search and delete a memory",   "memory"),
-    ("search_mem","🔍",  "搜索记忆",     "Search Memory",    "在长期记忆中搜索",           "Search long-term memory",      "memory"),
+    # ("forget",    "🧹",  "清除记忆",     "Forget",           "搜索并删除指定记忆",         "Search and delete a memory",   "memory"),
+    # ("search_mem","🔍",  "搜索记忆",     "Search Memory",    "在长期记忆中搜索",           "Search long-term memory",      "memory"),
     ("memories",  "📚",  "记忆库",       "Memory Library",   "打开记忆管理窗口",         "Open memory manager (full CRUD)", "memory"),
     # ── Houdini 场景 ──
     ("network",   "🌐",  "读取网络",     "Read Network",     "读取当前网络结构",           "Read current network structure","scene"),
@@ -840,9 +840,15 @@ class ChatInput(QtWidgets.QPlainTextEdit):
         self._slash_start_pos = -1
         self._hide_slash()
 
-    def insert_slash_completion(self, command: str):
-        """斜杠命令被选中后，清空输入框（命令将直接执行，不需要保留文字）"""
-        self.clear()
+    def insert_slash_completion(self, command: str, expects_args: bool = False):
+        """Complete a slash command, preserving parameter commands for editing."""
+        if expects_args:
+            self.setPlainText(f"/{command} ")
+            cursor = self.textCursor()
+            cursor.movePosition(QtGui.QTextCursor.End)
+            self.setTextCursor(cursor)
+        else:
+            self.clear()
         self._slash_active = False
         self._slash_start_pos = -1
 

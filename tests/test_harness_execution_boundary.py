@@ -2,6 +2,7 @@
 """Harness execution boundary tests."""
 
 import unittest
+from unittest.mock import patch
 
 from tests.test_import_smoke import (
     _install_hou_stub,
@@ -18,6 +19,7 @@ from houdini_agent.core.harness_engine import (
     HarnessToolPolicyEngine,
     ToolPolicyDecision,
 )
+from houdini_agent.core.send_orchestrator_mixin import SendOrchestratorMixin
 from houdini_agent.ui.ai_tab import AITab
 
 
@@ -32,6 +34,39 @@ class _SignalStub:
 class _ClientStub:
     def is_stop_requested(self):
         return False
+
+
+class _ControlStub:
+    def __init__(self, value):
+        self._value = value
+
+    def currentText(self):
+        return self._value
+
+    def isChecked(self):
+        return bool(self._value)
+
+
+class _ThreadStub:
+    last_args = None
+
+    def __init__(self, target, args, daemon):
+        self.__class__.last_args = args
+
+    def start(self):
+        pass
+
+
+class _ThreadStub:
+    last_target = None
+    last_args = None
+
+    def __init__(self, target, args, daemon):
+        self.__class__.last_target = target
+        self.__class__.last_args = args
+
+    def start(self):
+        pass
 
 
 class HarnessExecutionBoundaryTest(unittest.TestCase):
@@ -98,6 +133,34 @@ class HarnessExecutionBoundaryTest(unittest.TestCase):
 
         self.assertFalse(result["success"])
         self.assertEqual(confirmations[0][0], "execute_shell")
+
+    def test_start_agent_run_captures_user_message_in_thread_params(self):
+        tab = self._make_tab()
+        tab._current_user_message = "上一轮消息"
+        tab._capture_pre_agent_update_mode = lambda: None
+        tab._update_context_stats = lambda: None
+        tab._set_running = lambda value: None
+        tab._add_ai_response = lambda: None
+        tab._current_response = object()
+        tab._start_active_aurora = lambda: None
+        tab._current_provider = lambda: "test"
+        tab.model_combo = _ControlStub("model")
+        tab.web_check = _ControlStub(False)
+        tab.think_check = _ControlStub(False)
+        tab._get_current_context_limit = lambda: 1000
+        tab._collect_scene_context = lambda: {}
+        tab._current_model_supports_vision = lambda: False
+        tab._plan_mode = False
+        tab._save_model_preference = lambda: None
+
+        with patch("houdini_agent.core.send_orchestrator_mixin.threading.Thread", _ThreadStub):
+            SendOrchestratorMixin._start_agent_run(
+                tab, inject_scene=False, user_message="记住上面这次的回答"
+            )
+
+        params = _ThreadStub.last_args[0]
+        self.assertEqual(params["user_message"], "记住上面这次的回答")
+        self.assertEqual(tab._current_user_message, "记住上面这次的回答")
 
     def test_empty_geometry_after_cook_blocks_validation_signal(self):
         tab = self._make_tab()

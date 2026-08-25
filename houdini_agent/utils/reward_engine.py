@@ -28,6 +28,8 @@ from shared.user_paths import normalize_username
 
 TAG_ERROR_CORRECTION = "error_correction"   # 出错 → 纠正 → 成功
 TAG_UNRESOLVED_ERROR = "unresolved_error"   # 出错且未解决
+TAG_USER_PRAISED = "user_praised"           # 用户手动 👍 奖励
+TAG_USER_REJECTED = "user_rejected"         # 用户手动 👎 纠错
 
 # ============================================================
 # 奖励权重配置
@@ -253,6 +255,42 @@ class RewardEngine:
         """
         self.apply_time_decay()
         return self.store.maintain_long_term_memory()
+
+    # ==========================================================
+    # 用户手动反馈（👍/👎）
+    # ==========================================================
+
+    def apply_user_feedback(self, episodic_id: str, positive: bool) -> Dict:
+        """根据用户 👍/👎 修正已有 episodic 记忆的 reward 与 importance。
+
+        - 👍：reward 提到 0.85（确保超 strengthen 阈值），importance 强化
+        - 👎：reward 压到 0.15（确保低于 weaken 阈值），importance 衰减
+        - 打 tag（user_praised / user_rejected）供后续反思/检索识别
+
+        Returns:
+            dict 含 reward、importance、tags；记录不存在时返回 {"error": ...}
+        """
+        record = self.store.get_episodic(episodic_id)
+        if record is None:
+            return {"error": f"episodic record not found: {episodic_id}"}
+
+        if positive:
+            reward = 0.85
+            importance = min(5.0, record.importance * self.strengthen_factor)
+            tag = TAG_USER_PRAISED
+        else:
+            reward = 0.15
+            importance = max(0.01, record.importance * self.weaken_factor)
+            tag = TAG_USER_REJECTED
+
+        tags = list(record.tags)
+        if tag not in tags:
+            tags.append(tag)
+
+        self.store.update_episodic_reward(episodic_id, reward, importance)
+        self.store.update_episodic_tags(episodic_id, tags)
+
+        return {"reward": reward, "importance": importance, "tags": tags}
 
 
 # ============================================================

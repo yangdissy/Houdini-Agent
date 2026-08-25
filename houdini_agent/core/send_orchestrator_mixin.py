@@ -27,7 +27,12 @@ from houdini_agent.utils.plan_manager import (
 
 
 class SendOrchestratorMixin:
-    def _start_agent_run(self, agent_params_overrides: dict = None, inject_scene: bool = True):
+    def _start_agent_run(
+        self,
+        agent_params_overrides: dict = None,
+        inject_scene: bool = True,
+        user_message: str = None,
+    ):
         """启动一次 Agent/Plan 执行，共享运行前准备逻辑。
 
         普通 Agent 与 Plan 执行阶段都必须走这里，避免 Plan copy 一套
@@ -36,6 +41,7 @@ class SendOrchestratorMixin:
         # 先记录用户/hip 原始 Update Mode。后续 Cook Guard 临时 Manual
         # 不能被误判为用户持久 Manual。
         self._capture_pre_agent_update_mode()
+        self._remember_memory_calls = 0
 
         if inject_scene:
             self._auto_inject_scene_read()
@@ -64,6 +70,11 @@ class SendOrchestratorMixin:
         }
         if agent_params_overrides:
             agent_params.update(agent_params_overrides)
+        current_user_message = (
+            user_message if user_message is not None else self._latest_user_message()
+        )
+        self._current_user_message = current_user_message
+        agent_params['user_message'] = current_user_message
 
         self._save_model_preference()
 
@@ -77,6 +88,14 @@ class SendOrchestratorMixin:
         # 任意 session 有 agent 在跑就阻止发送（AIClient 是共享的，不支持并行）
         if not text or self._agent_session_id is not None:
             return
+
+        parsed_command = self._parse_slash_command(text)
+        if parsed_command:
+            command, args = parsed_command
+            if getattr(self, f'_slash_{command}', None):
+                self.input_edit.clear()
+                self._execute_slash_command(command, args)
+                return
 
         provider = self._current_provider()
         if not self.client.has_api_key(provider):
@@ -108,7 +127,22 @@ class SendOrchestratorMixin:
         else:
             self._conversation_history.append({'role': 'user', 'content': processed_text})
 
-        self._start_agent_run()
+        self._start_agent_run(user_message=text)
+
+    def _latest_user_message(self) -> str:
+        """Return the latest user text without depending on mutable state later in the worker."""
+        for message in reversed(self._conversation_history):
+            if message.get('role') != 'user':
+                continue
+            content = message.get('content', '')
+            if isinstance(content, list):
+                return ' '.join(
+                    part.get('text', '')
+                    for part in content
+                    if part.get('type') == 'text'
+                )
+            return str(content or '')
+        return ''
 
     def _select_agent_tools_for_message(self, user_message: str, use_web: bool = True) -> List[dict]:
         """Select a minimal Agent-mode tool set using ToolRegistry intent groups."""
@@ -207,14 +241,14 @@ class SendOrchestratorMixin:
             if personality_text:
                 sys_prompt = sys_prompt + "\n\n" + personality_text
             
-            # ★ L0 核心记忆加载：全部加载到 sys_prompt（上限 5 条，按 confidence TopK）
+            # ★ L0 核心记忆加载：用户手动 /remember 写入，优先级高于自动记忆（上限 8 条，按 confidence TopK）
             if self._memory_initialized and self._memory_store:
                 try:
-                    core_mems = self._memory_store.get_core_memories(max_count=5)
+                    core_mems = self._memory_store.get_core_memories(max_count=8)
                     if core_mems:
                         core_lines = [f"- {m.rule}" for m in core_mems]
                         sys_prompt = sys_prompt + (
-                            "\n\n[Core Memory — 以下为核心记忆，仅供参考，请结合当前上下文判断]\n"
+                            "\n\n[Core Memory — 以下为用户手动设定的核心记忆，优先级高于自动积累的经验，请务必优先遵守]\n"
                             + "\n".join(core_lines)
                         )
                 except Exception as e:
@@ -255,19 +289,8 @@ class SendOrchestratorMixin:
             dynamic_sections = []
             
             # 3. 自动 RAG 注入（从用户最新消息中提取关键词，检索相关文档）
-            user_last_msg = ""
-            if self._conversation_history:
-                for msg in reversed(self._conversation_history):
-                    if msg.get('role') == 'user':
-                        raw_content = msg.get('content', '')
-                        # 多模态内容（list）中提取文字部分
-                        if isinstance(raw_content, list):
-                            user_last_msg = ' '.join(
-                                p.get('text', '') for p in raw_content if p.get('type') == 'text'
-                            )
-                        else:
-                            user_last_msg = raw_content
-                        break
+            user_last_msg = str(agent_params.get('user_message') or '')
+            self._current_user_message = user_last_msg
             if user_last_msg:
                 rag_context = self._auto_rag_retrieve(
                     user_last_msg,
@@ -413,9 +436,12 @@ class SendOrchestratorMixin:
                     
                     old_tokens = current_tokens
                     summarize_tool_content = self.client._summarize_tool_content if hasattr(self.client, '_summarize_tool_content') else None
+                    pruning_policy = self.token_optimizer.budget.automatic_pruning_policy(
+                        self._optimization_strategy
+                    )
                     prune_context_assembly_to_token_target(
                         context_assembly,
-                        int(context_limit * 0.7),
+                        int(context_limit * pruning_policy.target_ratio),
                         self.token_optimizer.calculate_message_tokens,
                         tools=tools,
                         min_rounds=2,

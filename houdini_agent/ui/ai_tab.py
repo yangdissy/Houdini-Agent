@@ -164,7 +164,8 @@ class AITab(
     _renderPlanViewer = QtCore.Signal(dict)          # Plan 模式：在主线程渲染 PlanViewer 卡片
     _updatePlanStep = QtCore.Signal(str, str, str)   # Plan 模式：更新步骤状态 (step_id, status, result_summary)
     _askQuestionRequest = QtCore.Signal()             # Plan 模式：ask_question 请求（参数通过属性传递）
-    
+    _episodicRecorded = QtCore.Signal(str)            # 任务反思完成：写入 episodic 记忆 (episodic_id)
+
     def __init__(self, parent=None, workspace_dir: Optional[Path] = None, username: Optional[str] = None):
         super().__init__(parent)
 
@@ -325,7 +326,8 @@ class AITab(
         self._renderPlanViewer.connect(self._on_render_plan_viewer, QtCore.Qt.QueuedConnection)
         self._updatePlanStep.connect(self._on_update_plan_step, QtCore.Qt.QueuedConnection)
         self._askQuestionRequest.connect(self._on_render_ask_question, QtCore.Qt.QueuedConnection)
-        
+        self._episodicRecorded.connect(self._on_episodic_recorded, QtCore.Qt.QueuedConnection)
+
         # ── 流式 VEX 预览状态 ──
         self._streaming_preview = None          # 当前的 StreamingCodePreview widget
         self._streaming_preview_tool = ""       # 正在流式预览的工具名

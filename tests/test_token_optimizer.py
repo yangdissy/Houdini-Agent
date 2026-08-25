@@ -493,6 +493,18 @@ class TokenBudgetTest(unittest.TestCase):
         self.assertGreater(b.max_tokens, 0)
         self.assertTrue(0 < b.compression_threshold <= 1)
 
+    def test_compression_strategy_controls_automatic_pruning(self):
+        b = TokenBudget()
+
+        aggressive = b.automatic_pruning_policy(CompressionStrategy.AGGRESSIVE)
+        balanced = b.automatic_pruning_policy(CompressionStrategy.BALANCED)
+        conservative = b.automatic_pruning_policy(CompressionStrategy.CONSERVATIVE)
+
+        self.assertLess(aggressive.target_ratio, balanced.target_ratio)
+        self.assertLess(balanced.target_ratio, conservative.target_ratio)
+        self.assertLess(aggressive.protect_ratio, balanced.protect_ratio)
+        self.assertLess(balanced.protect_ratio, conservative.protect_ratio)
+
 
 if __name__ == "__main__":
     unittest.main()

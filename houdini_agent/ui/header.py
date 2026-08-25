@@ -165,7 +165,7 @@ class HeaderMixin:
             'kimi-for-coding-highspeed': 262144,
             # OF3D
             'chatgpt-4o-latest': 128000,
-            'gpt-5.5': 128000,
+            'gpt-5.5': 425000,
             # SiliconFlow
             'deepseek-ai/DeepSeek-V4-Pro': 1048576,
             'deepseek-ai/DeepSeek-V4-Flash': 1048576,
@@ -334,12 +334,13 @@ class HeaderMixin:
         # OF3D 内置 key，不暴露 API Key 入口
         if self._current_provider() != 'of3d':
             menu.addAction("API Key", self.btn_key.click)
-        menu.addAction("Clear Chat", self.btn_clear.click)
-        menu.addAction("Cache", self.btn_cache.click)
-        menu.addAction("Optimize", self.btn_optimize.click)
-        menu.addAction(tr('train.menu_label'), self.btn_export_train.click)
+        menu.addAction("缓存设置", self.btn_cache.click)
+        menu.addAction("上下文压缩", self.btn_optimize.click)
+        export_training_action = menu.addAction(tr('train.menu_label'))
+        export_training_action.setEnabled(False)
         menu.addSeparator()
-        menu.addAction("Update", self.btn_update.click)
+        update_action = menu.addAction("Update")
+        update_action.setEnabled(False)
         menu.addAction("Font (Aa)", self.btn_font_scale.click)
         menu.addSeparator()
         menu.addAction(tr('rules.menu_label'), self._open_rules_editor)
@@ -451,13 +452,20 @@ class HeaderMixin:
         try:
             from ..utils.team_memory_store import rebuild_team_memory
             stats = rebuild_team_memory()
+            if stats["scanned_users"] == 0:
+                summary = "未发现成员导出文件，团队记忆库已清空。"
+            else:
+                summary = (
+                    f"扫描 {stats['scanned_users']} 名成员\n"
+                    f"合并 semantic {stats['semantic_merged']}/{stats['semantic_raw']}\n"
+                    f"合并 procedural {stats['procedural_merged']}/{stats['procedural_raw']}\n"
+                    f"拒绝文件 {stats['skipped_files']}，无效条目 {stats['invalid_entries']}，"
+                    f"不合共享资格条目 {stats['ineligible_entries']}"
+                )
             QtWidgets.QMessageBox.information(
                 self,
                 "团队记忆库",
-                "团队记忆库已重建：\n"
-                f"扫描 {stats['scanned_users']} 名成员\n"
-                f"合并 semantic {stats['semantic_merged']}/{stats['semantic_raw']}\n"
-                f"合并 procedural {stats['procedural_merged']}/{stats['procedural_raw']}",
+                "团队记忆库已重建：\n" + summary,
             )
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "团队记忆库", f"重建失败: {e}")

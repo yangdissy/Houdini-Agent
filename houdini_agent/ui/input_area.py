@@ -372,10 +372,18 @@ class InputAreaMixin:
 
     def _on_slash_command_selected(self, command: str):
         """用户从弹出框中选择了一个斜杠命令"""
-        self.input_edit.insert_slash_completion(command)
+        from .slash_commands import SLASH_COMMANDS_WITH_ARGS
+
+        # remember 选中后弹引导对话框收集内容，其余带参命令仍填入输入框等待输入。
+        expects_args = command in SLASH_COMMANDS_WITH_ARGS and command != "remember"
+        self.input_edit.insert_slash_completion(command, expects_args=expects_args)
         self._slash_completer.setVisible(False)
+        if expects_args:
+            self.input_edit.setFocus()
+            return
         # 执行命令 — 委托给 AITab 的 _execute_slash_command
         try:
+            self.input_edit.clear()
             self._execute_slash_command(command)
         except Exception as e:
             print(f"[SlashCommand] 执行 /{command} 失败: {e}")

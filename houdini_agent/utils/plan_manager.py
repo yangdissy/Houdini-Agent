@@ -4,7 +4,7 @@ Plan Manager — Plan 模式的数据模型与文件管理
 
 职责：
 - Plan 数据的 CRUD（创建、读取、更新、删除）
-- Plan 文件持久化到当前用户 cache root 下的 plans/plan_{session_id}.json
+- Plan 文件持sion_id}久化到当前用户 cache root 下的 plans/plan_{ses.json
 - 精简版 Plan 上下文生成（用于注入 LLM，最小化 token 消耗）
 - 一个 session 只有一个 active plan，重复创建时自动归档旧 plan
 """

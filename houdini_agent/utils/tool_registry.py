@@ -710,6 +710,10 @@ class ToolRegistry:
             'preview_node_operation', 'validate_node_network', 'get_scene_snapshot', 'get_houdini_node_doc',
             'search_memory',
         },
+        'memory_write': {
+            'remember_memory',
+            'search_memory',
+        },
         'layout': {
             'layout_nodes', 'create_network_box',
         },
@@ -755,9 +759,10 @@ class ToolRegistry:
         'code': ['python', 'script', 'code', 'vex', 'wrangle',
                   '脚本', '代码'],
         'search': ['search', 'find', 'where', 'document', 'doc', 'web', 'online',
-                   'memory', 'remember', 'recall',
+                   'memory', 'recall',
                    '搜索', '查找', '文档', '网上', '在线',
-                   '记忆', '记住', '回忆', '偏好', '历史'],
+                   '记忆', '回忆', '偏好', '历史'],
+        'memory_write': ['记住', '记下来', '保存为长期记忆', 'remember this', 'save this'],
         'layout': ['layout', 'organize', 'arrange', 'position', 'move',
                    '排列', '布局', '整理', '位置'],
         'perf': ['performance', 'profile', 'benchmark', 'speed', 'slow',

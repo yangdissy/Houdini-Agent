@@ -473,10 +473,13 @@ class VEXPreviewInline(QtWidgets.QFrame):
         layout.addWidget(title)
 
         # ★ 紧凑参数摘要（只显示关键参数，每个一行，最多 6 行）
+        # ★ remember_memory 的 content 必须完整展示（上限 2000 字符），
+        #   因为用户确认的依据就是这段将要写入长期记忆的总结内容。
+        full_value_keys = {"content"} if tool_name == "remember_memory" else frozenset()
         summary_lines = []
         for k, v in args.items():
             sv = str(v)
-            if len(sv) > 120:
+            if k not in full_value_keys and len(sv) > 120:
                 sv = sv[:117] + "..."
             summary_lines.append(f"  {k}: {sv}")
         if summary_lines:
@@ -891,7 +894,8 @@ class AIResponse(QtWidgets.QWidget):
     
     createWrangleRequested = QtCore.Signal(str)  # vex_code
     nodePathClicked = QtCore.Signal(str)         # 节点路径被点击
-    
+    feedbackGiven = QtCore.Signal(bool)          # 用户反馈 True=👍 False=👎
+
     def __init__(self, parent=None, session_node_map: dict = None):
         super().__init__(parent)
         self._session_node_map = session_node_map if session_node_map is not None else {}
@@ -975,7 +979,27 @@ class AIResponse(QtWidgets.QWidget):
         self._copy_btn.setObjectName("aiCopyBtn")
         self._copy_btn.clicked.connect(self._copy_content)
         status_row.addWidget(self._copy_btn)
-        
+
+        # ★ 用户反馈按钮 👍/👎（finalize 后可见，仅在有工具调用时有意义）
+        self._feedback_state = None  # None / True(👍) / False(👎)
+        self._thumb_up_btn = QtWidgets.QPushButton(tr('feedback.up'))
+        self._thumb_up_btn.setVisible(False)
+        self._thumb_up_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self._thumb_up_btn.setFixedHeight(22)
+        self._thumb_up_btn.setObjectName("aiThumbUpBtn")
+        self._thumb_up_btn.setToolTip(tr('feedback.good'))
+        self._thumb_up_btn.clicked.connect(lambda: self._on_feedback(True))
+        status_row.addWidget(self._thumb_up_btn)
+
+        self._thumb_down_btn = QtWidgets.QPushButton(tr('feedback.down'))
+        self._thumb_down_btn.setVisible(False)
+        self._thumb_down_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self._thumb_down_btn.setFixedHeight(22)
+        self._thumb_down_btn.setObjectName("aiThumbDownBtn")
+        self._thumb_down_btn.setToolTip(tr('feedback.bad'))
+        self._thumb_down_btn.clicked.connect(lambda: self._on_feedback(False))
+        status_row.addWidget(self._thumb_down_btn)
+
         self._summary_layout.addLayout(status_row)
         
         # ★ 独立的停止/警示横幅（默认隐藏）—— 与 status_label / content_label
@@ -1380,7 +1404,12 @@ class AIResponse(QtWidgets.QWidget):
         # 有内容时显示复制按钮
         if self._clean_content(self._content):
             self._copy_btn.setVisible(True)
-        
+
+        # ★ 有工具调用时显示反馈按钮（纯问答无 episodic 记忆可反馈）
+        if self._has_execution:
+            self._thumb_up_btn.setVisible(True)
+            self._thumb_down_btn.setVisible(True)
+
         # ★ finalize 后用完整正文重渲染一次，避免流式半截 Markdown 影响最终 UI
         content = self._clean_content(self._content)
         
@@ -1403,6 +1432,22 @@ class AIResponse(QtWidgets.QWidget):
         if url.startswith('houdini://'):
             node_path = url[len('houdini://'):]
             self.nodePathClicked.emit(node_path)
+
+    def _on_feedback(self, positive: bool):
+        """用户点击 👍/👎：toggle 逻辑 + 更新按钮视觉 + 发出信号"""
+        # 再次点击同一按钮 = 取消反馈
+        if self._feedback_state is positive:
+            self._feedback_state = None
+        else:
+            self._feedback_state = positive
+        # 更新按钮选中态
+        self._thumb_up_btn.setProperty("active", self._feedback_state is True)
+        self._thumb_down_btn.setProperty("active", self._feedback_state is False)
+        for btn in (self._thumb_up_btn, self._thumb_down_btn):
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+        if self._feedback_state is not None:
+            self.feedbackGiven.emit(self._feedback_state)
 
 
 # ============================================================

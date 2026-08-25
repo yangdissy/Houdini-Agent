@@ -309,6 +309,8 @@ class PreferencesMixin:
         menu.addSeparator()
 
         strategy_menu = menu.addMenu("压缩策略")
+        strategy_group = QtWidgets.QActionGroup(strategy_menu)
+        strategy_group.setExclusive(True)
         for label, strat in [
             ("激进 (最大节省)", CompressionStrategy.AGGRESSIVE),
             ("平衡 (推荐)", CompressionStrategy.BALANCED),
@@ -317,9 +319,15 @@ class PreferencesMixin:
             action = strategy_menu.addAction(label)
             action.setCheckable(True)
             action.setChecked(self._optimization_strategy == strat)
-            action.triggered.connect(lambda _, s=strat: setattr(self, '_optimization_strategy', s))
+            strategy_group.addAction(action)
+            action.triggered.connect(lambda checked=False, s=strat: self._set_optimization_strategy(s))
 
         menu.exec_(QtGui.QCursor.pos())
+
+    def _set_optimization_strategy(self, strategy):
+        """同步手动与自动上下文压缩策略。"""
+        self._optimization_strategy = strategy
+        self.token_optimizer.budget.strategy = strategy
 
     def _optimize_now(self):
         """立即优化当前对话"""

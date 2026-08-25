@@ -8,6 +8,15 @@ from houdini_agent.qt_compat import QtWidgets, QtCore
 from .i18n import tr
 
 
+def _rule_source_text(rule: dict, username: str) -> str:
+    """Return the on-disk path backing a rule."""
+    if rule.get("source") == "file":
+        return str(rule.get("file_path", ""))
+
+    from shared.user_paths import UserPaths
+    return str(UserPaths(username).user_rules_path())
+
+
 # ============================================================
 
 class IMELineEdit(QtWidgets.QLineEdit):
@@ -79,6 +88,31 @@ class IMEPlainTextEdit(QtWidgets.QPlainTextEdit):
         super().focusInEvent(event)
         self.setAttribute(QtCore.Qt.WA_InputMethodEnabled, True)
         self.update()
+
+
+class ElidedPathLabel(QtWidgets.QLabel):
+    """Single-line label that elides long paths while retaining a tooltip."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._full_text = ""
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+
+    def setText(self, text):
+        self._full_text = text or ""
+        self.setToolTip(self._full_text)
+        self._update_elided_text()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_elided_text()
+
+    def _update_elided_text(self):
+        available = max(0, self.width() - 2)
+        elided = self.fontMetrics().elidedText(
+            self._full_text, QtCore.Qt.ElideMiddle, available
+        )
+        QtWidgets.QLabel.setText(self, elided)
 
 
 # ============================================================
@@ -228,8 +262,9 @@ class RulesEditorDialog(QtWidgets.QDialog):
         bottom_row = QtWidgets.QHBoxLayout()
         bottom_row.setSpacing(6)
 
-        self._source_label = QtWidgets.QLabel("")
+        self._source_label = ElidedPathLabel()
         self._source_label.setObjectName("rulesSourceLabel")
+        self._source_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         bottom_row.addWidget(self._source_label, 1)
 
         self._btn_toggle = QtWidgets.QPushButton(tr('rules.disable'))
@@ -346,12 +381,13 @@ class RulesEditorDialog(QtWidgets.QDialog):
         self._title_edit.setReadOnly(is_file)
         self._content_edit.setReadOnly(is_file)
 
-        # 源标签
-        if is_file:
-            fp = rule.get("file_path", "")
-            self._source_label.setText(f"{tr('rules.file_readonly')}  {fp}")
-        else:
-            self._source_label.setText("")
+        # 源路径
+        source_path = _rule_source_text(rule, self._username)
+        source_text = (
+            f"{tr('rules.file_readonly')}  {source_path}"
+            if is_file else source_path
+        )
+        self._source_label.setText(source_text)
 
         # 启用/禁用按钮
         enabled = rule.get("enabled", True)
