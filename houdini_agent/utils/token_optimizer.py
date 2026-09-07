@@ -20,6 +20,7 @@ from enum import Enum
 # ============================================================
 _tiktoken = None
 _encoding_cache: Dict[str, Any] = {}
+_ENCODING_UNAVAILABLE = object()
 
 def _get_encoding(model: str):
     """获取 tiktoken 编码器（带缓存）"""
@@ -43,8 +44,12 @@ def _get_encoding(model: str):
                 if 'cl100k' not in _encoding_cache:
                     _encoding_cache['cl100k'] = _tiktoken.get_encoding('cl100k_base')
                 _encoding_cache[key] = _encoding_cache['cl100k']
-        return _encoding_cache[key]
+            except Exception:
+                _encoding_cache[key] = _ENCODING_UNAVAILABLE
+        encoding = _encoding_cache[key]
+        return None if encoding is _ENCODING_UNAVAILABLE else encoding
     except Exception:
+        _encoding_cache[key] = _ENCODING_UNAVAILABLE
         return None
 
 

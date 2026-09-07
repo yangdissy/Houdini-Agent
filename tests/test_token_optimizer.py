@@ -2,7 +2,9 @@
 """token_optimizer 单元测试（不依赖 Houdini hou，也不依赖 tiktoken）。"""
 
 import unittest
+from unittest import mock
 
+from houdini_agent.utils import token_optimizer
 from houdini_agent.utils.token_optimizer import (
     count_tokens,
     calculate_cost,
@@ -29,6 +31,10 @@ from houdini_agent.utils.token_optimizer import (
 
 
 class CountTokensTest(unittest.TestCase):
+    def tearDown(self):
+        token_optimizer._tiktoken = None
+        token_optimizer._encoding_cache.clear()
+
     def test_empty_string(self):
         self.assertEqual(count_tokens(""), 0)
 
@@ -44,6 +50,19 @@ class CountTokensTest(unittest.TestCase):
         short = count_tokens("hello world")
         long = count_tokens("hello world " * 50)
         self.assertGreater(long, short)
+
+    def test_encoding_load_failure_disables_repeated_load_attempts(self):
+        tiktoken = mock.Mock()
+        tiktoken.encoding_for_model.side_effect = OSError("network unavailable")
+        token_optimizer._tiktoken = tiktoken
+        token_optimizer._encoding_cache.clear()
+
+        first = count_tokens("offline token estimate", "gpt-4")
+        second = count_tokens("another offline estimate", "gpt-4")
+
+        self.assertGreater(first, 0)
+        self.assertGreater(second, 0)
+        self.assertEqual(tiktoken.encoding_for_model.call_count, 1)
 
 
 class MatchPricingTest(unittest.TestCase):
