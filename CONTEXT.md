@@ -17,6 +17,11 @@
 - **Help Source**：`houdini_agent/utils/help_source.py`，离线帮助数据源的底层 module。公开 `find_help_dir`（定位含 nodes.zip/vex.zip/hom.zip 的 help 目录）、`parse_wiki`（wiki 标记解析）、`iter_pages`（ZIP 页面遍历，统一过滤规则）。是 `HoudiniDocIndex` 与 `search_houdini_help` skill 共享的 seam。
 - **Doc Index**：`HoudiniDocIndex`（`houdini_agent/utils/doc_rag.py`），dict 索引 + 知识库分段检索。ZIP 索引缓存以 help_dir 路径 + 版本 + zip mtime/size 指纹失效。
 
+## 视觉验证（Visual Review）
+
+- **Visual Review**：对当前 Houdini viewport 截图进行目标驱动的视觉观察。技术事实、显示状态、图像观察和目标契合度必须分开；截图不能证明网络健康、几何 freshness 或材质绑定正确。
+- **Visual Goal**：用户明确提供的风格、构图、材质或灯光目标。缺少 Visual Goal 时，只允许检查通用可读性和明显视觉缺陷，不得宣称“美术正确”。
+
 ## 团队记忆（Team Memory）
 
 - **Team Memory Export Document（团队记忆导出文档）**：成员主动发布、供团队记忆重建消费的版本化文档。扫描来源决定贡献者身份；文档必须通过 schema、资源限制及共享资格检查。

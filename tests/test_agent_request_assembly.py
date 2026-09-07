@@ -70,6 +70,14 @@ class AgentRequestAssemblyTest(unittest.TestCase):
         self.assertEqual(viewport['function']['description'], 'original')
         self.assertIn('必须指定 output_path', tools[0]['function']['description'])
 
+    def test_visual_review_is_removed_for_non_vision_models(self):
+        visual_review = {
+            'type': 'function',
+            'function': {'name': 'visual_review', 'description': 'review'},
+        }
+        tools = finalize_tools([], [visual_review], supports_vision=False)
+        self.assertEqual(tools, [])
+
     def test_final_messages_stay_normalized_after_pruning(self):
         assistant_call = {
             'role': 'assistant',

@@ -88,6 +88,9 @@ Choose `Aggressive`, `Balanced`, or `Conservative` from the top-right menu → C
 ### Plugins, Rules, and UI
 Supports community plugins, persistent Markdown rules, and an in-panel Rules editor, together with multi-session chat, streaming output, Plan/confirmation cards, clickable node paths, token statistics, slash-command completion, and bilingual CN/EN UI.
 
+### Visual Review
+Vision-capable models can use the governed `visual_review` tool after technical validation of modeling, material, lighting, camera, composition, or USD lookdev work. The review keeps network/geometry facts separate from image observations and does not modify the scene, camera, or viewport state. Non-vision models do not receive this tool.
+
 ### Reliable Session & Plan Recovery
 Session files are committed transactionally with manifest-last publication and rollback on failure. Empty-workspace markers prevent stale conversations from reappearing, stale windows cannot overwrite a newly switched user, and Plan state is restored per session without auto-completing unverified steps.
 

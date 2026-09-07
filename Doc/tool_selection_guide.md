@@ -10,6 +10,7 @@ This guide helps the AI choose the smallest useful tool set for each Houdini tas
 4. Keep layout explicit. Do not rely on connection tools to arrange nodes; use `layout_nodes` only when the user asks for layout or the workflow has created a new batch of nodes.
 5. Keep high-risk tools explicit. `execute_shell`, `execute_python`, `delete_node`, `save_hip`, `undo_redo`, and `cook_node` require a clear user intent and remain governed by harness policy. Never call `cook_node` to "verify" your own changes; cooking runs on the Houdini main thread and can freeze the UI on heavy nodes. A successful ordinary `cook_node` does not rule out Manual update stale/empty geometry; follow `recommended_next_action` from `get_geometry_summary` or `verify_network`.
 6. Validate after writes with read-only tools. After creating, connecting, changing parameters, or flags, use the smallest sufficient verification tool: `inspect_node` for one node, `check_errors` for error details, `get_node_connections` for a wire change, `verify_network` for an entire parent network (preferred after `create_nodes_batch`), `validate_node_network` for structural issues (orphans, missing required inputs). These read Houdini's existing cook state and do not trigger a recook. In Manual update mode, `get_geometry_summary` / `verify_network` may return `recommended_next_action=temporary_auto_validate`; in Direct Execute mode use that signal before blaming generator nodes.
+7. Review visual work only after technical validation. For modeling, material, lighting, camera, composition, or USD lookdev tasks, call `visual_review` after freshness, health, display state, and relevant bindings are established. Report technical evidence separately from image observations. Without an explicit visual goal, limit the review to general readability and obvious defects.
 
 ## Mode Boundaries
 
@@ -36,6 +37,7 @@ This guide helps the AI choose the smallest useful tool set for each Houdini tas
 | Set flags | `inspect_node` | `preview_node_operation`, `set_node_flags` | `inspect_node`, `verify_network` |
 | Cook / force-recompute a node (only when the user explicitly asks) | `inspect_node`, `check_errors` | `cook_node` (high risk; may block the UI) | `inspect_node`, `verify_network` |
 | Validate network health | `verify_network`, `validate_node_network` | None | None |
+| Review a visual result | `verify_network`, `get_geometry_summary`, relevant material/USD skills | None | `visual_review` when the current model supports vision |
 | Layout nodes | `run_skill('get_node_positions')`, `get_network_structure` | `layout_nodes` | `run_skill('get_node_positions')` |
 | Make a network box | `run_skill('get_node_positions')`, `run_skill('list_network_boxes')` | `create_network_box` | `run_skill('list_network_boxes')` |
 | Find documentation | `run_skill('get_node_card')`, `search_local_doc`, `get_houdini_node_doc`, `web_search` when enabled | None | None |

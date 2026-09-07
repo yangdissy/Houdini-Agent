@@ -81,7 +81,7 @@ _ASK_TOOLS = frozenset({
     'search_local_doc', 'get_houdini_node_doc', 'list_skills',
     'add_todo', 'update_todo',
     'perf_start_profile', 'perf_stop_and_report',
-    'search_memory', 'capture_viewport', 'preview_layout_nodes',
+    'search_memory', 'capture_viewport', 'visual_review', 'preview_layout_nodes',
 })
 
 # Plan 规划阶段白名单
@@ -95,7 +95,7 @@ _PLAN_PLANNING_TOOLS = frozenset({
     'search_local_doc', 'get_houdini_node_doc', 'list_skills', 'run_skill',
     'add_todo', 'update_todo',
     'perf_start_profile', 'perf_stop_and_report',
-    'search_memory', 'capture_viewport', 'preview_layout_nodes',
+    'search_memory', 'capture_viewport', 'visual_review', 'preview_layout_nodes',
     'create_plan', 'ask_question',
 })
 
@@ -109,7 +109,7 @@ _READONLY_TOOLS = frozenset({
     'verify_network', 'web_search', 'fetch_webpage',
     'search_local_doc', 'get_houdini_node_doc', 'list_skills',
     'perf_start_profile', 'perf_stop_and_report',
-    'capture_viewport', 'search_memory', 'preview_layout_nodes',
+    'capture_viewport', 'visual_review', 'search_memory', 'preview_layout_nodes',
 })
 
 _HIGH_RISK_TOOLS = HIGH_RISK_TOOLS
@@ -184,7 +184,7 @@ _DEFAULT_HISTORY_QUERY_TOOLS = frozenset({
     'search_local_doc', 'get_houdini_node_doc',
     'execute_python', 'execute_shell', 'web_search', 'fetch_webpage',
     'run_skill', 'list_skills',
-    'capture_viewport',
+    'capture_viewport', 'visual_review',
 })
 
 _DEFAULT_COMPRESSION_OPERATION_TOOLS = frozenset({
@@ -196,7 +196,7 @@ _DEFAULT_THINKING_SIMPLE_SUCCESS_TOOLS = frozenset({
     'create_node', 'get_node_parameters', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
     'suggest_connection', 'preview_node_operation', 'validate_node_network',
     'list_children', 'find_nodes', 'get_geometry_summary', 'get_scene_snapshot',
-    'read_selection', 'check_errors', 'verify_network',
+    'read_selection', 'check_errors', 'verify_network', 'visual_review',
 })
 
 _DEFAULT_THINKING_DEEP_TOOLS = frozenset({

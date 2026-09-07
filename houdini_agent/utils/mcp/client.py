@@ -6005,6 +6005,7 @@ class HoudiniMCP:
         "remember_memory": "_tool_remember_memory",
         # 视口截图
         "capture_viewport": "_tool_capture_viewport",
+        "visual_review": "_tool_visual_review",
     }
 
     @contextlib.contextmanager
@@ -6523,6 +6524,62 @@ class HoudiniMCP:
             import traceback
             traceback.print_exc()
             return {"success": False, "error": f"视口截图失败: {str(e)}"}
+
+    def _tool_visual_review(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Capture the current viewport and attach a bounded review contract."""
+        review_type = str(args.get("review_type") or "").strip().lower()
+        allowed_types = {"general", "geometry", "composition", "material", "lighting", "usd"}
+        if review_type not in allowed_types:
+            return {
+                "success": False,
+                "error": "review_type must be one of: general, geometry, composition, material, lighting, usd",
+            }
+
+        target_path = str(args.get("target_path") or "").strip()
+        visual_goal = str(args.get("visual_goal") or "").strip()
+        capture_args = {
+            key: args[key]
+            for key in ("width", "height")
+            if key in args
+        }
+        result = self._tool_capture_viewport(capture_args)
+        if not result.get("success"):
+            return result
+
+        goal_text = visual_goal or (
+            "No explicit art-direction goal was provided; assess only general readability "
+            "and obvious visual defects."
+        )
+        result.update({
+            "review_type": review_type,
+            "target_path": target_path,
+            "technical_status": "not_evaluated",
+            "visual_status": "pending_model_review",
+            "evidence": {
+                "viewport_capture": True,
+                "technical_checks_included": False,
+            },
+            "limitations": [
+                "A viewport image does not prove geometry freshness, network health, or resolved material bindings.",
+                "The review uses the current viewport, camera, lighting, and display settings without changing them.",
+            ],
+            "recommended_checks": [
+                "Use verify_network or the smallest relevant read-only tool for technical validation.",
+                "Report technical facts separately from visual observations and target alignment.",
+            ],
+            "_image_prompt": (
+                "[visual review image attached]\n"
+                f"Review type: {review_type}\n"
+                f"Target: {target_path or 'current viewport'}\n"
+                f"Visual goal: {goal_text}\n"
+                "Evaluate shape readability, composition, material response, lighting, camera/framing, "
+                "scale, and obvious visual artifacts only where visible. Return visual_status as pass, "
+                "concerns, or unable_to_assess; list observations, evidence, limitations, target alignment, "
+                "and the single highest-value next action. Do not claim network health, geometry freshness, "
+                "or material-binding correctness from the image alone."
+            ),
+        })
+        return result
 
     def _tool_unknown(self, tool_name: str) -> Dict[str, Any]:
         """处理未知工具名称，提供建议"""

@@ -1595,6 +1595,40 @@ HOUDINI_TOOLS = [
                 "required": []
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "visual_review",
+            "description": "截取当前 Houdini 视口并按明确的视觉目标进行审查。仅用于建模、材质、灯光、相机、构图或 USD lookdev 等视觉任务；它不替代 verify_network、几何 freshness 或材质绑定等技术验证。不会修改场景、相机或视口状态。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "review_type": {
+                        "type": "string",
+                        "enum": ["general", "geometry", "composition", "material", "lighting", "usd"],
+                        "description": "审查类型"
+                    },
+                    "target_path": {
+                        "type": "string",
+                        "description": "可选：当前视觉审查对应的 Houdini 节点或网络路径"
+                    },
+                    "visual_goal": {
+                        "type": "string",
+                        "description": "可选：用户明确的风格、构图、材质或灯光目标。缺省时只能检查通用可读性和明显技术视觉问题。"
+                    },
+                    "width": {
+                        "type": "integer",
+                        "description": "截图宽度(像素)，默认960，范围160-1920"
+                    },
+                    "height": {
+                        "type": "integer",
+                        "description": "截图高度(像素)，默认540，范围120-1080"
+                    }
+                },
+                "required": ["review_type"]
+            }
+        }
     }
 ]
 
@@ -4554,10 +4588,14 @@ class AIClient:
                     if supports_vision and result.get('_viewport_image'):
                         _img_b64 = result['_viewport_image']
                         _img_mt = result.get('_image_media_type', 'image/jpeg')
+                        _img_prompt = result.get(
+                            '_image_prompt',
+                            '[viewport snapshot attached — please analyze the current viewport state, check for visual issues or confirm the result is correct]',
+                        )
                         working_messages.append({
                             'role': 'user',
                             'content': [
-                                {"type": "text", "text": "[viewport snapshot attached — please analyze the current viewport state, check for visual issues or confirm the result is correct]"},
+                                {"type": "text", "text": _img_prompt},
                                 {"type": "image_url", "image_url": {"url": f"data:{_img_mt};base64,{_img_b64}"}},
                             ],
                         })
@@ -5396,12 +5434,17 @@ class AIClient:
                 for tc in tool_calls:
                     _r = exec_results.get(tool_calls.index(tc))
                     if isinstance(_r, dict) and _r.get('_viewport_image'):
-                        _viewport_imgs.append((_r['_viewport_image'], _r.get('_image_media_type', 'image/jpeg')))
+                        _viewport_imgs.append((
+                            _r['_viewport_image'],
+                            _r.get('_image_media_type', 'image/jpeg'),
+                            _r.get('_image_prompt', '[viewport snapshot attached — please analyze the current viewport state]'),
+                        ))
             
             if _viewport_imgs:
                 # 多模态消息：文本 + 图片
-                _content_parts = [{"type": "text", "text": f"[TOOL_RESULT]\n{prompt}\n[viewport snapshot attached — please analyze the current viewport state]"}]
-                for _vimg_b64, _vimg_mt in _viewport_imgs:
+                _review_prompts = "\n".join(item[2] for item in _viewport_imgs)
+                _content_parts = [{"type": "text", "text": f"[TOOL_RESULT]\n{prompt}\n{_review_prompts}"}]
+                for _vimg_b64, _vimg_mt, _vimg_prompt in _viewport_imgs:
                     _content_parts.append({"type": "image_url", "image_url": {"url": f"data:{_vimg_mt};base64,{_vimg_b64}"}})
                     print(f"[AI Client] 📸 视口截图已注入消息 (JSON mode, {len(_vimg_b64)//1024}KB)")
                 working_messages.append({'role': 'user', 'content': _content_parts})

@@ -122,7 +122,10 @@ def finalize_tools(
 
     degraded = []
     for tool in tools:
-        if tool.get('function', {}).get('name') == 'capture_viewport':
+        tool_name = tool.get('function', {}).get('name')
+        if tool_name == 'visual_review':
+            continue
+        if tool_name == 'capture_viewport':
             tool = copy.deepcopy(tool)
             tool['function']['description'] = (
                 "截取当前 Houdini 3D 视口快照并保存到文件。"
