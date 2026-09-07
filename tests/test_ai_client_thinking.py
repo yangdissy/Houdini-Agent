@@ -121,6 +121,51 @@ class AIClientThinkingHintTest(unittest.TestCase):
         self.assertIn("points=4", compressed)
         self.assertIn("/obj/geo1/OUT", compressed)
 
+    def test_tool_result_compression_preserves_validation_contract_signals(self):
+        client = object.__new__(AIClient)
+        compressed = AIClient._compress_tool_result(
+            client,
+            "temporary_auto_validate_geometry",
+            {
+                "success": True,
+                "result": "x" * 1000,
+                "health": "unknown",
+                "freshness": {"status": "fresh", "cook_succeeded": True},
+                "validation_blocked": True,
+                "recovery_hint": "retry target validation",
+                "restore_attempted": True,
+                "restore_succeeded": False,
+                "restored_update_mode": "AutoUpdate",
+            },
+        )
+
+        self.assertIn("health=unknown", compressed)
+        self.assertIn("freshness=fresh", compressed)
+        self.assertIn("validation_blocked=true", compressed)
+        self.assertIn("restore_succeeded=false", compressed)
+        self.assertIn("retry target validation", compressed)
+
+    def test_failed_tool_result_compression_preserves_validation_contract_signals(self):
+        client = object.__new__(AIClient)
+        compressed = AIClient._compress_tool_result(
+            client,
+            "temporary_auto_validate_geometry",
+            {
+                "success": False,
+                "error": "恢复 Update Mode 失败",
+                "health": "unknown",
+                "freshness": {"status": "unknown"},
+                "restore_attempted": True,
+                "restore_succeeded": False,
+                "restored_update_mode": "unknown",
+            },
+        )
+
+        self.assertIn("恢复 Update Mode 失败", compressed)
+        self.assertIn("health=unknown", compressed)
+        self.assertIn("freshness=unknown", compressed)
+        self.assertIn("restore_succeeded=false", compressed)
+
     def test_json_execution_profile_uses_tool_registry(self):
         registry_profile = {
             "async_tools": {"web_search", "custom_async"},
@@ -260,7 +305,9 @@ class AIClientContextTrimTest(unittest.TestCase):
         client._get_streaming_tool_executor.return_value.reset.return_value = None
         client._sanitize_working_messages = lambda messages: messages
         client._ensure_context_within_budget = lambda messages, tools, limit: None
-        client._progressive_trim = mock.Mock(side_effect=lambda messages, history, **kwargs: messages)
+        client._progressive_trim = mock.Mock(side_effect=lambda messages, history, **kwargs: [
+            {"role": "user", "content": "inspect"}
+        ])
         client.chat_stream = mock.Mock(side_effect=[
             iter([{"type": "error", "error": "HTTP 413 payload too large"}]),
             iter([{"type": "content", "content": "done"}, {"type": "done", "usage": {}}]),
@@ -268,7 +315,11 @@ class AIClientContextTrimTest(unittest.TestCase):
         tools = [{"type": "function", "function": {"name": "inspect_node"}}]
 
         result = client.agent_loop_stream(
-            messages=[{"role": "user", "content": "inspect"}],
+            messages=[
+                {"role": "user", "content": "old context"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "inspect"},
+            ],
             model="test-model",
             provider="test-provider",
             tools_override=tools,
@@ -280,6 +331,66 @@ class AIClientContextTrimTest(unittest.TestCase):
         self.assertEqual(client.chat_stream.call_count, 2)
         self.assertIs(client._progressive_trim.call_args.kwargs["tools"], tools)
         self.assertEqual(client._progressive_trim.call_args.kwargs["trim_level"], 1)
+
+    def test_request_body_budget_removes_old_images_before_current_image(self):
+        old_image = "data:image/png;base64," + ("A" * 2500)
+        current_image = "data:image/png;base64," + ("B" * 2500)
+        messages = [
+            {"role": "user", "content": [
+                {"type": "text", "text": "old"},
+                {"type": "image_url", "image_url": {"url": old_image}},
+            ]},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "current"},
+                {"type": "image_url", "image_url": {"url": current_image}},
+            ]},
+        ]
+
+        result, removed = AIClient._fit_messages_to_request_body_budget(
+            messages, tools=[], max_body_bytes=3500
+        )
+
+        self.assertEqual(removed, 1)
+        self.assertIsInstance(result[0]["content"], str)
+        self.assertEqual(result[-1]["content"][1]["image_url"]["url"], current_image)
+
+    def test_request_body_budget_fails_closed_when_current_image_cannot_fit(self):
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": "current"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + ("A" * 5000)}},
+        ]}]
+
+        with self.assertRaisesRegex(ValueError, "请求体仍超过"):
+            AIClient._fit_messages_to_request_body_budget(
+                messages, tools=[], max_body_bytes=1000
+            )
+
+    def test_agent_loop_http_413_aborts_when_request_body_did_not_shrink(self):
+        client = object.__new__(AIClient)
+        client._tool_executor = mock.Mock()
+        client._stop_event = mock.Mock()
+        client._stop_event.is_set.return_value = False
+        client._get_streaming_tool_executor = mock.Mock()
+        client._get_streaming_tool_executor.return_value.reset.return_value = None
+        client._sanitize_working_messages = lambda messages: messages
+        client._ensure_context_within_budget = lambda messages, tools, limit: None
+        client._progressive_trim = mock.Mock(side_effect=lambda messages, history, **kwargs: list(messages))
+        client.chat_stream = mock.Mock(return_value=iter([
+            {"type": "error", "error": "HTTP 413 Request Entity Too Large"},
+        ]))
+
+        result = client.agent_loop_stream(
+            messages=[{"role": "user", "content": "inspect"}],
+            model="test-model",
+            provider="test-provider",
+            tools_override=[],
+            max_iterations=4,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(client.chat_stream.call_count, 1)
+        self.assertIn("请求体过大", result["error"])
 
 
 if __name__ == "__main__":

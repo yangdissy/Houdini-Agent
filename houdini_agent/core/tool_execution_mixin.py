@@ -38,6 +38,10 @@ class ToolExecutionMixin:
         """
         if getattr(self, '_pre_agent_update_mode', None) is not None:
             return self._pre_agent_update_mode
+        self._agent_explicit_update_mode = None
+        executor = getattr(self, '_houdini_main_thread_executor', None)
+        if executor is not None and hasattr(executor, 'set_explicit_update_mode'):
+            executor.set_explicit_update_mode(None)
         try:
             import hou  # type: ignore
             self._pre_agent_update_mode = hou.updateModeSetting()
@@ -66,9 +70,9 @@ class ToolExecutionMixin:
         except Exception:
             return ""
         mode_rule = (
-            "4. 不要擅自把用户的更新模式改回 Auto——这是用户有意的设置。"
+            "4. 不要擅自持久切 Auto；set_update_mode 必须由用户明确要求并确认，临时目标验证可以直接执行。"
             if confirm_mode
-            else "4. 直接执行模式下，若 Manual 导致几何验证持续为空，可调用 set_update_mode(mode=\"auto\") 将当前 hip 切到 Auto Update 后继续验证；最终总结中说明已切到 Auto Update。"
+            else "4. 使用 temporary_auto_validate_geometry(node_path=...) 或 check_errors(node_path=...) 做 scoped 临时 Auto 验证并恢复 Manual；仅用户明确要求持续 Auto 时才调用 set_update_mode。"
         )
         return (
             "[Houdini 状态 — 重要] 当前 hip 文件的更新模式是 **Manual（手动）**，这是用户的持久设置。\n"
@@ -76,7 +80,7 @@ class ToolExecutionMixin:
             "set_display_flag 等）后，Houdini 不会自动 cook，视口与下游几何不会自动刷新。\n"
             "你必须遵守：\n"
             "1. 工具返回 success 只代表操作已排队，绝不能据此宣称「已生效/视口已更新/效果已完成」。\n"
-            "2. 报告完成前，必须用 verify_network / check_errors / get_network_structure 确认结构、连接与错误状态；但 verify_network / get_geometry_summary 返回的空几何在 Manual 模式下是低置信验证信号，不能单独当作拓扑或参数错误证据。\n"
+            "2. 先在 Manual 下完成一组相关修改，不要每次写后切换；批次边界用目标范围临时 Auto 验证，且必须检查 cook/read/restore 状态。Manual 空几何在 freshness 未确认前不能单独当作拓扑或参数错误证据。\n"
             "3. 若用户期望看到结果，在总结中主动说明「当前为 Manual 模式，需手动 cook 或切回 Auto 才能看到更新」。\n"
             + mode_rule
         )
@@ -237,6 +241,14 @@ class ToolExecutionMixin:
             return
         if not result.get('persistent_update_mode_change'):
             return
+        data = result.get('data')
+        mode_kind = data.get('mode_kind') if isinstance(data, dict) else None
+        if mode_kind not in {'auto', 'manual'}:
+            mode_kind = result.get('mode_kind')
+        self._agent_explicit_update_mode = mode_kind if mode_kind in {'auto', 'manual'} else None
+        executor = getattr(self, '_houdini_main_thread_executor', None)
+        if executor is not None and hasattr(executor, 'set_explicit_update_mode'):
+            executor.set_explicit_update_mode(self._agent_explicit_update_mode)
         try:
             import hou  # type: ignore
             self._pre_agent_update_mode = hou.updateModeSetting()
@@ -326,6 +338,9 @@ class ToolExecutionMixin:
         authorization = self._authorize_registry_dispatch(tool_name, "houdini")
         if not authorization.get("allowed"):
             return {"success": False, "error": authorization.get("error", "Tool dispatch denied")}
+        meta = authorization.get("meta")
+        if meta is None:
+            return {"success": False, "error": f"Tool metadata unavailable: {tool_name}"}
 
         # ★ Stop 检测：用户请求停止时立即返回，不再排队新工具
         if self.client.is_stop_requested():
@@ -335,7 +350,7 @@ class ToolExecutionMixin:
         #   避免新的 Houdini 工具信号与迟到主线程操作重叠。
         executor = getattr(self, '_houdini_main_thread_executor', None)
         if executor is not None and executor.is_blocked():
-            if tool_name not in self._BG_SAFE_TOOLS:
+            if meta.runtime != "local":
                 return {
                     "success": False,
                     "error": "Houdini 主线程执行器处于阻塞状态，为避免崩溃已拒绝新的 Houdini 工具执行。请重启面板后再继续。"
@@ -383,7 +398,7 @@ class ToolExecutionMixin:
 
         
         # ★ 确认模式：对关键节点操作弹出预览确认
-        if (not skip_builtin_confirm) and self._confirm_mode and tool_name in self._CONFIRM_TOOLS:
+        if (not skip_builtin_confirm) and self._confirm_mode and meta.requires_confirmation:
             confirmed = self._request_tool_confirmation(tool_name, kwargs)
             if not confirmed:
                 return {
@@ -420,7 +435,7 @@ class ToolExecutionMixin:
                 return {"success": True, "result": f"Updated todo {todo_id} to {status}"}
             
             # 不依赖 hou 的工具 → 直接在后台线程执行（避免阻塞 UI）
-            if tool_name in self._BG_SAFE_TOOLS:
+            if meta.runtime == "local":
                 return self._execute_tool_in_bg(tool_name, kwargs)
             
             # 其他工具需要在主线程执行（Houdini hou 模块操作）

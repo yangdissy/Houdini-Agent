@@ -36,7 +36,6 @@ class _SignalStub:
 
 
 class _AITabToolExecutionStub(RuntimeStateMixin, ToolExecutionMixin):
-    _BG_SAFE_TOOLS = frozenset()
 
     def __init__(self, executor):
         self.client = _ClientStub()
@@ -293,6 +292,38 @@ class HoudiniMainThreadExecutorTest(unittest.TestCase):
             self.assertEqual(hou_stub.undos.events, [("begin", "AI Agent: set_node_parameter"), ("end", None)])
             self.assertEqual(result["_node_changes"], {"created": [{"path": "/obj/geo1/box1"}]})
             self.assertEqual(calls, ["refresh"])
+        finally:
+            if old_hou is None:
+                sys.modules.pop("hou", None)
+            else:
+                sys.modules["hou"] = old_hou
+
+    def test_cook_guard_respects_confirmed_persistent_auto(self):
+        old_hou = sys.modules.get("hou")
+        hou_stub = _HouStub()
+        sys.modules["hou"] = hou_stub
+        try:
+            executor = HoudiniMainThreadExecutor(
+                emit_tool_request=lambda name, kwargs: None,
+                emit_batch_request=lambda batch: None,
+                result_queue=queue.Queue(),
+            )
+            executor.set_explicit_update_mode("auto")
+
+            result = executor.run_in_main_thread(
+                tool_name="set_node_parameter",
+                kwargs={"node_path": "/obj/geo1/box1"},
+                execute_tool=lambda name, kwargs: {"success": True, "result": name},
+                cook_before_read=lambda: None,
+                snapshot_network_children=lambda: {},
+                diff_network_children=lambda before, after: None,
+                refresh_selection_baseline=lambda: None,
+                self_tracking_tools=frozenset(),
+                error_formatter=str,
+            )
+
+            self.assertTrue(result["success"])
+            self.assertEqual(hou_stub.set_modes, [])
         finally:
             if old_hou is None:
                 sys.modules.pop("hou", None)

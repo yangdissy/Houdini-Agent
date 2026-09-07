@@ -71,6 +71,21 @@ def count_tokens(text: str, model: str = '') -> int:
     return max(1, int(tokens))
 
 
+def message_content_text(content: Any) -> str:
+    """提取消息中的纯文本；多模态图片及未知内容块不会进入摘要。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return '\n'.join(
+            part.get('text', '')
+            for part in content
+            if isinstance(part, dict)
+            and part.get('type') == 'text'
+            and isinstance(part.get('text'), str)
+        )
+    return ''
+
+
 # ============================================================
 # 每模型定价（USD / 1M tokens）—— 对齐 Cursor
 # ============================================================
@@ -305,6 +320,14 @@ class CompressionStats:
             'saved_percent': self.saved_percent,
             'strategy': self.strategy,
         }
+
+
+@dataclass
+class ContextCompressionResult:
+    """统一压缩结果：历史与摘要分离，统计同时覆盖轮次和消息。"""
+    messages: List[Dict[str, Any]]
+    summary: str
+    stats: Dict[str, Any]
 
 
 @dataclass
@@ -726,6 +749,44 @@ class TokenOptimizer:
             strategy=strategy.value,
         )
         return compressed_messages, stats.to_dict()
+
+    def compress_context(
+        self,
+        messages: List[Dict[str, Any]],
+        protect_recent_rounds: int = 2,
+        strategy: Optional[CompressionStrategy] = None,
+        existing_summary: str = '',
+    ) -> ContextCompressionResult:
+        """压缩旧轮次，返回独立摘要和未注入摘要的近期历史。"""
+        strategy = strategy or self.budget.strategy
+        plan = plan_context_rounds(messages, protect_recent_rounds=protect_recent_rounds)
+        original_tokens = self.calculate_message_tokens(messages)
+        generated_summary = self._generate_summary_for_strategy(plan.old_messages, strategy) if plan.old_messages else ''
+        summary_parts = [part for part in (existing_summary.strip(), generated_summary.strip()) if part]
+        summary = '\n\n'.join(summary_parts)
+        compressed_tokens = self.calculate_message_tokens(plan.protected_messages)
+        if summary:
+            compressed_tokens += self.calculate_message_tokens([
+                {'role': 'system', 'content': summary}
+            ])
+        stats = CompressionStats.from_counts(
+            compressed=len(plan.old_messages),
+            kept=len(plan.protected_messages),
+            original_tokens=original_tokens,
+            compressed_tokens=compressed_tokens,
+            strategy=strategy.value,
+        ).to_dict()
+        stats.update({
+            'removed_rounds': plan.old_round_count,
+            'removed_messages': len(plan.old_messages),
+            'protected_rounds': plan.protected_round_count,
+            'protected_messages': len(plan.protected_messages),
+        })
+        return ContextCompressionResult(
+            messages=plan.protected_messages,
+            summary=summary,
+            stats=stats,
+        )
     
     def compress_messages(
         self,
@@ -764,7 +825,7 @@ class TokenOptimizer:
         
         for msg in messages:
             role = msg.get('role', '')
-            content = msg.get('content', '')
+            content = message_content_text(msg.get('content', ''))
             
             if role == 'user':
                 req = content[:150].replace('\n', ' ').strip()
@@ -822,7 +883,7 @@ class TokenOptimizer:
         if messages:
             last_user = next((m for m in reversed(messages) if m.get('role') == 'user'), None)
             if last_user:
-                content = last_user.get('content', '')[:100]
+                content = message_content_text(last_user.get('content', ''))[:100]
                 parts.append(f"\n最后请求: {content.replace(chr(10), ' ')}")
         
         return "\n".join(parts)
@@ -836,7 +897,7 @@ class TokenOptimizer:
         
         for msg in messages:
             role = msg.get('role', '')
-            content = msg.get('content', '')
+            content = message_content_text(msg.get('content', ''))
             
             if role == 'user':
                 req = content[:250].replace('\n', ' ').strip()
@@ -944,7 +1005,7 @@ class TokenOptimizer:
         filtered = []
         
         for msg in messages:
-            content = msg.get('content', '').lower()
+            content = message_content_text(msg.get('content', '')).lower()
             role = msg.get('role', '')
             
             if role == 'system':
@@ -1052,7 +1113,7 @@ Conversation to summarize:
         for r_idx, r in enumerate(rounds):
             for msg in r:
                 role = msg.get('role', 'unknown')
-                content = msg.get('content', '')
+                content = message_content_text(msg.get('content', ''))
                 if not content:
                     # 对于有 tool_calls 的 assistant 消息
                     if role == 'assistant' and 'tool_calls' in msg:

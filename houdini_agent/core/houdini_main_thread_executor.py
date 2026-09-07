@@ -40,6 +40,12 @@ class HoudiniMainThreadExecutor:
         self._active_operation_id = None
         self._blocked = False
         self._shutdown = False
+        self._explicit_update_mode = None
+
+    def set_explicit_update_mode(self, mode: Optional[str]) -> None:
+        """Record the current run's explicit persistent update-mode intent."""
+        normalized = str(mode or "").strip().lower()
+        self._explicit_update_mode = normalized if normalized in {"auto", "manual"} else None
 
     def is_blocked(self) -> bool:
         return self._blocked
@@ -325,6 +331,14 @@ class HoudiniMainThreadExecutor:
 
     def _set_manual_mode_for_cook_guard(self, tool_name: str, cook_triggering: bool = False):
         if not cook_triggering:
+            return
+        if self._explicit_update_mode == "auto":
+            self._record_event(
+                "update_mode_guard",
+                tool_name=tool_name,
+                decision="preserve_explicit_auto",
+                scope="agent_run",
+            )
             return
         try:
             import hou  # type: ignore

@@ -10,6 +10,7 @@
 - **Node Path（节点路径）**：Houdini 场景内的节点路径，如 `/obj/geo1`。校验 traversal、null-byte，并强制落在 `_HOUDINI_ROOTS` 内。参数集合 `_NODE_PATH_KEYS`。
 - **File Path（文件系统路径）**：操作系统路径，如 HIP 保存路径、渲染输出图片路径。校验 traversal、null-byte，豁免 Houdini root。参数集合 `_FILE_PATH_KEYS = {file_path, output_path}`。
 - **Policy Decision**：`ToolPolicyDecision`，action ∈ `allow` / `deny` / `ask` / `retry`；`retry` 携带 `patched_args` 用于自动修补后重试。
+- **Scoped Validation Transaction（目标范围验证事务）**：在捕获当前 Update Mode 后临时进入 Auto，只对指定 target 执行 cook/read，并恢复进入时模式的验证事务。operation 或 restore 失败、以及安全阻断时，健康与新鲜度均为 unknown。
 
 ## 文档检索（Doc RAG）
 

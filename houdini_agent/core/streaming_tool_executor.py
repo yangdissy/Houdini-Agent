@@ -8,6 +8,7 @@ independently (cc-haha style) while preserving current behavior.
 from __future__ import annotations
 
 import concurrent.futures
+import copy
 import json
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -114,6 +115,7 @@ class StreamingToolExecutor:
         self._runtime_batch_readonly_tools: Set[str] = set(self._LEGACY_BATCH_READONLY)
         self._runtime_network_mutating_tools: Set[str] = set(self._LEGACY_NETWORK_MUTATING_TOOLS)
         self._runtime_cache_invalidate_tools: Set[str] = set(self._LEGACY_CACHE_INVALIDATE_TOOLS)
+        self._runtime_execution_barrier_tools: Set[str] = set(self._LEGACY_NETWORK_MUTATING_TOOLS)
 
     def reset(self):
         self._turn_dedup_cache = {}
@@ -140,6 +142,9 @@ class StreamingToolExecutor:
             self._runtime_batch_readonly_tools = set(profile.get("batch_readonly_tools") or [])
             self._runtime_network_mutating_tools = set(profile.get("network_mutating_tools") or [])
             self._runtime_cache_invalidate_tools = set(profile.get("cache_invalidate_tools") or [])
+            self._runtime_execution_barrier_tools = set(
+                profile.get("execution_barrier_tools") or self._runtime_network_mutating_tools
+            )
         except Exception:
             # Keep last-known runtime profile if registry lookup fails.
             pass
@@ -149,25 +154,18 @@ class StreamingToolExecutor:
         results_ordered: List[Optional[Dict[str, Any]]] = [None] * len(parsed_calls)
         dedup_flags: List[bool] = [False] * len(parsed_calls)
 
-        # Dedup cache lookup.
-        for idx, (_tid, tname, targs, _tc) in enumerate(parsed_calls):
-            dedup_key = self._make_dedup_key(tname, targs)
-            if tname in self._runtime_dedup_tools and dedup_key in self._turn_dedup_cache:
-                results_ordered[idx] = self._turn_dedup_cache[dedup_key]
-                dedup_flags[idx] = True
-
         uncached_async = [
             (i, pc) for i, pc in enumerate(parsed_calls)
-            if pc[1] in self._runtime_async_tools and not dedup_flags[i]
+            if pc[1] in self._runtime_async_tools
         ]
         uncached_houdini = [
             (i, pc) for i, pc in enumerate(parsed_calls)
-            if pc[1] not in self._runtime_async_tools and not dedup_flags[i]
+            if pc[1] not in self._runtime_async_tools
         ]
-        dedup_hit_count = sum(1 for flag in dedup_flags if flag)
 
         self._execute_async_calls(uncached_async, results_ordered)
-        self._execute_houdini_calls(uncached_houdini, results_ordered)
+        self._execute_houdini_calls(uncached_houdini, results_ordered, dedup_flags)
+        dedup_hit_count = sum(1 for flag in dedup_flags if flag)
 
         early_skip_count = self._apply_early_skip(parsed_calls, results_ordered)
         self._update_dedup_cache(parsed_calls, results_ordered, dedup_flags)
@@ -224,25 +222,53 @@ class StreamingToolExecutor:
         self,
         uncached_houdini: List[Tuple[int, ParsedToolCall]],
         results_ordered: List[Optional[Dict[str, Any]]],
+        dedup_flags: List[bool],
     ):
-        readonly_batch = [(i, pc) for i, pc in uncached_houdini if pc[1] in self._runtime_batch_readonly_tools]
-        mutating_calls = [(i, pc) for i, pc in uncached_houdini if pc[1] not in self._runtime_batch_readonly_tools]
+        segment: List[Tuple[int, ParsedToolCall]] = []
 
-        if len(readonly_batch) > 1 and self._batch_tool_executor:
-            batch_input = [(tname, targs) for _, (_tid, tname, targs, _tc) in readonly_batch]
-            try:
-                batch_results = self._batch_tool_executor(batch_input)
-                for (idx, _), result in zip(readonly_batch, batch_results):
-                    results_ordered[idx] = result
-            except Exception:
-                for idx, (_tid, tname, targs, _tc) in readonly_batch:
+        def flush_readonly_segment():
+            if not segment:
+                return
+            if len(segment) > 1 and self._batch_tool_executor:
+                batch_input = [(pc[1], pc[2]) for _, pc in segment]
+                try:
+                    batch_results = self._batch_tool_executor(batch_input)
+                    if len(batch_results) != len(segment):
+                        raise ValueError("readonly batch result count mismatch")
+                    for (idx, _), result in zip(segment, batch_results):
+                        results_ordered[idx] = result
+                except Exception:
+                    for idx, (_tid, tname, targs, _tc) in segment:
+                        results_ordered[idx] = self._safe_tool_executor(tname, targs)
+            else:
+                for idx, (_tid, tname, targs, _tc) in segment:
                     results_ordered[idx] = self._safe_tool_executor(tname, targs)
-        else:
-            for idx, (_tid, tname, targs, _tc) in readonly_batch:
-                results_ordered[idx] = self._safe_tool_executor(tname, targs)
+            segment[:] = []
 
-        for idx, (_tid, tname, targs, _tc) in mutating_calls:
-            results_ordered[idx] = self._safe_tool_executor(tname, targs)
+        for idx, pc in uncached_houdini:
+            tname = pc[1]
+            dedup_key = self._make_dedup_key(tname, pc[2])
+            if tname in self._runtime_dedup_tools and dedup_key in self._turn_dedup_cache:
+                flush_readonly_segment()
+                results_ordered[idx] = copy.deepcopy(self._turn_dedup_cache[dedup_key])
+                dedup_flags[idx] = True
+                continue
+            if tname in self._runtime_batch_readonly_tools:
+                segment.append((idx, pc))
+                continue
+            flush_readonly_segment()
+            results_ordered[idx] = self._safe_tool_executor(tname, pc[2])
+            if results_ordered[idx].get("success") and tname in self._runtime_execution_barrier_tools:
+                self._invalidate_query_cache()
+        flush_readonly_segment()
+
+    def _invalidate_query_cache(self):
+        keys_to_remove = [
+            key for key in self._turn_dedup_cache
+            if key.split(":", 1)[0] in self._runtime_cache_invalidate_tools
+        ]
+        for key in keys_to_remove:
+            del self._turn_dedup_cache[key]
 
     def _safe_tool_executor(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -304,24 +330,20 @@ class StreamingToolExecutor:
         results_ordered: List[Optional[Dict[str, Any]]],
         dedup_flags: List[bool],
     ):
-        has_mutation = any(
-            pc[1] in self._runtime_network_mutating_tools
+        has_successful_barrier = any(
+            pc[1] in self._runtime_execution_barrier_tools
+            and bool(results_ordered[idx_m] and results_ordered[idx_m].get("success"))
             for idx_m, pc in enumerate(parsed_calls)
             if not dedup_flags[idx_m]
         )
-        if has_mutation:
-            keys_to_remove = [
-                k for k in self._turn_dedup_cache
-                if k.split(":", 1)[0] in self._runtime_cache_invalidate_tools
-            ]
-            for key in keys_to_remove:
-                del self._turn_dedup_cache[key]
+        if has_successful_barrier:
+            self._invalidate_query_cache()
 
         for idx, (_tid, tname, targs, _tc) in enumerate(parsed_calls):
             result = results_ordered[idx]
             if not dedup_flags[idx] and tname in self._runtime_dedup_tools and result:
                 dedup_key = self._make_dedup_key(tname, targs)
-                self._turn_dedup_cache[dedup_key] = result
+                self._turn_dedup_cache[dedup_key] = copy.deepcopy(result)
 
     @staticmethod
     def _make_dedup_key(tool_name: str, arguments: Dict[str, Any]) -> str:

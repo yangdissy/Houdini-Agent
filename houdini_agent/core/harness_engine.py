@@ -192,56 +192,6 @@ class HarnessRuntimeState:
 class ToolArgumentValidator:
     """Validate and normalize tool arguments before policy scoring."""
 
-    _REQUIRED_ARG_KEYS = {
-        "execute_python": ("code",),
-        "execute_shell": ("command",),
-        "remember_memory": ("content",),
-        "get_node_parameters": ("node_path",),
-        "get_parameter_schema": ("node_path",),
-        "inspect_node": ("node_path",),
-        "get_geometry_summary": ("node_path",),
-        "temporary_auto_validate_geometry": ("node_path",),
-        "list_children": ("node_path",),
-        "delete_node": ("node_path",),
-        "rename_node": ("node_path",),
-        "set_node_parameter": ("node_path",),
-        "set_parameter_expression": ("node_path", "param_name"),
-        "batch_set_parameters": ("node_path",),
-        "connect_nodes": ("from_path", "to_path"),
-        "create_named_null": ("name",),
-        "cook_node": ("node_path",),
-        "disconnect_nodes": ("node_path",),
-        "get_node_connections": ("node_path",),
-        "suggest_connection": ("from_path", "to_path"),
-        "copy_node": ("source_path",),
-        "set_display_flag": ("node_path",),
-        "set_node_flags": ("node_path",),
-        "set_update_mode": ("mode",),
-        "check_errors": ("node_path",),
-        "read_selection": ("node_path",),
-    }
-
-    # Houdini 节点路径参数：校验 traversal/null-byte，并强制落在 _HOUDINI_ROOTS 之内。
-    _NODE_PATH_KEYS = frozenset({
-        "node_path",
-        "source_path",
-        "target_path",
-        "network_path",
-        "parent_path",
-        "from_path",
-        "to_path",
-        "input_path",
-        "path",
-        "root_path",
-    })
-
-    # 文件系统路径参数（HIP 保存、渲染输出等）：校验 traversal/null-byte，
-    # 但豁免 Houdini root 校验，因为它们是 OS 路径而非节点路径。
-    _FILE_PATH_KEYS = frozenset({
-        "file_path",
-        "output_path",
-    })
-
     _HOUDINI_ROOTS = frozenset({
         "/obj",
         "/out",
@@ -254,12 +204,18 @@ class ToolArgumentValidator:
         "/cop",
     })
 
-    def _normalize_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    def __init__(self, get_tool_meta=None):
+        if get_tool_meta is None:
+            from houdini_agent.utils.tool_registry import get_tool_registry
+            get_tool_meta = get_tool_registry().get_meta
+        self._get_tool_meta = get_tool_meta
+
+    def _normalize_args(self, args: Dict[str, Any], path_kinds: Dict[str, str]) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         for key, value in (args or {}).items():
             if isinstance(value, str):
                 v = value.strip()
-                if key in self._NODE_PATH_KEYS and v:
+                if path_kinds.get(key) == "node" and v:
                     v = self._normalize_path(v)
                 out[key] = v
             else:
@@ -267,10 +223,20 @@ class ToolArgumentValidator:
         return out
 
     def validate(self, tool_name: str, args: Dict[str, Any]) -> ToolValidationResult:
-        safe_args = self._normalize_args(args)
+        try:
+            meta = self._get_tool_meta(tool_name)
+        except Exception:
+            meta = None
+        if meta is None:
+            return ToolValidationResult(args=dict(args or {}), issues=[ToolValidationIssue(
+                severity="error", code="unknown_tool", message=f"Tool metadata unavailable: {tool_name}"
+            )])
+
+        path_kinds = dict(meta.path_kinds or {})
+        safe_args = self._normalize_args(args, path_kinds)
         issues: List[ToolValidationIssue] = []
 
-        for key in self._REQUIRED_ARG_KEYS.get(tool_name, ()):
+        for key in meta.required_args():
             if not str(safe_args.get(key, "")).strip():
                 issues.append(
                     ToolValidationIssue(
@@ -285,7 +251,7 @@ class ToolArgumentValidator:
         if sensitive_reason:
             issues.append(ToolValidationIssue(severity="error", code="sensitive_input", message=sensitive_reason))
 
-        path_reason = self._check_path_args(safe_args)
+        path_reason = self._check_path_args(safe_args, path_kinds)
         if path_reason:
             issues.append(ToolValidationIssue(severity="error", code="invalid_path", message=path_reason))
 
@@ -330,17 +296,17 @@ class ToolArgumentValidator:
                     return reason
         return ""
 
-    def _check_path_args(self, args: Dict[str, Any]) -> str:
+    def _check_path_args(self, args: Dict[str, Any], path_kinds: Dict[str, str]) -> str:
         for key, value in (args or {}).items():
             if not isinstance(value, str) or not value.strip():
                 continue
-            reason = self._validate_path_arg(key, value.strip())
+            reason = self._validate_path_arg(key, value.strip(), path_kinds.get(key))
             if reason:
                 return reason
         return ""
 
-    def _validate_path_arg(self, key: str, path: str) -> str:
-        if key not in self._NODE_PATH_KEYS and key not in self._FILE_PATH_KEYS:
+    def _validate_path_arg(self, key: str, path: str, path_kind: Optional[str]) -> str:
+        if path_kind not in {"node", "file"}:
             return ""
 
         normalized = path.replace("\\", "/")
@@ -351,7 +317,7 @@ class ToolArgumentValidator:
             return f"Tool input guardrail blocked invalid path in {key}"
 
         # 文件系统路径（file_path/output_path）豁免 Houdini root 校验。
-        if key in self._FILE_PATH_KEYS:
+        if path_kind == "file":
             return ""
 
         if normalized.startswith("/") and not any(
@@ -400,10 +366,9 @@ class HarnessToolPolicyEngine:
     The default policy is conservative and only blocks obviously invalid calls.
     """
 
-    _DANGEROUS_TOOLS = HIGH_RISK_TOOLS
-
-    def __init__(self, validator: Optional[ToolArgumentValidator] = None):
-        self.validator = validator or ToolArgumentValidator()
+    def __init__(self, validator: Optional[ToolArgumentValidator] = None, get_tool_meta=None):
+        self.validator = validator or ToolArgumentValidator(get_tool_meta=get_tool_meta)
+        self._get_tool_meta = get_tool_meta or self.validator._get_tool_meta
 
     def decide(self, tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> ToolPolicyDecision:
         validation = self.validator.validate(tool_name, args)
@@ -416,6 +381,13 @@ class HarnessToolPolicyEngine:
                 risk_factors=self._validation_risk_factors(validation),
                 required_control="deny",
             )
+
+        try:
+            meta = self._get_tool_meta(tool_name)
+        except Exception:
+            meta = None
+        if meta is None:
+            return self._decision("deny", f"Tool metadata unavailable: {tool_name}", required_control="deny")
 
         mode = context.get("mode", "agent")
         confirm_mode = bool(context.get("confirm_mode", False))
@@ -474,7 +446,7 @@ class HarnessToolPolicyEngine:
                 required_control="confirm",
             )
 
-        if mode == "ask" and tool_name in self._DANGEROUS_TOOLS:
+        if mode == "ask" and meta.risk_level == "high":
             return self._decision(
                 "deny",
                 f"Ask mode blocked tool: {tool_name}",
@@ -485,10 +457,22 @@ class HarnessToolPolicyEngine:
         # confirm_mode=True means Step Confirm is enabled: high-risk tools must
         # ask the user before execution. confirm_mode=False is Direct Execute
         # (HIGH-RISK), where the user has opted out of confirmation prompts.
-        if mode in {"agent", "plan"} and tool_name in self._DANGEROUS_TOOLS and confirm_mode:
+        if mode in {"agent", "plan"} and meta.requires_confirmation and confirm_mode:
+            if tool_name == "set_update_mode":
+                return self._decision(
+                    "ask",
+                    "persistent Update Mode change requires confirmation",
+                    risk_factors=[RiskFactor(
+                        "persistent_state_confirmation",
+                        "warning",
+                        "persistent Update Mode change requires confirmation",
+                        0.4,
+                    )],
+                    required_control="confirm",
+                )
             return self._decision(
                 "ask",
-                f"Dangerous tool requires confirmation: {tool_name}",
+                f"Tool requires confirmation: {tool_name}",
                 risk_factors=[RiskFactor("high_risk_confirmation", "warning", f"Dangerous tool requires confirmation: {tool_name}", 0.7)],
                 required_control="confirm",
             )

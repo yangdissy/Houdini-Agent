@@ -61,7 +61,14 @@ class PreferencesMixin:
         total += self.token_optimizer.estimate_tokens(self._system_prompt)
         if self._context_summary:
             total += self.token_optimizer.estimate_tokens(self._context_summary)
-        total += self.token_optimizer.calculate_message_tokens(self._conversation_history)
+        history = [
+            message for message in self._conversation_history
+            if not (
+                message.get('role') == 'system'
+                and message.get('content') == self._context_summary
+            )
+        ]
+        total += self.token_optimizer.calculate_message_tokens(history)
         return total
 
     def _save_model_preference(self):
@@ -331,19 +338,24 @@ class PreferencesMixin:
 
     def _optimize_now(self):
         """立即优化当前对话"""
-        if len(self._conversation_history) <= 4:
+        history = self._agent_history if self._agent_history is not None else self._conversation_history
+        if len(history) <= 4:
             QtWidgets.QMessageBox.information(self, "提示", "对话历史太短，无需优化")
             return
 
-        before_tokens = self._calculate_context_tokens()
-        compressed_messages, stats = self.token_optimizer.compress_messages(
-            self._conversation_history,
-            strategy=self._optimization_strategy
+        before_tokens = self.token_optimizer.calculate_message_tokens(history)
+        result = self.token_optimizer.compress_context(
+            history,
+            protect_recent_rounds=max(1, self.token_optimizer.budget.keep_recent_messages // 2),
+            strategy=self._optimization_strategy,
+            existing_summary=self._context_summary,
         )
+        stats = result.stats
 
         if stats['saved_tokens'] > 0:
-            self._conversation_history = compressed_messages
-            self._context_summary = compressed_messages[0].get('content', '') if compressed_messages and compressed_messages[0].get('role') == 'system' else self._context_summary
+            history.clear()
+            history.extend(result.messages)
+            self._context_summary = result.summary
             self._render_conversation_history()
             self._update_context_stats()
             saved_percent = stats.get('saved_percent', 0)
@@ -353,7 +365,8 @@ class PreferencesMixin:
                 f"原始: ~{before_tokens:,} tokens\n"
                 f"优化后: ~{stats['compressed_tokens']:,} tokens\n"
                 f"节省: ~{stats['saved_tokens']:,} tokens ({saved_percent:.1f}%)\n\n"
-                f"压缩了 {stats['compressed']} 条消息，保留 {stats['kept']} 条"
+                f"压缩了 {stats['removed_rounds']} 轮（{stats['removed_messages']} 条消息），"
+                f"保留 {stats['protected_rounds']} 轮（{stats['protected_messages']} 条消息）"
             )
         else:
             QtWidgets.QMessageBox.information(self, "提示", "无需优化，对话历史已经很精简")

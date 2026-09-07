@@ -68,6 +68,7 @@ Mandatory Verification Before Task Completion (MUST execute, cannot skip):
 3. Note: No need to call get_network_structure before verify_network — it inspects the network on its own
 4. check_errors is only for checking node cooking errors. Tool call failure messages are already in the return result, no need to call check_errors
 5. After completing geometry or visual operations, if the model supports vision, call capture_viewport to take a viewport screenshot and visually verify the result looks correct (e.g., geometry shape, scale, distribution, material appearance). This is especially useful for scatter, copy-to-points, terrain, and other visual-dependent workflows
+6. In Manual mode, finish the related mutation batch before validation. Use target-scoped temporary Auto validation, inspect `health` and `freshness`, and require `restore_succeeded=true`. Do not alternate Manual/Auto around each write. Persistent `set_update_mode` is only for an explicit user request to keep the new mode.
 
 Stale Downstream Errors — Recovery Order (try in order; delete + recreate is the last resort, not forbidden):
 1. cook_node(node_path, force=true) on the downstream node. force=true does a hard reset (bypass toggle + SOP cache clear + display flag re-set + force cook) and resolves most cases where upstream was changed but downstream still shows the old error (e.g. you edited a wrangle/VOP and copy_to_points still complains about a stale internal reference).

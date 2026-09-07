@@ -111,6 +111,7 @@ class ToolSemanticFactsTest(unittest.TestCase):
             "undo": True,
             "cook_triggering": True,
             "cook_before_read": False,
+            "execution_barrier": True,
         })
         self.assertTrue(reg.get_execution_semantics("get_network_structure")["cook_before_read"])
         self.assertIsNone(reg.get_execution_semantics("missing"))
@@ -716,6 +717,9 @@ class RegisterCoreToolsTest(unittest.TestCase):
         self.assertIn("get_network_structure", ask_names)
         self.assertNotIn("execute_shell", ask_names)
         self.assertNotIn("create_node", ask_names)
+        self.assertEqual(reg.get_meta("execute_shell").runtime, "local")
+        self.assertTrue(reg.get_meta("execute_shell").requires_confirmation)
+        self.assertTrue(reg.get_meta("create_node").execution_barrier)
 
 
 if __name__ == "__main__":

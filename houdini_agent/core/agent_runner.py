@@ -5,11 +5,11 @@ Agent Runner — Agent 循环辅助：标题生成、确认模式、工具调度
 从 ai_tab.py 中拆分出的 Mixin，负责：
 - 自动 AI 标题生成
 - 确认模式拦截
-- 工具分类常量（Ask 模式白名单、后台安全工具、静默工具）
+- 工具分类常量（静默工具）
 
 工具分类常量统一维护在：
-  - houdini_agent/core/harness_policy_config.py  （策略类：CONFIRM_TOOLS, BG_SAFE_TOOLS 等）
-  - houdini_agent/utils/tool_registry.py          （模式白名单：_ASK_TOOLS, _PLAN_PLANNING_TOOLS）
+    - houdini_agent/core/harness_policy_config.py  （UI 静默工具）
+    - houdini_agent/utils/tool_registry.py          （治理、执行与模式事实）
 此处仅做导入，不再重复定义。
 """
 
@@ -19,8 +19,6 @@ from houdini_agent.qt_compat import QtWidgets, QtCore
 from ..ui.i18n import tr, get_language
 from ..ui.cursor_chat_widgets import VEXPreviewInline
 from .harness_policy_config import (
-    CONFIRM_TOOLS,
-    BG_SAFE_TOOLS,
     SILENT_TOOLS,
     PLAN_SILENT_TOOLS,
     PLAN_EXECUTION_EXTRA_TOOLS,
@@ -31,8 +29,6 @@ class AgentRunnerMixin:
     """Agent 循环辅助、工具调度常量"""
 
     # 工具分类常量：从统一配置文件导入，避免多处维护
-    _CONFIRM_TOOLS = CONFIRM_TOOLS
-    _BG_SAFE_TOOLS = BG_SAFE_TOOLS
     _SILENT_TOOLS = SILENT_TOOLS
     _PLAN_SILENT_TOOLS = PLAN_SILENT_TOOLS
     _PLAN_EXECUTION_EXTRA_TOOLS = PLAN_EXECUTION_EXTRA_TOOLS

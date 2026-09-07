@@ -11,21 +11,70 @@ from houdini_agent.core.harness_engine import (
 )
 from houdini_agent.core.harness_policy_config import (
     CODE_EXEC_TOOLS,
-    CONFIRM_TOOLS,
     DESTRUCTIVE_TOOLS,
     HIGH_RISK_TOOLS,
     SCENE_MUTATION_TOOLS,
 )
+from houdini_agent.utils.tool_registry import ToolRegistry
+
+
+def _core_registry():
+    registry = ToolRegistry()
+    required = {
+        "execute_python": ["code"], "execute_shell": ["command"],
+        "remember_memory": ["content"], "get_node_parameters": ["node_path"],
+        "get_parameter_schema": ["node_path"], "inspect_node": ["node_path"],
+        "get_geometry_summary": ["node_path"], "temporary_auto_validate_geometry": ["node_path"],
+        "connect_nodes": ["from_path", "to_path"], "suggest_connection": ["from_path", "to_path"],
+        "create_named_null": ["name"], "cook_node": ["node_path"],
+        "get_node_connections": ["node_path"], "set_update_mode": ["mode"],
+    }
+    optional_path_properties = {
+        "find_nodes": ["root_path"], "get_scene_snapshot": ["root_path"],
+        "create_named_null": ["parent_path"], "save_hip": ["file_path"],
+        "get_network_structure": ["network_path"],
+    }
+    tool_names = set(required) | set(optional_path_properties)
+    for name in tool_names:
+        property_names = set(required.get(name, [])) | set(optional_path_properties.get(name, []))
+        schema = {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": name,
+                "parameters": {
+                    "type": "object",
+                    "properties": {key: {"type": "string"} for key in property_names},
+                    "required": required.get(name, []),
+                },
+            },
+        }
+        registry.register(
+            name,
+            schema,
+            modes={"agent", "ask", "plan_executing"},
+            risk_level="high" if name in HIGH_RISK_TOOLS else "normal",
+            requires_confirmation=name in (SCENE_MUTATION_TOOLS | HIGH_RISK_TOOLS | {"set_update_mode"}),
+            path_kinds={
+                key: "file" if key in {"file_path", "output_path"} else "node"
+                for key in property_names
+                if key.endswith("_path") or key in {"path", "file_path", "output_path"}
+            },
+        )
+    return registry
 
 
 class HarnessPolicyConfigTest(unittest.TestCase):
     def test_high_risk_groups_are_confirmed(self):
         self.assertTrue(DESTRUCTIVE_TOOLS <= HIGH_RISK_TOOLS)
         self.assertTrue(CODE_EXEC_TOOLS <= HIGH_RISK_TOOLS)
-        self.assertTrue(HIGH_RISK_TOOLS <= CONFIRM_TOOLS)
+        registry = _core_registry()
+        self.assertTrue(registry.get_meta("execute_python").requires_confirmation)
+        self.assertTrue(registry.get_meta("save_hip").requires_confirmation)
 
     def test_scene_mutations_are_confirmed_but_not_all_high_risk(self):
-        self.assertTrue(SCENE_MUTATION_TOOLS <= CONFIRM_TOOLS)
+        registry = _core_registry()
+        self.assertTrue(registry.get_meta("connect_nodes").requires_confirmation)
         self.assertIn("create_node", SCENE_MUTATION_TOOLS)
         self.assertNotIn("create_node", HIGH_RISK_TOOLS)
 
@@ -42,14 +91,19 @@ class HarnessPolicyConfigTest(unittest.TestCase):
             modes={"ask", "agent"}, risk_level="low", mutating=False, undo=False,
         )
 
-        self.assertNotIn("plugin_probe", CONFIRM_TOOLS)
-        self.assertIn("delete_node", CONFIRM_TOOLS)
+        self.assertTrue(registry.get_meta("plugin_probe").requires_confirmation)
         self.assertIn("execute_shell", HIGH_RISK_TOOLS)
 
 
 class HarnessToolPolicyEngineTest(unittest.TestCase):
     def setUp(self):
-        self.policy = HarnessToolPolicyEngine()
+        self.registry = _core_registry()
+        self.policy = HarnessToolPolicyEngine(get_tool_meta=self.registry.get_meta)
+
+    def test_unknown_tool_fails_closed(self):
+        decision = self.policy.decide("unknown_tool", {}, {"mode": "agent"})
+        self.assertEqual(decision.action, "deny")
+        self.assertIn("metadata unavailable", decision.reason)
 
     def test_ask_mode_denies_high_risk_tools(self):
         decision = self.policy.decide("execute_python", {"code": "print(1)"}, {"mode": "ask"})
@@ -110,7 +164,7 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         )
         self.assertEqual(decision.action, "allow")
 
-    def test_set_update_mode_requires_mode_and_is_allowed(self):
+    def test_set_update_mode_requires_mode_and_confirm_mode_asks(self):
         missing_mode = self.policy.decide("set_update_mode", {}, {"mode": "agent"})
         self.assertEqual(missing_mode.action, "deny")
         self.assertIn("mode", missing_mode.reason)
@@ -120,7 +174,8 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
             {"mode": "auto"},
             {"mode": "agent", "confirm_mode": True},
         )
-        self.assertEqual(decision.action, "allow")
+        self.assertEqual(decision.action, "ask")
+        self.assertIn("persistent", decision.reason)
 
     def test_sensitive_argument_key_is_denied(self):
         decision = self.policy.decide(
@@ -348,7 +403,13 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
 
 class ToolArgumentValidatorTest(unittest.TestCase):
     def setUp(self):
-        self.validator = ToolArgumentValidator()
+        self.registry = _core_registry()
+        self.validator = ToolArgumentValidator(get_tool_meta=self.registry.get_meta)
+
+    def test_required_and_path_facts_come_from_tool_meta(self):
+        meta = self.registry.get_meta("get_node_parameters")
+        self.assertEqual(meta.required_args(), ("node_path",))
+        self.assertEqual(meta.path_kinds["node_path"], "node")
 
     def test_validator_normalizes_paths_and_reports_missing_args(self):
         result = self.validator.validate("get_node_parameters", {"node_path": " //obj//geo1 "})

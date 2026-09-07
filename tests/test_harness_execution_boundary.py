@@ -116,6 +116,7 @@ class HarnessExecutionBoundaryTest(unittest.TestCase):
         tab = self._make_tab()
         tab._agent_mode = True
         tab._confirm_mode = True
+        tab._request_tool_confirmation = lambda *args: True
         confirmations = []
 
         def request_confirmation(tool_name, args):
@@ -192,6 +193,7 @@ class HarnessExecutionBoundaryTest(unittest.TestCase):
         tab = self._make_tab()
         tab._agent_mode = True
         tab._confirm_mode = True
+        tab._request_tool_confirmation = lambda *args: True
         tab._pre_agent_update_mode = "Manual"
         tab._execute_tool_impl = lambda *args, **kwargs: {
             "success": True,
@@ -204,6 +206,30 @@ class HarnessExecutionBoundaryTest(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["mode"], "Auto")
         self.assertNotEqual(tab._pre_agent_update_mode, "Manual")
+
+    def test_confirmed_persistent_auto_reaches_cook_guard_owner(self):
+        tab = self._make_tab()
+        tab._agent_mode = True
+        tab._confirm_mode = True
+        tab._request_tool_confirmation = lambda *args: True
+        recorded_modes = []
+        tab._houdini_main_thread_executor = type(
+            "ExecutorStub",
+            (),
+            {"set_explicit_update_mode": lambda self, mode: recorded_modes.append(mode)},
+        )()
+        tab._execute_tool_impl = lambda *args, **kwargs: {
+            "success": True,
+            "mode": "AutoUpdate",
+            "persistent_update_mode_change": True,
+            "data": {"mode_kind": "auto"},
+        }
+
+        result = AITab._execute_tool_with_todo(tab, "set_update_mode", mode="auto")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(tab._agent_explicit_update_mode, "auto")
+        self.assertEqual(recorded_modes, ["auto"])
 
     def test_batch_items_each_pass_through_harness(self):
         tab = self._make_tab()

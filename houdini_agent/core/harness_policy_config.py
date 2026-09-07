@@ -106,18 +106,6 @@ SHELL_DANGEROUS_PATTERNS = (
     (r':\(\)\{.*\}', 'shell_fork_bomb_sh'),
 )
 
-# 需要用户确认的工具（确认模式下拦截）
-CONFIRM_TOOLS = frozenset(SCENE_MUTATION_TOOLS | HIGH_RISK_TOOLS)
-
-# 不需要 Houdini 主线程的工具（纯 Python / 系统操作，可在后台线程直接执行）
-BG_SAFE_TOOLS = frozenset({
-    'execute_shell',       # subprocess.run，不依赖 hou
-    'search_local_doc',    # 纯 Python 文本检索
-    'list_skills',         # 纯 Python 列表
-    'search_memory',       # 纯 Python 记忆库检索
-    'remember_memory',     # 纯 Python 长期记忆写入
-})
-
 # 静默工具：不在执行列表 UI 中显示
 SILENT_TOOLS = frozenset({
     'add_todo',

@@ -13,15 +13,21 @@ Image Mixin — 图片附件与多模态消息处理
 import os
 
 from houdini_agent.qt_compat import QtWidgets, QtCore, QtGui
+from houdini_agent.utils.image_budget import (
+    MAX_IMAGE_BYTES,
+    encode_image_within_limit,
+    preferred_image_format,
+    shared_image_budget,
+)
 from .cursor_chat_widgets import ClickableImageLabel
 
 
 class ImageMixin:
     """图片附件与多模态消息处理"""
 
-    # ★ 图片尺寸限制：超过此分辨率的图片自动缩放（防止 base64 过大导致 API 400 错误）
+    # 为共享 nginx 代理预留消息、工具 schema 和 JSON 开销；base64 后约 3.3MB。
     _MAX_IMAGE_DIMENSION = 2048  # 最长边不超过 2048px
-    _MAX_IMAGE_BYTES = 5 * 1024 * 1024  # base64 前的原始字节数上限 ~5MB（编码后约 6.7MB）
+    _MAX_IMAGE_BYTES = MAX_IMAGE_BYTES
 
     def _current_model_supports_vision(self) -> bool:
         """检查当前选中的模型是否支持图片输入"""
@@ -60,28 +66,18 @@ class ImageMixin:
             ext = os.path.splitext(file_path)[1].lower()
             # 优先保持原始格式；BMP/GIF 等不适合直接发 API，统一转 PNG
             if ext in ('.jpg', '.jpeg'):
-                fmt, media_type = 'JPEG', 'image/jpeg'
+                fmt, media_type, quality = 'JPEG', 'image/jpeg', 90
             elif ext == '.webp':
-                fmt, media_type = 'WEBP', 'image/webp'
+                fmt, media_type, quality = 'WEBP', 'image/webp', -1
             else:
-                fmt, media_type = 'PNG', 'image/png'
+                fmt, media_type, quality = preferred_image_format(
+                    qimg.width(), qimg.height(), qimg.hasAlphaChannel()
+                )
 
-            buf = QtCore.QBuffer()
-            buf.open(QtCore.QIODevice.WriteOnly)
-            quality = 90 if fmt == 'JPEG' else -1
-            qimg.save(buf, fmt, quality)
-            raw_bytes = buf.data().data()
-            buf.close()
-
-            # ★ 过大时降级为 JPEG 压缩
-            if len(raw_bytes) > self._MAX_IMAGE_BYTES and fmt != 'JPEG':
-                buf2 = QtCore.QBuffer()
-                buf2.open(QtCore.QIODevice.WriteOnly)
-                qimg.save(buf2, 'JPEG', 85)
-                raw_bytes = buf2.data().data()
-                buf2.close()
-                media_type = 'image/jpeg'
-                print(f"[AI Tab] 图片过大，已转为 JPEG ({len(raw_bytes)//1024}KB)")
+            raw_bytes, media_type = self._encode_image_within_limit(
+                qimg, fmt, media_type, quality,
+                max_bytes=shared_image_budget(len(self._pending_images) + 1),
+            )
 
             b64 = base64.b64encode(raw_bytes).decode('utf-8')
             self._add_pending_image(b64, media_type)
@@ -110,24 +106,45 @@ class ImageMixin:
         import base64
         # ★ 自动缩放过大图片
         image = self._resize_image_if_needed(image, self._MAX_IMAGE_DIMENSION)
-        buf = QtCore.QBuffer()
-        buf.open(QtCore.QIODevice.WriteOnly)
-        image.save(buf, "PNG")
-        raw_bytes = buf.data().data()
-        buf.close()
-        # ★ 如果 PNG 仍然过大，改用 JPEG 压缩
-        if len(raw_bytes) > self._MAX_IMAGE_BYTES:
-            buf2 = QtCore.QBuffer()
-            buf2.open(QtCore.QIODevice.WriteOnly)
-            image.save(buf2, "JPEG", 85)
-            raw_bytes = buf2.data().data()
-            buf2.close()
-            media_type = 'image/jpeg'
-            print(f"[AI Tab] PNG 过大，已转为 JPEG (quality=85, {len(raw_bytes)//1024}KB)")
-        else:
-            media_type = 'image/png'
+        fmt, media_type, quality = preferred_image_format(
+            image.width(), image.height(), image.hasAlphaChannel()
+        )
+        raw_bytes, media_type = self._encode_image_within_limit(
+            image, fmt, media_type, quality,
+            max_bytes=shared_image_budget(len(self._pending_images) + 1),
+        )
         b64 = base64.b64encode(raw_bytes).decode('utf-8')
         self._add_pending_image(b64, media_type)
+
+    @classmethod
+    def _encode_image_within_limit(
+        cls, image, fmt, media_type, quality=-1, max_bytes=None
+    ):
+        """编码图片，并逐级压缩到代理可接受的单图体积。"""
+        def encode(source, target_format, target_quality):
+            buf = QtCore.QBuffer()
+            buf.open(QtCore.QIODevice.WriteOnly)
+            if not source.save(buf, target_format, target_quality):
+                buf.close()
+                raise ValueError(f"无法编码图片为 {target_format}")
+            data = bytes(buf.data())
+            buf.close()
+            return data
+
+        return encode_image_within_limit(
+            image,
+            fmt,
+            media_type,
+            encode=encode,
+            resize=lambda source, scale: source.scaled(
+                max(1, int(source.width() * scale)),
+                max(1, int(source.height() * scale)),
+                QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.SmoothTransformation,
+            ),
+            initial_quality=quality,
+            max_bytes=max_bytes or cls._MAX_IMAGE_BYTES,
+        )
 
     def _add_pending_image(self, b64_data: str, media_type: str):
         """添加图片到待发送列表并在预览区显示缩略图（点击可放大）"""
@@ -166,6 +183,28 @@ class ImageMixin:
         count = self.image_preview_layout.count()
         self.image_preview_layout.insertWidget(count - 1, img_widget)
         self.image_preview_container.setVisible(True)
+
+    def _rebudget_pending_images(self):
+        """按当前图片数量重新编码待发图片，使整组共享固定预算。"""
+        import base64
+        per_image_bytes = shared_image_budget(len(self._pending_images))
+        changed = False
+        reencoded = []
+        for b64_data, media_type, thumb in self._pending_images:
+            raw_bytes = base64.b64decode(b64_data)
+            if len(raw_bytes) <= per_image_bytes:
+                reencoded.append((b64_data, media_type, thumb))
+                continue
+            image = QtGui.QImage.fromData(raw_bytes)
+            if image.isNull():
+                raise ValueError("待发送图片数据无效")
+            raw_bytes, media_type = self._encode_image_within_limit(
+                image, 'JPEG', 'image/jpeg', 85, max_bytes=per_image_bytes
+            )
+            reencoded.append((base64.b64encode(raw_bytes).decode('utf-8'), media_type, thumb))
+            changed = True
+        if changed:
+            self._pending_images = reencoded
 
     def _remove_pending_image(self, index: int):
         """移除待发送图片"""

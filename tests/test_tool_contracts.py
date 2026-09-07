@@ -6,7 +6,6 @@ import sys
 from unittest import mock
 
 from houdini_agent.core.harness_policy_config import (
-    CONFIRM_TOOLS,
     HIGH_RISK_TOOLS,
     SCENE_MUTATION_TOOLS,
 )
@@ -51,7 +50,7 @@ class CoreToolContractTest(unittest.TestCase):
         core_names = set(self.registry._tools)
         for name in HIGH_RISK_TOOLS & core_names:
             with self.subTest(tool=name):
-                self.assertIn(name, CONFIRM_TOOLS)
+                self.assertTrue(self.registry._tools[name].requires_confirmation)
                 self.assertEqual(self.registry._tools[name].risk_level, "high")
 
     def test_mutating_confirm_tools_do_not_leak_into_ask_mode(self):
@@ -59,7 +58,10 @@ class CoreToolContractTest(unittest.TestCase):
             schema["function"]["name"]
             for schema in self.registry.get_tools_for_mode("ask")
         }
-        self.assertFalse(CONFIRM_TOOLS & ask_names)
+        confirmed_names = {
+            meta.name for meta in self.registry._tools.values() if meta.requires_confirmation
+        }
+        self.assertFalse(confirmed_names & ask_names)
 
     def test_new_query_tools_are_registered_for_ask_mode(self):
         ask_names = {
@@ -79,14 +81,14 @@ class CoreToolContractTest(unittest.TestCase):
 
         self.assertIn("temporary_auto_validate_geometry", core_names)
         self.assertNotIn("temporary_auto_validate_geometry", HIGH_RISK_TOOLS)
-        self.assertNotIn("temporary_auto_validate_geometry", CONFIRM_TOOLS)
+        self.assertFalse(self.registry._tools["temporary_auto_validate_geometry"].requires_confirmation)
 
     def test_set_update_mode_tool_is_registered_but_not_code_exec(self):
         core_names = set(self.registry._tools)
 
         self.assertIn("set_update_mode", core_names)
         self.assertNotIn("set_update_mode", HIGH_RISK_TOOLS)
-        self.assertNotIn("set_update_mode", CONFIRM_TOOLS)
+        self.assertTrue(self.registry._tools["set_update_mode"].requires_confirmation)
         description = self.registry._tools["set_update_mode"].schema["function"]["description"]
         self.assertIn("agent 工具", description)
         self.assertIn("不是 Houdini 原生 API", description)
@@ -144,7 +146,13 @@ class CoreToolContractTest(unittest.TestCase):
         self.assertTrue(after.mutating)
         self.assertTrue(after.undo)
         self.assertIn("delete_node", HIGH_RISK_TOOLS)
-        self.assertIn("delete_node", CONFIRM_TOOLS)
+        self.assertTrue(after.requires_confirmation)
+
+    def test_core_runtime_and_argument_facts_are_registered(self):
+        self.assertEqual(self.registry.get_meta("execute_shell").runtime, "local")
+        self.assertEqual(self.registry.get_meta("get_parameter_schema").required_args(), ("node_path",))
+        self.assertEqual(self.registry.get_meta("get_parameter_schema").path_kinds["node_path"], "node")
+        self.assertEqual(self.registry.get_meta("save_hip").path_kinds["file_path"], "file")
 
 
 if __name__ == "__main__":

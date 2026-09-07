@@ -7,6 +7,7 @@ OpenAI-compatible API client with Function Calling, streaming, and web search.
 import os
 import sys
 import json
+import copy
 import ssl
 import time
 import re
@@ -972,7 +973,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_geometry_summary",
-            "description": "结构化读取 SOP 节点的真实几何摘要：点/面/顶点数量、bbox、属性 schema、groups、update_mode/manual_mode/is_empty_geometry/recommended_next_action，以及可选点/primitive 属性抽样。用于验证几何网络实际产物，不要只凭截图猜测；若多个基础源 SOP 都读到空，第一步先看 update_mode/manual_mode，不要先改参数或替换 generator。Manual 更新模式下若 recommended_next_action=temporary_auto_validate，优先调用 set_update_mode(mode='auto') 切到 Auto Update 后再判断。",
+            "description": "结构化读取 SOP 节点的真实几何摘要：点/面/顶点数量、bbox、属性 schema、groups，以及 health/freshness/update mode 信号。Manual 下完成相关修改批次后，若 recommended_next_action=temporary_auto_validate，调用 temporary_auto_validate_geometry 对目标做临时 Auto 验证并恢复 Manual；不要用持久 set_update_mode 代替验证。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -995,7 +996,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "temporary_auto_validate_geometry",
-            "description": "专用几何验证工具：当 Manual 更新模式下 get_geometry_summary/verify_network 返回 recommended_next_action=temporary_auto_validate 或 validation_blocked=manual_empty_geometry_after_cook 时使用。工具会临时切到 Auto/AlwaysUpdate，cook 并读取指定 SOP 节点几何摘要，然后恢复原 update mode。不要用 execute_python 手写 setUpdateMode。",
+            "description": "Manual 批次完成后的专用 scoped validation barrier：临时切 Auto/AlwaysUpdate，只 cook/read 指定 SOP，然后真实恢复原 update mode。检查 health/freshness/restore_succeeded；任一步失败不得声称健康。Confirm Mode 下无需为此临时验证确认。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1012,7 +1013,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "set_update_mode",
-            "description": "agent 工具，不是 Houdini 原生 API：设置当前 hip 的 Houdini Update Mode。Manual 模式导致基础源 SOP/最终输出持续读空时，优先调用 set_update_mode(mode='auto') 直接切到 Auto Update，再重新验证几何。此工具是受限状态切换，不执行任意 Python。",
+            "description": "agent 工具，不是 Houdini 原生 API：持久设置当前 hip 的 Houdini Update Mode。仅当用户明确要求持续 Auto/Manual 时使用；批次验证必须改用 temporary_auto_validate_geometry 或带 node_path 的 check_errors。Confirm Mode 下此持久状态变更需要确认。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2047,6 +2048,39 @@ class AIClient:
 
         return stripped
 
+    _MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
+
+    @staticmethod
+    def _request_body_size(messages: list, tools: Optional[list] = None) -> int:
+        """返回请求中主要可变字段的 UTF-8 JSON 字节数。"""
+        return len(json.dumps(
+            {'messages': messages, 'tools': tools or []},
+            ensure_ascii=False,
+            separators=(',', ':'),
+        ).encode('utf-8'))
+
+    @classmethod
+    def _fit_messages_to_request_body_budget(
+        cls,
+        messages: list,
+        tools: Optional[list] = None,
+        max_body_bytes: Optional[int] = None,
+    ) -> tuple:
+        """剥离旧轮图片使完整请求适配代理预算；绝不静默删除当前图片。"""
+        limit = max_body_bytes or cls._MAX_REQUEST_BODY_BYTES
+        working = copy.deepcopy(messages)
+        if cls._request_body_size(working, tools) <= limit:
+            return working, 0
+
+        removed = cls._strip_image_content(working, keep_recent_user=1)
+        final_size = cls._request_body_size(working, tools)
+        if final_size > limit:
+            raise ValueError(
+                f"请求体仍超过代理上限（{final_size / 1024 / 1024:.1f}MB / "
+                f"{limit / 1024 / 1024:.1f}MB）。请减少当前消息中的图片数量或裁剪图片。"
+            )
+        return working, removed
+
     # ----------------------------------------------------------
     # 渐进式裁剪
     # ----------------------------------------------------------
@@ -2191,10 +2225,28 @@ class AIClient:
         - 失败 → 保留完整错误
         """
         result = sanitize_tool_result(result)
+        def validation_signals(payload):
+            signals = []
+            freshness = payload.get('freshness')
+            for key in ('health', 'validation_blocked', 'mode', 'restore_attempted', 'restore_succeeded', 'restored_update_mode'):
+                if key in payload:
+                    value = payload[key]
+                    if isinstance(value, bool):
+                        value = str(value).lower()
+                    signals.append(f"{key}={value}")
+            if isinstance(freshness, dict) and freshness.get('status'):
+                signals.append(f"freshness={freshness['status']}")
+            if payload.get('recovery_hint'):
+                signals.append(f"recovery_hint={payload['recovery_hint']}")
+            return signals
+
         if result.get('success'):
             content = result.get('summary') or result.get('result', '')
             if not isinstance(content, str):
                 content = json.dumps(content, ensure_ascii=False, default=str)
+            signals = validation_signals(result)
+            if signals:
+                content = "[validation " + ", ".join(signals) + "]\n" + content
             # 已自带分页逻辑的工具：软上限截断 + 引导用 offset 翻页
             if tool_name in self._SELF_PAGED_TOOLS:
                 return self._soft_cap_with_offset_hint(tool_name, content)
@@ -2217,7 +2269,11 @@ class AIClient:
                 return self._paginate_result(content, max_lines=80)
         else:
             error = result.get('error', '未知错误')
-            return error[:500] if len(error) > 500 else error
+            signals = validation_signals(result)
+            content = error[:500] if len(error) > 500 else error
+            if signals:
+                content = "[validation " + ", ".join(signals) + "]\n" + content
+            return content
 
     # ----------------------------------------------------------
     # ★ 分级工具结果压缩（用于上下文压缩阶段，比 _summarize_tool_content 更智能）
@@ -3278,6 +3334,14 @@ class AIClient:
         if provider not in ('ollama', 'custom') and not api_key:
             yield {"type": "error", "error": f"缺少 {self._get_vendor_name(provider)} API Key"}
             return
+
+        try:
+            messages, removed_images = self._fit_messages_to_request_body_budget(messages, tools)
+            if removed_images:
+                print(f"[AI Client] 请求体预算：已移除 {removed_images} 张旧图片")
+        except ValueError as exc:
+            yield {"type": "error", "error": str(exc)}
+            return
         
         # ★ Anthropic 协议分支（Duojie GLM 等）
         if self._is_anthropic_protocol(provider, model):
@@ -3903,6 +3967,19 @@ class AIClient:
             if _needs_sanitize:
                 working_messages = self._sanitize_working_messages(working_messages)
                 _needs_sanitize = False
+
+            try:
+                working_messages, removed_images = self._fit_messages_to_request_body_budget(
+                    working_messages, effective_tools
+                )
+                if removed_images:
+                    print(f"[AI Client] 请求体预算：已移除 {removed_images} 张旧图片")
+            except ValueError as exc:
+                return {
+                    'ok': False, 'error': str(exc), 'content': full_content,
+                    'tool_calls_history': tool_calls_history, 'call_records': call_records,
+                    'iterations': iteration, 'usage': total_usage,
+                }
             
             # 诊断：仅打印消息数量摘要（完整内容通过"导出训练数据"功能获取）
             if iteration > 1:
@@ -4048,12 +4125,13 @@ class AIClient:
                     
                     # ---- 精确分类错误类型 ----
                     # 1. 真正的上下文超限（API 明确告知 token 超限）
+                    is_http_413 = 'http 413' in error_lower
                     is_context_exceeded = any(k in error_lower for k in (
                         'context_length_exceeded', 'maximum context length',
                         'max_tokens', 'token limit', 'too many tokens',
                         'request too large', 'payload too large',
                         'context window', 'input too long',
-                    )) or ('http 413' in error_lower)
+                    )) or is_http_413
                     
                     # 2. 临时服务器错误 / 连接中断（502/503/529 / InvalidChunkLength 等）
                     is_server_transient = any(k in error_msg for k in (
@@ -4097,6 +4175,7 @@ class AIClient:
                                 on_content(f"\n[上下文超限，正在智能裁剪后重试 ({server_error_retries}/{max_server_retries})...]\n")
                             
                             old_len = len(working_messages)
+                            old_body_size = self._request_body_size(working_messages, effective_tools)
                             working_messages = self._progressive_trim(
                                 working_messages, tool_calls_history,
                                 trim_level=server_error_retries,  # 逐次加大裁剪力度
@@ -4104,6 +4183,14 @@ class AIClient:
                                 tools=effective_tools,
                             )
                             cleanup_count = old_len - len(working_messages)
+                            new_body_size = self._request_body_size(working_messages, effective_tools)
+                            if is_http_413 and new_body_size >= old_body_size:
+                                should_abort = True
+                                abort_error = (
+                                    "请求体过大，且自动裁剪未能缩小请求。"
+                                    "请减少当前消息中的图片数量或裁剪图片后重试。"
+                                )
+                                break
                             try:
                                 self._ensure_context_within_budget(
                                     working_messages, effective_tools, context_limit

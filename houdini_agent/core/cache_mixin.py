@@ -729,15 +729,14 @@ class CacheMixin:
             return
         
         old_tokens = self.token_optimizer.calculate_message_tokens(self._conversation_history)
-        compressed, stats = self.token_optimizer.compress_context_rounds(
+        result = self.token_optimizer.compress_context(
             self._conversation_history,
             protect_recent_rounds=2,
+            existing_summary=self._context_summary,
         )
-        self._conversation_history = compressed
-        summary_text = compressed[0].get('content', '') if compressed else ''
-        
-        # 更新上下文摘要
-        self._context_summary = summary_text
+        stats = result.stats
+        self._conversation_history = result.messages
+        self._context_summary = result.summary
         
         # 重新渲染
         self._render_conversation_history()

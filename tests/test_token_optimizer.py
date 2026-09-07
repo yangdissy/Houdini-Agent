@@ -14,7 +14,9 @@ from houdini_agent.utils.token_optimizer import (
     TokenBudget,
     TokenEstimate,
     CompressionStats,
+    ContextCompressionResult,
     CompressionStrategy,
+    LLMSummarizer,
     plan_context_rounds,
     compress_old_round_tool_results,
     flatten_context_rounds,
@@ -272,6 +274,110 @@ class CompressMessagesTest(unittest.TestCase):
         self.assertEqual(stats["compressed"], 4)
         self.assertEqual(stats["kept"], 3)
         self.assertEqual(stats["strategy"], "balanced")
+
+    def test_compress_context_returns_summary_separate_from_history(self):
+        messages = [
+            {"role": "user", "content": "first request"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "second request"},
+            {"role": "assistant", "content": "second answer"},
+            {"role": "user", "content": "current request"},
+        ]
+
+        result = self.opt.compress_context(messages, protect_recent_rounds=1)
+
+        self.assertIsInstance(result, ContextCompressionResult)
+        self.assertIn("first request", result.summary)
+        self.assertEqual(result.messages, [
+            {"role": "user", "content": "current request"},
+        ])
+        self.assertFalse(any(message.get("role") == "system" for message in result.messages))
+        self.assertEqual(result.stats["removed_rounds"], 2)
+        self.assertEqual(result.stats["removed_messages"], 4)
+        self.assertEqual(result.stats["protected_rounds"], 1)
+        self.assertEqual(result.stats["protected_messages"], 1)
+
+    def test_compress_context_merges_existing_summary_once(self):
+        messages = [
+            {"role": "user", "content": "new old request"},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "current"},
+        ]
+
+        result = self.opt.compress_context(
+            messages,
+            protect_recent_rounds=1,
+            existing_summary="previous summary",
+        )
+
+        self.assertEqual(result.summary.count("previous summary"), 1)
+        self.assertIn("new old request", result.summary)
+        self.assertNotIn("previous summary", str(result.messages))
+
+    def test_compress_context_rounds_summarizes_multimodal_content(self):
+        old_content = [
+            {"type": "text", "text": "希望图片碎块边缘为被动刚体"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        ]
+        messages = [
+            {"role": "user", "content": old_content},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "已分析图片中的碎块区域"},
+            ]},
+            {"role": "user", "content": "current request"},
+        ]
+
+        compressed, _ = self.opt.compress_context_rounds(
+            messages, protect_recent_rounds=1,
+        )
+
+        self.assertIn("希望图片碎块边缘为被动刚体", compressed[0]["content"])
+        self.assertIn("已分析图片中的碎块区域", compressed[0]["content"])
+        self.assertNotIn("base64", compressed[0]["content"])
+
+    def test_all_summary_strategies_accept_multimodal_and_empty_content(self):
+        messages = [
+            {"role": "user", "content": [
+                {"type": "text", "text": "多模态请求"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,secret"}},
+                {"type": "unknown", "value": "ignored"},
+            ]},
+            {"role": "assistant", "content": None},
+            {"role": "assistant", "content": [{"type": "text", "text": "多模态回答"}]},
+            {"role": "user", "content": "current"},
+        ]
+
+        for strategy in CompressionStrategy.AGGRESSIVE, CompressionStrategy.BALANCED, CompressionStrategy.CONSERVATIVE:
+            with self.subTest(strategy=strategy):
+                compressed, _ = self.opt.compress_context_rounds(
+                    messages, protect_recent_rounds=1, strategy=strategy,
+                )
+                self.assertIsInstance(compressed[0]["content"], str)
+                self.assertNotIn("base64", compressed[0]["content"])
+
+    def test_filter_redundant_messages_accepts_multimodal_content(self):
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "创建节点"}]},
+            {"role": "assistant", "content": None},
+        ]
+
+        filtered = self.opt.filter_redundant_messages(messages)
+
+        self.assertEqual(filtered, messages)
+
+    def test_llm_summary_formatter_extracts_text_without_image_payload(self):
+        rounds = [[
+            {"role": "user", "content": [
+                {"type": "text", "text": "分析当前图片"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,secret"}},
+            ]},
+            {"role": "assistant", "content": None},
+        ]]
+
+        formatted = LLMSummarizer.format_rounds_for_summary(rounds)
+
+        self.assertIn("分析当前图片", formatted)
+        self.assertNotIn("base64", formatted)
 
 
 class ContextRoundPlanTest(unittest.TestCase):

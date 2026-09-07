@@ -43,6 +43,7 @@ except ImportError:
     requests = None  # type: ignore
 
 from .settings import read_settings
+from ..scoped_validation import ScopedValidationOperationResult, ScopedValidationTransaction
 
 # 导入 RAG 检索系统
 try:
@@ -4418,7 +4419,19 @@ class HoudiniMCP:
             include_hidden=bool(args.get("include_hidden", False)),
         )
         if ok:
-            return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2)}
+            stale = bool(data.get("manual_mode") and data.get("is_empty_geometry"))
+            return {
+                "success": True,
+                "result": json.dumps(data, ensure_ascii=False, indent=2),
+                "data": data,
+                "health": "unknown" if stale else "healthy",
+                "freshness": {
+                    "status": "stale" if stale else "fresh",
+                    "target": node_path,
+                    "cook_succeeded": None,
+                    "read_succeeded": True,
+                },
+            }
         return {"success": False, "error": str(data.get("error", "获取参数 schema 失败"))}
 
     def _tool_get_node_card(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -4829,7 +4842,19 @@ class HoudiniMCP:
             sample_primitives=bool(args.get("sample_primitives", False)),
         )
         if ok:
-            return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2)}
+            stale = bool(data.get("manual_mode") and data.get("is_empty_geometry"))
+            return {
+                "success": True,
+                "result": json.dumps(data, ensure_ascii=False, indent=2),
+                "data": data,
+                "health": "unknown" if stale else "healthy",
+                "freshness": {
+                    "status": "stale" if stale else "fresh",
+                    "target": node_path,
+                    "cook_succeeded": None,
+                    "read_succeeded": True,
+                },
+            }
         return {"success": False, "error": str(data.get("error", "获取几何摘要失败"))}
 
     def _tool_get_scene_snapshot(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -4985,32 +5010,27 @@ class HoudiniMCP:
         if hou is None:
             return {"success": False, "error": "未检测到 Houdini API"}
 
-        original_mode = None
-        original_mode_name = "unknown"
-        auto_mode = None
-        try:
-            original_mode = hou.updateModeSetting()
-            original_mode_name = original_mode.name() if hasattr(original_mode, "name") else str(original_mode)
-        except Exception:
-            original_mode = None
-
-        try:
-            auto_mode = (
+        transaction = ScopedValidationTransaction(
+            hou.updateModeSetting,
+            hou.setUpdateMode,
+            lambda: (
                 getattr(hou.updateMode, "AutoUpdate", None)
                 or getattr(hou.updateMode, "AlwaysUpdate", None)
                 or getattr(hou.updateMode, "Auto", None)
-            )
-            if auto_mode is not None and hasattr(hou, "setUpdateMode"):
-                hou.setUpdateMode(auto_mode)
+            ),
+        )
 
+        def validate_target():
             node, error = self._resolve_geometry_node(node_path)
             if error:
-                return {"success": False, "error": error}
+                return ScopedValidationOperationResult(success=False, error=error)
             assert node is not None
             try:
                 node.cook(force=True)
             except Exception as exc:
-                return {"success": False, "error": f"临时 Auto 验证 cook 失败: {exc}"}
+                return ScopedValidationOperationResult(
+                    success=False, error=f"临时 Auto 验证 cook 失败: {exc}"
+                )
 
             ok, result = self.get_geometry_summary(
                 node_path,
@@ -5021,29 +5041,31 @@ class HoudiniMCP:
                 sample_primitives=bool(args.get("sample_primitives", False)),
             )
             if not ok:
-                return {"success": False, "error": result.get("error", "临时 Auto 验证失败") if isinstance(result, dict) else str(result)}
-            point_count = result.get("point_count", "?") if isinstance(result, dict) else "?"
-            primitive_count = result.get("primitive_count", "?") if isinstance(result, dict) else "?"
-            update_mode = result.get("update_mode", "unknown") if isinstance(result, dict) else "unknown"
-            return {
-                "success": True,
-                "temporary_auto_validation": True,
-                "original_update_mode": original_mode_name,
-                "restored_update_mode": original_mode_name,
-                "auto_update_mode": auto_mode.name() if hasattr(auto_mode, "name") else str(auto_mode),
-                "summary": (
-                    f"临时 Auto 验证完成: {node_path} points={point_count}, "
-                    f"prims={primitive_count}, verification_update_mode={update_mode}; "
-                    f"已恢复 update mode={original_mode_name}"
-                ),
-                "result": result,
-            }
-        finally:
-            if original_mode is not None and hasattr(hou, "setUpdateMode"):
-                try:
-                    hou.setUpdateMode(original_mode)
-                except Exception:
-                    pass
+                error_text = result.get("error", "临时 Auto 验证失败") if isinstance(result, dict) else str(result)
+                return ScopedValidationOperationResult(
+                    success=False, cook_succeeded=True, error=error_text
+                )
+            return ScopedValidationOperationResult(
+                success=True,
+                payload=result,
+                health="unhealthy" if result.get("errors") else "healthy",
+                cook_succeeded=True,
+                read_succeeded=True,
+            )
+
+        outcome = transaction.run(node_path, validate_target)
+        result = outcome.pop("payload", None)
+        outcome["temporary_auto_validation"] = True
+        outcome["result"] = result if result is not None else ""
+        outcome["data"] = result if result is not None else {}
+        if outcome["success"] and isinstance(result, dict):
+            outcome["summary"] = (
+                f"临时 Auto 验证完成: {node_path} points={result.get('point_count', '?')}, "
+                f"prims={result.get('primitive_count', '?')}, "
+                f"verification_update_mode={result.get('update_mode', 'unknown')}; "
+                f"已恢复 update mode={outcome['restored_update_mode']}"
+            )
+        return outcome
 
     def _tool_set_update_mode(self, args: Dict[str, Any]) -> Dict[str, Any]:
         mode_text = str(args.get("mode") or "").strip().lower().replace("_", "-").replace(" ", "-")
@@ -5077,6 +5099,12 @@ class HoudiniMCP:
             return {
                 "success": True,
                 "result": f"Update Mode 已设置为 {current_name}（之前: {previous_name}）",
+                "data": {
+                    "requested": "auto" if mode_text != "manual" else "manual",
+                    "effective": current_name,
+                    "mode_kind": "auto" if mode_text != "manual" else "manual",
+                    "persistent": True,
+                },
                 "previous_mode": previous_name,
                 "mode": current_name,
                 "persistent_update_mode_change": True,
@@ -5529,8 +5557,75 @@ class HoudiniMCP:
             return {"success": False, "error": f"Skill 执行异常: {e}\n{traceback.format_exc()[:500]}"}
 
     def _tool_check_errors(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        ok, text = self.check_node_errors_text(args.get("node_path"))
-        return {"success": ok, "result": text if ok else "", "error": "" if ok else text}
+        node_path = str(args.get("node_path") or "").strip()
+        if not node_path:
+            return {"success": False, "error": "缺少 node_path 参数"}
+
+        original_mode = None
+        original_mode_name = "unknown"
+        target = hou.node(node_path) if hou is not None else None
+        if target is None:
+            return {"success": False, "error": f"未找到节点: {node_path}", "health": "unknown"}
+
+        try:
+            original_mode = hou.updateModeSetting()
+            original_mode_name = original_mode.name() if hasattr(original_mode, "name") else str(original_mode)
+        except Exception:
+            original_mode = None
+
+        manual_mode = original_mode is not None and original_mode == getattr(hou.updateMode, "Manual", None)
+        if manual_mode:
+            transaction = ScopedValidationTransaction(
+                hou.updateModeSetting,
+                hou.setUpdateMode,
+                lambda: (
+                    getattr(hou.updateMode, "AutoUpdate", None)
+                    or getattr(hou.updateMode, "AlwaysUpdate", None)
+                    or getattr(hou.updateMode, "Auto", None)
+                ),
+            )
+
+            def validate_target():
+                if hasattr(target, "needsToCook") and target.needsToCook():
+                    reason = "Target may contain uncooked Volume/VDB geometry; scoped cook was skipped for safety."
+                    return ScopedValidationOperationResult(
+                        success=False, validation_blocked=True,
+                        block_reason=reason, error=reason,
+                    )
+                target.cook(force=True)
+                ok, text = self.check_node_errors_text(node_path)
+                lower_text = text.lower()
+                unhealthy = "error" in lower_text or "错误" in text and "无错误" not in text
+                return ScopedValidationOperationResult(
+                    success=bool(ok), payload=text,
+                    health="unhealthy" if unhealthy else "healthy",
+                    cook_succeeded=True, read_succeeded=bool(ok),
+                    error="" if ok else text,
+                )
+
+            outcome = transaction.run(node_path, validate_target)
+            text = outcome.pop("payload", None)
+            outcome["result"] = text if outcome["success"] else "验证状态未知；目标健康状态未确认。"
+            outcome["recovery_hint"] = outcome.get("block_reason", "")
+            return outcome
+
+        ok, text = self.check_node_errors_text(node_path)
+        lower_text = text.lower()
+        unhealthy = "error" in lower_text or "错误" in text and "无错误" not in text
+        return {
+            "success": ok,
+            "result": text,
+            "health": "unhealthy" if unhealthy else "healthy",
+            "freshness": {
+                "status": "fresh",
+                "target": node_path,
+                "cook_succeeded": True,
+                "read_succeeded": bool(ok),
+            },
+            "restore_attempted": False,
+            "restore_succeeded": True,
+            "restored_update_mode": original_mode_name,
+        }
 
     def _tool_verify_network(self, args: Dict[str, Any]) -> Dict[str, Any]:
         parent_path = args.get("parent_path", "")

@@ -6,11 +6,9 @@ import re
 from houdini_agent.qt_compat import QtCore
 from houdini_agent.ui.i18n import tr
 from houdini_agent.utils.token_optimizer import (
-    assemble_context_messages,
     compress_old_round_tool_results,
     flatten_context_rounds,
     plan_context_rounds,
-    prune_context_rounds_to_token_target,
 )
 
 
@@ -351,30 +349,34 @@ class ContextManagerMixin:
                 ])
             return
         
-        # --- 第二遍：删除最早的完整轮次，直到低于阈值 ---
+        # --- 第二遍：统一压缩旧完整轮次并保留真实摘要 ---
         target = int(context_limit * pruning_policy.target_ratio)
-        prune_context_rounds_to_token_target(
-            rounds,
-            target,
-            self.token_optimizer.calculate_message_tokens,
-            min_rounds=2,
-            check_before_pop=False,
+        protect_rounds = max(2, int(n_rounds * pruning_policy.target_ratio))
+        result = self.token_optimizer.compress_context(
+            flatten_context_rounds(rounds),
+            protect_recent_rounds=protect_rounds,
+            strategy=self._optimization_strategy,
+            existing_summary=self._context_summary,
         )
-        
-        # 在头部插入摘要提示
-        summary_note = {
-            'role': 'system',
-            'content': tr('ai.old_rounds', n_rounds - len(rounds))
-        }
-        
+        while (result.stats['compressed_tokens'] > target and protect_rounds > 2):
+            protect_rounds -= 1
+            result = self.token_optimizer.compress_context(
+                flatten_context_rounds(rounds),
+                protect_recent_rounds=protect_rounds,
+                strategy=self._optimization_strategy,
+                existing_summary=self._context_summary,
+            )
+
         history.clear()
-        history.extend(assemble_context_messages(rounds, summary_message=summary_note))
+        history.extend(result.messages)
+        self._context_summary = result.summary
+        removed_rounds = result.stats['removed_rounds']
         
-        saved = old_tokens - self.token_optimizer.calculate_message_tokens(history)
+        saved = old_tokens - result.stats['compressed_tokens']
         if saved > 0:
             self._addStatus.emit(tr('opt.auto_status', saved))
             # 只在聊天区顶部插一条提示，不全量重渲染（避免 UI 闪烁/重绘）
-            self._insert_compression_notice(n_rounds - len(rounds))
+            self._insert_compression_notice(removed_rounds)
             pct = saved / old_tokens * 100 if old_tokens else 0
             self._append_session_diagnostics_records([
                 {
@@ -384,8 +386,10 @@ class ContextManagerMixin:
                     'saved_tokens': int(saved),
                     'saved_percent': round(pct, 2),
                     'old_tokens': int(old_tokens),
-                    'new_tokens': int(self.token_optimizer.calculate_message_tokens(history)),
-                    'removed_rounds': int(n_rounds - len(rounds)),
+                    'new_tokens': int(result.stats['compressed_tokens']),
+                    'removed_rounds': int(removed_rounds),
+                    'removed_messages': int(result.stats['removed_messages']),
+                    'protected_rounds': int(result.stats['protected_rounds']),
                 }
             ])
     
@@ -401,10 +405,6 @@ class ContextManagerMixin:
     def _get_context_reminder(self) -> str:
         """生成上下文提醒（极简，强调复用）"""
         parts = []
-        
-        # 添加压缩的历史摘要（极简）
-        if self._context_summary:
-            parts.append(f"[Context Cache] {self._context_summary}")
         
         # 添加当前 Todo 状态（极简）
         todo_summary = self._get_todo_summary_safe()

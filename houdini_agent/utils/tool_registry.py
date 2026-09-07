@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 from dataclasses import dataclass, field
 
-from ..core.harness_policy_config import HIGH_RISK_TOOLS
+from ..core.harness_policy_config import HIGH_RISK_TOOLS, SCENE_MUTATION_TOOLS
 
 
 # ─────────────────────────────────────────────
@@ -37,11 +37,14 @@ class ToolMeta:
     concurrency_safe: bool = False               # 是否允许与其他工具并发执行
     risk_level: str = "normal"                  # "low" | "normal" | "high"
     runtime: str = "houdini"                    # "houdini" | "local"
+    requires_confirmation: bool = True           # Confirm Mode 下是否需要用户确认
+    path_kinds: Dict[str, str] = field(default_factory=dict)  # 参数名 -> "node" | "file"
     mutating: bool = False                       # 是否修改 Houdini/网络状态
     undo: bool = False                           # 是否需要 Houdini undo group
     cook_triggering: bool = False                # 是否在执行前启用 cook guard
     cook_before_read: bool = False               # 是否在读取前定向 cook
     cache_invalidation: bool = False             # 是否使本轮网络读取缓存失效
+    execution_barrier: bool = False              # 是否分隔执行段并在成功后失效读取缓存
 
     def execution_semantics(self) -> Dict[str, bool]:
         """Return the Houdini runtime facts owned by this registration."""
@@ -50,7 +53,13 @@ class ToolMeta:
             "undo": bool(self.undo),
             "cook_triggering": bool(self.cook_triggering),
             "cook_before_read": bool(self.cook_before_read),
+            "execution_barrier": bool(self.execution_barrier),
         }
+
+    def required_args(self) -> tuple:
+        parameters = self.schema.get("function", {}).get("parameters", {})
+        required = parameters.get("required", []) if isinstance(parameters, dict) else []
+        return tuple(str(key) for key in required if isinstance(key, str) and key)
 
 
 class ToolRegistrationError(ValueError):
@@ -104,6 +113,11 @@ _READONLY_TOOLS = frozenset({
 })
 
 _HIGH_RISK_TOOLS = HIGH_RISK_TOOLS
+_CORE_CONFIRM_TOOLS = frozenset(SCENE_MUTATION_TOOLS | HIGH_RISK_TOOLS | {"set_update_mode"})
+
+_LOCAL_RUNTIME_TOOLS = frozenset({
+    "execute_shell", "search_local_doc", "list_skills", "search_memory", "remember_memory",
+})
 
 _CONCURRENCY_SAFE_TOOLS = frozenset({
     'web_search',
@@ -127,6 +141,29 @@ _MUTATING_TOOLS = frozenset({
     'create_network_box', 'add_nodes_to_box', 'execute_python', 'save_hip',
     'run_skill', 'undo_redo',
 })
+
+_EXECUTION_BARRIER_TOOLS = frozenset(
+    set(_MUTATING_TOOLS) | {"set_update_mode", "temporary_auto_validate_geometry"}
+)
+
+_NODE_PATH_KEYS = frozenset({
+    "node_path", "source_path", "target_path", "network_path", "parent_path",
+    "from_path", "to_path", "input_path", "path", "root_path",
+})
+
+_FILE_PATH_KEYS = frozenset({"file_path", "output_path"})
+
+
+def _infer_path_kinds(schema: dict) -> Dict[str, str]:
+    parameters = schema.get("function", {}).get("parameters", {})
+    properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
+    if not isinstance(properties, dict):
+        return {}
+    return {
+        key: "node" if key in _NODE_PATH_KEYS else "file"
+        for key in properties
+        if key in _NODE_PATH_KEYS or key in _FILE_PATH_KEYS
+    }
 
 _COOK_TRIGGERING_TOOLS = frozenset({
     'connect_nodes', 'set_display_flag', 'set_node_parameter',
@@ -186,6 +223,7 @@ def build_default_tool_execution_profile() -> Dict[str, Set[str]]:
         "thinking_simple_success_tools": set(_DEFAULT_THINKING_SIMPLE_SUCCESS_TOOLS),
         "thinking_deep_tools": set(_DEFAULT_THINKING_DEEP_TOOLS),
         "loop_guidance_query_tools": set(_DEFAULT_LOOP_GUIDANCE_QUERY_TOOLS),
+        "execution_barrier_tools": set(_EXECUTION_BARRIER_TOOLS),
     }
 
 
@@ -279,14 +317,20 @@ class ToolRegistry:
                  concurrency_safe: bool = False,
                  risk_level: str = "normal",
                  runtime: str = "houdini",
+                 requires_confirmation: bool = True,
+                 path_kinds: Optional[Dict[str, str]] = None,
                  mutating: bool = False,
                  undo: bool = False,
                  cook_triggering: bool = False,
                  cook_before_read: bool = False,
-                 cache_invalidation: bool = False):
+                 cache_invalidation: bool = False,
+                 execution_barrier: bool = False):
         """注册工具"""
         if runtime not in {"houdini", "local"}:
             raise ToolRegistrationError(f"Unsupported tool runtime: {runtime}")
+        resolved_path_kinds = dict(path_kinds or {})
+        if any(kind not in {"node", "file"} for kind in resolved_path_kinds.values()):
+            raise ToolRegistrationError("Tool path kinds must be 'node' or 'file'")
         schema_name = schema.get("function", {}).get("name") if isinstance(schema, dict) else None
         if not name or schema_name != name:
             raise ToolRegistrationError("Tool schema name must match registration name")
@@ -310,11 +354,14 @@ class ToolRegistry:
                 concurrency_safe=concurrency_safe,
                 risk_level=risk_level,
                 runtime=runtime,
+                requires_confirmation=requires_confirmation,
+                path_kinds=resolved_path_kinds,
                 mutating=mutating or ("network" in (tags or set()) and "readonly" not in (tags or set())),
                 undo=undo or ("network" in (tags or set()) and "readonly" not in (tags or set())),
                 cook_triggering=cook_triggering,
                 cook_before_read=cook_before_read,
                 cache_invalidation=cache_invalidation or ("network" in (tags or set()) and "readonly" in (tags or set())),
+                execution_barrier=execution_barrier or name in _EXECUTION_BARRIER_TOOLS,
             )
             self._tools[name] = meta
 
@@ -441,6 +488,7 @@ class ToolRegistry:
                     "cook_triggering": meta.cook_triggering,
                     "cook_before_read": meta.cook_before_read,
                     "cache_invalidation": meta.cache_invalidation,
+                    "execution_barrier": meta.execution_barrier,
                     "description": meta.schema.get("function", {}).get("description", "")[:120],
                 })
             return sorted(result, key=lambda x: (x["source"], x["name"]))
@@ -462,6 +510,7 @@ class ToolRegistry:
             thinking_simple_success_tools: Set[str] = set()
             thinking_deep_tools: Set[str] = set()
             loop_guidance_query_tools: Set[str] = set()
+            execution_barrier_tools: Set[str] = set()
 
             for meta in self._tools.values():
                 if not meta.enabled:
@@ -489,6 +538,8 @@ class ToolRegistry:
                 # 网络写操作会导致结构缓存失效。
                 if meta.mutating:
                     network_mutating_tools.add(meta.name)
+                if meta.execution_barrier:
+                    execution_barrier_tools.add(meta.name)
 
                 if meta.name in {
                     "create_node", "create_nodes_batch", "create_named_null",
@@ -537,6 +588,7 @@ class ToolRegistry:
                 "thinking_simple_success_tools": thinking_simple_success_tools,
                 "thinking_deep_tools": thinking_deep_tools,
                 "loop_guidance_query_tools": loop_guidance_query_tools,
+                "execution_barrier_tools": execution_barrier_tools,
             }
 
     # ---------- 执行 ----------
@@ -624,6 +676,9 @@ class ToolRegistry:
                     modes=_infer_modes(name),
                     concurrency_safe=_infer_concurrency_safe(name),
                     risk_level=_infer_risk_level(name),
+                    runtime="local" if name in _LOCAL_RUNTIME_TOOLS else "houdini",
+                    requires_confirmation=name in _CORE_CONFIRM_TOOLS,
+                    path_kinds=_infer_path_kinds(tool_def),
                     mutating=name in _MUTATING_TOOLS,
                     undo=name in _MUTATING_TOOLS,
                     cook_triggering=name in _COOK_TRIGGERING_TOOLS,

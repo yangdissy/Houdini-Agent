@@ -284,7 +284,10 @@ class AITab(
         self._houdini_main_thread_executor = None
         self._harness_v2_enabled = is_harness_v2_enabled(default=True)
         self._harness_state = HarnessRuntimeState(session_id=self._session_id)
-        self._tool_policy_engine = HarnessToolPolicyEngine()
+        from ..utils.tool_registry import get_tool_registry
+        self._tool_policy_engine = HarnessToolPolicyEngine(
+            get_tool_meta=get_tool_registry().get_meta
+        )
         try:
             self._policy_retry_limit = max(1, int(os.getenv("HOUDINI_AGENT_POLICY_MAX_RETRIES", "2")))
         except Exception:

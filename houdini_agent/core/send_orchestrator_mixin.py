@@ -6,6 +6,7 @@ import traceback
 
 from typing import List
 
+from houdini_agent.qt_compat import QtWidgets
 from houdini_agent.ui.i18n import tr
 from houdini_agent.core.harness_engine import HarnessRuntimeState
 from houdini_agent.utils.ai_client import AIClient, HOUDINI_TOOLS
@@ -107,6 +108,12 @@ class SendOrchestratorMixin:
 
         # 收集待发送的图片（在 clear 之前）
         has_images = bool(self._pending_images) and self._current_model_supports_vision()
+        if has_images and len(self._pending_images) > 1:
+            try:
+                self._rebudget_pending_images()
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "图片处理失败", str(e))
+                return
         pending_imgs = [img for img in self._pending_images if img is not None] if has_images else []
 
         # 显示用户消息（含图片缩略图）
