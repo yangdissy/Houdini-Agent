@@ -10,6 +10,7 @@ Token 优化管理器
 """
 
 import json
+import os
 import re
 from typing import List, Dict, Any, Optional, Tuple, Callable
 from dataclasses import dataclass, field
@@ -25,6 +26,10 @@ _ENCODING_UNAVAILABLE = object()
 def _get_encoding(model: str):
     """获取 tiktoken 编码器（带缓存）"""
     global _tiktoken, _encoding_cache
+    if os.environ.get('HOUDINI_AGENT_USE_TIKTOKEN', '').strip().lower() not in {
+        '1', 'true', 'yes', 'on',
+    }:
+        return None
     if _tiktoken is None:
         try:
             import tiktoken as _tk  # type: ignore
@@ -46,10 +51,12 @@ def _get_encoding(model: str):
                 _encoding_cache[key] = _encoding_cache['cl100k']
             except Exception:
                 _encoding_cache[key] = _ENCODING_UNAVAILABLE
+                _tiktoken = False
         encoding = _encoding_cache[key]
         return None if encoding is _ENCODING_UNAVAILABLE else encoding
     except Exception:
         _encoding_cache[key] = _ENCODING_UNAVAILABLE
+        _tiktoken = False
         return None
 
 

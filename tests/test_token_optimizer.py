@@ -35,6 +35,13 @@ class CountTokensTest(unittest.TestCase):
         token_optimizer._tiktoken = None
         token_optimizer._encoding_cache.clear()
 
+    @mock.patch.dict("os.environ", {}, clear=False)
+    def test_default_counting_does_not_initialize_tiktoken(self):
+        with mock.patch.dict("sys.modules", {"tiktoken": mock.Mock()}):
+            count_tokens("offline by default", "gpt-4")
+
+        self.assertIsNone(token_optimizer._tiktoken)
+
     def test_empty_string(self):
         self.assertEqual(count_tokens(""), 0)
 
@@ -51,6 +58,7 @@ class CountTokensTest(unittest.TestCase):
         long = count_tokens("hello world " * 50)
         self.assertGreater(long, short)
 
+    @mock.patch.dict("os.environ", {"HOUDINI_AGENT_USE_TIKTOKEN": "1"})
     def test_encoding_load_failure_disables_repeated_load_attempts(self):
         tiktoken = mock.Mock()
         tiktoken.encoding_for_model.side_effect = OSError("network unavailable")
@@ -58,7 +66,7 @@ class CountTokensTest(unittest.TestCase):
         token_optimizer._encoding_cache.clear()
 
         first = count_tokens("offline token estimate", "gpt-4")
-        second = count_tokens("another offline estimate", "gpt-4")
+        second = count_tokens("another offline estimate", "gpt-5")
 
         self.assertGreater(first, 0)
         self.assertGreater(second, 0)
