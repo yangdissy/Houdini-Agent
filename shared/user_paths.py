@@ -12,6 +12,7 @@ from typing import Iterable, Optional, Set
 
 
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_\u4e00-\u9fff]{2,32}$")
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def _normalize_allowlist_entries(entries: Iterable[object]) -> Set[str]:
@@ -115,6 +116,7 @@ class UserPaths:
             self.memory_dir(),
             self.embeddings_dir(),
             self.workspace_dir(),
+            self.captures_dir(),
         ):
             p.mkdir(parents=True, exist_ok=True)
 
@@ -146,6 +148,14 @@ class UserPaths:
 
     def workspace_file(self) -> Path:
         return self.workspace_dir() / "workspace.json"
+
+    def captures_dir(self) -> Path:
+        return self.workspace_dir() / "captures"
+
+    def capture_session_dir(self, session_id: str) -> Path:
+        if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
+            raise ValueError("invalid session id")
+        return self.captures_dir() / session_id
 
     def user_config_path(self) -> Path:
         return self.user_root / "config.ini"

@@ -24,6 +24,18 @@ except Exception:
     hou = None  # type: ignore
 
 
+def compare_capture_fingerprints(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, str]:
+    """Conservatively decide whether two captures support strict comparison."""
+    required = ("frame", "viewport", "camera_mode", "camera_path", "resolution", "target_path")
+    if any(before.get(key) in (None, "", []) or after.get(key) in (None, "", []) for key in required):
+        return {"status": "incomparable", "reason": "missing_fingerprint_field"}
+    if before["camera_mode"] != "camera" or after["camera_mode"] != "camera":
+        return {"status": "incomparable", "reason": "free_view_not_stable"}
+    if any(before[key] != after[key] for key in required):
+        return {"status": "incomparable", "reason": "fingerprint_mismatch"}
+    return {"status": "comparable", "reason": "matching_camera_view"}
+
+
 # ============================================================
 # 文档检索功能已移除，请使用 web_search 查询官方文档
 # ============================================================
@@ -6387,27 +6399,19 @@ class HoudiniMCP:
     # 视口截图
     # ========================================
 
-    def _tool_capture_viewport(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """截取当前 Houdini 3D 视口的快照，返回 base64 编码的图片。
-        
-        使用 flipbook 机制截取当前帧的单帧图片，供 AI 视觉分析节点运行结果。
-        ★ 必须在主线程执行（涉及 hou UI 操作）。
-        """
+    def _capture_viewport(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Capture one viewport frame as bytes with comparison metadata."""
         if hou is None:
             return {"success": False, "error": "Houdini 环境不可用"}
-        
+
         width = args.get("width", 960)
         height = args.get("height", 540)
-        output_path = args.get("output_path", "")
-        # 限制分辨率范围
         width = max(160, min(width, 1920))
         height = max(120, min(height, 1080))
-        
+
         try:
             import tempfile
-            import base64
-            
-            # 获取 Scene Viewer
+
             viewer = None
             try:
                 desktop = hou.ui.curDesktop()
@@ -6424,73 +6428,93 @@ class HoudiniMCP:
             
             if viewer is None:
                 return {"success": False, "error": "找不到 Scene Viewer 面板，请确保有打开的 3D 视口"}
-            
-            # 获取当前帧
-            current_frame = int(hou.frame())
-            
-            # 生成临时文件路径
-            tmp_dir = tempfile.gettempdir()
-            tmp_file = os.path.join(tmp_dir, f"houdini_viewport_{int(time.time() * 1000)}.jpg")
-            
-            # 使用 flipbook 截取单帧
-            try:
-                flip_settings = viewer.flipbookSettings().stash()
-                flip_settings.output(tmp_file)
-                flip_settings.frameRange((current_frame, current_frame))
-                flip_settings.resolution((width, height))
-                flip_settings.outputToMPlay(False)
-                
-                # 执行单帧截图
-                viewport = viewer.curViewport()
-                viewer.flipbook(viewport, flip_settings)
-            except Exception as e:
-                # 某些 Houdini 版本可能不支持 flipbook API
-                return {"success": False, "error": f"Flipbook 截图失败: {e}"}
-            
-            # 读取生成的图片
-            if not os.path.exists(tmp_file):
-                # flipbook 可能使用帧号作为文件名后缀
-                import glob
-                pattern = tmp_file.replace('.jpg', '*.jpg')
-                candidates = sorted(glob.glob(pattern))
-                if candidates:
-                    tmp_file = candidates[0]
-                else:
-                    return {"success": False, "error": "截图文件未生成，请检查视口状态"}
-            
-            # 读取并编码
-            with open(tmp_file, 'rb') as f:
-                img_bytes = f.read()
-            
+
+            current_frame = float(hou.frame())
+            viewport = viewer.curViewport()
+            with tempfile.TemporaryDirectory(prefix="houdini_viewport_") as tmp_dir:
+                tmp_file = os.path.join(tmp_dir, "capture.jpg")
+                try:
+                    flip_settings = viewer.flipbookSettings().stash()
+                    flip_settings.output(tmp_file)
+                    flip_settings.frameRange((current_frame, current_frame))
+                    flip_settings.resolution((width, height))
+                    flip_settings.outputToMPlay(False)
+                    viewer.flipbook(viewport, flip_settings)
+                except Exception as e:
+                    return {"success": False, "error": f"Flipbook 截图失败: {e}"}
+
+                if not os.path.exists(tmp_file):
+                    import glob
+                    candidates = sorted(glob.glob(os.path.join(tmp_dir, "capture*.jpg")))
+                    if candidates:
+                        tmp_file = candidates[0]
+                    else:
+                        return {"success": False, "error": "截图文件未生成，请检查视口状态"}
+
+                with open(tmp_file, 'rb') as f:
+                    img_bytes = f.read()
+
             if len(img_bytes) == 0:
                 return {"success": False, "error": "截图文件为空"}
-            
-            b64_data = base64.b64encode(img_bytes).decode('utf-8')
-            
-            # 清理临时文件
-            try:
-                os.remove(tmp_file)
-            except Exception:
-                pass
-            
-            # 获取视口信息
+
             viewport_name = ""
             try:
-                viewport_name = viewer.curViewport().name()
+                viewport_name = viewport.name()
             except Exception:
                 pass
-            
-            cam_info = ""
+
+            camera_path = ""
             try:
-                vp = viewer.curViewport()
-                cam = vp.camera()
+                cam = viewport.camera()
                 if cam:
-                    cam_info = f", camera={cam.path()}"
+                    camera_path = cam.path()
             except Exception:
                 pass
-            
-            size_kb = len(img_bytes) / 1024
-            
+
+            return {
+                "success": True,
+                "image_bytes": img_bytes,
+                "media_type": "image/jpeg",
+                "fingerprint": {
+                    "frame": current_frame,
+                    "viewport": viewport_name,
+                    "camera_mode": "camera" if camera_path else "free",
+                    "camera_path": camera_path,
+                    "resolution": [width, height],
+                    "target_path": str(args.get("target_path") or "").strip(),
+                    "available": {
+                        "frame": True,
+                        "viewport": bool(viewport_name),
+                        "camera_path": bool(camera_path),
+                        "resolution": True,
+                        "target_path": bool(str(args.get("target_path") or "").strip()),
+                    },
+                },
+            }
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return {"success": False, "error": f"视口截图失败: {str(e)}"}
+
+    def _tool_capture_viewport(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """截取当前 Houdini 3D 视口的快照，返回 base64 编码的图片。"""
+        import base64
+
+        capture = self._capture_viewport(args)
+        if not capture.get("success"):
+            return capture
+
+        img_bytes = capture["image_bytes"]
+        fingerprint = capture["fingerprint"]
+        camera_path = fingerprint["camera_path"]
+        cam_info = f", camera={camera_path}" if camera_path else ""
+        size_kb = len(img_bytes) / 1024
+        width, height = fingerprint["resolution"]
+        current_frame = fingerprint["frame"]
+        viewport_name = fingerprint["viewport"]
+        output_path = args.get("output_path", "")
+
+        try:
             result_msg = (
                 f"已截取视口快照: {width}x{height}, frame={current_frame}, "
                 f"viewport={viewport_name}{cam_info}, "
@@ -6514,12 +6538,10 @@ class HoudiniMCP:
             return {
                 "success": True,
                 "result": result_msg,
-                # ★ 特殊字段：包含 base64 图片数据，
-                # agent_loop_stream 中检测到此字段会将图片注入消息
-                "_viewport_image": b64_data,
-                "_image_media_type": "image/jpeg",
+                "_viewport_image": base64.b64encode(img_bytes).decode('utf-8'),
+                "_image_media_type": capture["media_type"],
+                "fingerprint": fingerprint,
             }
-            
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -6539,7 +6561,7 @@ class HoudiniMCP:
         visual_goal = str(args.get("visual_goal") or "").strip()
         capture_args = {
             key: args[key]
-            for key in ("width", "height")
+            for key in ("width", "height", "target_path")
             if key in args
         }
         result = self._tool_capture_viewport(capture_args)
