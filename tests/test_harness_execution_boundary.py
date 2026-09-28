@@ -248,6 +248,45 @@ class HarnessExecutionBoundaryTest(unittest.TestCase):
         self.assertFalse(results[1]["success"])
         self.assertEqual([name for name, _ in calls], ["get_network_structure"])
 
+    def test_external_mcp_adapter_uses_existing_main_thread_executor(self):
+        tab = self._make_tab()
+        tab._username = "artist"
+        tab._session_id = "session-1"
+        tab.mcp = type("MCPStub", (), {
+            "_TOOL_DISPATCH": {"get_network_structure": "_tool_get_network_structure"}
+        })()
+        tab._houdini_main_thread_executor = type("ExecutorStub", (), {
+            "is_blocked": lambda self: False,
+            "is_shutdown": lambda self: False,
+        })()
+        audits = []
+        tab._append_session_diagnostics_records = lambda records, *args, **kwargs: audits.extend(records)
+        main_thread_calls = []
+        tab._execute_tool_in_main_thread = lambda name, args: main_thread_calls.append((name, args)) or {
+            "success": True, "result": "ok",
+        }
+
+        from houdini_agent.utils.mcp.settings import MCPSettings
+        settings = MCPSettings(enabled=True, allowed_tools=("health", "get_network_structure"))
+        with patch("houdini_agent.utils.mcp.server.configure_external_mcp_adapter") as configure, patch(
+            "houdini_agent.utils.mcp.settings.read_settings", return_value=settings
+        ):
+            AITab._configure_external_mcp_adapter(tab)
+
+        adapter = configure.call_args.args[0]
+        context_type = __import__(
+            "houdini_agent.utils.mcp.external_adapter", fromlist=["ExternalMCPContext"]
+        ).ExternalMCPContext
+        result = adapter.execute(
+            context_type("session-1", "client-1", "ask", "artist", "call-1"),
+            "get_network_structure",
+            {"network_path": "/obj"},
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(main_thread_calls, [("get_network_structure", {"network_path": "/obj"})])
+        self.assertTrue(audits)
+
 
 class GovernedToolExecutorTest(unittest.TestCase):
     def test_allow_sanitizes_result_and_audits_metadata_only(self):
@@ -325,6 +364,30 @@ class GovernedToolExecutorTest(unittest.TestCase):
         self.assertNotIn("topsecret", str(result))
         self.assertEqual(audits[-1]["error_code"], "tool_execution_failed")
         self.assertNotIn("topsecret", str(audits))
+
+    def test_governed_executor_audits_inconclusive_post_write_verification(self):
+        audits = []
+        owner = GovernedToolExecutor(
+            type("FixedPolicy", (), {
+                "decide": lambda self, *args: ToolPolicyDecision(action="allow")
+            })(),
+            lambda *args: {
+                "success": True,
+                "result": "mutation returned",
+                "verification": {
+                    "status": "applied_unknown",
+                    "node_path": "/obj/secret",
+                },
+            },
+            audit=audits.append,
+        )
+
+        result = owner.execute("create_node", {}, {"mode": "agent"})
+
+        self.assertTrue(result["success"])
+        self.assertEqual(audits[-1]["verification_status"], "applied_unknown")
+        self.assertEqual(audits[-1]["error_code"], "verification_inconclusive")
+        self.assertNotIn("/obj/secret", str(audits[-1]))
 
 
 if __name__ == "__main__":

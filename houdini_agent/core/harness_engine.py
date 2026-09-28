@@ -625,11 +625,20 @@ class GovernedToolExecutor:
         except Exception:
             result = {"success": False, "error": "Tool execution adapter failed"}
         result = sanitize_tool_result(result)
+        verification_status = (
+            str((result.get("verification") or {}).get("status") or "")
+            if isinstance(result.get("verification"), dict)
+            else ""
+        )
+        error_code = "tool_execution_failed" if not result.get("success") else ""
+        if result.get("success") and verification_status == "applied_unknown":
+            error_code = "verification_inconclusive"
         self._record_audit({
             "event_type": "tool_call", "phase": "result", "tool": tool_name,
             "action": action, "mode": context.get("mode", "agent"),
             "success": bool(result.get("success")),
-            "error_code": "tool_execution_failed" if not result.get("success") else "",
+            "verification_status": verification_status,
+            "error_code": error_code,
             "duration_ms": int(max(0.0, time.time() - started_at) * 1000),
         })
 

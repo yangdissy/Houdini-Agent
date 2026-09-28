@@ -314,6 +314,7 @@ class AITab(
             batch_timeout=60.0,
             record_event=lambda event: self._append_session_diagnostics_records([event]),
         )
+        self._configure_external_mcp_adapter()
         self._addThinking.connect(self._on_add_thinking)
         self._finalizeThinkingSignal.connect(self._finalize_thinking_main_thread)
         self._resumeThinkingSignal.connect(self._resume_thinking_main_thread)
@@ -379,6 +380,61 @@ class AITab(
         from .i18n import language_changed
         language_changed.changed.connect(self._rebuild_system_prompts)
         language_changed.changed.connect(self._retranslateUi)
+
+    def _configure_external_mcp_adapter(self):
+        from importlib import metadata
+
+        from ..utils.mcp.external_adapter import ExternalMCPExecutionAdapter
+        from ..utils.mcp.capabilities import build_external_tool_manifest
+        from ..utils.mcp.server import configure_external_mcp_adapter
+        from ..utils.mcp.settings import read_settings
+        from ..utils.tool_registry import get_tool_registry
+
+        try:
+            settings = read_settings()
+        except ValueError:
+            return
+
+        registry = get_tool_registry()
+        manifest = build_external_tool_manifest(
+            registry,
+            dispatch=self.mcp._TOOL_DISPATCH,
+            allowed_tools=settings.allowed_tools,
+            denied_tools=settings.denied_tools,
+        )
+        try:
+            sdk_version = metadata.version("fastmcp")
+        except metadata.PackageNotFoundError:
+            sdk_version = None
+        try:
+            agent_version = (Path(__file__).resolve().parents[2] / "VERSION").read_text(
+                encoding="utf-8"
+            ).strip()
+        except Exception:
+            agent_version = "unknown"
+        try:
+            import hou as hou_module  # type: ignore
+        except Exception:
+            hou_module = None
+        adapter = ExternalMCPExecutionAdapter(
+            settings=settings,
+            registry=registry,
+            policy_engine=self._tool_policy_engine,
+            execute=self._execute_tool_in_main_thread,
+            confirm=self._request_tool_confirmation,
+            audit=lambda record: self._append_session_diagnostics_records(
+                [record], session_id=record.get("session_id")
+            ),
+            session_id=self._session_id,
+            username=self._username,
+            manifest=manifest,
+            dispatcher=self.mcp,
+            executor=self._houdini_main_thread_executor,
+            hou_module=hou_module,
+            agent_version=agent_version,
+            sdk_version=sdk_version,
+        )
+        configure_external_mcp_adapter(adapter)
 
     def _run_diagnostics_retention_cleanup(self):
         if not is_retention_cleanup_enabled():

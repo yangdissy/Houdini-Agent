@@ -116,14 +116,16 @@ class AgentRunnerMixin:
     def _on_confirm_tool_request(self):
         """主线程：在对话流中插入内联预览卡片，用户确认/取消后写入 _confirm_result_queue。
         
-        参数通过 self._pending_confirm_* 属性传递（避免 PySide6 QueuedConnection 传 dict 的兼容性问题）。
+        请求通过线程安全队列传递（避免 PySide6 QueuedConnection 传 dict 的兼容性问题）。
         """
-        q = getattr(self, '_confirm_result_queue', None)
-        tool_name = getattr(self, '_pending_confirm_tool', 'unknown')
-        args = getattr(self, '_pending_confirm_args', {})
-
-        if not q:
-            print(f"[ConfirmMode] ⚠ _confirm_result_queue 不存在")
+        requests = getattr(self, '_confirm_request_queue', None)
+        if requests is None:
+            print(f"[ConfirmMode] ⚠ _confirm_request_queue 不存在")
+            return
+        try:
+            tool_name, args, q = requests.get_nowait()
+        except queue.Empty:
+            print(f"[ConfirmMode] ⚠ 确认请求队列为空")
             return
 
         # 确保 args 是 dict
@@ -182,14 +184,19 @@ class AgentRunnerMixin:
         
         从后台线程调用，通过 QueuedConnection 信号在主线程创建预览控件。
         后台线程在 queue 上阻塞等待用户决策。
-        ★ 参数通过属性传递，信号不携带参数（规避 PySide6 dict 序列化问题）。
+        ★ 请求通过队列传递，信号不携带参数（规避 PySide6 dict 序列化和并发覆盖问题）。
         """
-        self._confirm_result_queue = queue.Queue()
-        self._pending_confirm_tool = tool_name
-        self._pending_confirm_args = dict(kwargs) if kwargs else {}
+        result_queue = queue.Queue(maxsize=1)
+        if not hasattr(self, '_confirm_request_queue'):
+            self._confirm_request_queue = queue.Queue()
+        self._confirm_request_queue.put((
+            tool_name,
+            dict(kwargs) if kwargs else {},
+            result_queue,
+        ))
         self._confirmToolRequest.emit()
         try:
-            return self._confirm_result_queue.get(timeout=120.0)
+            return result_queue.get(timeout=120.0)
         except queue.Empty:
             # 超时通常意味着主线程槽函数未执行（事件循环阻塞或信号未分发）
             print(f"[ConfirmMode] ✗ 确认超时(120s): {tool_name}")

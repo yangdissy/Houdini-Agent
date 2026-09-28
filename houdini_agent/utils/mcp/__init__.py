@@ -16,11 +16,22 @@ Public APIs:
 """
 from __future__ import annotations
 
+from importlib import import_module
+
 from .settings import MCPSettings, read_settings
 from .logger import get_logger
-from .client import HoudiniMCP
-from .server import ensure_mcp_running, stop_mcp_server, get_mcp_status
-from . import hou_core
+
+
+def __getattr__(name):
+    if name == "HoudiniMCP":
+        from .client import HoudiniMCP
+        return HoudiniMCP
+    if name in {"ensure_mcp_running", "stop_mcp_server", "get_mcp_status"}:
+        server = import_module(".server", __name__)
+        return getattr(server, name)
+    if name == "hou_core":
+        return import_module(".hou_core", __name__)
+    raise AttributeError(name)
 
 __all__ = [
     "MCPSettings",

@@ -219,6 +219,18 @@ class RegisterAndQueryTest(unittest.TestCase):
         self.assertTrue(self.reg.has_tool("foo"))
         self.assertFalse(self.reg.has_tool("missing"))
 
+    def test_external_mcp_visibility_is_explicit(self):
+        self.reg.register("hidden", _schema("hidden"), modes={"ask"})
+        self.reg.register(
+            "visible", _schema("visible"), modes={"ask"}, external_mcp_visible=True
+        )
+
+        self.assertFalse(self.reg.get_meta("hidden").external_mcp_visible)
+        self.assertTrue(self.reg.get_meta("visible").external_mcp_visible)
+        listed = {item["name"]: item for item in self.reg.list_all()}
+        self.assertFalse(listed["hidden"]["external_mcp_visible"])
+        self.assertTrue(listed["visible"]["external_mcp_visible"])
+
     def test_get_tools_for_mode_filters_by_mode(self):
         self.reg.register("a", _schema("a"), modes={"agent"})
         self.reg.register("b", _schema("b"), modes={"ask"})
@@ -720,6 +732,56 @@ class RegisterCoreToolsTest(unittest.TestCase):
         self.assertEqual(reg.get_meta("execute_shell").runtime, "local")
         self.assertTrue(reg.get_meta("execute_shell").requires_confirmation)
         self.assertTrue(reg.get_meta("create_node").execution_barrier)
+
+    def test_core_external_mcp_visibility_is_explicit_and_governed(self):
+        reg = ToolRegistry()
+        reg.register_core_tools([_schema(name) for name in (
+            "get_network_structure", "get_geometry_points", "get_geometry_primitives",
+            "get_usd_prim_info", "get_usd_layer_stack", "read_selection",
+            "get_top_network_status", "list_top_work_items", "get_top_errors",
+            "create_node", "set_node_parameter", "connect_nodes",
+            "rename_node", "layout_nodes", "set_node_flags", "execute_python",
+        )])
+
+        self.assertTrue(reg.get_meta("get_network_structure").external_mcp_visible)
+        self.assertTrue(reg.get_meta("get_geometry_points").external_mcp_visible)
+        self.assertTrue(reg.get_meta("get_geometry_primitives").external_mcp_visible)
+        self.assertTrue(reg.get_meta("get_usd_prim_info").external_mcp_visible)
+        self.assertTrue(reg.get_meta("get_usd_layer_stack").external_mcp_visible)
+        self.assertTrue(reg.get_meta("get_top_network_status").external_mcp_visible)
+        self.assertTrue(reg.get_meta("list_top_work_items").external_mcp_visible)
+        self.assertTrue(reg.get_meta("get_top_errors").external_mcp_visible)
+        self.assertTrue(reg.get_meta("read_selection").external_mcp_visible)
+        for name in (
+            "create_node", "set_node_parameter", "connect_nodes",
+            "rename_node", "layout_nodes", "set_node_flags",
+        ):
+            meta = reg.get_meta(name)
+            self.assertTrue(meta.external_mcp_visible)
+            self.assertEqual(meta.risk_level, "normal")
+            self.assertTrue(meta.mutating)
+            self.assertTrue(meta.undo)
+            self.assertTrue(meta.requires_confirmation)
+            self.assertNotIn("ask", meta.modes)
+        self.assertFalse(reg.get_meta("execute_python").external_mcp_visible)
+        for name in (
+            "get_network_structure", "get_geometry_points",
+            "get_geometry_primitives", "get_usd_prim_info", "get_usd_layer_stack",
+            "get_top_network_status", "list_top_work_items", "get_top_errors",
+            "read_selection",
+        ):
+            meta = reg.get_meta(name)
+            self.assertEqual(meta.risk_level, "low")
+            self.assertIn("readonly", meta.tags)
+            self.assertIn("ask", meta.modes)
+            self.assertFalse(meta.mutating)
+            self.assertFalse(meta.undo)
+            self.assertFalse(meta.requires_confirmation)
+        self.assertIn("feature:pxr", reg.get_meta("get_usd_prim_info").tags)
+        self.assertIn("feature:pxr", reg.get_meta("get_usd_layer_stack").tags)
+        self.assertIn("feature:pdg", reg.get_meta("get_top_network_status").tags)
+        self.assertIn("feature:pdg", reg.get_meta("list_top_work_items").tags)
+        self.assertIn("feature:pdg", reg.get_meta("get_top_errors").tags)
 
 
 if __name__ == "__main__":

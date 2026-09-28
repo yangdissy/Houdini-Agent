@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """LOP/USD stage inspection Skill."""
 
+from houdini_agent.utils.usd_inspection import inspect_usd_layer_stack
+
 SKILL_INFO = {
     "name": "inspect_lop_stage",
     "category": "usd",
@@ -54,8 +56,10 @@ def run(node_path, max_prims=5000):
         return {"error": f"Could not read USD stage from {node_path}"}
 
     max_prims = max(1, min(int(max_prims), 50000))
-    root_layer = _safe_call(lambda: stage.GetRootLayer(), None)
-    session_layer = _safe_call(lambda: stage.GetSessionLayer(), None)
+    layer_result = inspect_usd_layer_stack(stage)
+    layer_data = layer_result.get("data", {}) if layer_result.get("success") else {}
+    root_layer = layer_data.get("root_layer") or {}
+    session_layer = layer_data.get("session_layer") or {}
     prims = []
     type_counts = {}
     cameras = []
@@ -105,9 +109,10 @@ def run(node_path, max_prims=5000):
 
     return {
         "node_path": node_path,
-        "root_layer": str(_safe_call(lambda: root_layer.identifier, "")) if root_layer else "",
-        "session_layer": str(_safe_call(lambda: session_layer.identifier, "")) if session_layer else "",
-        "sub_layers": list(_safe_call(lambda: root_layer.subLayerPaths, []) or []) if root_layer else [],
+        "root_layer": root_layer.get("identifier", ""),
+        "session_layer": session_layer.get("identifier", ""),
+        "sub_layers": list(root_layer.get("sub_layers", [])),
+        "layer_stack": layer_data,
         "inspected_prim_count": sum(type_counts.values()),
         "truncated": truncated,
         "type_counts": type_counts,

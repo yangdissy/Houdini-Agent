@@ -157,6 +157,11 @@ _SKIP = {
 
 
 class ImportSmokeTest(unittest.TestCase):
+    def test_mcp_lazy_submodule_exports_importable(self):
+        from houdini_agent.utils.mcp import hou_core
+
+        self.assertEqual(hou_core.__name__, "houdini_agent.utils.mcp.hou_core")
+
     def test_all_submodules_importable(self):
         _install_hou_stub()
         _install_thirdparty_stubs()

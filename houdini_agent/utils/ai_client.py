@@ -995,6 +995,44 @@ HOUDINI_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_geometry_points",
+            "description": "分页读取 SOP 输出中的 point number 和指定属性。结果有硬上限并返回 truncated/next_start；用于精确抽样，概览应使用 get_geometry_summary。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "SOP 节点或几何容器路径"},
+                    "attributes": {"type": "array", "items": {"type": "string"}, "description": "要读取的 point 属性名，如 ['P', 'Cd']"},
+                    "start": {"type": "integer", "description": "起始偏移，默认 0"},
+                    "count": {"type": "integer", "description": "本页数量，默认 100，最大 500"},
+                    "group": {"type": "string", "description": "可选 point group 名"},
+                    "output_index": {"type": "integer", "description": "SOP 输出索引，默认 0"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_geometry_primitives",
+            "description": "分页读取 SOP 输出中的 primitive number、类型和指定属性。结果有硬上限并返回 truncated/next_start；用于精确抽样，概览应使用 get_geometry_summary。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "SOP 节点或几何容器路径"},
+                    "attributes": {"type": "array", "items": {"type": "string"}, "description": "要读取的 primitive 属性名，如 ['name', 'material']"},
+                    "start": {"type": "integer", "description": "起始偏移，默认 0"},
+                    "count": {"type": "integer", "description": "本页数量，默认 100，最大 500"},
+                    "group": {"type": "string", "description": "可选 primitive group 名"},
+                    "output_index": {"type": "integer", "description": "SOP 输出索引，默认 0"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "temporary_auto_validate_geometry",
             "description": "Manual 批次完成后的专用 scoped validation barrier：临时切 Auto/AlwaysUpdate，只 cook/read 指定 SOP，然后真实恢复原 update mode。检查 health/freshness/restore_succeeded；任一步失败不得声称健康。Confirm Mode 下无需为此临时验证确认。",
             "parameters": {
@@ -1037,6 +1075,90 @@ HOUDINI_TOOLS = [
                     "max_nodes": {"type": "integer", "description": "最大节点数，默认 300，最大 1000"}
                 },
                 "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_usd_prim_info",
+            "description": "只读查询 LOP stage 中一个 composed USD prim：基本状态、属性值、metadata、prim stack/authored opinions 和 resolved material binding。结果有条目与字节硬上限，不修改 stage 或加载 payload。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "提供 stage 的 LOP 节点路径，如 '/stage/OUT'"},
+                    "prim_path": {"type": "string", "description": "USD prim path，如 '/World/geo'"},
+                    "attribute_names": {"type": "array", "items": {"type": "string"}, "description": "可选属性过滤；留空读取有界属性列表"},
+                    "max_attributes": {"type": "integer", "description": "最大属性数，默认 100，最大 500"},
+                    "max_metadata": {"type": "integer", "description": "最大 metadata 数，默认 100，最大 500"},
+                    "max_prim_stack": {"type": "integer", "description": "最大 prim stack 项数，默认 100，最大 500"},
+                    "binding_purpose": {"type": "string", "description": "material binding purpose，默认 allPurpose"}
+                },
+                "required": ["node_path", "prim_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_usd_layer_stack",
+            "description": "只读查询 LOP stage 的 root/session layer、完整有界 layer stack、muted layers 和每层 sublayers。不打开、静音或修改 layer。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "提供 stage 的 LOP 节点路径，如 '/stage/OUT'"},
+                    "max_layers": {"type": "integer", "description": "最大 layer 数，默认 100，最大 500"},
+                    "max_sublayers": {"type": "integer", "description": "每层最大 sublayer 数，默认 100，最大 500"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_top_network_status",
+            "description": "只读查询 TOP/PDG graph context、scheduler、PDG node 数量及 work item 状态汇总。不触发 cook、dirty、pause 或 cancel。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "TOP 节点路径，如 '/obj/topnet1/ropgeometry1'"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_top_work_items",
+            "description": "分页读取一个 TOP 节点的 work items：index、name、state、关键 attributes 和输出文件元数据。结果有条目与字节硬上限，不读取日志正文或触发 cook。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "TOP 节点路径"},
+                    "start": {"type": "integer", "description": "起始偏移，默认 0"},
+                    "count": {"type": "integer", "description": "本页数量，默认 100，最大 500"},
+                    "max_attributes": {"type": "integer", "description": "每项最大属性数，默认 50，最大 100"},
+                    "max_output_files": {"type": "integer", "description": "每项最大输出文件数，默认 50，最大 100"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_top_errors",
+            "description": "分页汇总失败 TOP work items 的状态、错误摘要、命令和日志路径。不读取无限日志正文，也不触发 cook、dirty、pause 或 cancel。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "TOP 节点路径"},
+                    "start": {"type": "integer", "description": "失败项起始偏移，默认 0"},
+                    "count": {"type": "integer", "description": "本页失败项数量，默认 100，最大 500"}
+                },
+                "required": ["node_path"]
             }
         }
     },

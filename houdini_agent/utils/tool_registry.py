@@ -45,6 +45,7 @@ class ToolMeta:
     cook_before_read: bool = False               # 是否在读取前定向 cook
     cache_invalidation: bool = False             # 是否使本轮网络读取缓存失效
     execution_barrier: bool = False              # 是否分隔执行段并在成功后失效读取缓存
+    external_mcp_visible: bool = False           # 是否允许被外部 MCP 配置进一步选择
 
     def execution_semantics(self) -> Dict[str, bool]:
         """Return the Houdini runtime facts owned by this registration."""
@@ -74,7 +75,10 @@ class ToolRegistrationError(ValueError):
 _ASK_TOOLS = frozenset({
     'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
     'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
-    'get_geometry_summary', 'temporary_auto_validate_geometry', 'get_scene_snapshot',
+    'get_geometry_summary', 'get_geometry_points', 'get_geometry_primitives',
+    'get_usd_prim_info', 'get_usd_layer_stack', 'get_top_network_status',
+    'list_top_work_items', 'get_top_errors',
+    'temporary_auto_validate_geometry', 'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
     'check_errors',
     'verify_network', 'web_search', 'fetch_webpage',
@@ -88,7 +92,10 @@ _ASK_TOOLS = frozenset({
 _PLAN_PLANNING_TOOLS = frozenset({
     'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
     'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
-    'get_geometry_summary', 'temporary_auto_validate_geometry', 'get_scene_snapshot',
+    'get_geometry_summary', 'get_geometry_points', 'get_geometry_primitives',
+    'get_usd_prim_info', 'get_usd_layer_stack', 'get_top_network_status',
+    'list_top_work_items', 'get_top_errors',
+    'temporary_auto_validate_geometry', 'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
     'check_errors',
     'verify_network', 'web_search', 'fetch_webpage',
@@ -103,7 +110,10 @@ _PLAN_PLANNING_TOOLS = frozenset({
 _READONLY_TOOLS = frozenset({
     'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
     'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
-    'get_geometry_summary', 'temporary_auto_validate_geometry', 'get_scene_snapshot',
+    'get_geometry_summary', 'get_geometry_points', 'get_geometry_primitives',
+    'get_usd_prim_info', 'get_usd_layer_stack', 'get_top_network_status',
+    'list_top_work_items', 'get_top_errors',
+    'temporary_auto_validate_geometry', 'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
     'check_errors',
     'verify_network', 'web_search', 'fetch_webpage',
@@ -131,6 +141,24 @@ _ASYNC_PREFERRED_TOOLS = frozenset({
     'web_search',
     'fetch_webpage',
     'execute_shell',
+})
+
+_EXTERNAL_MCP_VISIBLE_TOOLS = frozenset({
+    "create_node",
+    "set_node_parameter",
+    "connect_nodes",
+    "rename_node",
+    "layout_nodes",
+    "set_node_flags",
+    "get_network_structure",
+    "get_geometry_points",
+    "get_geometry_primitives",
+    "get_usd_prim_info",
+    "get_usd_layer_stack",
+    "get_top_network_status",
+    "list_top_work_items",
+    "get_top_errors",
+    "read_selection",
 })
 
 _MUTATING_TOOLS = frozenset({
@@ -266,6 +294,10 @@ def _infer_tags(name: str) -> Set[str]:
     # 任务管理
     if name in ('add_todo', 'update_todo'):
         tags.add("task")
+    if name in {"get_usd_prim_info", "get_usd_layer_stack"}:
+        tags.update({"usd", "feature:pxr"})
+    if name in {"get_top_network_status", "list_top_work_items", "get_top_errors"}:
+        tags.update({"pdg", "feature:pdg"})
     return tags
 
 
@@ -324,7 +356,8 @@ class ToolRegistry:
                  cook_triggering: bool = False,
                  cook_before_read: bool = False,
                  cache_invalidation: bool = False,
-                 execution_barrier: bool = False):
+                 execution_barrier: bool = False,
+                 external_mcp_visible: bool = False):
         """注册工具"""
         if runtime not in {"houdini", "local"}:
             raise ToolRegistrationError(f"Unsupported tool runtime: {runtime}")
@@ -362,6 +395,7 @@ class ToolRegistry:
                 cook_before_read=cook_before_read,
                 cache_invalidation=cache_invalidation or ("network" in (tags or set()) and "readonly" in (tags or set())),
                 execution_barrier=execution_barrier or name in _EXECUTION_BARRIER_TOOLS,
+                external_mcp_visible=external_mcp_visible,
             )
             self._tools[name] = meta
 
@@ -489,6 +523,7 @@ class ToolRegistry:
                     "cook_before_read": meta.cook_before_read,
                     "cache_invalidation": meta.cache_invalidation,
                     "execution_barrier": meta.execution_barrier,
+                    "external_mcp_visible": meta.external_mcp_visible,
                     "description": meta.schema.get("function", {}).get("description", "")[:120],
                 })
             return sorted(result, key=lambda x: (x["source"], x["name"]))
@@ -684,6 +719,7 @@ class ToolRegistry:
                     cook_triggering=name in _COOK_TRIGGERING_TOOLS,
                     cook_before_read=name in _COOK_BEFORE_READ_TOOLS,
                     cache_invalidation=name in _READONLY_TOOLS and "network" in _infer_tags(name),
+                    external_mcp_visible=name in _EXTERNAL_MCP_VISIBLE_TOOLS,
                 )
                 registered_names.append(name)
         except Exception:

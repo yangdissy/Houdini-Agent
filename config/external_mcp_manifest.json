@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "tools": [
+    {
+      "feature": null,
+      "handler": "_tool_get_geometry_points",
+      "long_running": false,
+      "minimum_houdini_version": null,
+      "mutating": false,
+      "name": "get_geometry_points",
+      "readonly": true,
+      "risk_level": "low",
+      "runtime": "houdini"
+    },
+    {
+      "feature": null,
+      "handler": "_tool_get_geometry_primitives",
+      "long_running": false,
+      "minimum_houdini_version": null,
+      "mutating": false,
+      "name": "get_geometry_primitives",
+      "readonly": true,
+      "risk_level": "low",
+      "runtime": "houdini"
+    },
+    {
+      "feature": null,
+      "handler": "_tool_get_network_structure",
+      "long_running": false,
+      "minimum_houdini_version": null,
+      "mutating": false,
+      "name": "get_network_structure",
+      "readonly": true,
+      "risk_level": "low",
+      "runtime": "houdini"
+    },
+    {
+      "feature": "pdg",
+      "handler": "_tool_get_top_errors",
+      "long_running": false,
+      "minimum_houdini_version": null,
+      "mutating": false,
+      "name": "get_top_errors",
+      "readonly": true,
+      "risk_level": "low",
+      "runtime": "houdini"
+    },
+    {
+      "feature": "pdg",
+      "handler": "_tool_get_top_network_status",
+      "long_running": false,
+      "minimum_houdini_version": null,
+      "mutating": false,
+      "name": "get_top_network_status",
+      "readonly": true,
+      "risk_level": "low",
+      "runtime": "houdini"
+    },
+    {
+      "feature": "pxr",
+      "handler": "_tool_get_usd_layer_stack",
+      "long_running": false,
+      "minimum_houdini_version": null,
+      "mutating": false,
+      "name": "get_usd_layer_stack",
+      "readonly": true,
+      "risk_level": "low",
+      "runtime": "houdini"
+    },
+    {
+      "feature": "pxr",
+      "handler": "_tool_get_usd_prim_info",
+      "long_running": false,
+      "minimum_houdini_version": null,
+      "mutating": false,
+      "name": "get_usd_prim_info",
+      "readonly": true,
+      "risk_level": "low",
+      "runtime": "houdini"
+    },
+    {
+      "feature": "pdg",
+      "handler": "_tool_list_top_work_items",
+      "long_running": false,
+      "minimum_houdini_version": null,
+      "mutating": false,
+      "name": "list_top_work_items",
+      "readonly": true,
+      "risk_level": "low",
+      "runtime": "houdini"
+    },
+    {
+      "feature": null,
+      "handler": "_tool_read_selection",
+      "long_running": false,
+      "minimum_houdini_version": null,
+      "mutating": false,
+      "name": "read_selection",
+      "readonly": true,
+      "risk_level": "low",
+      "runtime": "houdini"
+    }
+  ]
+}

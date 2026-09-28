@@ -361,5 +361,14 @@ class MainWindow(QtWidgets.QMainWindow):
         #   防止旧窗口 closeEvent 用旧数据覆盖新窗口刚写好的 manifest。
         #   普通关闭（用户点 X）时 _already_saved=False，行为与之前完全一致。
         self._save_workspace_once()
+        try:
+            from ..utils.mcp.server import clear_external_mcp_adapter, stop_mcp_server
+            stop_mcp_server()
+            clear_external_mcp_adapter()
+            executor = getattr(self.ai_tab, '_houdini_main_thread_executor', None)
+            if executor is not None:
+                executor.shutdown()
+        except Exception:
+            pass
         event.accept()
         super().closeEvent(event)
