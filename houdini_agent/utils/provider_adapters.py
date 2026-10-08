@@ -171,11 +171,7 @@ class AnthropicRequestAdapter:
             payload["system"] = system_text
 
         if enable_thinking:
-            if provider == "kimi_coding":
-                if (model or "").lower().startswith("kimi-for-coding"):
-                    payload["thinking"] = {"type": "enabled", "budget_tokens": min(resolved_max_tokens, 10000)}
-            else:
-                payload["thinking"] = {"type": "enabled", "budget_tokens": min(resolved_max_tokens, 10000)}
+            payload["thinking"] = {"type": "enabled", "budget_tokens": min(resolved_max_tokens, 10000)}
 
         if tools:
             payload["tools"] = self.convert_tools(tools)

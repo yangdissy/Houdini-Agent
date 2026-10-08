@@ -73,11 +73,11 @@ class ToolRegistrationError(ValueError):
 
 # Ask 模式白名单（只读 / 查询工具）
 _ASK_TOOLS = frozenset({
-    'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
+    'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'find_parameter_references', 'list_multiparm_instances', 'inspect_node', 'get_node_connections',
     'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
     'get_geometry_summary', 'get_geometry_points', 'get_geometry_primitives',
     'get_usd_prim_info', 'get_usd_layer_stack', 'get_top_network_status',
-    'list_top_work_items', 'get_top_errors',
+    'list_top_work_items', 'get_top_errors', 'build_pdg_expression',
     'temporary_auto_validate_geometry', 'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
     'check_errors',
@@ -90,11 +90,11 @@ _ASK_TOOLS = frozenset({
 
 # Plan 规划阶段白名单
 _PLAN_PLANNING_TOOLS = frozenset({
-    'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
+    'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'find_parameter_references', 'list_multiparm_instances', 'inspect_node', 'get_node_connections',
     'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
     'get_geometry_summary', 'get_geometry_points', 'get_geometry_primitives',
     'get_usd_prim_info', 'get_usd_layer_stack', 'get_top_network_status',
-    'list_top_work_items', 'get_top_errors',
+    'list_top_work_items', 'get_top_errors', 'build_pdg_expression',
     'temporary_auto_validate_geometry', 'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
     'check_errors',
@@ -108,11 +108,11 @@ _PLAN_PLANNING_TOOLS = frozenset({
 
 # 只读标签推断
 _READONLY_TOOLS = frozenset({
-    'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
+    'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'find_parameter_references', 'list_multiparm_instances', 'inspect_node', 'get_node_connections',
     'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
     'get_geometry_summary', 'get_geometry_points', 'get_geometry_primitives',
     'get_usd_prim_info', 'get_usd_layer_stack', 'get_top_network_status',
-    'list_top_work_items', 'get_top_errors',
+    'list_top_work_items', 'get_top_errors', 'build_pdg_expression',
     'temporary_auto_validate_geometry', 'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
     'check_errors',
@@ -126,7 +126,7 @@ _HIGH_RISK_TOOLS = HIGH_RISK_TOOLS
 _CORE_CONFIRM_TOOLS = frozenset(SCENE_MUTATION_TOOLS | HIGH_RISK_TOOLS | {"set_update_mode"})
 
 _LOCAL_RUNTIME_TOOLS = frozenset({
-    "execute_shell", "search_local_doc", "list_skills", "search_memory", "remember_memory",
+    "execute_shell", "search_local_doc", "list_skills",
 })
 
 _CONCURRENCY_SAFE_TOOLS = frozenset({
@@ -163,10 +163,14 @@ _EXTERNAL_MCP_VISIBLE_TOOLS = frozenset({
 
 _MUTATING_TOOLS = frozenset({
     'create_node', 'create_nodes_batch', 'create_named_null', 'delete_node',
-    'rename_node', 'set_node_parameter', 'set_parameter_expression',
+    'rename_node', 'set_node_parameter', 'set_parameter_expression', 'set_parameter_reference',
+    'insert_multiparm_instance',
+    'remove_multiparm_instance',
+    'create_object_merges_batch',
     'batch_set_parameters', 'connect_nodes', 'disconnect_nodes', 'copy_node',
     'create_wrangle_node', 'set_display_flag', 'set_node_flags', 'layout_nodes',
-    'create_network_box', 'add_nodes_to_box', 'execute_python', 'save_hip',
+    'create_network_box', 'add_nodes_to_box', 'set_network_box_comment',
+    'execute_python', 'save_hip',
     'run_skill', 'undo_redo',
 })
 
@@ -175,7 +179,7 @@ _EXECUTION_BARRIER_TOOLS = frozenset(
 )
 
 _NODE_PATH_KEYS = frozenset({
-    "node_path", "source_path", "target_path", "network_path", "parent_path",
+    "node_path", "source_path", "source_paths", "target_path", "network_path", "parent_path",
     "from_path", "to_path", "input_path", "path", "root_path",
 })
 
@@ -806,7 +810,8 @@ class ToolRegistry:
             'search_memory',
         },
         'layout': {
-            'layout_nodes', 'create_network_box',
+            'layout_nodes', 'create_network_box', 'add_nodes_to_box',
+            'set_network_box_comment',
         },
         'task': {
             'add_todo', 'update_todo',
@@ -884,6 +889,7 @@ class ToolRegistry:
         'create_named_null': {'get_node_connections', 'suggest_connection', 'preview_node_operation', 'validate_node_network'},
         'layout_nodes': {'get_network_structure'},
         'create_network_box': set(),
+        'set_network_box_comment': set(),
         'cook_node': {'inspect_node', 'verify_network'},
         'copy_node': {'inspect_node', 'get_network_structure'},
         'save_hip': {'get_scene_snapshot'},

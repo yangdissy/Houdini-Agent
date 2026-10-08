@@ -88,20 +88,36 @@ class TeamMemoryStore:
         db_path: Optional[Path] = None,
         embedder: Optional[LocalEmbedder] = None,
         force_delete: bool = False,
+        read_only: Optional[bool] = None,
     ):
         self.db_path = db_path or _TEAM_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.embedder = embedder or get_embedder()
         self._force_delete = force_delete
+        # 显式指定 read_only 则优先；否则根据路径自动推断：
+        # 默认全局单例（_TEAM_DB_PATH）→ 只读模式（避免网络盘锁）
+        # 其他路径（如测试临时目录）→ 写模式
+        if read_only is not None:
+            self._read_only = read_only
+        else:
+            self._read_only = (self.db_path == _TEAM_DB_PATH)
         self._conn = None
         self.embedding_diagnostic: Optional[str] = None
         self._db_lock = threading.RLock()
-        self._init_db()
+        if not self._read_only:
+            self._init_db()
 
     def _get_conn(self):
         if self._conn is None:
-            conn, _used_delete = open_sqlite(self.db_path, self._force_delete)
-            self._conn = conn
+            if self._read_only:
+                # 只读模式：避免 WAL 写锁，网络盘多进程安全
+                uri = f"file:{self.db_path.as_posix()}?mode=ro"
+                conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=30.0)
+                conn.execute("PRAGMA busy_timeout=30000")
+                self._conn = conn
+            else:
+                conn, _used_delete = open_sqlite(self.db_path, self._force_delete)
+                self._conn = conn
         return self._conn
 
     def _init_db(self):
@@ -289,7 +305,8 @@ def _refresh_team_memory_singleton(db_path: Path, embedder: LocalEmbedder) -> No
         return
     with _team_store_lock:
         old_store = _team_store_instance
-        _team_store_instance = TeamMemoryStore(db_path=db_path, embedder=embedder)
+        # 运行时只读模式，避免网络盘 WAL 写锁
+        _team_store_instance = TeamMemoryStore(db_path=db_path, embedder=embedder, read_only=True)
         if old_store is not None:
             old_store.close()
 
@@ -491,7 +508,8 @@ def rebuild_team_memory(
     live_path = Path(db_path) if db_path is not None else _TEAM_DB_PATH
     live_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = live_path.with_name(f".{live_path.name}.{uuid.uuid4().hex}.tmp")
-    store = TeamMemoryStore(db_path=temp_path, embedder=embedder, force_delete=True)
+    # rebuild 需要写模式（read_only=False），通过 temp_path + os.replace 原子替换
+    store = TeamMemoryStore(db_path=temp_path, embedder=embedder, force_delete=True, read_only=False)
     try:
         store.replace_all(merged_semantic, merged_procedural)
         if store.embedding_diagnostic:

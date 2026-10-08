@@ -218,6 +218,11 @@ class ToolArgumentValidator:
                 if path_kinds.get(key) == "node" and v:
                     v = self._normalize_path(v)
                 out[key] = v
+            elif isinstance(value, list) and path_kinds.get(key) == "node":
+                out[key] = [
+                    self._normalize_path(item.strip()) if isinstance(item, str) and item.strip() else item
+                    for item in value
+                ]
             else:
                 out[key] = value
         return out
@@ -298,11 +303,18 @@ class ToolArgumentValidator:
 
     def _check_path_args(self, args: Dict[str, Any], path_kinds: Dict[str, str]) -> str:
         for key, value in (args or {}).items():
-            if not isinstance(value, str) or not value.strip():
-                continue
-            reason = self._validate_path_arg(key, value.strip(), path_kinds.get(key))
-            if reason:
-                return reason
+            if isinstance(value, str) and value.strip():
+                reason = self._validate_path_arg(key, value.strip(), path_kinds.get(key))
+                if reason:
+                    return reason
+            elif isinstance(value, list) and path_kinds.get(key) in {"node", "file"}:
+                for index, item in enumerate(value):
+                    if isinstance(item, str) and item.strip():
+                        reason = self._validate_path_arg(
+                            f"{key}[{index}]", item.strip(), path_kinds.get(key)
+                        )
+                        if reason:
+                            return reason
         return ""
 
     def _validate_path_arg(self, key: str, path: str, path_kind: Optional[str]) -> str:

@@ -11,7 +11,12 @@ _install_hou_stub()
 _install_thirdparty_stubs()
 
 import houdini_agent.utils.mcp.client as mcp_client
-from houdini_agent.utils.pdg_inspection import get_top_errors, inspect_top_network, list_work_items
+from houdini_agent.utils.pdg_inspection import (
+    build_pdg_expression,
+    get_top_errors,
+    inspect_top_network,
+    list_work_items,
+)
 
 
 class _State:
@@ -126,6 +131,19 @@ class PDGInspectionTest(unittest.TestCase):
         self.assertEqual(error["command"], "hython render.py")
         self.assertEqual(error["log_path"], "/tmp/1.log")
         self.assertNotIn("log_contents", error)
+
+    def test_builds_whitelisted_attribute_expression(self):
+        result = build_pdg_expression("attribute", name="frame", value_type="int")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["data"]["expression"], "@frame")
+        self.assertTrue(result["data"]["requires_work_item_context"])
+
+    def test_rejects_invalid_attribute_name(self):
+        result = build_pdg_expression("attribute", name="frame); system('bad')")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "invalid_attribute_name")
 
 
 class PDGToolHandlerTest(unittest.TestCase):

@@ -13,9 +13,55 @@ _hou_core = importlib.util.module_from_spec(_spec)
 assert _spec.loader is not None
 _spec.loader.exec_module(_hou_core)
 _compute_tidy_layout = _hou_core._compute_tidy_layout
+plan_node_layout = _hou_core.plan_node_layout
 
 
 class TidyLayoutTests(unittest.TestCase):
+    def test_layout_plan_normalizes_compatible_methods(self):
+        node_ids = ["source", "output"]
+        edges = [("source", "output", 0)]
+        original = {"source": (10.0, 10.0), "output": (10.0, 8.0)}
+
+        tidy = plan_node_layout(node_ids, edges, original, method="tidy")
+        columns = plan_node_layout(node_ids, edges, original, method="columns")
+
+        self.assertEqual(tidy["method"], "tidy")
+        self.assertEqual(columns["method"], "tidy")
+        self.assertEqual(columns["positions"], tidy["positions"])
+
+    def test_layout_plan_preserves_pins_and_avoids_fixed_obstacles(self):
+        plan = plan_node_layout(
+            ["source", "output"],
+            [("source", "output", 0)],
+            {"source": (0.0, 2.0), "output": (0.0, 0.0)},
+            method="tidy",
+            pinned_node_ids={"output"},
+            obstacles=[{"id": "existing", "x": 0.0, "y": 2.0, "width": 4.0, "height": 1.5}],
+        )
+
+        self.assertEqual(plan["positions"]["output"], (0.0, 0.0))
+        self.assertGreaterEqual(abs(plan["positions"]["source"][0]), 4.0)
+
+    def test_layout_plan_reports_before_and_after_quality_metrics(self):
+        plan = plan_node_layout(
+            ["left", "right", "left_out", "right_out"],
+            [("left", "right_out", 0), ("right", "left_out", 0)],
+            {
+                "left": (-3.0, 2.0), "right": (3.0, 2.0),
+                "left_out": (-3.0, 0.0), "right_out": (3.0, 0.0),
+            },
+            method="tidy",
+        )
+
+        self.assertEqual(plan["metrics_before"]["crossing_count"], 1)
+        self.assertLessEqual(
+            plan["metrics_after"]["crossing_count"],
+            plan["metrics_before"]["crossing_count"],
+        )
+        self.assertGreater(plan["metrics_after"]["total_movement"], 0.0)
+        self.assertIn("overlap_count", plan["metrics_after"])
+        self.assertIn("total_wire_length", plan["metrics_after"])
+
     def test_chain_stays_vertical(self):
         positions = _compute_tidy_layout(
             ["box", "scatter", "attrib", "copy"],

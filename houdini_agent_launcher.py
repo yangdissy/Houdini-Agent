@@ -24,10 +24,18 @@ def _cleanup_legacy_modules():
 _ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 _LIB_DIR = os.path.join(_ROOT_DIR, 'lib')
 
+_VERSIONED_LIB_DIR = os.path.join(
+    _LIB_DIR, f'python{sys.version_info.major}{sys.version_info.minor}'
+)
+
 if os.path.exists(_LIB_DIR):
     if _LIB_DIR in sys.path:
         sys.path.remove(_LIB_DIR)
     sys.path.insert(0, _LIB_DIR)
+if os.path.exists(_VERSIONED_LIB_DIR):
+    if _VERSIONED_LIB_DIR in sys.path:
+        sys.path.remove(_VERSIONED_LIB_DIR)
+    sys.path.insert(0, _VERSIONED_LIB_DIR)
 
 # ============================================================
 

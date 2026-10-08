@@ -99,6 +99,18 @@ class InferHelpersTest(unittest.TestCase):
 
 
 class ToolSemanticFactsTest(unittest.TestCase):
+    def test_memory_tools_use_houdini_dispatch_runtime(self):
+        reg = ToolRegistry()
+        reg.register_core_tools([
+            _schema("search_memory"),
+            _schema("remember_memory"),
+        ])
+
+        for name in ("search_memory", "remember_memory"):
+            with self.subTest(tool=name):
+                self.assertEqual(reg.get_meta(name).runtime, "houdini")
+                self.assertTrue(reg.authorize_dispatch(name, "agent", "houdini")["allowed"])
+
     def test_execution_semantics_query_is_registry_owned(self):
         reg = ToolRegistry()
         reg.register_core_tools([

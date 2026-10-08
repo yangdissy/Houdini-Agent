@@ -72,6 +72,7 @@ class CoreToolContractTest(unittest.TestCase):
             "get_parameter_schema", "inspect_node", "get_node_connections",
             "suggest_connection", "preview_node_operation", "validate_node_network",
             "find_nodes", "get_geometry_summary", "get_scene_snapshot",
+            "build_pdg_expression", "find_parameter_references", "list_multiparm_instances",
         ):
             with self.subTest(tool=name):
                 self.assertIn(name, ask_names)
@@ -101,6 +102,81 @@ class CoreToolContractTest(unittest.TestCase):
         ):
             with self.subTest(tool=name):
                 self.assertIn(name, core_names)
+
+    def test_pdg_expression_tool_has_callable_dispatch(self):
+        self.assertIn("build_pdg_expression", self.registry._tools)
+        handler_name = HoudiniMCP._TOOL_DISPATCH.get("build_pdg_expression")
+        self.assertTrue(handler_name)
+        self.assertTrue(callable(getattr(HoudiniMCP, handler_name, None)))
+
+    def test_parameter_reference_tool_has_callable_dispatch(self):
+        self.assertIn("find_parameter_references", self.registry._tools)
+        handler_name = HoudiniMCP._TOOL_DISPATCH.get("find_parameter_references")
+        self.assertTrue(handler_name)
+        self.assertTrue(callable(getattr(HoudiniMCP, handler_name, None)))
+
+    def test_set_parameter_reference_is_governed_mutation(self):
+        self.assertIn("set_parameter_reference", SCENE_MUTATION_TOOLS)
+        meta = self.registry._tools["set_parameter_reference"]
+        self.assertTrue(meta.requires_confirmation)
+        self.assertTrue(meta.undo)
+        ask_names = {
+            schema["function"]["name"]
+            for schema in self.registry.get_tools_for_mode("ask")
+        }
+        self.assertNotIn("set_parameter_reference", ask_names)
+        handler_name = HoudiniMCP._TOOL_DISPATCH.get("set_parameter_reference")
+        self.assertTrue(callable(getattr(HoudiniMCP, handler_name, None)))
+
+    def test_multiparm_list_tool_has_callable_dispatch(self):
+        self.assertIn("list_multiparm_instances", self.registry._tools)
+        handler_name = HoudiniMCP._TOOL_DISPATCH.get("list_multiparm_instances")
+        self.assertTrue(handler_name)
+        self.assertTrue(callable(getattr(HoudiniMCP, handler_name, None)))
+
+    def test_multiparm_insert_tool_is_governed_mutation(self):
+        self.assertIn("insert_multiparm_instance", SCENE_MUTATION_TOOLS)
+        meta = self.registry._tools["insert_multiparm_instance"]
+        self.assertTrue(meta.requires_confirmation)
+        self.assertTrue(meta.undo)
+        self.assertTrue(meta.mutating)
+        ask_names = {
+            schema["function"]["name"]
+            for schema in self.registry.get_tools_for_mode("ask")
+        }
+        self.assertNotIn("insert_multiparm_instance", ask_names)
+        handler_name = HoudiniMCP._TOOL_DISPATCH.get("insert_multiparm_instance")
+        self.assertTrue(callable(getattr(HoudiniMCP, handler_name, None)))
+
+    def test_multiparm_remove_tool_is_governed_mutation(self):
+        self.assertIn("remove_multiparm_instance", SCENE_MUTATION_TOOLS)
+        meta = self.registry._tools["remove_multiparm_instance"]
+        self.assertTrue(meta.requires_confirmation)
+        self.assertTrue(meta.undo)
+        self.assertTrue(meta.mutating)
+        ask_names = {
+            schema["function"]["name"]
+            for schema in self.registry.get_tools_for_mode("ask")
+        }
+        self.assertNotIn("remove_multiparm_instance", ask_names)
+        handler_name = HoudiniMCP._TOOL_DISPATCH.get("remove_multiparm_instance")
+        self.assertTrue(callable(getattr(HoudiniMCP, handler_name, None)))
+
+    def test_object_merge_batch_tool_is_governed_mutation(self):
+        self.assertIn("create_object_merges_batch", SCENE_MUTATION_TOOLS)
+        meta = self.registry._tools["create_object_merges_batch"]
+        self.assertTrue(meta.requires_confirmation)
+        self.assertTrue(meta.undo)
+        self.assertTrue(meta.mutating)
+        self.assertEqual(meta.path_kinds["parent_path"], "node")
+        self.assertEqual(meta.path_kinds["source_paths"], "node")
+        ask_names = {
+            schema["function"]["name"]
+            for schema in self.registry.get_tools_for_mode("ask")
+        }
+        self.assertNotIn("create_object_merges_batch", ask_names)
+        handler_name = HoudiniMCP._TOOL_DISPATCH.get("create_object_merges_batch")
+        self.assertTrue(callable(getattr(HoudiniMCP, handler_name, None)))
 
     def test_schema_and_dispatch_contracts_model_internal_tools_explicitly(self):
         core_names = set(self.registry._tools)

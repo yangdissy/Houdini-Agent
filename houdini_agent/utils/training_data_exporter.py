@@ -5,11 +5,27 @@
 """
 
 import json
+import re
 import uuid
 import getpass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional
+
+
+_INJECTED_BLOCK_PATTERNS = [
+    re.compile(r"\n*\[重要：你的下一条回复必须以 <think>.*?\]\s*$", re.DOTALL),
+    re.compile(r"\n*\[注意：上述工具调用返回了错误.*?\]\s*", re.DOTALL),
+]
+
+
+def _strip_injected_guidance(text: str) -> str:
+    """移除 Agent Loop 注入到工具结果中的运行时引导。"""
+    if not text:
+        return text
+    for pattern in _INJECTED_BLOCK_PATTERNS:
+        text = pattern.sub("", text)
+    return text.strip()
 
 
 class ChatTrainingExporter:
@@ -214,11 +230,26 @@ class ChatTrainingExporter:
         
         # 添加当前对话
         messages.extend(current)
-        
+
+        messages = self._strip_to_first_user(messages)
+        if messages is None:
+            return None
+
         # 验证工具调用配对
         messages = self._validate_tool_calls(messages)
-        
+
         return {"messages": messages}
+
+    @staticmethod
+    def _strip_to_first_user(messages: List[Dict]) -> Optional[List[Dict]]:
+        """丢弃系统消息之后、第一条用户消息之前的截断上下文。"""
+        if not messages:
+            return None
+        system_msg = messages[0]
+        for index in range(1, len(messages)):
+            if messages[index].get("role") == "user":
+                return [system_msg] + messages[index:]
+        return None
     
     def _clean_message(self, msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """清理消息格式"""
@@ -286,8 +317,8 @@ class ChatTrainingExporter:
         新格式: {"role": "tool", "tool_call_id": "xxx", "content": "..."}
         """
         content = self._extract_text_content(msg.get("content", ""))
+        content = _strip_injected_guidance(content)
         tool_call_id = msg.get("tool_call_id")
-        name = msg.get("name", "")
         
         if not content:
             return None
@@ -299,7 +330,7 @@ class ChatTrainingExporter:
         return {
             "role": "tool",
             "tool_call_id": tool_call_id,
-            "content": content[:500]  # 限制长度
+            "content": content[:2000]
         }
     
     def _validate_tool_calls(self, messages: List[Dict]) -> List[Dict]:
@@ -328,12 +359,13 @@ class ChatTrainingExporter:
                     result.append(msg)
                     del pending_tool_calls[tc_id]
                 else:
-                    # 没有对应的 tool_calls，创建一个
-                    # 从内容中提取工具名
+                    # 没有对应的 tool_calls，创建一个占位调用
                     content = msg.get("content", "")
-                    tool_name = "execute_tool"
+                    tool_name = "unknown_tool"
                     if ":" in content:
-                        tool_name = content.split(":")[0].strip()
+                        candidate = content.split(":", 1)[0].strip()
+                        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", candidate):
+                            tool_name = candidate
                     
                     # 添加 assistant 消息
                     new_tc_id = f"call_{uuid.uuid4().hex[:12]}"
@@ -375,7 +407,7 @@ class ChatTrainingExporter:
 -不输出思考过程
 -先检查节点存在再操作
 -VEX代码优先使用create_wrangle_node
--完成后调用verify_network验证"""
+-完成后调用verify_and_summarize验证"""
 
 
 def export_chat_training_data(

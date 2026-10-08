@@ -98,7 +98,7 @@ class HeaderMixin:
                 'qwen/qwen3-235b-a22b',
                 'mistralai/mistral-large-2512',
             ],
-            'kimi_coding': ['k3', 'kimi-for-coding', 'kimi-for-coding-highspeed'],
+            'kimi_coding': ['k3', 'k3-256k', 'kimi-for-coding', 'kimi-for-coding-highspeed'],
             'of3d': ['gpt-5.5', 'chatgpt-4o-latest'],
             'siliconflow': [
                 'deepseek-ai/DeepSeek-V4-Pro',
@@ -161,7 +161,8 @@ class HeaderMixin:
             'mistralai/mistral-large-2512': 262144,
             # Kimi Coding
             'k3': 1048576,
-            'kimi-for-coding': 262144,
+            'k3-256k': 262144,
+            'kimi-for-coding': 1048576,
             'kimi-for-coding-highspeed': 262144,
             # OF3D
             'chatgpt-4o-latest': 128000,
@@ -228,6 +229,7 @@ class HeaderMixin:
             'mistralai/mistral-large-2512':       {'supports_prompt_caching': True, 'supports_vision': True},
             # Kimi Coding
             'k3':                                  {'supports_prompt_caching': True, 'supports_vision': False},
+            'k3-256k':                             {'supports_prompt_caching': True, 'supports_vision': False},
             'kimi-for-coding':                    {'supports_prompt_caching': True, 'supports_vision': False},
             'kimi-for-coding-highspeed':          {'supports_prompt_caching': True, 'supports_vision': False},
             # OF3D

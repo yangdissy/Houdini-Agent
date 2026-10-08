@@ -599,6 +599,89 @@ HOUDINI_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "find_parameter_references",
+            "description": "精确查询直接引用某个标量参数的参数路径。使用 Houdini 的引用关系，不扫描或猜测表达式文本。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "目标参数所属节点路径，如 /obj/geo1/box1"},
+                    "param_name": {"type": "string", "description": "目标标量参数名，如 sizex；tuple 参数请使用分量名"}
+                },
+                "required": ["node_path", "param_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_multiparm_instances",
+            "description": "列出 Multiparm 的实例数量、实例索引及每个实例的实际参数路径。不读取实例值，不修改场景。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "Multiparm 所属节点路径"},
+                    "param_name": {"type": "string", "description": "Multiparm 计数参数名"}
+                },
+                "required": ["node_path", "param_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "insert_multiparm_instance",
+            "description": "在 Multiparm 的指定零基索引插入一个实例。写入场景、需要确认并支持 Houdini Undo。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "Multiparm 所属节点路径"},
+                    "param_name": {"type": "string", "description": "Multiparm 计数参数名"},
+                    "index": {"type": "integer", "minimum": 0, "description": "插入位置，零基；可等于当前实例数量以追加"}
+                },
+                "required": ["node_path", "param_name", "index"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_multiparm_instance",
+            "description": "删除 Multiparm 指定零基索引处的一个实例。写入场景、需要确认并支持 Houdini Undo。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "Multiparm 所属节点路径"},
+                    "param_name": {"type": "string", "description": "Multiparm 计数参数名"},
+                    "index": {"type": "integer", "minimum": 0, "description": "要删除的实例索引，零基"}
+                },
+                "required": ["node_path", "param_name", "index"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_object_merges_batch",
+            "description": "在目标 SOP 网络中为多个来源节点分别创建 Object Merge，并使用相对 objpath1。最多 25 个；所有路径验证通过后才执行。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "parent_path": {"type": "string", "description": "创建 Object Merge 的目标 SOP 网络路径"},
+                    "source_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 25,
+                        "description": "要引用的来源节点路径列表"
+                    }
+                },
+                "required": ["parent_path", "source_paths"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "inspect_node",
             "description": "结构化读取单个节点的当前状态：类型、标签、备注、flags、位置、输入/输出连接、错误/警告、非默认参数摘要。用于快速理解一个节点，不需要拉取完整参数列表时优先使用。",
             "parameters": {
@@ -653,6 +736,23 @@ HOUDINI_TOOLS = [
                     }
                 },
                 "required": ["node_path", "param_name", "expression"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_parameter_reference",
+            "description": "将目标标量参数设置为对来源标量参数的相对 HScript 通道引用。写入场景并支持撤销；tuple 参数需使用具体分量名。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_node_path": {"type": "string", "description": "待写入参数所属节点路径"},
+                    "target_param_name": {"type": "string", "description": "待写入的标量参数名"},
+                    "source_node_path": {"type": "string", "description": "被引用参数所属节点路径"},
+                    "source_param_name": {"type": "string", "description": "被引用的标量参数名"}
+                },
+                "required": ["target_node_path", "target_param_name", "source_node_path", "source_param_name"]
             }
         }
     },
@@ -1165,6 +1265,24 @@ HOUDINI_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "build_pdg_expression",
+            "description": "生成受白名单约束的 PDG 表达式文本，不读取或修改 PDG graph，不触发 cook。表达式需要在有效 work item 上下文中使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["attribute"], "description": "表达式种类；首版支持 attribute"},
+                    "name": {"type": "string", "description": "PDG 属性名，仅允许标识符字符"},
+                    "value_type": {"type": "string", "enum": ["int", "float", "string"], "description": "属性值类型，默认 string"},
+                    "index": {"type": "integer", "description": "保留的非负文件索引，attribute 类型忽略，默认 0"},
+                    "syntax": {"type": "string", "enum": ["hscript"], "description": "表达式语法，首版仅支持 hscript"}
+                },
+                "required": ["kind", "name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "copy_node",
             "description": "复制/克隆节点到新位置。可以复制到同一网络或其他网络。",
             "parameters": {
@@ -1483,7 +1601,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "layout_nodes",
-            "description": "自动布局节点位置。仅在以下两种情况下调用：1) 用户明确要求整理/排列节点；2) 即将调用 create_network_box 之前（NetworkBox.fitAroundContents() 依赖节点位置）。注意：必须通过 node_paths 指定要布局的节点，不要省略 node_paths——省略会触发 layoutChildren() 重排整个网络中所有节点，破坏用户已有的手动布局。支持布局策略：auto（智能选择）、tidy（推荐，美观拓扑布局：主链垂直、分支左右展开、多输入节点形成清晰汇合）、grid（网格排列）、columns（tidy 的兼容别名）。",
+            "description": "自动布局节点位置。仅在以下两种情况下调用：1) 用户明确要求整理/排列节点；2) 即将调用 create_network_box 之前（NetworkBox.fitAroundContents() 依赖节点位置）。注意：必须通过 node_paths 指定要布局的节点，不要省略 node_paths——省略会触发 layoutChildren() 重排整个网络中所有节点，破坏用户已有的手动布局。支持布局策略：auto（智能选择）、tidy（推荐，美观拓扑布局：主链垂直、分支左右展开、多输入节点形成清晰汇合）、native（Houdini 原生布局）、columns（tidy 的兼容别名）。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1498,8 +1616,8 @@ HOUDINI_TOOLS = [
                     },
                     "method": {
                         "type": "string",
-                        "enum": ["auto", "tidy", "native", "grid", "columns"],
-                        "description": "布局方法。tidy=推荐的美观拓扑布局（自定义 DAG 分层+碰撞检测），native=Houdini 原生 layoutChildren/moveToGoodPosition（对新建节点最自然），auto=智能选择，grid=网格排列，columns=tidy 的兼容别名。默认 auto。"
+                        "enum": ["auto", "tidy", "native", "columns"],
+                        "description": "布局方法。tidy=推荐的美观拓扑布局（自定义 DAG 分层+碰撞检测），native=Houdini 原生 layoutChildren/moveToGoodPosition（对新建节点最自然），auto=智能选择，columns=tidy 的兼容别名。默认 auto。"
                     },
                     "spacing": {
                         "type": "number",
@@ -1529,7 +1647,7 @@ HOUDINI_TOOLS = [
                     },
                     "method": {
                         "type": "string",
-                        "enum": ["auto", "tidy", "native", "grid", "columns"],
+                        "enum": ["auto", "tidy", "native", "columns"],
                         "description": "要预览的布局方法，与 layout_nodes 参数相同。默认 tidy。"
                     },
                     "spacing": {
@@ -1603,6 +1721,31 @@ HOUDINI_TOOLS = [
                     }
                 },
                 "required": ["box_name", "node_paths"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_network_box_comment",
+            "description": "原地修改已有 NetworkBox 的注释，不重建分组框，也不改变其中的节点、位置、颜色或折叠状态。使用空字符串可清除注释。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "parent_path": {
+                        "type": "string",
+                        "description": "NetworkBox 所在父网络的完整路径（如 /obj/geo1）。"
+                    },
+                    "box_name": {
+                        "type": "string",
+                        "description": "目标 NetworkBox 的精确名称，不支持模糊匹配。"
+                    },
+                    "comment": {
+                        "type": "string",
+                        "description": "新的注释文字；传入空字符串表示清除现有注释。"
+                    }
+                },
+                "required": ["parent_path", "box_name", "comment"]
             }
         }
     },

@@ -420,6 +420,38 @@ class ToolArgumentValidatorTest(unittest.TestCase):
         self.assertFalse(missing.ok)
         self.assertEqual(missing.issues[0].code, "missing_required_arg")
 
+    def test_validator_normalizes_and_validates_node_path_arrays(self):
+        schema = {
+            "type": "function",
+            "function": {
+                "name": "node_path_array_probe",
+                "description": "test",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "source_paths": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["source_paths"],
+                },
+            },
+        }
+        self.registry.register(
+            "node_path_array_probe",
+            schema,
+            path_kinds={"source_paths": "node"},
+            modes={"agent"},
+        )
+
+        result = self.validator.validate(
+            "node_path_array_probe",
+            {"source_paths": [" //obj//geo1/OUT ", "/obj/../out/rop1"]},
+        )
+
+        self.assertEqual(result.args["source_paths"][0], "/obj/geo1/OUT")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.issues[0].code, "invalid_path")
+        self.assertIn("source_paths[1]", result.issues[0].message)
+
     def test_validator_reports_sensitive_and_command_issues_structurally(self):
         result = self.validator.validate(
             "execute_shell",

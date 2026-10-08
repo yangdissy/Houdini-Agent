@@ -316,7 +316,7 @@ def layout_nodes(
     Args:
         parent_path: 父网络路径，留空使用当前活跃网络
         node_paths: 要布局的节点路径列表；为空时布局整个网络
-        method: 布局方法 auto / tidy / grid / columns
+        method: 布局方法 auto / tidy / native / columns
         spacing: 间距倍率（默认 1.0）
         anchor_position: 可选整体布局中心；未传时保留原始位置中心
 
@@ -403,10 +403,6 @@ def layout_nodes(
             _layout_columns(nodes, spacing, anchor_position=anchor_position)
             layout_method_used = "tidy" if method == "tidy" else "columns(tidy)"
 
-        elif method == "grid":
-            _layout_grid(nodes, spacing)
-            layout_method_used = "grid"
-
         else:
             return False, f"未知布局方法: {method}", []
 
@@ -431,33 +427,14 @@ def layout_nodes(
         return False, f"布局失败: {e}", []
 
 
-def _layout_grid(nodes: list, spacing: float = 1.0) -> None:
-    """网格布局：按节点列表顺序排成 N 列网格"""
-    if not nodes:
-        return
-    import math
-    cols = max(1, int(math.ceil(math.sqrt(len(nodes)))))
-    h_sp = 5.5 * spacing
-    v_sp = 2.0 * spacing
-    for idx, node in enumerate(nodes):
-        col = idx % cols
-        row = idx // cols
-        node.setPosition(hou.Vector2(col * h_sp, -row * v_sp))
-
-
-def _layout_columns(
-    nodes: list,
-    spacing: float = 1.0,
-    anchor_position: Optional[Tuple[float, float]] = None,
-) -> None:
-    """按拓扑关系整理节点：主链垂直，分支左右展开。"""
-    if not nodes:
-        return
-    node_ids = [n.path() for n in nodes]
+def snapshot_node_layout(nodes: list) -> Tuple[
+    List[str], List[Tuple[str, str, int]], Dict[str, Tuple[float, float]],
+]:
+    """Read the graph data needed by the pure layout planner."""
+    node_ids = [node.path() for node in nodes]
     node_set = set(node_ids)
-    edges: List[Tuple[str, str, int]] = []
-    original_positions: Dict[str, Tuple[float, float]] = {}
-
+    edges = []
+    original_positions = {}
     for node in nodes:
         node_id = node.path()
         try:
@@ -471,17 +448,151 @@ def _layout_columns(
                     edges.append((input_node.path(), node_id, input_index))
         except Exception:
             continue
+    return node_ids, edges, original_positions
 
-    positions = _compute_tidy_layout(
-        node_ids,
-        edges,
-        spacing=spacing,
-        original_positions=original_positions,
+
+def _layout_columns(
+    nodes: list,
+    spacing: float = 1.0,
+    anchor_position: Optional[Tuple[float, float]] = None,
+) -> None:
+    """按拓扑关系整理节点：主链垂直，分支左右展开。"""
+    if not nodes:
+        return
+    node_ids, edges, original_positions = snapshot_node_layout(nodes)
+    plan = plan_node_layout(
+        node_ids, edges, original_positions, method="tidy", spacing=spacing,
         anchor_position=anchor_position,
     )
     for node in nodes:
-        x, y = positions.get(node.path(), (0.0, 0.0))
+        x, y = plan["positions"].get(node.path(), (0.0, 0.0))
         node.setPosition(hou.Vector2(x, y))
+
+
+def plan_node_layout(
+    node_ids: List[str],
+    edges: List[Tuple[str, str, int]],
+    original_positions: Dict[str, Tuple[float, float]],
+    method: str = "tidy",
+    spacing: float = 1.0,
+    anchor_position: Optional[Tuple[float, float]] = None,
+    pinned_node_ids: Optional[set] = None,
+    obstacles: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Compute one reusable layout plan without calling Houdini APIs."""
+    normalized_method = "tidy" if method in ("auto", "columns") else method
+    if normalized_method == "tidy":
+        positions = _compute_tidy_layout(
+            node_ids,
+            edges,
+            spacing=spacing,
+            original_positions=original_positions,
+            anchor_position=anchor_position,
+        )
+    else:
+        raise ValueError(f"布局方法不支持纯计算预览: {method}")
+
+    pinned = set(pinned_node_ids or ()) & set(node_ids)
+    for node_id in pinned:
+        positions[node_id] = original_positions.get(node_id, positions[node_id])
+
+    fixed_rects = [dict(item) for item in (obstacles or [])]
+    for node_id in pinned:
+        x, y = positions[node_id]
+        fixed_rects.append({
+            "id": node_id, "x": x, "y": y,
+            "width": max(3.2, len(node_id.rsplit('/', 1)[-1]) * 0.12 + 2.4),
+            "height": 1.2,
+        })
+
+    def overlaps_fixed(node_id: str, x: float, y: float, item: Dict[str, Any]) -> bool:
+        if item.get("id") == node_id:
+            return False
+        width = max(3.2, len(node_id.rsplit('/', 1)[-1]) * 0.12 + 2.4)
+        return (
+            abs(x - float(item.get("x", 0.0))) < (width + float(item.get("width", 3.2))) / 2.0 + 0.3
+            and abs(y - float(item.get("y", 0.0))) < (1.2 + float(item.get("height", 1.2))) / 2.0 + 0.2
+        )
+
+    for node_id in node_ids:
+        if node_id in pinned:
+            continue
+        x, y = positions[node_id]
+        width = max(3.2, len(node_id.rsplit('/', 1)[-1]) * 0.12 + 2.4)
+        for _ in range(len(fixed_rects) + len(node_ids) + 1):
+            collision = next(
+                (item for item in fixed_rects if overlaps_fixed(node_id, x, y, item)),
+                None,
+            )
+            if collision is None:
+                break
+            x = float(collision.get("x", 0.0)) + (
+                float(collision.get("width", 3.2)) + width
+            ) / 2.0 + 0.5
+        positions[node_id] = (x, y)
+        fixed_rects.append({"id": node_id, "x": x, "y": y, "width": width, "height": 1.2})
+    def quality_metrics(layout_positions: Dict[str, Tuple[float, float]]) -> Dict[str, Any]:
+        node_rects = []
+        for metric_node_id in node_ids:
+            metric_x, metric_y = layout_positions[metric_node_id]
+            metric_width = max(3.2, len(metric_node_id.rsplit('/', 1)[-1]) * 0.12 + 2.4)
+            node_rects.append((metric_node_id, metric_x, metric_y, metric_width, 1.2))
+        overlap_count = sum(
+            1
+            for index, first in enumerate(node_rects)
+            for second in node_rects[index + 1:]
+            if abs(first[1] - second[1]) < (first[3] + second[3]) / 2.0
+            and abs(first[2] - second[2]) < (first[4] + second[4]) / 2.0
+        )
+
+        edge_lines = [
+            (source, target, layout_positions[source], layout_positions[target])
+            for source, target, _ in edges
+            if source in layout_positions and target in layout_positions
+        ]
+
+        def orientation(a, b, c):
+            return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+        crossing_count = 0
+        for index, first in enumerate(edge_lines):
+            for second in edge_lines[index + 1:]:
+                if {first[0], first[1]} & {second[0], second[1]}:
+                    continue
+                if (
+                    orientation(first[2], first[3], second[2])
+                    * orientation(first[2], first[3], second[3]) < 0
+                    and orientation(second[2], second[3], first[2])
+                    * orientation(second[2], second[3], first[3]) < 0
+                ):
+                    crossing_count += 1
+
+        total_wire_length = sum(
+            ((end[0] - start[0]) ** 2 + (end[1] - start[1]) ** 2) ** 0.5
+            for _, _, start, end in edge_lines
+        )
+        movements = [
+            (
+                (layout_positions[node_id][0] - original_positions[node_id][0]) ** 2
+                + (layout_positions[node_id][1] - original_positions[node_id][1]) ** 2
+            ) ** 0.5
+            for node_id in node_ids
+            if node_id in original_positions
+        ]
+        return {
+            "overlap_count": overlap_count,
+            "crossing_count": crossing_count,
+            "total_wire_length": round(total_wire_length, 6),
+            "total_movement": round(sum(movements), 6),
+            "max_movement": round(max(movements, default=0.0), 6),
+        }
+
+    return {
+        "method": normalized_method,
+        "positions": positions,
+        "metrics_before": quality_metrics(original_positions),
+        "metrics_after": quality_metrics(positions),
+    }
 
 
 def _compute_tidy_layout(
@@ -838,6 +949,44 @@ def add_nodes_to_box(
         target_box.fitAroundContents()
 
     return True, f"已将 {len(added)} 个节点添加到 {box_name}"
+
+
+def set_network_box_comment(
+    parent_path: str,
+    box_name: str,
+    comment: str,
+) -> Tuple[bool, str, Optional[Dict[str, str]]]:
+    """原地修改已有 NetworkBox 的注释，并回读确认结果。"""
+    if hou is None:
+        return False, "Houdini 环境不可用", None
+    parent = hou.node(parent_path)
+    if not parent:
+        return False, f"父网络 '{parent_path}' 不存在", None
+
+    matches = [box for box in parent.networkBoxes() if box.name() == box_name]
+    if not matches:
+        return False, f"未找到 NetworkBox: {box_name}", None
+    if len(matches) != 1:
+        return False, f"NetworkBox 名称不唯一: {box_name}", None
+
+    box = matches[0]
+    try:
+        old_comment = box.comment() or ""
+        box.setComment(comment)
+        actual_comment = box.comment() or ""
+    except Exception as exc:
+        return False, f"修改 NetworkBox 注释失败: {exc}", None
+    if actual_comment != comment:
+        return False, f"NetworkBox 注释回读不一致: {box_name}", {
+            "box_name": box_name,
+            "old_comment": old_comment,
+            "new_comment": actual_comment,
+        }
+    return True, f"已更新 NetworkBox '{box_name}' 的注释", {
+        "box_name": box_name,
+        "old_comment": old_comment,
+        "new_comment": actual_comment,
+    }
 
 
 def list_network_boxes(parent_path: str) -> Tuple[bool, str, List[Dict[str, Any]]]:

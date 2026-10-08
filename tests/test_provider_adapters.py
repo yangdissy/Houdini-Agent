@@ -55,10 +55,21 @@ class AnthropicRequestAdapterTest(unittest.TestCase):
         self.assertEqual(payload["tool_choice"], {"type": "any"})
         self.assertEqual(payload["tools"][0]["input_schema"], {"type": "object"})
 
-    def test_kimi_coding_only_enables_thinking_for_kimi_for_coding(self):
+    def test_kimi_coding_enables_thinking_for_all_models(self):
         k3_payload = _adapter().build_payload(
             messages=[{"role": "user", "content": "hi"}],
             model="k3",
+            provider="kimi_coding",
+            temperature=0.2,
+            max_tokens=4096,
+            tools=None,
+            tool_choice="auto",
+            enable_thinking=True,
+            stream=True,
+        )
+        k3_256k_payload = _adapter().build_payload(
+            messages=[{"role": "user", "content": "hi"}],
+            model="k3-256k",
             provider="kimi_coding",
             temperature=0.2,
             max_tokens=4096,
@@ -80,7 +91,8 @@ class AnthropicRequestAdapterTest(unittest.TestCase):
         )
 
         self.assertEqual(k3_payload["temperature"], 1)
-        self.assertNotIn("thinking", k3_payload)
+        self.assertEqual(k3_payload["thinking"], {"type": "enabled", "budget_tokens": 4096})
+        self.assertEqual(k3_256k_payload["thinking"], {"type": "enabled", "budget_tokens": 4096})
         self.assertEqual(coding_payload["thinking"], {"type": "enabled", "budget_tokens": 4096})
 
     def test_headers_include_stream_accept_and_kimi_user_agent(self):

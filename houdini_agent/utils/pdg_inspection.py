@@ -4,7 +4,35 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, Iterable, List
+
+
+_PDG_ATTRIBUTE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def build_pdg_expression(kind: str, name: str = "", value_type: str = "string",
+                         index: int = 0, syntax: str = "hscript") -> Dict[str, Any]:
+    """Build one whitelisted PDG expression without touching the PDG graph."""
+    if syntax != "hscript":
+        return {"success": False, "error_code": "unsupported_syntax", "error": "Only hscript is supported"}
+    if kind != "attribute":
+        return {"success": False, "error_code": "unsupported_kind", "error": f"Unsupported PDG expression kind: {kind}"}
+    if not _PDG_ATTRIBUTE_NAME_RE.fullmatch(str(name or "")):
+        return {"success": False, "error_code": "invalid_attribute_name", "error": "Invalid PDG attribute name"}
+    if value_type not in {"int", "float", "string"}:
+        return {"success": False, "error_code": "unsupported_value_type", "error": f"Unsupported value type: {value_type}"}
+    return {
+        "success": True,
+        "data": {
+            "kind": kind,
+            "name": name,
+            "expression": f"@{name}",
+            "syntax": syntax,
+            "value_type": value_type,
+            "requires_work_item_context": True,
+        },
+    }
 
 
 def _load_pdg():

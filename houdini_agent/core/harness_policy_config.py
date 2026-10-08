@@ -26,6 +26,10 @@ SCENE_MUTATION_TOOLS = frozenset({
     "rename_node",
     "set_node_parameter",
     "set_parameter_expression",
+    "set_parameter_reference",
+    "insert_multiparm_instance",
+    "remove_multiparm_instance",
+    "create_object_merges_batch",
     "batch_set_parameters",
     "connect_nodes",
     "cook_node",
@@ -35,6 +39,7 @@ SCENE_MUTATION_TOOLS = frozenset({
     "set_node_flags",
     "create_network_box",
     "add_nodes_to_box",
+    "set_network_box_comment",
     "layout_nodes",
 })
 

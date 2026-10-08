@@ -3699,6 +3699,197 @@ class HoudiniMCP:
     # ========================================
     # 参数设置
     # ========================================
+
+    def find_parameter_references(self, node_path: str, param_name: str) -> Dict[str, Any]:
+        """精确查询直接引用目标标量参数的参数路径。"""
+        if hou is None:
+            return {"success": False, "error_code": "hou_unavailable", "error": "未检测到 Houdini API"}
+
+        node = hou.node(node_path)
+        if node is None:
+            return {"success": False, "error_code": "node_not_found", "error": f"未找到节点: {node_path}"}
+
+        parm = node.parm(param_name)
+        if parm is None:
+            return {
+                "success": False,
+                "error_code": "parameter_not_found",
+                "error": f"节点 {node_path} 不存在标量参数 '{param_name}'",
+            }
+
+        try:
+            references = sorted({referencing_parm.path() for referencing_parm in parm.parmsReferencingThis()})
+        except Exception as exc:
+            return {
+                "success": False,
+                "error_code": "reference_query_failed",
+                "error": f"查询参数引用失败: {exc}",
+            }
+
+        return {
+            "success": True,
+            "data": {
+                "target_parm_path": parm.path(),
+                "reference_count": len(references),
+                "references": references,
+            },
+        }
+
+    def list_multiparm_instances(self, node_path: str, param_name: str) -> Dict[str, Any]:
+        """列出 Multiparm 实例及其实际参数路径，不求值实例内容。"""
+        if hou is None:
+            return {"success": False, "error_code": "hou_unavailable", "error": "未检测到 Houdini API"}
+        node = hou.node(node_path)
+        if node is None:
+            return {"success": False, "error_code": "node_not_found", "error": f"未找到节点: {node_path}"}
+        parm = node.parm(param_name)
+        if parm is None:
+            return {"success": False, "error_code": "parameter_not_found", "error": f"未找到参数: {param_name}"}
+        if not hasattr(parm, "multiParmInstances"):
+            return {"success": False, "error_code": "not_multiparm", "error": f"参数 {param_name} 不是 Multiparm"}
+
+        try:
+            instance_count = int(parm.evalAsInt())
+            grouped: Dict[int, List[str]] = {}
+            for instance_parm in parm.multiParmInstances():
+                indices = tuple(instance_parm.multiParmInstanceIndices())
+                if not indices:
+                    return {
+                        "success": False,
+                        "error_code": "missing_instance_index",
+                        "error": f"参数 {instance_parm.path()} 缺少 Multiparm 实例索引",
+                    }
+                grouped.setdefault(int(indices[0]), []).append(instance_parm.path())
+        except Exception as exc:
+            return {"success": False, "error_code": "multiparm_query_failed", "error": f"查询 Multiparm 失败: {exc}"}
+
+        instances = [
+            {"index": index, "parameter_paths": paths}
+            for index, paths in sorted(grouped.items())
+        ]
+        return {
+            "success": True,
+            "data": {
+                "node_path": node_path,
+                "param_name": param_name,
+                "instance_count": instance_count,
+                "instances": instances,
+            },
+        }
+
+    def insert_multiparm_instance(self, node_path: str, param_name: str, index: int
+                                  ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """在给定零基索引插入一个 Multiparm 实例。"""
+        if hou is None:
+            return False, "未检测到 Houdini API", None
+        node = hou.node(node_path)
+        if node is None:
+            return False, f"未找到节点: {node_path}", None
+        parm = node.parm(param_name)
+        if parm is None or not hasattr(parm, "insertMultiParmInstance"):
+            return False, f"参数 {param_name} 不是 Multiparm", None
+
+        try:
+            old_count = int(parm.evalAsInt())
+            instance_index = int(index)
+        except (TypeError, ValueError) as exc:
+            return False, f"无效的实例索引: {exc}", None
+        if instance_index < 0 or instance_index > old_count:
+            return False, f"实例索引超出范围: {instance_index}（允许 0 到 {old_count}）", None
+
+        try:
+            parm.insertMultiParmInstance(instance_index)
+        except Exception as exc:
+            return False, f"插入 Multiparm 实例失败: {exc}", None
+
+        snapshot = {
+            "node_path": node_path,
+            "param_name": param_name,
+            "operation": "insert",
+            "index": instance_index,
+            "old_count": old_count,
+            "new_count": old_count + 1,
+            "is_multiparm": True,
+        }
+        return True, f"已在 {param_name}[{instance_index}] 插入实例", snapshot
+
+    def remove_multiparm_instance(self, node_path: str, param_name: str, index: int
+                                  ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """删除给定零基索引处的一个 Multiparm 实例。"""
+        if hou is None:
+            return False, "未检测到 Houdini API", None
+        node = hou.node(node_path)
+        if node is None:
+            return False, f"未找到节点: {node_path}", None
+        parm = node.parm(param_name)
+        if parm is None or not hasattr(parm, "removeMultiParmInstance"):
+            return False, f"参数 {param_name} 不是 Multiparm", None
+
+        try:
+            old_count = int(parm.evalAsInt())
+            instance_index = int(index)
+        except (TypeError, ValueError) as exc:
+            return False, f"无效的实例索引: {exc}", None
+        if instance_index < 0 or instance_index >= old_count:
+            upper = old_count - 1
+            return False, f"实例索引超出范围: {instance_index}（允许 0 到 {upper}）", None
+
+        try:
+            parm.removeMultiParmInstance(instance_index)
+        except Exception as exc:
+            return False, f"删除 Multiparm 实例失败: {exc}", None
+
+        snapshot = {
+            "node_path": node_path,
+            "param_name": param_name,
+            "operation": "remove",
+            "index": instance_index,
+            "old_count": old_count,
+            "new_count": old_count - 1,
+            "is_multiparm": True,
+        }
+        return True, f"已删除 {param_name}[{instance_index}] 实例", snapshot
+
+    def create_object_merges_batch(self, parent_path: str, source_paths: List[str]
+                                   ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """在目标 SOP 网络中为每个来源创建一个使用相对路径的 Object Merge。"""
+        if hou is None:
+            return False, "未检测到 Houdini API", None
+        if not source_paths:
+            return False, "source_paths 不能为空", None
+        if len(source_paths) > 25:
+            return False, "Object Merge 数量超过上限 25", None
+        if hou.node(parent_path) is None:
+            return False, f"未找到目标网络: {parent_path}", None
+
+        nodes = []
+        for index, source_path in enumerate(source_paths, start=1):
+            if hou.node(source_path) is None:
+                return False, f"未找到来源节点: {source_path}", None
+            relative_path = hou.text.relpath(source_path, parent_path)
+            if not relative_path:
+                return False, f"无法计算来源节点相对路径: {source_path}", None
+            nodes.append({
+                "id": f"object_merge_{index}",
+                "type": "object_merge",
+                "parameters": {"objpath1": relative_path},
+            })
+
+        plan = {
+            "parent_path": parent_path,
+            "dry_run": False,
+            "connections": [],
+            "nodes": nodes,
+        }
+        ok, message = self.create_network(plan)
+        if not ok:
+            return False, message, None
+        return True, message, {
+            "parent_path": parent_path,
+            "source_paths": list(source_paths),
+            "created_count": len(nodes),
+            "operation": "create_object_merges_batch",
+        }
     
     def set_parameter(self, node_path: str, param_name: str, value: Any) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """设置节点参数（设置前自动快照旧值，支持撤销）
@@ -3883,6 +4074,23 @@ class HoudiniMCP:
         return True, (
             f"已为 {node_path} {param_name} 设置{lang_key or 'hscript'}表达式: {expression}"
         ), snapshot
+
+    def set_parameter_reference(self, target_node_path: str, target_param_name: str,
+                                source_node_path: str, source_param_name: str
+                                ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """将目标标量参数设为指向来源标量参数的相对 HScript 引用。"""
+        if '"' in source_param_name:
+            return False, "source_param_name 包含不允许的字符", None
+        source_parm_path = f"{source_node_path.rstrip('/')}/{source_param_name}"
+        expression_path = hou.text.relpath(source_parm_path, target_node_path) if hou is not None else ""
+        if not expression_path:
+            return False, "无法计算参数相对路径", None
+        return self.set_parameter_expression(
+            target_node_path,
+            target_param_name,
+            f'ch("{expression_path}")',
+            "hscript",
+        )
 
     # ========================================
     # 节点删除
@@ -4539,6 +4747,84 @@ class HoudiniMCP:
             }
         return {"success": False, "error": str(data.get("error", "获取参数 schema 失败"))}
 
+    def _tool_find_parameter_references(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_path = str(args.get("node_path", ""))
+        param_name = str(args.get("param_name", ""))
+        if not node_path or not param_name:
+            return {"success": False, "error": "缺少 node_path 或 param_name 参数"}
+        result = self.find_parameter_references(node_path, param_name)
+        if result.get("success"):
+            result["result"] = result["data"]
+        return result
+
+    def _tool_list_multiparm_instances(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_path = str(args.get("node_path", ""))
+        param_name = str(args.get("param_name", ""))
+        if not node_path or not param_name:
+            return {"success": False, "error": "缺少 node_path 或 param_name 参数"}
+        result = self.list_multiparm_instances(node_path, param_name)
+        if result.get("success"):
+            result["result"] = result["data"]
+        return result
+
+    def _tool_insert_multiparm_instance(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_path = str(args.get("node_path", ""))
+        param_name = str(args.get("param_name", ""))
+        if not node_path or not param_name or "index" not in args:
+            return {"success": False, "error": "缺少 node_path、param_name 或 index 参数"}
+        ok, msg, snapshot = self.insert_multiparm_instance(
+            node_path, param_name, args.get("index")
+        )
+        result = {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
+        if ok and snapshot:
+            result["_undo_snapshot"] = snapshot
+        return result
+
+    def _tool_remove_multiparm_instance(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_path = str(args.get("node_path", ""))
+        param_name = str(args.get("param_name", ""))
+        if not node_path or not param_name or "index" not in args:
+            return {"success": False, "error": "缺少 node_path、param_name 或 index 参数"}
+        ok, msg, snapshot = self.remove_multiparm_instance(
+            node_path, param_name, args.get("index")
+        )
+        result = {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
+        if ok and snapshot:
+            result["_undo_snapshot"] = snapshot
+        return result
+
+    def _tool_create_object_merges_batch(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        parent_path = str(args.get("parent_path", ""))
+        source_paths = args.get("source_paths", [])
+        if not parent_path or not isinstance(source_paths, list) or not source_paths:
+            return {"success": False, "error": "缺少 parent_path 或 source_paths 参数"}
+        ok, msg, snapshot = self.create_object_merges_batch(
+            parent_path, [str(path) for path in source_paths]
+        )
+        result = {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
+        if ok and snapshot:
+            result["verification"] = {
+                "status": "applied_unknown",
+                "parent_path": parent_path,
+                "expected_node_count": snapshot["created_count"],
+            }
+            result["_undo_snapshot"] = snapshot
+        return result
+
+    def _tool_build_pdg_expression(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        from houdini_agent.utils.pdg_inspection import build_pdg_expression
+
+        result = build_pdg_expression(
+            kind=str(args.get("kind", "")),
+            name=str(args.get("name", "")),
+            value_type=str(args.get("value_type", "string")),
+            index=int(args.get("index", 0) or 0),
+            syntax=str(args.get("syntax", "hscript")),
+        )
+        if result.get("success"):
+            result["result"] = result["data"]["expression"]
+        return result
+
     def _tool_get_node_card(self, args: Dict[str, Any]) -> Dict[str, Any]:
         node_type = args.get("node_type", "")
         if not node_type:
@@ -4617,6 +4903,25 @@ class HoudiniMCP:
         result = {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
         if ok and snapshot:
             result["_undo_snapshot"] = snapshot  # 供 UI 撤销使用，不会发给 AI
+        return result
+
+    def _tool_set_parameter_reference(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        required = (
+            "target_node_path", "target_param_name",
+            "source_node_path", "source_param_name",
+        )
+        missing = [name for name in required if not args.get(name)]
+        if missing:
+            return {"success": False, "error": f"缺少必要参数: {', '.join(missing)}"}
+        ok, msg, snapshot = self.set_parameter_reference(
+            str(args["target_node_path"]),
+            str(args["target_param_name"]),
+            str(args["source_node_path"]),
+            str(args["source_param_name"]),
+        )
+        result = {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
+        if ok and snapshot:
+            result["_undo_snapshot"] = snapshot
         return result
 
     def _tool_create_node(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -4806,7 +5111,7 @@ class HoudiniMCP:
         """Dry-run 预览布局：返回当前位置和计划位置，不实际移动节点。"""
         if hou is None:
             return False, {"error": "未检测到 Houdini API"}
-        from .hou_core import _layout_columns, _compute_tidy_layout
+        from .hou_core import plan_node_layout, snapshot_node_layout
         parent = hou.node(parent_path) if parent_path else self._current_network()
         if parent is None:
             return False, {"error": "未找到目标网络"}
@@ -4816,6 +5121,8 @@ class HoudiniMCP:
             nodes = list(parent.children())
         if not nodes:
             return False, {"error": "没有可布局的节点"}
+        if method == "native" or (method == "auto" and not node_paths):
+            return False, {"error": "Houdini 原生布局无法在不移动节点时精确预览，请使用 tidy 或 grid"}
 
         # 当前位置快照
         before = {}
@@ -4824,23 +5131,11 @@ class HoudiniMCP:
             before[n.path()] = {"name": n.name(), "x": round(float(pos[0]), 3), "y": round(float(pos[1]), 3)}
 
         # 计算目标位置（纯 Python，不移动节点）
-        node_ids = [n.path() for n in nodes]
-        node_set = set(node_ids)
-        edges = []
-        original_positions = {}
-        for n in nodes:
-            try:
-                pos = n.position()
-                original_positions[n.path()] = (float(pos[0]), float(pos[1]))
-            except Exception:
-                original_positions[n.path()] = (0.0, 0.0)
-            try:
-                for idx, inp in enumerate(n.inputs() or []):
-                    if inp is not None and inp.path() in node_set:
-                        edges.append((inp.path(), n.path(), idx))
-            except Exception:
-                pass
-        planned = _compute_tidy_layout(node_ids, edges, spacing=spacing, original_positions=original_positions)
+        node_ids, edges, original_positions = snapshot_node_layout(nodes)
+        plan = plan_node_layout(
+            node_ids, edges, original_positions, method=method, spacing=spacing,
+        )
+        planned = plan["positions"]
 
         after = {}
         for n in nodes:
@@ -4877,6 +5172,8 @@ class HoudiniMCP:
             "spacing": spacing,
             "moves": moves,
             "overlap_warnings": overlap_warnings,
+            "metrics_before": plan["metrics_before"],
+            "metrics_after": plan["metrics_after"],
             "will_move_count": sum(1 for m in moves if m["delta"]["dx"] != 0 or m["delta"]["dy"] != 0),
         }
 
@@ -5720,14 +6017,36 @@ class HoudiniMCP:
                 lines.append(f"(共 {len(positions)} 个节点，仅显示前 10 个)")
                 for p in positions[:10]:
                     lines.append(f"  {p['path']}: ({p['x']}, {p['y']})")
+            actual_positions = []
+            mismatched_paths = []
+            for expected in positions or []:
+                path = expected.get("path", "")
+                node = hou.node(path) if hou is not None and path else None
+                try:
+                    actual = node.position() if node is not None else None
+                    actual_x = round(float(actual[0]), 3)
+                    actual_y = round(float(actual[1]), 3)
+                    actual_positions.append({"path": path, "x": actual_x, "y": actual_y})
+                    if (
+                        abs(actual_x - float(expected.get("x", 0.0))) > 0.001
+                        or abs(actual_y - float(expected.get("y", 0.0))) > 0.001
+                    ):
+                        mismatched_paths.append(path)
+                except Exception:
+                    mismatched_paths.append(path)
             return {
                 "success": True,
                 "result": "\n".join(lines),
                 "verification": {
-                    "status": "verified" if positions else "applied_unknown",
+                    "status": (
+                        "verified" if positions and not mismatched_paths
+                        else "applied_unknown"
+                    ),
                     "network_path": parent_path,
                     "node_count": len(positions or []),
                     "positions": list(positions or [])[:50],
+                    "actual_positions": actual_positions[:50],
+                    "mismatched_paths": mismatched_paths[:50],
                 },
             }
         return {"success": False, "error": msg}
@@ -5816,6 +6135,41 @@ class HoudiniMCP:
         with _SuspendHoudiniUIRedraw():
             ok, msg = hou_core.add_nodes_to_box(parent_path, box_name, node_paths, auto_fit)
         return {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
+
+    def _tool_set_network_box_comment(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """原地修改已有 NetworkBox 的注释。"""
+        from . import hou_core
+
+        parent_path = args.get("parent_path", "")
+        if not parent_path:
+            net = self._current_network()
+            if net is None:
+                return {"success": False, "error": "未找到当前网络，请指定 parent_path"}
+            parent_path = net.path()
+        box_name = args.get("box_name", "")
+        if not box_name:
+            return {"success": False, "error": "缺少 box_name 参数"}
+        if "comment" not in args or not isinstance(args["comment"], str):
+            return {"success": False, "error": "缺少有效的 comment 参数"}
+
+        with _SuspendHoudiniUIRedraw():
+            ok, msg, details = hou_core.set_network_box_comment(
+                parent_path, box_name, args["comment"]
+            )
+        if not ok:
+            return {"success": False, "error": msg}
+        details = details or {}
+        return {
+            "success": True,
+            "result": msg,
+            "verification": {
+                "status": "verified",
+                "parent_path": parent_path,
+                "box_name": details.get("box_name", box_name),
+                "old_comment": details.get("old_comment", ""),
+                "actual_comment": details.get("new_comment", ""),
+            },
+        }
 
     def _tool_list_network_boxes(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """列出网络中所有 NetworkBox 及其内容"""
@@ -6318,6 +6672,7 @@ class HoudiniMCP:
         # NetworkBox
         "create_network_box": 'create_network_box(parent_path="/obj/geo1", name="input_stage", comment="数据输入", color_preset="input", node_paths=["/obj/geo1/box1"])',
         "add_nodes_to_box": 'add_nodes_to_box(parent_path="/obj/geo1", box_name="input_stage", node_paths=["/obj/geo1/box1"])',
+        "set_network_box_comment": 'set_network_box_comment(parent_path="/obj/geo1", box_name="input_stage", comment="数据输入与预处理")',
         "list_network_boxes": 'list_network_boxes(parent_path="/obj/geo1")',
         # PerfMon 性能分析
         "perf_start_profile": 'perf_start_profile(title="Cook Analysis", force_cook_node="/obj/geo1/output0")',
@@ -6330,10 +6685,16 @@ class HoudiniMCP:
         "get_network_structure": "_tool_get_network_structure",
         "get_node_parameters": "_tool_get_node_parameters",
         "get_parameter_schema": "_tool_get_parameter_schema",
+        "find_parameter_references": "_tool_find_parameter_references",
+        "list_multiparm_instances": "_tool_list_multiparm_instances",
+        "insert_multiparm_instance": "_tool_insert_multiparm_instance",
+        "remove_multiparm_instance": "_tool_remove_multiparm_instance",
+        "create_object_merges_batch": "_tool_create_object_merges_batch",
         "get_node_card": "_tool_get_node_card",
         "inspect_node": "_tool_inspect_node",
         "set_node_parameter": "_tool_set_node_parameter",
         "set_parameter_expression": "_tool_set_parameter_expression",
+        "set_parameter_reference": "_tool_set_parameter_reference",
         "create_node": "_tool_create_node",
         "create_nodes_batch": "_tool_create_nodes_batch",
         "connect_nodes": "_tool_connect_nodes",
@@ -6359,6 +6720,7 @@ class HoudiniMCP:
         "get_top_network_status": "_tool_get_top_network_status",
         "list_top_work_items": "_tool_list_top_work_items",
         "get_top_errors": "_tool_get_top_errors",
+        "build_pdg_expression": "_tool_build_pdg_expression",
         "temporary_auto_validate_geometry": "_tool_temporary_auto_validate_geometry",
         "set_update_mode": "_tool_set_update_mode",
         "get_scene_snapshot": "_tool_get_scene_snapshot",
@@ -6386,6 +6748,7 @@ class HoudiniMCP:
         # NetworkBox
         "create_network_box": "_tool_create_network_box",
         "add_nodes_to_box": "_tool_add_nodes_to_box",
+        "set_network_box_comment": "_tool_set_network_box_comment",
         "list_network_boxes": "_tool_list_network_boxes",
         # PerfMon 性能分析
         "perf_start_profile": "_tool_perf_start_profile",
@@ -6738,7 +7101,7 @@ class HoudiniMCP:
             )
 
             if total_found == 0:
-                return {
+                payload = {
                     "success": True,
                     "count": 0,
                     "memories": [],
@@ -6747,6 +7110,8 @@ class HoudiniMCP:
                         f"（semantic={sem_total}, episodic={epi_total}, procedural={proc_total}）"
                     ),
                 }
+                payload["result"] = json.dumps(payload, ensure_ascii=False, indent=2)
+                return payload
 
             # 更新激活计数
             for rec, _ in sem_results:
@@ -6755,7 +7120,7 @@ class HoudiniMCP:
                 except Exception:
                     pass
 
-            return {
+            payload = {
                 "success": True,
                 "count": total_found,
                 "query": query,
@@ -6769,6 +7134,8 @@ class HoudiniMCP:
                 "episodic_count": len(episodic_memories),
                 "procedural_count": len(procedural_memories),
             }
+            payload["result"] = json.dumps(payload, ensure_ascii=False, indent=2)
+            return payload
 
         except Exception as e:
             return {"success": False, "error": f"记忆搜索失败: {str(e)}"}

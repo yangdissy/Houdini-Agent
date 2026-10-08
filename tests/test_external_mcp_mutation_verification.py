@@ -38,6 +38,9 @@ class _Node:
     def children(self):
         return tuple(getattr(self, "_children", ()))
 
+    def position(self):
+        return getattr(self, "_position", (0.0, 0.0))
+
 
 class ExternalMCPMutationVerificationTest(unittest.TestCase):
     def test_create_nodes_batch_enforces_hard_limits_before_mutation(self):
@@ -162,6 +165,29 @@ class ExternalMCPMutationVerificationTest(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["verification"]["status"], "applied_unknown")
+
+    def test_layout_nodes_verification_reads_back_actual_positions(self):
+        client = object.__new__(HoudiniMCP)
+        node = _Node("/obj/project/source")
+        node._position = (9.0, 9.0)
+        parent = _Node("/obj/project")
+        hou = type("Hou", (), {"node": staticmethod(lambda path: {
+            parent.path(): parent, node.path(): node,
+        }.get(path))})()
+
+        with patch("houdini_agent.utils.mcp.client.hou", hou), patch(
+            "houdini_agent.utils.mcp.hou_core.layout_nodes",
+            return_value=(True, "ok", [{
+                "name": "source", "path": node.path(), "x": 1.0, "y": 2.0,
+            }]),
+        ):
+            result = HoudiniMCP._tool_layout_nodes(client, {
+                "network_path": parent.path(), "node_paths": [node.path()],
+            })
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["verification"]["status"], "applied_unknown")
+        self.assertEqual(result["verification"]["mismatched_paths"], [node.path()])
 
 
 if __name__ == "__main__":

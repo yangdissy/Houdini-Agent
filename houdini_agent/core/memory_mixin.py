@@ -19,6 +19,7 @@ MemoryMixin — 长期记忆系统相关方法
 import threading
 
 from ..utils.memory_store import get_memory_store
+from ..utils.token_optimizer import message_content_text
 from ..utils.reward_engine import get_reward_engine
 from ..utils.reflection import get_reflection_module
 from ..utils.growth_tracker import get_growth_tracker, TaskMetric
@@ -67,6 +68,37 @@ class MemoryMixin:
         except Exception:
             pass
 
+    def _build_memory_query(self, user_message: str, scene_context: dict = None) -> str:
+        """构建当前请求的召回查询，并补充上一条用户目标。"""
+        query_parts = [user_message]
+        for message in reversed(getattr(self, '_conversation_history', []) or []):
+            if message.get('role') != 'user':
+                continue
+            previous_goal = message_content_text(message.get('content')).strip()
+            if previous_goal and previous_goal != user_message.strip():
+                query_parts.append(previous_goal[:300])
+                break
+
+        if scene_context:
+            selected_types = scene_context.get('selected_types', [])
+            if selected_types:
+                query_parts.append(' '.join(selected_types))
+        return '\n'.join(part for part in query_parts if part)
+
+    def _reinforce_pending_memories(self, reward: float):
+        """仅在任务获得正向结果后强化本轮实际召回的个人记忆。"""
+        pending = getattr(self, '_pending_memory_reinforcement', None)
+        self._pending_memory_reinforcement = None
+        if reward <= 0 or not pending or not self._memory_store:
+            return
+
+        for record_id in pending.get('semantic_ids', []):
+            self._memory_store.increment_semantic_activation(record_id)
+        for record_id, importance in pending.get('episodic', []):
+            self._memory_store.update_episodic_importance(
+                record_id, min(5.0, importance * 1.05)
+            )
+
     def _activate_long_term_memory(self, user_message: str, scene_context: dict = None) -> str:
         """动态记忆激活 — 分层 chunk 检索
 
@@ -84,18 +116,14 @@ class MemoryMixin:
         远低于 sentence-transformers 的 0~1.0。threshold 会在 search_by_level 内部
         自动缩放以适配不同后端。Episodic / Procedural 的 score 阈值也需同样处理。
         """
+        self._pending_memory_reinforcement = None
         if not self._memory_initialized or not self._memory_store:
             return ""
 
         try:
             store = self._memory_store
 
-            # 构建查询（用户消息 + 场景关键词）
-            query = user_message
-            if scene_context:
-                selected_types = scene_context.get('selected_types', [])
-                if selected_types:
-                    query += ' ' + ' '.join(selected_types)
+            query = self._build_memory_query(user_message, scene_context)
 
             # ★ fallback 模式下 cosine similarity 值域很低，缩放 score 阈值
             _is_semantic = store.embedder.is_semantic
@@ -175,17 +203,41 @@ class MemoryMixin:
                         source=strat,
                     ))
 
+            # ── Team Memory: 团队共享经验（只读，按相关性自动激活） ──
+            try:
+                from ..utils.team_memory_store import get_team_memory_store
+                team_store = get_team_memory_store()
+                for rec, score in team_store.search_semantic(query=query, top_k=3):
+                    if score < _ep_threshold:
+                        continue
+                    contributors = ", ".join(rec.source_users)
+                    candidates.append(MemoryActivationCandidate(
+                        kind="team_semantic",
+                        text=(
+                            f"[Team Memory] (conf={rec.confidence:.2f}, by={contributors}) "
+                            f"{rec.rule[:120]}"
+                        ),
+                        score=score,
+                        priority=0.95,
+                        confidence=rec.confidence,
+                        record_id=rec.id,
+                        source=rec,
+                    ))
+            except Exception as e:
+                print(f"[Memory] 团队记忆自动激活跳过 (非致命): {e}")
+
             selected = MemoryActivationSelector(max_chars=900).select(candidates)
 
-            for item in selected:
-                if item.kind == "semantic" and item.record_id:
-                    store.increment_semantic_activation(item.record_id)
-                elif item.kind == "episodic" and item.source:
-                    try:
-                        new_imp = min(5.0, item.source.importance * 1.05)
-                        store.update_episodic_importance(item.record_id, new_imp)
-                    except Exception:
-                        pass
+            self._pending_memory_reinforcement = {
+                "semantic_ids": [
+                    item.record_id for item in selected
+                    if item.kind == "semantic" and item.record_id
+                ],
+                "episodic": [
+                    (item.record_id, item.source.importance) for item in selected
+                    if item.kind == "episodic" and item.record_id and item.source
+                ],
+            }
 
             if not selected:
                 return ""
@@ -307,6 +359,7 @@ class MemoryMixin:
                 model=agent_params.get('model', 'deepseek-v4-flash'),
                 provider=agent_params.get('provider', 'deepseek'),
             )
+            self._reinforce_pending_memories(reflect_result.get('reward', 0.0))
 
             # 更新 Growth Tracker
             if self._growth_tracker:
