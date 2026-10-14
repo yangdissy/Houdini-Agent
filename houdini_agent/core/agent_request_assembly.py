@@ -31,6 +31,11 @@ class AgentRequest:
     budget_result: ContextPruneResult
 
 
+def has_prior_completed_turn(history: Sequence[dict]) -> bool:
+    """Return whether history contains an assistant response before the current turn."""
+    return any(message.get('role') == 'assistant' for message in history)
+
+
 def normalize_history(
     history: Sequence[dict],
     supports_vision: bool,

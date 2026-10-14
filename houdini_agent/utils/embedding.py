@@ -2,11 +2,11 @@
 """
 本地 Embedding 封装模块
 
-使用 sentence-transformers 的 all-MiniLM-L6-v2 模型生成文本向量。
+使用 sentence-transformers 的 paraphrase-multilingual-MiniLM-L12-v2 模型生成文本向量。
 优先使用 ONNX Runtime 推理（轻量），回退到 PyTorch。
 支持批量编码、缓存、以及无模型时的 fallback（TF-IDF 风格哈希向量）。
 
-向量维度: 384 (all-MiniLM-L6-v2)
+向量维度: 384 (paraphrase-multilingual-MiniLM-L12-v2)
 """
 
 import os
@@ -21,7 +21,7 @@ from typing import List, Optional, Tuple, Union
 # ============================================================
 
 # 默认模型名（HuggingFace hub）
-DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 # 向量维度
 EMBEDDING_DIM = 384
 # 模型缓存目录
@@ -41,7 +41,12 @@ class LocalEmbedder:
     2. 纯 fallback: 基于字符 n-gram 的伪向量 (零依赖，质量有限但可用)
     """
 
-    def __init__(self, model_name: str = DEFAULT_MODEL, cache_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        model_name: str = DEFAULT_MODEL,
+        cache_dir: Optional[Path] = None,
+        load_semantic_model: bool = True,
+    ):
         self.model_name = model_name
         self.cache_dir = cache_dir or _MODEL_CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -51,7 +56,10 @@ class LocalEmbedder:
         self._encode_cache = {}  # 小型内存缓存: hash -> vector
         self._max_cache = 2000
 
-        self._try_load_model()
+        if load_semantic_model:
+            self._try_load_model()
+        else:
+            self._backend = "fallback"
 
     # ==========================================================
     # 模型加载
@@ -62,13 +70,15 @@ class LocalEmbedder:
         # 1. sentence-transformers
         try:
             from sentence_transformers import SentenceTransformer
+            local_model_dir = self.cache_dir / self.model_name.rsplit("/", 1)[-1]
+            model_source = str(local_model_dir) if local_model_dir.is_dir() else self.model_name
             self._model = SentenceTransformer(
-                self.model_name,
+                model_source,
                 cache_folder=str(self.cache_dir),
             )
             self._backend = "sentence-transformers"
             self.dim = self._model.get_sentence_embedding_dimension()
-            print(f"[Embedding] 加载成功: {self.model_name} (dim={self.dim}, backend=sentence-transformers)")
+            print(f"[Embedding] 加载成功: {model_source} (dim={self.dim}, backend=sentence-transformers)")
             return
         except ImportError:
             print("[Embedding] sentence-transformers 未安装")
@@ -258,6 +268,9 @@ class LocalEmbedder:
         "加载": ("load", "import", "read"),
         "缓存": ("cache", "caching"),
         "烘焙": ("bake", "baking"),
+        "性能": ("performance", "slow", "profile", "profiling"),
+        "拖慢": ("slow", "performance", "bottleneck"),
+        "运算": ("cook", "cooking", "compute", "performance"),
         "循环": ("loop", "foreach", "for_each", "iterate"),
         "随机": ("random", "rand", "stochastic"),
         "噪声": ("noise", "noises", "random"),

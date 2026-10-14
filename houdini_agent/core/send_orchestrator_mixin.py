@@ -18,6 +18,7 @@ from houdini_agent.utils.token_optimizer import (
 from houdini_agent.core.agent_request_assembly import (
     build_context,
     finalize_context_request,
+    has_prior_completed_turn,
     normalize_history,
 )
 from houdini_agent.utils.plan_manager import (
@@ -212,10 +213,7 @@ class SendOrchestratorMixin:
             # 1. 系统提示词（根据思考模式和轮次选择版本）
             # 对话已有历史（续接轮）→ 用核心规则子集，节省 ~2000 tokens/轮，提升 cache 命中率
             # 首轮（无历史或全是 system 消息）→ 用完整规则，确保 AI 掌握所有约束
-            _has_prior_history = bool(
-                self._conversation_history
-                and any(m.get('role') != 'system' for m in self._conversation_history)
-            )
+            _has_prior_history = has_prior_completed_turn(self._conversation_history)
             if _has_prior_history:
                 sys_prompt = (
                     self._cached_prompt_core_think

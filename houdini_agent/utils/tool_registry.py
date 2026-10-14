@@ -86,6 +86,7 @@ _ASK_TOOLS = frozenset({
     'add_todo', 'update_todo',
     'perf_start_profile', 'perf_stop_and_report',
     'search_memory', 'capture_viewport', 'visual_review', 'preview_layout_nodes',
+    'get_operation_status', 'list_operation_receipts',
 })
 
 # Plan 规划阶段白名单
@@ -103,6 +104,7 @@ _PLAN_PLANNING_TOOLS = frozenset({
     'add_todo', 'update_todo',
     'perf_start_profile', 'perf_stop_and_report',
     'search_memory', 'capture_viewport', 'visual_review', 'preview_layout_nodes',
+    'get_operation_status', 'list_operation_receipts',
     'create_plan', 'ask_question',
 })
 
@@ -120,6 +122,7 @@ _READONLY_TOOLS = frozenset({
     'search_local_doc', 'get_houdini_node_doc', 'list_skills',
     'perf_start_profile', 'perf_stop_and_report',
     'capture_viewport', 'visual_review', 'search_memory', 'preview_layout_nodes',
+    'get_operation_status', 'list_operation_receipts',
 })
 
 _HIGH_RISK_TOOLS = HIGH_RISK_TOOLS
@@ -127,6 +130,7 @@ _CORE_CONFIRM_TOOLS = frozenset(SCENE_MUTATION_TOOLS | HIGH_RISK_TOOLS | {"set_u
 
 _LOCAL_RUNTIME_TOOLS = frozenset({
     "execute_shell", "search_local_doc", "list_skills",
+    "get_operation_status", "list_operation_receipts",
 })
 
 _CONCURRENCY_SAFE_TOOLS = frozenset({
@@ -135,6 +139,8 @@ _CONCURRENCY_SAFE_TOOLS = frozenset({
     'search_local_doc',
     'list_skills',
     'search_memory',
+    'get_operation_status',
+    'list_operation_receipts',
 })
 
 _ASYNC_PREFERRED_TOOLS = frozenset({
@@ -142,6 +148,12 @@ _ASYNC_PREFERRED_TOOLS = frozenset({
     'fetch_webpage',
     'execute_shell',
 })
+
+
+def resolve_tool_runtime(registry, tool_name: str) -> str:
+    """Return the registered runtime, defaulting unknown tools to Houdini."""
+    meta = registry.get_meta(tool_name)
+    return meta.runtime if meta is not None else "houdini"
 
 _EXTERNAL_MCP_VISIBLE_TOOLS = frozenset({
     "create_node",

@@ -1,0 +1,6 @@
+---
+{"name":"setup_dynamics_sim","category":"workflow","description":"Return a node-building BLUEPRINT for a standard SOP-based dynamics simulation: RBD (rigid body), FLIP (liquid), or Vellum (cloth/softbody/grain). Does NOT modify the scene — it returns a recipe (nodes + connections + parameters) that you then build by calling create_nodes_batch (pass the blueprint's 'nodes' and 'connections' directly). Use when the user asks to 'set up RBD/destruction', 'make a FLIP/liquid sim', or 'set up vellum cloth/softbody'. For smoke/fire use setup_pyro_sim instead. After building, the source node's output feeds the first blueprint node.","risk_level":"normal","parameters":{"source_node_path":{"type":"string","description":"Path of the existing SOP node providing the sim geometry (e.g. '/obj/geo1/box1'). Its output feeds the sim source.","required":true},"sim_type":{"type":"string","description":"'rbd', 'flip', or 'vellum'. Selects the solver chain. Required.","required":true},"vellum_mode":{"type":"string","description":"Only for sim_type='vellum': 'cloth', 'softbody', or 'grain'. Default 'cloth'.","required":false,"default":"cloth"}},"entrypoint":"scripts/main.py:run"}
+---
+# Setup Dynamics Sim
+
+按照参数合同执行此 Skill；保持返回结构与既有行为不变。

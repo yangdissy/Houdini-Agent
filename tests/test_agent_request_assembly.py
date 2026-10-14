@@ -6,6 +6,7 @@ from houdini_agent.core.agent_request_assembly import (
     build_context,
     finalize_context_request,
     finalize_tools,
+    has_prior_completed_turn,
     normalize_history,
     normalize_provider_messages,
 )
@@ -19,6 +20,19 @@ def _image(text, url):
 
 
 class AgentRequestAssemblyTest(unittest.TestCase):
+    def test_first_user_message_does_not_count_as_prior_completed_turn(self):
+        self.assertFalse(has_prior_completed_turn([
+            {'role': 'system', 'content': 'scene snapshot'},
+            {'role': 'user', 'content': 'build a box'},
+        ]))
+
+    def test_assistant_response_counts_as_prior_completed_turn(self):
+        self.assertTrue(has_prior_completed_turn([
+            {'role': 'user', 'content': 'first'},
+            {'role': 'assistant', 'content': 'done'},
+            {'role': 'user', 'content': 'second'},
+        ]))
+
     def test_history_strips_old_image_and_keeps_current_vision_image(self):
         current = _image('current', 'current-image')
         result = normalize_history(

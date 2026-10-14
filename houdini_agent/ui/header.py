@@ -99,7 +99,7 @@ class HeaderMixin:
                 'mistralai/mistral-large-2512',
             ],
             'kimi_coding': ['k3', 'k3-256k', 'kimi-for-coding', 'kimi-for-coding-highspeed'],
-            'of3d': ['gpt-5.5', 'chatgpt-4o-latest'],
+            'of3d': ['gpt-5.6', 'chatgpt-4o-latest'],
             'siliconflow': [
                 'deepseek-ai/DeepSeek-V4-Pro',
                 'deepseek-ai/DeepSeek-V4-Flash',
@@ -166,7 +166,7 @@ class HeaderMixin:
             'kimi-for-coding-highspeed': 262144,
             # OF3D
             'chatgpt-4o-latest': 128000,
-            'gpt-5.5': 425000,
+            'gpt-5.6': 425000,
             # SiliconFlow
             'deepseek-ai/DeepSeek-V4-Pro': 1048576,
             'deepseek-ai/DeepSeek-V4-Flash': 1048576,
@@ -234,7 +234,7 @@ class HeaderMixin:
             'kimi-for-coding-highspeed':          {'supports_prompt_caching': True, 'supports_vision': False},
             # OF3D
             'chatgpt-4o-latest':                  {'supports_prompt_caching': False, 'supports_vision': True},
-            'gpt-5.5':                            {'supports_prompt_caching': False, 'supports_vision': True},
+            'gpt-5.6':                            {'supports_prompt_caching': False, 'supports_vision': True},
             # SiliconFlow
             'deepseek-ai/DeepSeek-V4-Pro':        {'supports_prompt_caching': False, 'supports_vision': False},
             'deepseek-ai/DeepSeek-V4-Flash':      {'supports_prompt_caching': False, 'supports_vision': False},
@@ -492,7 +492,7 @@ class HeaderMixin:
         """打开插件管理面板"""
         try:
             from .cursor_plugin_manager_dialog import PluginManagerDialog
-            dlg = PluginManagerDialog(parent=self)
+            dlg = PluginManagerDialog(parent=self, username=getattr(self, "_username", None))
             dlg.pluginStateChanged.connect(self._on_plugin_state_changed)
             dlg.exec_()
         except Exception as e:

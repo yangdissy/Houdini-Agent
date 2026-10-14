@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -26,7 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from shared.user_paths import get_repo_root
+from shared.user_paths import UserPaths, get_repo_root
 from .embedding import LocalEmbedder, get_embedder
 from .memory_sqlite import (
     embedding_metadata,
@@ -39,6 +40,37 @@ from .team_memory_document import MAX_DIAGNOSTICS, parse_team_export_file
 
 _TEAM_DB_DIR = Path(__file__).parent.parent.parent / "cache" / "memory" / "team"
 _TEAM_DB_PATH = _TEAM_DB_DIR / "team_memory.db"
+
+
+def _user_team_db_path(username: str) -> Path:
+    return UserPaths(username).memory_dir() / "team_memory.db"
+
+
+def _snapshot_version(path: Path) -> Tuple[int, int]:
+    stat = path.stat()
+    return stat.st_size, stat.st_mtime_ns
+
+
+def _sync_local_team_db(shared_path: Path, local_path: Path) -> bool:
+    """Copy a changed shared snapshot locally without replacing a usable old cache on failure."""
+    shared_version = _snapshot_version(shared_path)
+    if local_path.exists():
+        if _snapshot_version(local_path) == shared_version:
+            return False
+
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = local_path.with_name(f".{local_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        shutil.copy2(str(shared_path), str(temp_path))
+        if _snapshot_version(shared_path) != shared_version:
+            raise OSError("Team Memory shared snapshot changed while it was being copied")
+        os.replace(str(temp_path), str(local_path))
+    finally:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+    return True
 
 # 去重相似度阈值：同一 category + 同一 embedding 后端下，相似度达到此值视为重复经验。
 DEDUP_SIMILARITY_THRESHOLD = 0.85
@@ -291,22 +323,43 @@ _team_store_instance: Optional[TeamMemoryStore] = None
 _team_store_lock = threading.RLock()
 
 
-def get_team_memory_store() -> TeamMemoryStore:
+def get_team_memory_store(username: str) -> TeamMemoryStore:
     global _team_store_instance
     with _team_store_lock:
-        if _team_store_instance is None:
-            _team_store_instance = TeamMemoryStore()
+        local_path = _user_team_db_path(username)
+        try:
+            updated = _sync_local_team_db(_TEAM_DB_PATH, local_path)
+        except OSError as exc:
+            if not local_path.exists():
+                raise
+            updated = False
+            print(f"[TeamMemoryStore] 共享快照同步失败，继续使用本地缓存: {exc}")
+        if _team_store_instance is None or updated or _team_store_instance.db_path != local_path:
+            old_store = _team_store_instance
+            _team_store_instance = TeamMemoryStore(db_path=local_path, read_only=True)
+            if old_store is not None:
+                old_store.close()
         return _team_store_instance
 
 
-def _refresh_team_memory_singleton(db_path: Path, embedder: LocalEmbedder) -> None:
+def _refresh_team_memory_singleton(
+    db_path: Path,
+    embedder: LocalEmbedder,
+    username: Optional[str] = None,
+) -> None:
     global _team_store_instance
     if Path(db_path) != _TEAM_DB_PATH:
         return
     with _team_store_lock:
         old_store = _team_store_instance
-        # 运行时只读模式，避免网络盘 WAL 写锁
-        _team_store_instance = TeamMemoryStore(db_path=db_path, embedder=embedder, read_only=True)
+        if username is None:
+            if old_store is not None:
+                old_store.close()
+            _team_store_instance = None
+            return
+        local_path = _user_team_db_path(username)
+        _sync_local_team_db(Path(db_path), local_path)
+        _team_store_instance = TeamMemoryStore(db_path=local_path, embedder=embedder, read_only=True)
         if old_store is not None:
             old_store.close()
 
@@ -497,6 +550,22 @@ def rebuild_team_memory(
 
     if files and valid_documents == 0:
         raise RuntimeError("No valid Team Memory export documents; existing database was preserved")
+
+    current_backend = str(getattr(embedder, "_backend", "unknown"))
+    current_model = str(getattr(embedder, "model_name", "unknown"))
+    current_dimension = int(getattr(embedder, "dim", 0))
+    for item in raw_semantic:
+        item["embedding"] = embedder.encode(item["rule"]).tolist()
+        item["embedding_backend"] = current_backend
+        item["embedding_model"] = current_model
+        item["embedding_dimension"] = current_dimension
+    for item in raw_procedural:
+        item["embedding"] = embedder.encode(
+            f"{item['strategy_name']}: {item['description']}"
+        ).tolist()
+        item["embedding_backend"] = current_backend
+        item["embedding_model"] = current_model
+        item["embedding_dimension"] = current_dimension
 
     merged_semantic = _dedup_semantic(raw_semantic)
     merged_procedural = _dedup_procedural(raw_procedural)

@@ -19,12 +19,15 @@ class ToolExecutionMixin:
             return "plan_planning" if self._plan_phase == "planning" else "plan_executing"
         return "agent" if self._agent_mode else "ask"
 
-    def _authorize_registry_dispatch(self, tool_name: str, runtime: str = "houdini") -> dict:
+    def _authorize_registry_dispatch(self, tool_name: str, runtime: str = None) -> dict:
         if tool_name == "scene_info":
             return {"allowed": True}
         try:
-            from ..utils.tool_registry import get_tool_registry
-            return get_tool_registry().authorize_dispatch(
+            from ..utils.tool_registry import get_tool_registry, resolve_tool_runtime
+            registry = get_tool_registry()
+            if runtime is None:
+                runtime = resolve_tool_runtime(registry, tool_name)
+            return registry.authorize_dispatch(
                 tool_name, self._registry_execution_mode(), runtime
             )
         except Exception as exc:
@@ -70,18 +73,13 @@ class ToolExecutionMixin:
         except Exception:
             return ""
         mode_rule = (
-            "4. 不要擅自持久切 Auto；set_update_mode 必须由用户明确要求并确认，临时目标验证可以直接执行。"
-            if confirm_mode
-            else "4. 使用 temporary_auto_validate_geometry(node_path=...) 或 check_errors(node_path=...) 做 scoped 临时 Auto 验证并恢复 Manual；仅用户明确要求持续 Auto 时才调用 set_update_mode。"
+            "本轮未经用户确认，不得持久切换为 Auto。"
+            if confirm_mode else
+            "本轮可直接执行 core guidance 规定的目标范围临时验证。"
         )
         return (
             "[Houdini 状态 — 重要] 当前 hip 文件的更新模式是 **Manual（手动）**，这是用户的持久设置。\n"
-            "含义：创建/修改节点（create_node、set_node_parameter、connect_nodes、"
-            "set_display_flag 等）后，Houdini 不会自动 cook，视口与下游几何不会自动刷新。\n"
-            "你必须遵守：\n"
-            "1. 工具返回 success 只代表操作已排队，绝不能据此宣称「已生效/视口已更新/效果已完成」。\n"
-            "2. 先在 Manual 下完成一组相关修改，不要每次写后切换；批次边界用目标范围临时 Auto 验证，且必须检查 cook/read/restore 状态。Manual 空几何在 freshness 未确认前不能单独当作拓扑或参数错误证据。\n"
-            "3. 若用户期望看到结果，在总结中主动说明「当前为 Manual 模式，需手动 cook 或切回 Auto 才能看到更新」。\n"
+            "当前视口、下游几何和空几何读数可能尚未刷新；在 freshness 未确认前，不能把空几何单独当作拓扑或参数错误证据。\n"
             + mode_rule
         )
 
@@ -335,7 +333,7 @@ class ToolExecutionMixin:
         """Execute a tool after the public harness/policy boundary has run."""
         kwargs = dict(kwargs or {})
 
-        authorization = self._authorize_registry_dispatch(tool_name, "houdini")
+        authorization = self._authorize_registry_dispatch(tool_name)
         if not authorization.get("allowed"):
             return {"success": False, "error": authorization.get("error", "Tool dispatch denied")}
         meta = authorization.get("meta")
@@ -433,6 +431,34 @@ class ToolExecutionMixin:
                 status = kwargs.get("status", "done")
                 self._updateTodo.emit(todo_id, "", status)
                 return {"success": True, "result": f"Updated todo {todo_id} to {status}"}
+
+            elif tool_name == "get_operation_status":
+                operation_id = str(kwargs.get("operation_id") or "").strip()
+                if not operation_id:
+                    return {"success": False, "error": "operation_id is required"}
+                receipt = executor.get_operation_status(operation_id) if executor is not None else None
+                if receipt is None:
+                    session_id = self._agent_session_id or self._session_id
+                    receipt = next((
+                        item for item in self._read_operation_receipts(session_id)
+                        if item.get("operation_id") == operation_id
+                    ), None)
+                return {
+                    "success": receipt is not None,
+                    "result": receipt,
+                    "error": "Operation receipt not found" if receipt is None else "",
+                }
+
+            elif tool_name == "list_operation_receipts":
+                try:
+                    limit = max(1, min(int(kwargs.get("limit", 20)), 100))
+                except (TypeError, ValueError):
+                    return {"success": False, "error": "limit must be an integer from 1 to 100"}
+                receipts = executor.list_operation_receipts(limit=limit) if executor is not None else []
+                if not receipts:
+                    session_id = self._agent_session_id or self._session_id
+                    receipts = self._read_operation_receipts(session_id)[-limit:]
+                return {"success": True, "result": receipts}
             
             # 不依赖 hou 的工具 → 直接在后台线程执行（避免阻塞 UI）
             if meta.runtime == "local":

@@ -43,6 +43,8 @@ class MemoryMixin:
                 self._growth_tracker = get_growth_tracker(self._username)
                 self._memory_initialized = True
                 print(f"[Memory] 长期记忆系统已初始化: {self._memory_store.get_stats()}")
+                if self._memory_store.embedding_diagnostic:
+                    self._memoryMigrationRequired.emit()
                 self._maybe_notify_team_memory_export()
             except Exception as e:
                 print(f"[Memory] 初始化失败 (非致命): {e}")
@@ -50,6 +52,43 @@ class MemoryMixin:
 
         thread = threading.Thread(target=_init, daemon=True)
         thread.start()
+
+    def _on_memory_migration_required(self):
+        """在主线程提示用户迁移旧向量，稍后选择会在下次启动继续提醒。"""
+        from ..qt_compat import QtWidgets
+
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "记忆向量需要升级",
+            "检测到记忆库仍使用旧的 fallback 向量，因此语义搜索已暂停。\n\n"
+            "是否现在使用本地 paraphrase-multilingual-MiniLM-L12-v2 重新生成向量？原始记忆不会改变，迁移前会自动备份数据库。",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        def _migrate():
+            try:
+                backup = self._memory_store.migrate_embeddings()
+                self._memoryMigrationFinished.emit(True, str(backup or ""))
+            except Exception as exc:
+                self._memoryMigrationFinished.emit(False, str(exc))
+
+        threading.Thread(target=_migrate, daemon=True).start()
+
+    def _on_memory_migration_finished(self, success: bool, detail: str):
+        """在主线程报告后台向量迁移结果。"""
+        from ..qt_compat import QtWidgets
+
+        if success:
+            QtWidgets.QMessageBox.information(
+                self,
+                "记忆向量升级完成",
+                f"全部记忆已重新生成语义向量，搜索已恢复。\n\n备份文件：\n{detail}",
+            )
+            return
+        QtWidgets.QMessageBox.critical(self, "记忆向量升级失败", detail)
 
     def _maybe_notify_team_memory_export(self):
         """首次初始化记忆系统时，告知一次「团队记忆共享」（默认开启，可关闭）。"""
@@ -206,7 +245,7 @@ class MemoryMixin:
             # ── Team Memory: 团队共享经验（只读，按相关性自动激活） ──
             try:
                 from ..utils.team_memory_store import get_team_memory_store
-                team_store = get_team_memory_store()
+                team_store = get_team_memory_store(self._username)
                 for rec, score in team_store.search_semantic(query=query, top_k=3):
                     if score < _ep_threshold:
                         continue

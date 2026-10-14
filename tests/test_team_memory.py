@@ -203,6 +203,13 @@ class RebuildTeamMemoryTest(unittest.TestCase):
         return result
 
     def test_rebuild_dedupes_similar_entries_and_unions_contributors(self):
+        class DedupEmbedder(FakeEmbedder):
+            def encode(self, text):
+                self.encoded_texts.append(text)
+                if "update mode" in text:
+                    return _vec(1.0, 0.0, 0.0, 0.0)
+                return _vec(0.0, 1.0, 0.0, 0.0)
+
         with TemporaryDirectory() as temp_dir, TemporaryDirectory() as db_dir:
             same_vec = _vec(1.0, 0.0, 0.0, 0.0).tolist()
             different_vec = _vec(0.0, 1.0, 0.0, 0.0).tolist()
@@ -260,6 +267,7 @@ class RebuildTeamMemoryTest(unittest.TestCase):
             path_bob = self._write_export(temp_dir, "bob", payload_bob)
 
             stats = rebuild_team_memory(
+                embedder=DedupEmbedder(),
                 db_path=Path(db_dir) / "team_memory.db",
                 export_files=[("alice", path_alice), ("bob", path_bob)],
             )
@@ -284,6 +292,39 @@ class RebuildTeamMemoryTest(unittest.TestCase):
             self.assertEqual(sorted(all_rules["先检查 update mode 再 cook（更完整表述）"]), ["alice", "bob"])
             self.assertNotIn("低质量条目", all_rules)
             store.close()
+
+    def test_rebuild_reembeds_exports_before_deduplication(self):
+        class TextEmbedder(FakeEmbedder):
+            def encode(self, text):
+                self.encoded_texts.append(text)
+                if text == "first distinct rule":
+                    return _vec(1.0, 0.0, 0.0, 0.0)
+                return _vec(0.0, 1.0, 0.0, 0.0)
+
+        with TemporaryDirectory() as temp_dir, TemporaryDirectory() as db_dir:
+            stale_vector = _vec(1.0, 0.0, 0.0, 0.0).tolist()
+            exports = []
+            for username, rule in (("alice", "first distinct rule"), ("bob", "second distinct rule")):
+                payload = self._v1_payload(username, semantic=[
+                    self._with_provenance({
+                        "rule": rule,
+                        "category": "knowledge",
+                        "abstraction_level": 2,
+                        "confidence": 0.9,
+                        "embedding": stale_vector,
+                        "embedding_backend": "fallback",
+                    }),
+                ])
+                exports.append((username, self._write_export(temp_dir, username, payload)))
+
+            stats = rebuild_team_memory(
+                embedder=TextEmbedder(),
+                db_path=Path(db_dir) / "team_memory.db",
+                export_files=exports,
+            )
+
+            self.assertEqual(stats["semantic_raw"], 2)
+            self.assertEqual(stats["semantic_merged"], 2)
 
     def test_search_semantic_and_procedural_round_trip(self):
         with TemporaryDirectory() as db_dir:
@@ -365,7 +406,7 @@ class RebuildTeamMemoryTest(unittest.TestCase):
 
     def test_rebuild_refreshes_default_singleton(self):
         import houdini_agent.utils.team_memory_store as module
-        with TemporaryDirectory() as export_dir:
+        with TemporaryDirectory() as export_dir, TemporaryDirectory() as local_dir:
             payload = self._v1_payload("alice")
             export_path = self._write_export(export_dir, "alice", payload)
             old_path = module._TEAM_DB_PATH
@@ -374,14 +415,48 @@ class RebuildTeamMemoryTest(unittest.TestCase):
                 module._TEAM_DB_PATH = Path(export_dir) / "live.db"
                 module._team_store_instance = TeamMemoryStore(module._TEAM_DB_PATH, FakeEmbedder())
                 previous = module._team_store_instance
-                rebuild_team_memory(FakeEmbedder(), export_files=[("alice", export_path)])
-                self.assertIsNot(module._team_store_instance, previous)
-                self.assertEqual(module._team_store_instance.db_path, module._TEAM_DB_PATH)
+                with mock.patch.object(module, "_user_team_db_path", return_value=Path(local_dir) / "team.db"):
+                    rebuild_team_memory(FakeEmbedder(), export_files=[("alice", export_path)])
+                self.assertIsNone(module._team_store_instance)
+                self.assertIsNot(previous, module._team_store_instance)
             finally:
                 if module._team_store_instance:
                     module._team_store_instance.close()
                 module._team_store_instance = old_instance
                 module._TEAM_DB_PATH = old_path
+
+    def test_runtime_copies_shared_database_and_refreshes_changed_snapshot(self):
+        import houdini_agent.utils.team_memory_store as module
+        with TemporaryDirectory() as shared_dir, TemporaryDirectory() as local_dir:
+            shared_path = Path(shared_dir) / "team.db"
+            local_path = Path(local_dir) / "team.db"
+            shared_path.write_bytes(b"first")
+            self.assertTrue(module._sync_local_team_db(shared_path, local_path))
+            self.assertEqual(local_path.read_bytes(), b"first")
+            self.assertFalse(module._sync_local_team_db(shared_path, local_path))
+
+            shared_path.write_bytes(b"second-version")
+            self.assertTrue(module._sync_local_team_db(shared_path, local_path))
+            self.assertEqual(local_path.read_bytes(), b"second-version")
+
+    def test_runtime_cache_is_next_to_users_personal_memory_database(self):
+        import houdini_agent.utils.team_memory_store as module
+        with TemporaryDirectory() as repo_root:
+            with mock.patch("shared.user_paths.get_repo_root", return_value=repo_root):
+                expected = Path(repo_root) / "cache" / "users" / "caijingcheng" / "memory" / "team_memory.db"
+                self.assertEqual(module._user_team_db_path("caijingcheng"), expected)
+
+    def test_runtime_keeps_existing_local_snapshot_when_shared_copy_fails(self):
+        import houdini_agent.utils.team_memory_store as module
+        with TemporaryDirectory() as shared_dir, TemporaryDirectory() as local_dir:
+            shared_path = Path(shared_dir) / "team.db"
+            local_path = Path(local_dir) / "team.db"
+            shared_path.write_bytes(b"new")
+            local_path.write_bytes(b"old")
+            with mock.patch("houdini_agent.utils.team_memory_store.shutil.copy2", side_effect=OSError("SMB unavailable")):
+                with self.assertRaises(OSError):
+                    module._sync_local_team_db(shared_path, local_path)
+            self.assertEqual(local_path.read_bytes(), b"old")
 
     def test_parser_keeps_valid_entries_and_reports_invalid_and_ineligible(self):
         with TemporaryDirectory() as export_dir:
@@ -482,6 +557,44 @@ class PersonalMemoryProvenanceTest(unittest.TestCase):
             self.assertIsNone(legacy.embedding_diagnostic)
             self.assertEqual(legacy.get_all_semantic()[0].rule, "text survives")
             legacy.close()
+
+    def test_embedding_migration_backups_are_rotated_safely(self):
+        with TemporaryDirectory() as db_dir:
+            path = Path(db_dir) / "personal.db"
+            store = MemoryStore(path, FakeEmbedder())
+            unrelated = path.with_name(path.name + ".pre-overwrite-backup")
+            unrelated.write_bytes(b"keep")
+            for timestamp in range(1, 6):
+                path.with_name(path.name + f".bak.{timestamp}").write_bytes(b"backup")
+            path.with_name(path.name + ".bak.invalid").write_bytes(b"keep")
+
+            deleted = store.prune_embedding_backups(keep=3)
+
+            self.assertEqual([backup.name for backup in store.list_embedding_backups()], [
+                "personal.db.bak.5", "personal.db.bak.4", "personal.db.bak.3",
+            ])
+            self.assertEqual({backup.name for backup in deleted}, {
+                "personal.db.bak.1", "personal.db.bak.2",
+            })
+            self.assertTrue(unrelated.exists())
+            self.assertTrue(path.with_name(path.name + ".bak.invalid").exists())
+            store.close()
+
+    def test_failed_embedding_migration_keeps_all_recovery_backups(self):
+        with TemporaryDirectory() as db_dir:
+            path = Path(db_dir) / "personal.db"
+            embedder = FakeEmbedder()
+            store = MemoryStore(path, embedder)
+            store.add_semantic(SemanticRecord(rule="cannot migrate", confidence=0.9))
+            for timestamp in range(1, 5):
+                path.with_name(path.name + f".bak.{timestamp}").write_bytes(b"backup")
+
+            with mock.patch.object(embedder, "encode", side_effect=RuntimeError("failed")):
+                with self.assertRaisesRegex(RuntimeError, "failed"):
+                    store.migrate_embeddings()
+
+            self.assertGreaterEqual(len(store.list_embedding_backups()), 5)
+            store.close()
 
 
 if __name__ == "__main__":

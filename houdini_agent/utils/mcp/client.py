@@ -36,6 +36,32 @@ def compare_capture_fingerprints(before: Dict[str, Any], after: Dict[str, Any]) 
     return {"status": "comparable", "reason": "matching_camera_view"}
 
 
+def format_tool_usage_from_schema(schema: Dict[str, Any]) -> str:
+    """Render a compact call signature using only the provider tool schema."""
+    function = schema.get("function", {})
+    name = function.get("name", "")
+    parameters = function.get("parameters", {})
+    properties = parameters.get("properties", {})
+    required = set(parameters.get("required", []))
+    arguments = []
+    for parameter_name, definition in properties.items():
+        if "default" in definition:
+            value = repr(definition["default"])
+        elif definition.get("enum"):
+            value = repr(definition["enum"][0])
+        else:
+            value = {
+                "array": "[]",
+                "boolean": "true",
+                "integer": "1",
+                "number": "1.0",
+                "object": "{}",
+            }.get(definition.get("type"), '"..."')
+        suffix = "" if parameter_name in required else " (optional)"
+        arguments.append(f"{parameter_name}={value}{suffix}")
+    return f"{name}({', '.join(arguments)})" if name else ""
+
+
 # ============================================================
 # 文档检索功能已移除，请使用 web_search 查询官方文档
 # ============================================================
@@ -171,6 +197,8 @@ class HoudiniMCP:
     # 类级别缓存（跨实例共享，只加载一次）
     _node_types_cache: Optional[Dict[str, List[str]]] = None  # {category: [type_names]}
     _node_types_cache_time: float = 0  # 缓存时间
+    _node_types_embedding_cache = None
+    _node_types_embedding_key = None
     _common_node_inputs_cache: Dict[str, str] = {}  # 常见节点输入信息缓存
     _ats_cache: Dict[str, Dict[str, Any]] = {}  # ATS缓存: {node_type_key: ats_data}
 
@@ -190,6 +218,8 @@ class HoudiniMCP:
 
     def set_user(self, username: str):
         self._username = username
+        from ...skills import set_current_user
+        set_current_user(username)
 
     def set_stop_event(self, event):
         """设置停止事件（从 AIClient 传入，用于检测用户中断）
@@ -1316,6 +1346,8 @@ class HoudiniMCP:
             
             HoudiniMCP._node_types_cache = index
             HoudiniMCP._node_types_cache_time = _time.time()
+            HoudiniMCP._node_types_embedding_cache = None
+            HoudiniMCP._node_types_embedding_key = None
         except Exception:
             pass
         
@@ -1359,12 +1391,11 @@ class HoudiniMCP:
         return True, "\n".join(matches)
 
     def semantic_search_nodes(self, description: str, category: str = "sop") -> Tuple[bool, str]:
-        """语义搜索节点 - 通过自然语言描述找到合适的节点
-        
-        内置常用节点的语义映射
-        """
+        """通过多语言语义与精确关键词混合排序查找节点类型。"""
         if hou is None:
             return False, "未检测到 Houdini API"
+        if not description or not description.strip():
+            return False, "请输入功能描述"
         
         # 语义映射表：描述关键词 -> 节点类型
         # 格式: "关键词": ["节点1", "节点2", ...]
@@ -1432,7 +1463,6 @@ class HoudiniMCP:
         }
         
         desc_lower = description.lower()
-        results = []
         scores = {}
         
         # 匹配语义映射
@@ -1443,32 +1473,54 @@ class HoudiniMCP:
                         scores[node] = 0
                     scores[node] += 1
         
-        # 获取匹配的节点详情
         cat_filter = category.lower() if category != "all" else None
-        
-        for node_name in sorted(scores.keys(), key=lambda x: -scores[x])[:10]:
-            for cat_name, cat in hou.nodeTypeCategories().items():
-                if cat_filter and cat_name.lower() != cat_filter:
-                    continue
-                for type_name, node_type in cat.nodeTypes().items():
-                    if node_name in type_name.lower():
-                        desc = node_type.description()
-                        results.append(f"- `{cat_name.lower()}/{type_name}` — {desc}")
-                        break
-        
-        # 如果语义匹配没找到，尝试直接关键词搜索
-        if not results:
-            for cat_name, cat in hou.nodeTypeCategories().items():
-                if cat_filter and cat_name.lower() != cat_filter:
-                    continue
-                for type_name, node_type in cat.nodeTypes().items():
-                    desc = node_type.description().lower()
-                    if any(w in desc or w in type_name.lower() for w in desc_lower.split()):
-                        results.append(f"- `{cat_name.lower()}/{type_name}` — {node_type.description()}")
-                        if len(results) >= 10:
-                            break
-                if len(results) >= 10:
-                    break
+
+        entries = []
+        for cat_name, types in self._get_node_types_index().items():
+            if cat_filter and cat_name != cat_filter:
+                continue
+            entries.extend((cat_name, type_name, desc, full_path)
+                           for type_name, desc, full_path in types)
+
+        ranked = []
+        try:
+            from ..embedding import get_embedder
+            embedder = get_embedder()
+            if embedder.is_semantic and entries:
+                cache_key = tuple((entry[3], entry[2]) for entry in entries)
+                if HoudiniMCP._node_types_embedding_key != cache_key:
+                    texts = [f"{full_path}: {desc}" for _, _, desc, full_path in entries]
+                    HoudiniMCP._node_types_embedding_cache = embedder.encode_batch(texts)
+                    HoudiniMCP._node_types_embedding_key = cache_key
+                query_vector = embedder.encode(description)
+                semantic_scores = embedder.batch_cosine_similarity(
+                    query_vector, HoudiniMCP._node_types_embedding_cache
+                )
+                for index, entry in enumerate(entries):
+                    _, type_name, desc, _ = entry
+                    lexical_bonus = float(scores.get(type_name.lower(), 0)) * 0.20
+                    exact_bonus = 0.35 if type_name.lower() in desc_lower else 0.0
+                    ranked.append((float(semantic_scores[index]) + lexical_bonus + exact_bonus, entry))
+        except Exception as exc:
+            print(f"[Node Search] 语义排序失败，回退关键词检索: {exc}")
+
+        if not ranked:
+            for entry in entries:
+                _, type_name, desc, _ = entry
+                map_score = float(scores.get(type_name.lower(), 0))
+                word_hits = sum(
+                    1 for word in desc_lower.split()
+                    if word in desc.lower() or word in type_name.lower()
+                )
+                if map_score or word_hits:
+                    ranked.append((map_score + word_hits * 0.1, entry))
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        results = [
+            f"- `{full_path}` — {desc}"
+            for score, (_, _, desc, full_path) in ranked[:10]
+            if score > 0.20
+        ]
         
         if results:
             result_text = f"根据 '{description}' 找到以下节点:\n" + "\n".join(results[:10])
@@ -6206,8 +6258,12 @@ class HoudiniMCP:
             return {"success": False, "error": "Skill 系统未加载"}
         try:
             category = (args or {}).get("category") or None
-            skills = _list_skills(category) if category else _list_skills()
+            query = (args or {}).get("query") or None
+            limit = (args or {}).get("limit", 5)
+            skills = _list_skills(category=category, query=query, limit=limit)
             if not skills:
+                if query:
+                    return {"success": True, "result": f"没有找到与 '{query}' 相关的 Skill。"}
                 if category:
                     return {"success": True, "result": f"分类 '{category}' 下没有可用的 Skill。"}
                 return {"success": True, "result": "当前没有可用的 Skill。"}
@@ -6278,6 +6334,9 @@ class HoudiniMCP:
         timeout = max(5, min(timeout, 300))
 
         try:
+            if self._username:
+                from ...skills import set_current_user
+                set_current_user(self._username)
             with self._timeout_guard(timeout):
                 result = _run_skill(skill_name, params)
             if "error" in result:
@@ -6633,52 +6692,6 @@ class HoudiniMCP:
     # 工具分派表 & 用法提示 & 安全检查
     # ========================================
 
-    # 工具用法提示：参数缺失或调用出错时附带正确调用方式
-    _TOOL_USAGE: Dict[str, str] = {
-        "get_network_structure": 'get_network_structure(network_path="/obj/geo1", page=1)',
-        "get_node_parameters": 'get_node_parameters(node_path="/obj/geo1/box1", page=1)',
-        "set_node_parameter": 'set_node_parameter(node_path="/obj/geo1/box1", param_name="sizex", value=2.0)',
-        "set_parameter_expression": 'set_parameter_expression(node_path="/obj/geo1/copy1", param_name="ncy", expression="ch(\\"../box1/sizex\\")", language="hscript")  # 设表达式/通道引用，非静态值',
-        "create_node": 'create_node(parent_path="/obj/geo1", node_type="box", node_name="box1")',
-        "get_node_card": 'get_node_card(node_type="scatter", context="Sop")  # 用陌生节点前查：min/max inputs + 参数 + menu items',
-        "create_nodes_batch": 'create_nodes_batch(parent_path="/obj/geo1", nodes=[{"id":"a","type":"box","parameters":{"sizex":2}},{"id":"b","type":"scatter"}], connections=[{"from":"a","to":"b","input":0}])  # 陌生节点先用 dry_run=True 校验',
-        "create_wrangle_node": 'create_wrangle_node(parent_path="/obj/geo1", code="@P.y += 1;", name="my_wrangle")',
-        "connect_nodes": 'connect_nodes(from_path="/obj/geo1/box1", to_path="/obj/geo1/merge1", input_index=0)',
-        "delete_node": 'delete_node(node_path="/obj/geo1/box1")',
-        "rename_node": 'rename_node(node_path="/obj/geo1/box1", new_name="my_box")',
-        "search_node_types": 'search_node_types(keyword="scatter", category="sop")',
-        "semantic_search_nodes": 'semantic_search_nodes(query="随机散布点", category="sop")',
-        "list_children": 'list_children(path="/obj/geo1", page=1)',
-        "read_selection": 'read_selection()',
-        "set_display_flag": 'set_display_flag(node_path="/obj/geo1/box1")',
-        "copy_node": 'copy_node(source_path="/obj/geo1/box1", dest_parent="/obj/geo1", new_name="box1_copy")',
-        "batch_set_parameters": 'batch_set_parameters(node_path="/obj/geo1/box1", parameters={"sizex":2,"sizey":3})',
-        "find_nodes_by_param": 'find_nodes_by_param(network_path="/obj/geo1", param_name="file", param_value="*.bgeo")',
-        "save_hip": 'save_hip(file_path="C:/path/to/file.hip")',
-        "undo_redo": 'undo_redo(action="undo")',
-        "execute_python": 'execute_python(code="import hou; print(hou.node(\\"/obj\\").children())")',
-        "execute_shell": 'execute_shell(command="pip list", cwd="C:/project", timeout=30)',
-        "check_errors": 'check_errors(node_path="/obj/geo1/box1")',
-        "set_update_mode": 'set_update_mode(mode="auto")  # 将当前 hip 切到 Auto Update；mode 仅支持 "auto"/"manual"',
-        "verify_network": 'verify_network(parent_path="/obj/geo1")  # 建完一组节点后，一次性核查整个网络（errors/warnings/flags/display 几何）',
-        "search_local_doc": 'search_local_doc(query="scatter")',
-        "get_houdini_node_doc": 'get_houdini_node_doc(node_type="scatter", page=1)',
-        "get_node_inputs": 'get_node_inputs(node_type="copytopoints", category="sop")',
-        "run_skill": 'run_skill(skill_name="analyze_geometry_attribs", params={"node_path":"/obj/geo1/box1"})',
-        "list_skills": 'list_skills()',
-        # 节点布局
-        "layout_nodes": 'layout_nodes(network_path="/obj/geo1", method="auto")',
-        "get_node_positions": 'get_node_positions(network_path="/obj/geo1")',
-        # NetworkBox
-        "create_network_box": 'create_network_box(parent_path="/obj/geo1", name="input_stage", comment="数据输入", color_preset="input", node_paths=["/obj/geo1/box1"])',
-        "add_nodes_to_box": 'add_nodes_to_box(parent_path="/obj/geo1", box_name="input_stage", node_paths=["/obj/geo1/box1"])',
-        "set_network_box_comment": 'set_network_box_comment(parent_path="/obj/geo1", box_name="input_stage", comment="数据输入与预处理")',
-        "list_network_boxes": 'list_network_boxes(parent_path="/obj/geo1")',
-        # PerfMon 性能分析
-        "perf_start_profile": 'perf_start_profile(title="Cook Analysis", force_cook_node="/obj/geo1/output0")',
-        "perf_stop_and_report": 'perf_stop_and_report(save_path="C:/tmp/profile.hperf")',
-    }
-
     # 工具名称 -> 处理方法名的映射表
     _TOOL_DISPATCH: Dict[str, str] = {
         "create_wrangle_node": "_tool_create_wrangle_node",
@@ -6853,7 +6866,15 @@ class HoudiniMCP:
         """在错误消息末尾附加工具的正确调用方式，以及查阅文档的建议"""
         parts = [error_msg]
 
-        usage = self._TOOL_USAGE.get(tool_name)
+        usage = ""
+        try:
+            from ..tool_registry import get_tool_registry
+
+            meta = get_tool_registry().get_meta(tool_name)
+            if meta is not None:
+                usage = format_tool_usage_from_schema(meta.schema)
+        except Exception:
+            usage = ""
         if usage:
             parts.append(f"正确调用方式: {usage}")
 
@@ -6881,10 +6902,13 @@ class HoudiniMCP:
         """
         print(f"[MCP Client] 执行工具: {tool_name}, 参数: {list(arguments.keys())}")
 
+        tool_runtime = "houdini"
         if tool_name != "scene_info":
             try:
-                from ..tool_registry import get_tool_registry
-                authorization = get_tool_registry().authorize_dispatch(tool_name, mode, "houdini")
+                from ..tool_registry import get_tool_registry, resolve_tool_runtime
+                registry = get_tool_registry()
+                tool_runtime = resolve_tool_runtime(registry, tool_name)
+                authorization = registry.authorize_dispatch(tool_name, mode, tool_runtime)
             except Exception as exc:
                 return {"success": False, "error": f"Tool Registry unavailable: {exc}"}
             if not authorization.get("allowed"):
@@ -6905,9 +6929,9 @@ class HoudiniMCP:
             try:
                 from ..tool_registry import get_tool_registry
                 _reg = get_tool_registry()
-                _handler = _reg.get_handler_for_execution(tool_name, mode, "houdini")
+                _handler = _reg.get_handler_for_execution(tool_name, mode, tool_runtime)
                 if _handler:
-                    result = _reg.execute(tool_name, arguments, mode=mode, runtime="houdini")
+                    result = _reg.execute(tool_name, arguments, mode=mode, runtime=tool_runtime)
                     if not isinstance(result, dict):
                         result = {"success": True, "result": str(result)}
                     try:
@@ -7062,7 +7086,7 @@ class HoudiniMCP:
             # ★ 团队记忆（只读）：与个人库联合检索，结果标注 source=team + contributors。
             try:
                 from ..team_memory_store import get_team_memory_store
-                team_store = get_team_memory_store()
+                team_store = get_team_memory_store(self._username)
                 for rec, score in team_store.search_semantic(query=query, top_k=min(3, top_k), category=category):
                     if score < epi_threshold:
                         continue

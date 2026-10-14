@@ -18,8 +18,8 @@ def _model_features():
 
 
 class ModelFeaturesTest(unittest.TestCase):
-    def test_of3d_gpt_55_supports_image_input(self):
-        self.assertTrue(_model_features()['gpt-5.5']['supports_vision'])
+    def test_of3d_gpt_56_supports_image_input(self):
+        self.assertTrue(_model_features()['gpt-5.6']['supports_vision'])
 
 
 if __name__ == '__main__':

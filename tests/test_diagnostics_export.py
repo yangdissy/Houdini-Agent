@@ -57,7 +57,14 @@ class DiagnosticsPayloadTest(unittest.TestCase):
             audit_path = AITab._get_session_diagnostics_jsonl_path(tab, "abc123")
             audit_path.write_text(
                 '{"event_type":"tool_call","recorded_at":"2026-07-20T10:00:00"}\n'
-                '{"event_type":"geometry_validation_loop_guard","recorded_at":"2026-07-20T10:01:00"}\n',
+                '{"event_type":"geometry_validation_loop_guard","recorded_at":"2026-07-20T10:01:00"}\n'
+                '{"event_type":"job_start","recorded_at":"2026-07-20T10:02:00",'
+                '"operation_id":"op-1","kind":"render","decision":"allow",'
+                '"payload":"secret","absolute_path":"C:/secret/result.json"}\n'
+                '{"event_type":"job_exit","recorded_at":"2026-07-20T10:03:00",'
+                '"operation_id":"op-1","kind":"render","decision":"completed",'
+                '"exit_code":0,"artifacts":[{"name":"result","path":"result.json",'
+                '"size":12,"media_type":"application/json"}]}\n',
                 encoding="utf-8",
             )
 
@@ -75,9 +82,61 @@ class DiagnosticsPayloadTest(unittest.TestCase):
             self.assertIn("session_audit_exists", payload["session"])
             self.assertTrue(str(payload["session"]["session_audit_jsonl"]).endswith("session_abc123.jsonl"))
             self.assertTrue(payload["session"]["session_audit_exists"])
-            self.assertEqual(payload["session"]["session_audit_records"], 2)
-            self.assertEqual(payload["session"]["session_audit_last_recorded_at"], "2026-07-20T10:01:00")
+            self.assertEqual(payload["session"]["session_audit_records"], 4)
+            self.assertEqual(payload["session"]["session_audit_last_recorded_at"], "2026-07-20T10:03:00")
             self.assertIn("session_audit_stale", payload["session"])
+            self.assertTrue(payload["external_jobs"]["module_available"])
+            self.assertFalse(payload["external_jobs"]["runtime_configured"])
+            self.assertEqual(payload["external_jobs"]["event_counts"]["job_start"], 1)
+            self.assertEqual(payload["external_jobs"]["event_counts"]["job_exit"], 1)
+            self.assertEqual(payload["external_jobs"]["events"][-1]["exit_code"], 0)
+            self.assertNotIn("secret", rendered)
+            self.assertNotIn("C:/secret", rendered)
+
+    def test_operations_use_latest_receipt_and_project_running_as_abandoned(self):
+        tab = object.__new__(AITab)
+        tab._session_id = "receipt-session"
+        tab._username = "tester"
+        tab._agent_mode = True
+        tab._plan_mode = False
+        tab._plan_phase = "idle"
+        tab._confirm_mode = False
+        tab._conversation_history = []
+        tab._policy_timeline_records = []
+        tab._harness_trace_records = []
+        tab._call_records = []
+        tab._token_stats = {}
+        tab._harness_state = type("HarnessState", (), {"trace": [], "policy_retry_counts": {}})()
+        tab._current_provider = lambda: "test"
+        tab.model_combo = type("ModelCombo", (), {"currentText": lambda self: "model"})()
+
+        with TemporaryDirectory() as tmp:
+            tab._cache_dir = Path(tmp)
+            audit_path = AITab._get_session_diagnostics_jsonl_path(tab, tab._session_id)
+            audit_path.write_text(
+                '{"event_type":"operation_receipt","operation_id":"done","state":"running",'
+                '"tool_name":"cook_node","recorded_at":"2026-10-14T10:00:00"}\n'
+                '{"event_type":"operation_receipt","operation_id":"done","state":"completed",'
+                '"success":true,"result":"secret-result","path":"C:/secret",'
+                '"recorded_at":"2026-10-14T10:01:00"}\n'
+                '{"event_type":"operation_receipt","operation_id":"lost","state":"running",'
+                '"recorded_at":"2026-10-14T10:02:00"}\n'
+                'not-json\n'
+                '[1,2,3]\n'
+                '{"event_type":"operation_receipt","operation_id":"partial"',
+                encoding="utf-8",
+            )
+
+            payload = AITab._build_diagnostics_payload(tab)
+
+        operations = {item["operation_id"]: item for item in payload["operations"]["items"]}
+        self.assertEqual(payload["operations"]["total_count"], 2)
+        self.assertEqual(operations["done"]["state"], "completed")
+        self.assertEqual(operations["lost"]["state"], "abandoned")
+        self.assertEqual(operations["lost"]["wait_status"], "process_interrupted")
+        rendered = str(payload["operations"])
+        self.assertNotIn("secret-result", rendered)
+        self.assertNotIn("C:/secret", rendered)
 
 
 if __name__ == "__main__":

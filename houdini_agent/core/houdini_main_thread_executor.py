@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from itertools import count
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -28,6 +29,8 @@ class HoudiniMainThreadExecutor:
         main_timeout: float = 120.0,
         batch_timeout: float = 60.0,
         record_event: Optional[Callable[[dict], None]] = None,
+        session_id_provider: Optional[Callable[[], str]] = None,
+        max_receipts: int = 32,
     ):
         self._emit_tool_request = emit_tool_request
         self._emit_batch_request = emit_batch_request
@@ -35,8 +38,13 @@ class HoudiniMainThreadExecutor:
         self._main_timeout = main_timeout
         self._batch_timeout = batch_timeout
         self._record_event_callback = record_event
+        self._session_id_provider = session_id_provider
         self._lock = threading.Lock()
+        self._receipt_lock = threading.Lock()
         self._operation_ids = count(1)
+        self._max_receipts = max(1, int(max_receipts))
+        self._receipts = {}
+        self._receipt_ids_by_correlation = {}
         self._active_operation_id = None
         self._blocked = False
         self._shutdown = False
@@ -54,6 +62,14 @@ class HoudiniMainThreadExecutor:
         return self._shutdown
 
     def shutdown(self):
+        with self._receipt_lock:
+            for receipt in self._receipts.values():
+                if receipt["state"] in {"accepted", "running"}:
+                    self._update_receipt_locked(
+                        receipt,
+                        wait_status="owner_shutdown",
+                        scene_consistency="unknown",
+                    )
         with self._lock:
             self._shutdown = True
             self._blocked = True
@@ -68,6 +84,9 @@ class HoudiniMainThreadExecutor:
                 return guard
 
             operation_id = next(self._operation_ids)
+            receipt = self._create_receipt(operation_id, tool_name, 1)
+            if receipt is None:
+                return {"success": False, "error": "Operation receipt capacity reached; refusing new Houdini execution"}
             self._active_operation_id = operation_id
             self._drain_results()
             request_kwargs = dict(kwargs or {})
@@ -82,10 +101,21 @@ class HoudiniMainThreadExecutor:
                 args_keys=sorted(str(key) for key in request_kwargs.keys() if key != OPERATION_ID_KEY),
                 state="executing",
             )
+            self._update_receipt(operation_id, state="running")
             self._emit_tool_request(tool_name, request_kwargs)
 
             try:
                 result = self._get_matching_result(operation_id, self._main_timeout)
+                success = bool(isinstance(result, dict) and result.get("success"))
+                self._update_receipt(
+                    operation_id,
+                    state="completed" if success else "failed",
+                    success=success,
+                    result_available=True,
+                    thread_still_running=False,
+                    scene_consistency="known",
+                    error_code="" if success else "tool_failed",
+                )
                 if self._active_operation_id == operation_id:
                     self._active_operation_id = None
                 self._record_event(
@@ -97,6 +127,7 @@ class HoudiniMainThreadExecutor:
                     success=bool(isinstance(result, dict) and result.get("success")),
                     state="idle",
                 )
+                result = self._attach_receipt_to_result(operation_id, result)
                 return result
             except queue.Empty:
                 self._blocked = True
@@ -109,15 +140,25 @@ class HoudiniMainThreadExecutor:
                     timeout_seconds=self._main_timeout,
                     duration_ms=int((time.monotonic() - start) * 1000),
                     main_thread_stack=self._capture_main_thread_stack(),
+                    thread_still_running=True,
+                    scene_consistency="unknown",
                     state="blocked",
                 )
-                return {
+                self._update_receipt(
+                    operation_id,
+                    wait_status="timed_out",
+                    thread_still_running=True,
+                    scene_consistency="unknown",
+                )
+                return self._attach_receipt_to_result(operation_id, {
                     "success": False,
                     "error": (
                         f"操作超时（{int(self._main_timeout)}秒）：Houdini 主线程可能仍在执行 {tool_name}。"
                         "为避免崩溃，后续 Houdini 工具执行已阻止；请停止当前 Agent 或重启面板后再继续。"
                     ),
-                }
+                    "thread_still_running": True,
+                    "scene_consistency": "unknown",
+                })
 
     def execute_batch(self, batch: ToolBatch) -> List[ToolResult]:
         with self._lock:
@@ -173,12 +214,16 @@ class HoudiniMainThreadExecutor:
                     timeout_seconds=self._batch_timeout,
                     duration_ms=int((time.monotonic() - start) * 1000),
                     main_thread_stack=self._capture_main_thread_stack(),
+                    thread_still_running=True,
+                    scene_consistency="unknown",
                     state="blocked",
                 )
                 return [
                     {
                         "success": False,
                         "error": "批量工具执行超时：Houdini 主线程可能仍忙。为避免崩溃，后续 Houdini 工具执行已阻止。",
+                        "thread_still_running": True,
+                        "scene_consistency": "unknown",
                     }
                     for _ in batch
                 ]
@@ -236,7 +281,99 @@ class HoudiniMainThreadExecutor:
         return result
 
     def attach_result(self, operation_id, result):
+        success = bool(isinstance(result, dict) and result.get("success"))
+        self._update_receipt(
+            operation_id,
+            state="completed" if success else "failed",
+            success=success,
+            result_available=True,
+            thread_still_running=False,
+            scene_consistency="known",
+            error_code="" if success else "tool_failed",
+        )
         return {"operation_id": operation_id, "result": result}
+
+    def get_operation_status(self, operation_id: str) -> Optional[dict]:
+        with self._receipt_lock:
+            receipt = self._receipts.get(str(operation_id or ""))
+            return dict(receipt) if receipt is not None else None
+
+    def list_operation_receipts(self, limit: int = 20) -> List[dict]:
+        bounded_limit = min(100, max(1, int(limit)))
+        with self._receipt_lock:
+            receipts = sorted(self._receipts.values(), key=lambda item: item["updated_at"])
+            return [dict(item) for item in receipts[-bounded_limit:]]
+
+    def _create_receipt(self, correlation_id: int, tool_name: str, batch_size: int) -> Optional[dict]:
+        with self._receipt_lock:
+            terminal = sorted(
+                (item for item in self._receipts.values() if item["state"] in {"completed", "failed"}),
+                key=lambda item: item["updated_at"],
+            )
+            while len(self._receipts) >= self._max_receipts and terminal:
+                expired = terminal.pop(0)
+                self._receipts.pop(expired["operation_id"], None)
+            if len(self._receipts) >= self._max_receipts:
+                return None
+            now = time.time()
+            public_id = uuid.uuid4().hex
+            session_id = "unknown"
+            if self._session_id_provider is not None:
+                try:
+                    session_id = str(self._session_id_provider() or "unknown")
+                except Exception:
+                    session_id = "unknown"
+            receipt = {
+                "operation_id": public_id,
+                "kind": "houdini_tool",
+                "tool_name": str(tool_name),
+                "state": "accepted",
+                "created_at": now,
+                "updated_at": now,
+                "batch_size": int(batch_size),
+                "wait_status": "waiting",
+                "thread_still_running": False,
+                "scene_consistency": "known",
+                "success": None,
+                "error_code": "",
+                "result_available": False,
+                "session_id": session_id,
+                "revision": 1,
+            }
+            self._receipts[public_id] = receipt
+            self._receipt_ids_by_correlation[correlation_id] = public_id
+            self._record_receipt_event(receipt)
+            return dict(receipt)
+
+    def _update_receipt(self, correlation_id: int, **changes) -> Optional[dict]:
+        with self._receipt_lock:
+            public_id = self._receipt_ids_by_correlation.get(correlation_id)
+            receipt = self._receipts.get(public_id) if public_id else None
+            if receipt is None:
+                return None
+            return self._update_receipt_locked(receipt, **changes)
+
+    def _update_receipt_locked(self, receipt: dict, **changes) -> dict:
+        if receipt["state"] in {"completed", "failed"} and changes.get("state"):
+            return dict(receipt)
+        receipt.update(changes)
+        receipt["updated_at"] = time.time()
+        receipt["revision"] += 1
+        self._record_receipt_event(receipt)
+        return dict(receipt)
+
+    def _record_receipt_event(self, receipt: dict) -> None:
+        self._record_event("operation_receipt", **dict(receipt))
+
+    def _attach_receipt_to_result(self, correlation_id: int, result):
+        if not isinstance(result, dict):
+            return result
+        public_id = self._receipt_ids_by_correlation.get(correlation_id)
+        receipt = self.get_operation_status(public_id) if public_id else None
+        if receipt is not None:
+            result = dict(result)
+            result["operation_receipt"] = receipt
+        return result
 
     def _guard_result(self, tool_name: str):
         if self._shutdown:
@@ -299,8 +436,12 @@ class HoudiniMainThreadExecutor:
         return request_kwargs
 
     def _get_matching_result(self, operation_id: int, timeout: float):
+        deadline = time.monotonic() + timeout
         while True:
-            item = self._result_queue.get(timeout=timeout)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise queue.Empty
+            item = self._result_queue.get(timeout=remaining)
             if isinstance(item, dict) and "operation_id" in item and "result" in item:
                 if item.get("operation_id") != operation_id:
                     self._record_event(

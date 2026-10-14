@@ -115,6 +115,56 @@ class _HouStub:
 
 
 class HoudiniMainThreadExecutorTest(unittest.TestCase):
+    def test_success_result_includes_completed_operation_receipt(self):
+        result_queue = queue.Queue()
+        events = []
+
+        def emit_tool_request(name, kwargs):
+            result_queue.put({
+                "operation_id": kwargs[OPERATION_ID_KEY],
+                "result": {"success": True, "result": name},
+            })
+
+        executor = HoudiniMainThreadExecutor(
+            emit_tool_request=emit_tool_request,
+            emit_batch_request=lambda batch: None,
+            result_queue=result_queue,
+            record_event=events.append,
+            session_id_provider=lambda: "session-a",
+        )
+
+        result = executor.execute("get_network_structure", {"node_path": "/obj/private-value"})
+
+        receipt = result["operation_receipt"]
+        self.assertEqual(receipt["state"], "completed")
+        self.assertEqual(receipt["session_id"], "session-a")
+        self.assertTrue(receipt["result_available"])
+        self.assertNotIn("/obj/private-value", repr(events))
+        receipt_events = [event for event in events if event.get("event_type") == "operation_receipt"]
+        self.assertEqual([event["state"] for event in receipt_events], ["accepted", "running", "completed"])
+
+    def test_timeout_receipt_is_queryable_and_late_result_completes_it(self):
+        result_queue = queue.Queue()
+        executor = HoudiniMainThreadExecutor(
+            emit_tool_request=lambda name, kwargs: None,
+            emit_batch_request=lambda batch: None,
+            result_queue=result_queue,
+            main_timeout=0.01,
+            session_id_provider=lambda: "session-a",
+        )
+
+        result = executor.execute("cook_node", {"node_path": "/obj/geo1/OUT"})
+        public_id = result["operation_receipt"]["operation_id"]
+        timed_out = executor.get_operation_status(public_id)
+        correlation_id = executor._active_operation_id
+
+        self.assertEqual(timed_out["state"], "running")
+        self.assertEqual(timed_out["wait_status"], "timed_out")
+        executor.attach_result(correlation_id, {"success": True, "result": "late"})
+        completed = executor.get_operation_status(public_id)
+        self.assertEqual(completed["state"], "completed")
+        self.assertTrue(completed["result_available"])
+
     def test_timeout_blocks_later_execution(self):
         result_queue = queue.Queue()
         emitted = []
@@ -129,6 +179,8 @@ class HoudiniMainThreadExecutorTest(unittest.TestCase):
         second = executor.execute("get_network_structure", {"node_path": "/obj"})
 
         self.assertFalse(first["success"])
+        self.assertTrue(first["thread_still_running"])
+        self.assertEqual(first["scene_consistency"], "unknown")
         self.assertTrue(executor.is_blocked())
         self.assertFalse(second["success"])
         self.assertIn("阻塞", second["error"])
@@ -167,6 +219,8 @@ class HoudiniMainThreadExecutorTest(unittest.TestCase):
         executor.shutdown()
 
         self.assertFalse(timeout_result["success"])
+        self.assertTrue(timeout_result["thread_still_running"])
+        self.assertEqual(timeout_result["scene_consistency"], "unknown")
         self.assertFalse(guard_result["success"])
         event_types = [event.get("event_type") for event in events]
         self.assertIn("main_thread_execute_start", event_types)
@@ -176,6 +230,9 @@ class HoudiniMainThreadExecutorTest(unittest.TestCase):
         event_text = repr(events)
         self.assertIn("args_keys", event_text)
         self.assertNotIn("do-not-log", event_text)
+        timeout_event = next(event for event in events if event.get("event_type") == "main_thread_execute_timeout")
+        self.assertTrue(timeout_event["thread_still_running"])
+        self.assertEqual(timeout_event["scene_consistency"], "unknown")
 
     def test_executor_records_stale_result_without_payload(self):
         result_queue = queue.Queue()

@@ -22,6 +22,7 @@ def _core_registry():
     registry = ToolRegistry()
     required = {
         "execute_python": ["code"], "execute_shell": ["command"],
+        "run_skill": ["skill_name", "params"],
         "remember_memory": ["content"], "get_node_parameters": ["node_path"],
         "get_parameter_schema": ["node_path"], "inspect_node": ["node_path"],
         "get_geometry_summary": ["node_path"], "temporary_auto_validate_geometry": ["node_path"],
@@ -54,7 +55,7 @@ def _core_registry():
             schema,
             modes={"agent", "ask", "plan_executing"},
             risk_level="high" if name in HIGH_RISK_TOOLS else "normal",
-            requires_confirmation=name in (SCENE_MUTATION_TOOLS | HIGH_RISK_TOOLS | {"set_update_mode"}),
+            requires_confirmation=name in (SCENE_MUTATION_TOOLS | HIGH_RISK_TOOLS | {"run_skill", "set_update_mode"}),
             path_kinds={
                 key: "file" if key in {"file_path", "output_path"} else "node"
                 for key in property_names
@@ -125,6 +126,44 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         self.assertGreater(decision.risk_score, 0.0)
         self.assertIn("high_risk_confirmation", decision.matched_rules)
         self.assertEqual(decision.required_control, "confirm")
+
+    def test_install_houdini_skill_requires_confirmation_for_write_actions(self):
+        preview = self.policy.decide(
+            "run_skill",
+            {
+                "skill_name": "install_houdini_skill",
+                "params": {"skill_source": "source", "mode": "preview"},
+            },
+            {"mode": "agent", "confirm_mode": True},
+        )
+        self.assertEqual(preview.action, "allow")
+
+        for params in (
+            {"skill_source": "source", "mode": "install"},
+            {"action": "activate", "skill_name": "user_quality_check"},
+        ):
+            decision = self.policy.decide(
+                "run_skill",
+                {"skill_name": "install_houdini_skill", "params": params},
+                {"mode": "agent", "confirm_mode": False},
+            )
+            self.assertEqual(decision.action, "ask")
+            self.assertIn("controlled_skill_write_confirmation", decision.matched_rules)
+            self.assertEqual(decision.required_control, "confirm")
+
+        other_skill = self.policy.decide(
+            "run_skill",
+            {"skill_name": "setup_project", "params": {}},
+            {"mode": "agent", "confirm_mode": True},
+        )
+        self.assertEqual(other_skill.action, "ask")
+
+        invalid_mode = self.policy.decide(
+            "run_skill",
+            {"skill_name": "install_houdini_skill", "params": {"mode": "overwrite"}},
+            {"mode": "agent", "confirm_mode": True},
+        )
+        self.assertEqual(invalid_mode.action, "ask")
 
     def test_remember_memory_requires_review_after_intent(self):
         context = {"mode": "agent", "user_message": "记住：以后都用中文回答"}

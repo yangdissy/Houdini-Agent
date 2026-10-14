@@ -466,6 +466,7 @@ SLASH_COMMANDS = [
     ("network",   "🌐",  "读取网络",     "Read Network",     "读取当前网络结构",           "Read current network structure","scene"),
     ("selection", "👆",  "读取选中",     "Read Selection",   "读取当前选中节点信息",       "Read selected node info",      "scene"),
     ("skills",    "⚡",  "技能列表",     "List Skills",      "列出所有可用 Skill",         "List all available skills",    "scene"),
+    ("create_skill", "🛠", "创建 Skill",   "Create Skill",     "描述需求并生成可审查的 Skill 草案", "Describe and draft a reviewable Skill", "scene"),
     # ── 工具 ──
     ("status",    "📊",  "系统状态",     "System Status",    "查看记忆/成长/上下文统计",   "View memory/growth/context stats", "tool"),
     ("diagnostics", "🧪", "导出诊断",     "Diagnostics",      "导出策略/trace诊断 JSON",    "Export policy/trace diagnostics JSON", "tool"),

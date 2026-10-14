@@ -85,7 +85,9 @@ class ManualUpdateModeDirectiveTest(unittest.TestCase):
 
         self.assertIn("这是用户的持久设置", directive)
         self.assertIn("空几何", directive)
-        self.assertIn("不能单独当作拓扑或参数错误证据", directive)
+        self.assertIn("不能把空几何单独当作拓扑或参数错误证据", directive)
+        self.assertNotIn("先在 Manual 下完成一组相关修改", directive)
+        self.assertNotIn("temporary_auto_validate_geometry", directive)
 
     def test_confirm_directive_forbids_switching_auto(self):
         sys.modules["hou"] = _HouStub(_UpdateMode.Auto)
@@ -94,15 +96,15 @@ class ManualUpdateModeDirectiveTest(unittest.TestCase):
 
         directive = AITab._build_manual_mode_directive(tab, confirm_mode=True)
 
-        self.assertIn("不要擅自", directive)
+        self.assertIn("未经用户确认", directive)
+        self.assertIn("不得持久切换", directive)
         self.assertIn("Auto", directive)
 
     def test_direct_execute_prompt_allows_temporary_auto_validation(self):
         prompt = tr('ai.direct_execute_prompt')
 
-        self.assertIn('set_update_mode(mode="auto")', prompt)
-        self.assertIn("不要用 `execute_python`", prompt)
-        self.assertIn("Auto Update", prompt)
+        self.assertNotIn('set_update_mode(mode="auto")', prompt)
+        self.assertNotIn("temporary_auto_validate_geometry", prompt)
 
     def test_scene_read_does_not_duplicate_manual_directive_in_history(self):
         sys.modules["hou"] = _HouStub(_UpdateMode.Auto)

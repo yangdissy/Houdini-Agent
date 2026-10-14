@@ -38,6 +38,27 @@ This guide helps the AI choose the smallest useful tool set for each Houdini tas
 | Cook / force-recompute a node (only when the user explicitly asks) | `inspect_node`, `check_errors` | `cook_node` (high risk; may block the UI) | `inspect_node`, `verify_network` |
 | Validate network health | `verify_network`, `validate_node_network` | None | None |
 | Review a visual result | `verify_network`, `get_geometry_summary`, relevant material/USD skills | None | `visual_review` when the current model supports vision |
+| Capture a reusable node workflow as memory | `run_skill('capture_network_memory')` | `remember_memory` only after the user reviews and explicitly confirms one `memory_draft` | `search_memory` when recall verification is needed |
+| Explain why an existing node workflow works | `run_skill('explain_network_pattern')` | `remember_memory` only after explicit review and confirmation | None |
+| Compare two workflow implementations | `run_skill('compare_network_patterns')` | `remember_memory` only after explicit review and confirmation | None |
+| Find repeated graph patterns worth assetizing | `run_skill('find_repeated_subgraphs')` | None; review candidates before creating an HDA or subnet | `validate_network_contract` on any later assetized result |
+| Find brittle paths and cross-node references | `run_skill('find_fragile_references')` | None | Re-run after any later path cleanup |
+| Extract a reusable network or HDA contract | `run_skill('extract_network_contract')` | `remember_memory` only after reviewing the generated `memory_draft` | `validate_network_contract` for current network health |
+| Generalize a concrete workflow memory | `run_skill('generalize_network_memory')` | `remember_memory` only after reviewing the generalized draft | `run_skill('validate_memory_against_scene')` when concrete claims remain |
+| Validate a memory against the current scene | `run_skill('validate_memory_against_scene')` | None | Review contradicted and unknown claims before reuse |
+| Recall a workflow for the current task | `search_memory`, then `run_skill('recall_workflow_for_task')` | None | Validate the selected memory before any scene mutation |
+| Compare a network before and after editing | `get_scene_snapshot` before and after, then `run_skill('compare_before_after_network')` | `remember_memory` only after reviewing causality and the draft | Check introduced health issues |
+| Build a consolidated HIP learning report | Run relevant read-only learning skills, then `run_skill('build_hip_learning_report')` | None | Review each memory candidate independently |
+| Suggest memory cleanup | Export/select memory records, then `run_skill('suggest_memory_cleanup')` | Use governed memory management only after explicit confirmation | Re-query records after any approved cleanup |
+| Design or adapt a Houdini-Agent Skill | `list_skills` for adjacent capabilities, then `run_skill('draft_houdini_skill')` | After implementation review, call `run_skill('install_houdini_skill', mode='preview')`; install only with its one-time token and the exact same source | Installer verifies loader discovery without executing the Skill; run focused behavior tests separately |
+| Build a versioned SOP cache pipeline | `run_skill('setup_cache_pipeline')` | `create_nodes_batch` after reviewing and dry-running the blueprint; cache writes require separate explicit intent | `verify_network`, `run_skill('cache_node_report')` after an approved write |
+| Build MaterialX/Karma or SOP lookdev | `run_skill('setup_material_lookdev')` | `create_nodes_batch` after dry run; create shader internals only from verified node cards | `run_skill('inspect_material_assignments')`, `run_skill('inspect_lop_stage')`, `visual_review` |
+| Build SOP/USD instance scatter | `run_skill('setup_instance_scatter')` | `create_nodes_batch` after dry run; connect both source contracts explicitly | `verify_network`, `get_geometry_summary`, `visual_review` |
+| Build a heightfield terrain workflow | `run_skill('setup_heightfield_terrain')` | `create_nodes_batch` after dry run and resolution review | `verify_network`, `get_geometry_summary`, `visual_review` |
+| Build an Alembic/USD/FBX/BGEO/VDB export | `run_skill('setup_export_pipeline')` | `create_nodes_batch`; actual file export requires explicit intent | `verify_network`, inspect output path after export |
+| Build a Copernicus texture workflow | `run_skill('setup_copernicus_pipeline')` | `create_nodes_batch` after node-type/schema checks; image writes require explicit intent | `verify_network`, inspect output path after write |
+| Build a KineFX rig/capture/retarget workflow | `run_skill('setup_kinefx_pipeline')` | `create_nodes_batch`; inspect connector labels before multi-input wiring | `verify_network`, `validate_node_network` |
+| Build a PDG/TOP batch workflow | `run_skill('setup_pdg_batch_pipeline')` | `create_nodes_batch`; cooking requires a separate explicit request | Inspect work items and output paths before cooking |
 | Layout nodes | `run_skill('get_node_positions')`, `get_network_structure` | `layout_nodes` | `run_skill('get_node_positions')` |
 | Make a network box | `run_skill('get_node_positions')`, `run_skill('list_network_boxes')` | `create_network_box` | `run_skill('list_network_boxes')` |
 | Find documentation | `run_skill('get_node_card')`, `search_local_doc`, `get_houdini_node_doc`, `web_search` when enabled | None | None |

@@ -79,7 +79,8 @@ class HoudiniDocIndex:
     def __init__(self, help_dir: Optional[str] = None,
                  cache_dir: Optional[str] = None,
                  doc_dir: Optional[str] = None,
-                 load_knowledge: bool = True):
+                 load_knowledge: bool = True,
+                 embedder=None):
         self._help_dir = find_help_dir(help_dir)
 
         # 三大索引
@@ -98,6 +99,8 @@ class HoudiniDocIndex:
         self._vex_search_names: List[Tuple[str, str, VexDoc]] = []
         self._hom_search_names: List[Tuple[str, str, HomDoc]] = []
         self._knowledge_search_cache: List[Tuple[KnowledgeChunk, Set[str], str, str]] = []
+        self._embedder = embedder
+        self._knowledge_embeddings = None
 
         # Labs 目录缓存（实例变量，避免类变量共享歧义）
         self._labs_catalog_cache: Optional[str] = None
@@ -279,6 +282,29 @@ class HoudiniDocIndex:
             )
             for chunk in self.knowledge_chunks
         ]
+        self._knowledge_embeddings = None
+
+    def _semantic_knowledge_scores(self, query: str):
+        """懒加载知识库向量；真实语义模型不可用时保持纯词法检索。"""
+        try:
+            if self._embedder is None:
+                from .embedding import get_embedder
+                self._embedder = get_embedder()
+            if not self._embedder.is_semantic:
+                return None
+            if self._knowledge_embeddings is None:
+                texts = [
+                    f"{chunk.title}\n{chunk.content[:600]}"
+                    for chunk in self.knowledge_chunks
+                ]
+                self._knowledge_embeddings = self._embedder.encode_batch(texts)
+            query_vector = self._embedder.encode(query)
+            return self._embedder.batch_cosine_similarity(
+                query_vector, self._knowledge_embeddings
+            )
+        except Exception as exc:
+            print(f"[DocIndex] 知识库语义检索失败，回退关键词检索: {exc}")
+            return None
 
     @staticmethod
     def _build_kb_fingerprints(txt_files: List[Path], doc_root: Path) -> Dict[str, Dict[str, float]]:
@@ -427,8 +453,10 @@ class HoudiniDocIndex:
         if not self._knowledge_search_cache:
             self._build_knowledge_search_cache()
 
+        semantic_scores = self._semantic_knowledge_scores(query)
+
         scored: List[tuple] = []
-        for chunk, chunk_kw_set, title_l, content_l in self._knowledge_search_cache:
+        for index, (chunk, chunk_kw_set, title_l, content_l) in enumerate(self._knowledge_search_cache):
             score = 0.0
 
             matched_terms = set()
@@ -472,6 +500,11 @@ class HoudiniDocIndex:
             elif content_len < 160:
                 score -= 0.08
 
+            semantic_score = 0.0
+            if semantic_scores is not None:
+                semantic_score = max(0.0, float(semantic_scores[index]))
+                score += semantic_score * 0.75
+
             if score > 0.30:
                 reasons = []
                 if matched_title_en or title_cn_hits > 0:
@@ -479,6 +512,8 @@ class HoudiniDocIndex:
                 if matched_kw or matched_content_en or content_cn_hits > 0:
                     reasons.append("content_match")
                 reasons.append(f"coverage={coverage:.2f}")
+                if semantic_scores is not None:
+                    reasons.append(f"semantic={semantic_score:.2f}")
                 reasons.append(f"source={chunk.source}")
 
                 scored.append((score, chunk, sorted(matched_terms), ", ".join(reasons)))

@@ -599,7 +599,6 @@ _ZH = {
         '- 不要输出"请回复\'确认\'我再继续"、"确认后进入下一步"之类的等待式话术。\n'
         '- 不要把任务人为拆成需要用户逐段点头的阶段（如 S4/S5）。\n'
         '- 直接按计划连续执行所有步骤，执行完毕后再一次性汇报结果。\n'
-        '- 若 Houdini 处于 Manual，先完成一组相关节点/参数修改，再调用 `temporary_auto_validate_geometry(node_path=...)` 或 `check_errors(node_path=...)` 做目标范围临时 Auto Update 验证并恢复 Manual；不要每次写后切换，不要用 `execute_python` 手写模式切换。仅在用户明确要求持续 Auto 时使用 `set_update_mode(mode="auto")`。\n'
         '- 例外：只有当遇到真正的歧义、缺少必要信息、或高风险不可逆操作时，才停下来提问。\n'
         '</direct_execute_mode>'
     ),
@@ -1254,7 +1253,6 @@ _EN = {
         '- Do NOT emit waiting-style prompts like "reply \'confirm\' and I will continue" or "proceed to next step after confirmation".\n'
         '- Do NOT artificially split the task into phases (e.g., S4/S5) that require the user to approve each segment.\n'
         '- Execute all planned steps consecutively, then report the results once at the end.\n'
-        '- In Manual mode, finish the related node/parameter mutation batch, then use `temporary_auto_validate_geometry(node_path=...)` or `check_errors(node_path=...)` for scoped temporary Auto validation and restore Manual. Do not alternate modes after each write. Use persistent `set_update_mode(mode="auto")` only when the user explicitly requests lasting Auto.\n'
         '- Exception: only pause to ask when facing genuine ambiguity, missing required information, or a high-risk irreversible operation.\n'
         '</direct_execute_mode>'
     ),

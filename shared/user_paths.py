@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import configparser
 from pathlib import Path
 from typing import Iterable, Optional, Set
 
@@ -117,8 +118,43 @@ class UserPaths:
             self.embeddings_dir(),
             self.workspace_dir(),
             self.captures_dir(),
+            self.skills_dir(),
         ):
             p.mkdir(parents=True, exist_ok=True)
+        self._ensure_skills_config()
+
+    def _ensure_skills_config(self) -> None:
+        if self.configured_skills_dir() is not None:
+            return
+        self.set_skills_dir(self.skills_dir())
+
+    def set_skills_dir(self, path: Path) -> None:
+        config_path = self.user_config_path()
+        skill_path = Path(path).expanduser().resolve()
+        skill_path.mkdir(parents=True, exist_ok=True)
+        try:
+            text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+            section_pattern = re.compile(
+                r"^\[skills\]\s*$.*?(?=^\[[^\]]+\]\s*$|\Z)",
+                flags=re.MULTILINE | re.DOTALL,
+            )
+            section = "[skills]\nuser_skill_dir = {}\n".format(skill_path)
+            if section_pattern.search(text):
+                updated = section_pattern.sub(lambda _: section, text)
+            else:
+                updated = text
+                if updated and not updated.endswith("\n"):
+                    updated += "\n"
+                updated += "\n" + section
+            temp_path = config_path.with_name(config_path.name + ".partial")
+            temp_path.write_text(updated, encoding="utf-8")
+            os.replace(str(temp_path), str(config_path))
+        except Exception:
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
+            raise
 
     def conversations_dir(self) -> Path:
         return self.user_root / "conversations"
@@ -152,6 +188,9 @@ class UserPaths:
     def captures_dir(self) -> Path:
         return self.workspace_dir() / "captures"
 
+    def skills_dir(self) -> Path:
+        return self.user_root / "skills"
+
     def capture_session_dir(self, session_id: str) -> Path:
         if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
             raise ValueError("invalid session id")
@@ -159,6 +198,26 @@ class UserPaths:
 
     def user_config_path(self) -> Path:
         return self.user_root / "config.ini"
+
+    def configured_skills_dir(self) -> Optional[Path]:
+        config_path = self.user_config_path()
+        if not config_path.exists():
+            return None
+        try:
+            text = config_path.read_text(encoding="utf-8")
+            section_start = re.search(r"^\[skills\]\s*$", text, flags=re.MULTILINE)
+            if section_start is None:
+                return None
+            section_text = text[section_start.start():]
+            parser = configparser.ConfigParser()
+            parser.read_string(section_text)
+            value = parser.get("skills", "user_skill_dir", fallback="").strip()
+            if not value:
+                return None
+            path = Path(value).expanduser()
+            return path if path.is_dir() else None
+        except Exception:
+            return None
 
     def user_rules_path(self) -> Path:
         return self.user_root / "user_rules.json"

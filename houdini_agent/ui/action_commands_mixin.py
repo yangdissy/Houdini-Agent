@@ -371,6 +371,22 @@ class ActionCommandsMixin:
             resp.set_content(f"❌ {result.get('error', '未知错误')}")
         resp.finalize()
 
+    def _slash_create_skill(self, args=""):
+        """/create_skill — 通过 Agent 治理流程生成可审查的 Skill 草案。"""
+        intent = (args or "").strip()
+        if not intent:
+            self._slash_command_reply(
+                "[/create_skill]",
+                "用法：`/create_skill <描述 Skill 要解决的问题、输入和期望结果>`",
+            )
+            return
+        self.input_edit.setPlainText(
+            "请使用 draft_houdini_skill 创建一个可审查的 Houdini-Agent Skill 草案。"
+            "先分析合适的名称、分类、参数和风险等级，只生成草案与测试，不要安装。\n\n"
+            f"需求：{intent}"
+        )
+        self._on_send()
+
     def _slash_status(self):
         """/status — 显示系统综合状态"""
         lines = ["📊 **系统状态概览**\n"]

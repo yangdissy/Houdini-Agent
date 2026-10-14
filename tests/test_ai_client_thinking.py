@@ -9,6 +9,7 @@ if "requests" not in sys.modules:
     sys.modules["requests"] = mock.MagicMock(name="requests")
 
 from houdini_agent.utils.ai_client import AIClient
+from houdini_agent.utils.embedding import LocalEmbedder
 
 
 def _call(tool_name, args=None):
@@ -16,6 +17,13 @@ def _call(tool_name, args=None):
 
 
 class AIClientThinkingHintTest(unittest.TestCase):
+    def test_lexical_embedder_does_not_probe_semantic_model(self):
+        with mock.patch.object(LocalEmbedder, "_try_load_model") as try_load:
+            embedder = LocalEmbedder(load_semantic_model=False)
+
+        try_load.assert_not_called()
+        self.assertEqual(embedder._backend, "fallback")
+
     def test_gpt5_models_use_default_temperature(self):
         self.assertTrue(AIClient.requires_temperature_one("gpt-5.5"))
         self.assertTrue(AIClient.requires_temperature_one("gpt-5.3-codex"))
@@ -235,6 +243,27 @@ class AIClientThinkingHintTest(unittest.TestCase):
             query_tools = AIClient._loop_guidance_query_tools()
 
         self.assertEqual(query_tools, {"get_parameter_schema"})
+
+    def test_list_skills_parameter_churn_has_hard_discovery_budget(self):
+        reason = AIClient._tool_loop_abort_reason(
+            tool_name="list_skills",
+            consecutive_same_calls=1,
+            window_same_count=1,
+            consecutive_same_tool=8,
+        )
+
+        self.assertIn("list_skills", reason)
+        self.assertIn("run_skill", reason)
+
+    def test_batch_mutation_is_not_stopped_by_discovery_budget(self):
+        reason = AIClient._tool_loop_abort_reason(
+            tool_name="set_node_parameter",
+            consecutive_same_calls=1,
+            window_same_count=1,
+            consecutive_same_tool=8,
+        )
+
+        self.assertIsNone(reason)
 
 
 class AIClientContextTrimTest(unittest.TestCase):

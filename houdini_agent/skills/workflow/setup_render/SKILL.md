@@ -1,0 +1,6 @@
+---
+{"name":"setup_render","category":"workflow","description":"Return a node-building BLUEPRINT for a standard render setup: Karma (USD/LOP) or Mantra (classic ROP). Does NOT modify the scene — it returns a recipe (nodes + connections + parameters) that you then build by calling create_nodes_batch (pass the blueprint's 'nodes' and 'connections' directly). Use when the user asks to 'set up rendering', 'configure a render', 'make a Karma/Mantra render'. Karma builds a LOP chain (camera + dome light + render settings + usdrender); Mantra builds an out/ ROP. After building, capture_viewport still works for quick previews.","risk_level":"normal","parameters":{"renderer":{"type":"string","description":"'karma' or 'mantra'. Karma = modern USD/LOP path (recommended); Mantra = classic out/ ROP. Default 'karma'.","required":false,"default":"karma"},"resolution":{"type":"string","description":"Output resolution as 'WIDTHxHEIGHT', e.g. '1920x1080'. Default '1920x1080'.","required":false,"default":"1920x1080"},"output_path":{"type":"string","description":"Output image path (e.g. '$HIP/render/$HIPNAME.$F4.exr'). Optional; leave empty to use the ROP default.","required":false,"default":""}},"entrypoint":"scripts/main.py:run"}
+---
+# Setup Render
+
+按照参数合同执行此 Skill；保持返回结构与既有行为不变。

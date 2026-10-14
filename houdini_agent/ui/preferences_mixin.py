@@ -204,8 +204,8 @@ class PreferencesMixin:
 
         cache_read = self._token_stats['cache_read']
         cache_write = self._token_stats['cache_write']
-        cache_total = cache_read + cache_write
-        hit_rate_display = f"{(cache_read / cache_total * 100):.1f}%" if cache_total > 0 else "N/A"
+        input_tokens = self._token_stats['input_tokens']
+        hit_rate_display = f"{(cache_read / input_tokens * 100):.1f}%" if input_tokens > 0 else "N/A"
 
         reasoning = self._token_stats.get('reasoning_tokens', 0)
         reasoning_line = tr('token.reasoning_line', reasoning) if reasoning > 0 else ""

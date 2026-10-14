@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Qt-free slash command parsing helpers."""
 
-SLASH_COMMANDS_WITH_ARGS = frozenset(("remember", "forget", "search_mem"))
+SLASH_COMMANDS_WITH_ARGS = frozenset(("remember", "forget", "search_mem", "create_skill"))
 
 
 def parse_slash_command(text: str):

@@ -93,6 +93,16 @@ VEX snippets（代码片段）用于 Attribute Wrangle、Volume Wrangle 等节�
     @opinput2_P  // 第三输入
     @opinput3_P  // 第四输入
 
+### 5. set*attrib() 跨元素写入的可见性
+    // setpointattrib、setprimattrib、setvertexattrib 等写入可能延迟到
+    // 当前 wrangle 执行结束后才对几何查询可见。不要在同一个 wrangle
+    // 中写入其他元素后，立即用 point()/prim()/vertex() 回读并依赖新值。
+    setpointattrib(0, "weight", other_pt, 1.0, "set");
+    float value = point(0, "weight", other_pt);  // 可能仍是执行前的值
+
+    // 需要可靠回读时，将读取放到下游第二个 wrangle；当前元素优先直接
+    // 使用绑定属性赋值，例如 f@weight = 1.0。
+
 ## 创建几何体
 
     // 添加点

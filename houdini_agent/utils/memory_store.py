@@ -144,6 +144,8 @@ class ProceduralRecord:
 class MemoryStore:
     """三层记忆 SQLite 存储 + Embedding 向量检索"""
 
+    EMBEDDING_BACKUP_RETENTION = 3
+
     def __init__(self, db_path: Optional[Path] = None, embedder: Optional[LocalEmbedder] = None):
         self.db_path = db_path or _DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -338,7 +340,29 @@ class MemoryStore:
                     conn.rollback()
                 raise
             self.embedding_diagnostic = None
+        self.prune_embedding_backups()
         return backup_path
+
+    def list_embedding_backups(self) -> List[Path]:
+        """Return migration backups from newest to oldest."""
+        prefix = self.db_path.name + ".bak."
+        backups = [
+            path for path in self.db_path.parent.glob(prefix + "*")
+            if path.is_file() and path.name[len(prefix):].isdigit()
+        ]
+        return sorted(backups, key=lambda path: int(path.name[len(prefix):]), reverse=True)
+
+    def prune_embedding_backups(self, keep: int = EMBEDDING_BACKUP_RETENTION) -> List[Path]:
+        """Delete old migration backups while retaining the newest ``keep`` files."""
+        keep = max(0, int(keep))
+        deleted = []
+        for path in self.list_embedding_backups()[keep:]:
+            try:
+                path.unlink()
+                deleted.append(path)
+            except OSError as exc:
+                print(f"[Memory] 删除旧向量备份失败 {path.name}: {exc}")
+        return deleted
 
     @staticmethod
     def _migrate_add_abstraction_level(conn: sqlite3.Connection):

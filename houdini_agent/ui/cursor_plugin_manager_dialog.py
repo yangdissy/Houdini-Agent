@@ -18,8 +18,9 @@ class PluginManagerDialog(QtWidgets.QDialog):
 
     pluginStateChanged = QtCore.Signal()  # 插件状态变化时通知
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, username=None):
         super().__init__(parent)
+        self._username = (username or "").strip().lower() or "default"
         self.setObjectName("pluginManagerDlg")
         self.setWindowTitle(tr('plugin.manager_title'))
         self.setMinimumSize(620, 480)
@@ -346,10 +347,12 @@ class PluginManagerDialog(QtWidgets.QDialog):
             print(f"[PluginManager] Reload error: {e}")
 
     def _reload_all(self):
-        """重载全部插件"""
+        """重载全部插件和 Skill"""
         try:
             from ..utils.hooks import reload_all_plugins
+            from ..skills import reload_skills
             reload_all_plugins()
+            reload_skills()
             self._refresh_list()
             # 如果当前在 Tools/Skills tab, 也刷新
             idx = self._tabs.currentIndex()
@@ -577,7 +580,14 @@ class PluginManagerDialog(QtWidgets.QDialog):
 
             self._skills_layout.addWidget(empty_frame)
         else:
+            current_category = None
             for s in skills:
+                category = s.get("category", "other")
+                if category != current_category:
+                    category_lbl = QtWidgets.QLabel(category.upper())
+                    category_lbl.setObjectName("pmSectionTitle")
+                    self._skills_layout.addWidget(category_lbl)
+                    current_category = category
                 row = self._create_skill_row(s)
                 self._skills_layout.addWidget(row)
 
@@ -585,8 +595,8 @@ class PluginManagerDialog(QtWidgets.QDialog):
 
         # 加载用户 Skill 目录
         try:
-            from ..skills import _get_user_skill_dir
-            user_dir = _get_user_skill_dir()
+            from shared.user_paths import UserPaths
+            user_dir = UserPaths(self._username).configured_skills_dir()
             if user_dir:
                 self._skill_dir_edit.setText(str(user_dir))
         except Exception:
@@ -644,7 +654,7 @@ class PluginManagerDialog(QtWidgets.QDialog):
         enabled = True
         try:
             from ..utils.tool_registry import get_tool_registry
-            enabled = get_tool_registry().is_enabled(tool_name)
+            enabled = tool_name not in get_tool_registry().get_disabled_tools()
         except Exception:
             pass
 
@@ -663,20 +673,15 @@ class PluginManagerDialog(QtWidgets.QDialog):
             self, tr('plugin.skill_dir_browse'), "")
         if dir_path:
             self._skill_dir_edit.setText(dir_path)
-            # 保存到 config/houdini_ai.ini
+            # 保存到当前用户的私有配置
             try:
-                import configparser
-                from pathlib import Path
-                config_dir = Path(__file__).resolve().parent.parent.parent / "config"
-                ini_path = config_dir / "houdini_ai.ini"
-                cfg = configparser.ConfigParser()
-                if ini_path.exists():
-                    cfg.read(str(ini_path), encoding='utf-8')
-                if not cfg.has_section("skills"):
-                    cfg.add_section("skills")
-                cfg.set("skills", "user_skill_dir", dir_path)
-                with open(ini_path, 'w', encoding='utf-8') as f:
-                    cfg.write(f)
+                from shared.user_paths import UserPaths
+                user_paths = UserPaths(self._username)
+                user_paths.set_skills_dir(dir_path)
+                from ..skills import reload_skills, set_current_user
+                set_current_user(self._username)
+                reload_skills()
+                self._refresh_skills_list()
                 print(f"[Skills] 用户 Skill 目录已设置: {dir_path}")
             except Exception as e:
                 print(f"[Skills] 保存 Skill 目录失败: {e}")

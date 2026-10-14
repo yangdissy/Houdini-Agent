@@ -511,6 +511,7 @@ _LOOP_WINDOW_HIT_THRESHOLD = 4
 # 查多个节点）是合理场景，阈值需足够高避免误报。软提示只在明显卡死时触发一次引导。
 _LOOP_SAME_TOOL_SOFT_HINT = 15  # 同工具连续调用 ≥15 次 → 软提示（批量操作常见，需高阈值）
 _LOOP_SAME_TOOL_HARD_ABORT = 25  # 同工具连续调用 ≥25 次 → 硬熔断（已禁用，保留常量供恢复）
+_SKILL_DISCOVERY_HARD_ABORT = 8  # list_skills 仅用于发现；连续换参数搜索不会产生新的能力
 
 
 # ============================================================
@@ -1581,13 +1582,21 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_skills",
-            "description": "列出所有可用的 Skill，按分类分组输出（结构化 JSON）。分类含 geometry(几何分析)/graph(网络节点)/scene(场景上下文)/usd(LOPs)/materials(材质)/performance(性能缓存)/docs(文档)/workflow(一键搭建)。在需要复杂分析时先调用此工具查看是否有现成 Skill，比手写 execute_python 更高效可靠。可传 category 只看某一类以节省 token。",
+            "description": "列出或按自然语言语义搜索可用 Skill，按分类分组输出（结构化 JSON）。分类含 geometry(几何分析)/graph(网络节点)/scene(场景上下文)/usd(LOPs)/materials(材质)/performance(性能缓存)/docs(文档)/workflow(一键搭建)。在需要复杂分析时先搜索现成 Skill，比手写 execute_python 更高效可靠。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "category": {
                         "type": "string",
                         "description": "可选。只列出该分类下的 Skill（如 geometry/graph/usd/performance/workflow）。留空返回全部并按分类分组。"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "可选。用自然语言描述任务，返回语义最相关的 Skill，例如‘检查哪些节点拖慢了运算’。"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "query 非空时的最大结果数，默认 5。"
                     }
                 },
                 "required": []
@@ -1894,6 +1903,34 @@ HOUDINI_TOOLS = [
                 "required": ["review_type"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_operation_status",
+            "description": "按 operation receipt ID 查询当前进程或当前会话诊断日志中的最新只读状态。不会修改 Houdini 场景。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation_id": {"type": "string", "description": "operation receipt ID"}
+                },
+                "required": ["operation_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_operation_receipts",
+            "description": "列出当前进程或当前会话诊断日志中的最新 operation receipts。不会修改 Houdini 场景。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "最多返回数量，默认20，范围1-100"}
+                },
+                "required": []
+            }
+        }
     }
 ]
 
@@ -2087,6 +2124,26 @@ class AIClient:
     def _loop_guidance_query_tools(cls) -> set:
         profile = cls._build_tool_execution_profile()
         return set(profile.get("loop_guidance_query_tools") or [])
+
+    @staticmethod
+    def _tool_loop_abort_reason(
+        tool_name: str,
+        consecutive_same_calls: int,
+        window_same_count: int,
+        consecutive_same_tool: int,
+    ) -> Optional[str]:
+        if tool_name == "list_skills" and consecutive_same_tool >= _SKILL_DISCOVERY_HARD_ABORT:
+            return (
+                f"已连续调用 list_skills {consecutive_same_tool} 次，Skill 发现预算已用尽。"
+                "请根据已有结果调用 run_skill，或直接向用户说明没有合适的 Skill。"
+            )
+        if (consecutive_same_calls >= _LOOP_HARD_ABORT_THRESHOLD
+                or window_same_count >= _LOOP_WINDOW_HIT_THRESHOLD):
+            return (
+                f"检测到 {tool_name} 的重复调用循环，已停止当前 agent loop。"
+                "请根据已有结果总结，或在下一次请求中更换策略。"
+            )
+        return None
 
     # ----------------------------------------------------------
     # 工具结果分页：按行分段，让 AI 自主判断是否需要更多
@@ -4782,16 +4839,20 @@ class AIClient:
                         recent_call_signatures.pop(0)
                     _window_same_count = recent_call_signatures.count(call_signature)
 
-                    # ★ 硬熔断已临时禁用：仅保留软提示，避免误杀合理的同工具多参数探索
-                    # 原逻辑：consecutive_same_calls/_window_same_count/consecutive_same_tool 达阈值即强制终止
-                    # 恢复时取消下方注释即可（常量仍保留：_LOOP_HARD_ABORT_THRESHOLD 等）
-                    # if (consecutive_same_calls >= _LOOP_HARD_ABORT_THRESHOLD
-                    #         or _window_same_count >= _LOOP_WINDOW_HIT_THRESHOLD
-                    #         or consecutive_same_tool >= _LOOP_SAME_TOOL_HARD_ABORT):
-                    #     print(f"[AI Client] ⛔ 循环检测硬熔断：{tool_name}（连续相同 {consecutive_same_calls} 次 / 窗口内 {_window_same_count} 次 / 同工具 {consecutive_same_tool} 次），强制终止")
-                    #     _loop_abort_reason = (...)
-                    #     should_break_tool_limit = True
-                    #     break
+                    _loop_abort_reason = self._tool_loop_abort_reason(
+                        tool_name,
+                        consecutive_same_calls,
+                        _window_same_count,
+                        consecutive_same_tool,
+                    )
+                    if _loop_abort_reason is not None:
+                        print(
+                            f"[AI Client] ⛔ 循环检测硬熔断：{tool_name}"
+                            f"（连续相同 {consecutive_same_calls} 次 / 窗口内 {_window_same_count} 次 / "
+                            f"同工具 {consecutive_same_tool} 次）"
+                        )
+                        should_break_tool_limit = True
+                        break
 
                     # ★ 循环检测软提示：连续相同调用或同工具连续调用达软阈值 → 注入换策略提示
                     _loop_inject = False
@@ -5583,16 +5644,20 @@ class AIClient:
                     recent_call_signatures.pop(0)
                 _window_same_count = recent_call_signatures.count(call_signature)
 
-                # ★ 硬熔断已临时禁用：仅保留软提示，避免误杀合理的同工具多参数探索
-                # 原逻辑：consecutive_same_calls/_window_same_count/consecutive_same_tool 达阈值即强制终止
-                # 恢复时取消下方注释即可（常量仍保留：_LOOP_HARD_ABORT_THRESHOLD 等）
-                # if (consecutive_same_calls >= _LOOP_HARD_ABORT_THRESHOLD
-                #         or _window_same_count >= _LOOP_WINDOW_HIT_THRESHOLD
-                #         or consecutive_same_tool >= _LOOP_SAME_TOOL_HARD_ABORT):
-                #     print(f"[AI Client] ⛔ JSON模式循环检测硬熔断：...")
-                #     _loop_abort_reason = (...)
-                #     should_break_limit = True
-                #     break
+                _loop_abort_reason = self._tool_loop_abort_reason(
+                    tool_name,
+                    consecutive_same_calls,
+                    _window_same_count,
+                    consecutive_same_tool,
+                )
+                if _loop_abort_reason is not None:
+                    print(
+                        f"[AI Client] ⛔ JSON模式循环检测硬熔断：{tool_name}"
+                        f"（连续相同 {consecutive_same_calls} 次 / 窗口内 {_window_same_count} 次 / "
+                        f"同工具 {consecutive_same_tool} 次）"
+                    )
+                    should_break_limit = True
+                    break
 
                 # ★ 循环检测软提示：连续相同调用或同工具连续调用达软阈值 → 注入换策略提示
                 _json_loop_hint = ""

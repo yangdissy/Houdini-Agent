@@ -2,6 +2,7 @@
 """Diagnostics and policy timeline helpers for AITab."""
 
 import json
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -11,6 +12,8 @@ from ..ui.i18n import tr
 
 
 class DiagnosticsMixin:
+    _diagnostics_write_lock = threading.Lock()
+
     def _refresh_mode_guard_ui(self):
         """刷新输入区模式风险提示与策略时间线入口。"""
         mode = 'PLAN' if self._plan_mode else ('AGENT' if self._agent_mode else 'ASK')
@@ -119,14 +122,15 @@ class DiagnosticsMixin:
         try:
             path = self._get_session_diagnostics_jsonl_path(sid)
             now_iso = datetime.now().isoformat()
-            with open(path, 'a', encoding='utf-8') as f:
-                for rec in records:
-                    row = dict(rec or {})
-                    row.setdefault('schema_version', 1)
-                    row.setdefault('session_id', sid)
-                    row.setdefault('recorded_at', now_iso)
-                    row.setdefault('event_type', 'unknown')
-                    f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+            with self._diagnostics_write_lock:
+                with open(path, 'a', encoding='utf-8') as f:
+                    for rec in records:
+                        row = dict(rec or {})
+                        row.setdefault('schema_version', 1)
+                        row.setdefault('session_id', sid)
+                        row.setdefault('recorded_at', now_iso)
+                        row.setdefault('event_type', 'unknown')
+                        f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         except Exception as e:
             print(f"[Diagnostics] 写入 session jsonl 失败: {e}")
 
@@ -196,6 +200,61 @@ class DiagnosticsMixin:
         except Exception as e:
             print(f"[Harness Trace] 写入失败: {e}")
 
+    @staticmethod
+    def _operation_receipt_from_row(row: dict) -> Optional[dict]:
+        if not isinstance(row, dict) or row.get('event_type') != 'operation_receipt':
+            return None
+        operation_id = row.get('operation_id')
+        if not isinstance(operation_id, str) or not operation_id:
+            return None
+        return {
+            key: row.get(key)
+            for key in (
+                'operation_id', 'kind', 'tool_name', 'state', 'created_at',
+                'updated_at', 'batch_size', 'wait_status', 'thread_still_running',
+                'scene_consistency', 'success', 'error_code', 'result_available',
+                'revision', 'recorded_at',
+            )
+            if row.get(key) is not None
+        }
+
+    @staticmethod
+    def _project_interrupted_receipt(receipt: dict) -> dict:
+        projected = dict(receipt)
+        if projected.get('state') in {'accepted', 'running'}:
+            projected['state'] = 'abandoned'
+            projected['wait_status'] = 'process_interrupted'
+            projected['scene_consistency'] = 'unknown'
+            projected['success'] = None
+        return projected
+
+    def _read_operation_receipts(self, session_id: str) -> list:
+        path = self._get_session_diagnostics_jsonl_path(session_id)
+        if not path.exists():
+            return []
+        records = {}
+        order = {}
+        with open(path, 'r', encoding='utf-8') as f:
+            for line_index, line in enumerate(f):
+                if not line.strip():
+                    continue
+                try:
+                    receipt = self._operation_receipt_from_row(json.loads(line))
+                except Exception:
+                    continue
+                if receipt is None:
+                    continue
+                operation_id = receipt['operation_id']
+                records[operation_id] = receipt
+                order[operation_id] = line_index
+        return [
+            self._project_interrupted_receipt(item)
+            for item in sorted(
+                records.values(),
+                key=lambda item: order.get(item['operation_id'], 0),
+            )
+        ]
+
     def _build_diagnostics_payload(self) -> dict:
         """Build a compact diagnostics payload without conversation message content."""
         session_id = self._session_id or "unknown"
@@ -207,6 +266,9 @@ class DiagnosticsMixin:
         session_audit_records = 0
         session_audit_last_recorded_at = None
         session_audit_stale = None
+        external_job_records = []
+        operation_records = {}
+        operation_order = {}
         try:
             session_audit_path = self._get_session_diagnostics_jsonl_path(session_id)
             session_audit_jsonl = str(session_audit_path)
@@ -220,7 +282,24 @@ class DiagnosticsMixin:
                         session_audit_records += 1
                         try:
                             row = json.loads(line)
+                            if not isinstance(row, dict):
+                                continue
                             last_recorded_at = row.get('recorded_at') or last_recorded_at
+                            receipt = self._operation_receipt_from_row(row)
+                            if receipt is not None:
+                                operation_id = receipt['operation_id']
+                                operation_records[operation_id] = receipt
+                                if operation_id:
+                                    operation_order[operation_id] = session_audit_records
+                            if str(row.get('event_type') or '').startswith('job_'):
+                                external_job_records.append({
+                                    key: row.get(key)
+                                    for key in (
+                                        'event_type', 'recorded_at', 'operation_id',
+                                        'kind', 'decision', 'exit_code', 'artifacts',
+                                    )
+                                    if row.get(key) is not None
+                                })
                         except Exception:
                             pass
                 session_audit_last_recorded_at = last_recorded_at
@@ -232,6 +311,25 @@ class DiagnosticsMixin:
                         session_audit_stale = None
         except Exception:
             pass
+
+        try:
+            from ..utils.mcp.external_jobs import ExternalProcessJobAdapter  # noqa: F401
+            external_jobs_available = True
+        except Exception:
+            external_jobs_available = False
+
+        external_job_events = external_job_records[-100:]
+        external_job_counts = {}
+        for record in external_job_records:
+            event_type = str(record.get('event_type') or 'unknown')
+            external_job_counts[event_type] = external_job_counts.get(event_type, 0) + 1
+
+        operation_items = sorted(
+            operation_records.values(),
+            key=lambda item: operation_order.get(item.get('operation_id'), 0),
+        )[-100:]
+        for item in operation_items:
+            item.update(self._project_interrupted_receipt(item))
 
         return {
             'schema_version': 1,
@@ -257,6 +355,16 @@ class DiagnosticsMixin:
                 'harness_v2_enabled': bool(getattr(self, '_harness_v2_enabled', False)),
                 'policy_retry_limit': getattr(self, '_policy_retry_limit', None),
                 'pending_user_switch': getattr(self, '_pending_user_switch', None),
+            },
+            'external_jobs': {
+                'module_available': external_jobs_available,
+                'runtime_configured': getattr(self, '_external_job_adapter', None) is not None,
+                'event_counts': external_job_counts,
+                'events': external_job_events,
+            },
+            'operations': {
+                'total_count': len(operation_records),
+                'items': operation_items,
             },
             'token_stats': dict(getattr(self, '_token_stats', {}) or {}),
             'policy': {
@@ -293,7 +401,9 @@ class DiagnosticsMixin:
             f"文件: {path}\n"
             f"Policy 记录: {len(payload['policy']['timeline'])}\n"
             f"Harness trace: {len(payload['harness']['executor_trace'])}\n"
-            f"Call records: {len(payload['calls'])}"
+            f"Call records: {len(payload['calls'])}\n"
+            f"External jobs: {len(payload['external_jobs']['events'])} events, "
+            f"runtime configured={payload['external_jobs']['runtime_configured']}"
         )
         response.finalize()
         return str(path)

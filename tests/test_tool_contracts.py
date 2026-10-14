@@ -16,7 +16,7 @@ for name in ("requests", "trafilatura"):
 
 from houdini_agent.utils.ai_client import HOUDINI_TOOLS
 from houdini_agent.utils.tool_registry import ToolRegistry
-from houdini_agent.utils.mcp.client import HoudiniMCP
+from houdini_agent.utils.mcp.client import HoudiniMCP, format_tool_usage_from_schema
 
 
 class CoreToolContractTest(unittest.TestCase):
@@ -35,6 +35,27 @@ class CoreToolContractTest(unittest.TestCase):
             with self.subTest(tool=meta.name):
                 description = meta.schema.get("function", {}).get("description", "")
                 self.assertTrue(description.strip())
+
+    def test_usage_hints_are_generated_from_schema_parameter_names(self):
+        for tool_name in ("create_wrangle_node", "semantic_search_nodes"):
+            with self.subTest(tool=tool_name):
+                meta = self.registry.get_meta(tool_name)
+                usage = format_tool_usage_from_schema(meta.schema)
+                properties = meta.schema["function"]["parameters"]["properties"]
+                for parameter_name in properties:
+                    self.assertIn(parameter_name + "=", usage)
+
+        wrangle_usage = format_tool_usage_from_schema(
+            self.registry.get_meta("create_wrangle_node").schema
+        )
+        semantic_usage = format_tool_usage_from_schema(
+            self.registry.get_meta("semantic_search_nodes").schema
+        )
+        self.assertIn("vex_code=", wrangle_usage)
+        self.assertIn("node_name=", wrangle_usage)
+        self.assertNotIn(" code=", wrangle_usage)
+        self.assertIn("description=", semantic_usage)
+        self.assertNotIn("query=", semantic_usage)
 
     def test_ask_mode_contains_only_readonly_core_tools(self):
         ask_names = {
@@ -181,7 +202,10 @@ class CoreToolContractTest(unittest.TestCase):
     def test_schema_and_dispatch_contracts_model_internal_tools_explicitly(self):
         core_names = set(self.registry._tools)
         dispatch_names = set(HoudiniMCP._TOOL_DISPATCH)
-        ai_internal_tools = {"web_search", "fetch_webpage", "add_todo", "update_todo"}
+        ai_internal_tools = {
+            "web_search", "fetch_webpage", "add_todo", "update_todo",
+            "get_operation_status", "list_operation_receipts",
+        }
         non_mcp_internal_dispatch = {
             "set_display_flag", "get_node_inputs", "list_network_boxes",
             "get_node_positions", "get_node_card", "check_errors",
@@ -229,6 +253,14 @@ class CoreToolContractTest(unittest.TestCase):
         self.assertEqual(self.registry.get_meta("get_parameter_schema").required_args(), ("node_path",))
         self.assertEqual(self.registry.get_meta("get_parameter_schema").path_kinds["node_path"], "node")
         self.assertEqual(self.registry.get_meta("save_hip").path_kinds["file_path"], "file")
+        for name in ("get_operation_status", "list_operation_receipts"):
+            with self.subTest(tool=name):
+                meta = self.registry.get_meta(name)
+                self.assertEqual(meta.runtime, "local")
+                self.assertEqual(meta.risk_level, "low")
+                self.assertFalse(meta.requires_confirmation)
+                self.assertFalse(meta.mutating)
+                self.assertFalse(meta.undo)
 
 
 if __name__ == "__main__":

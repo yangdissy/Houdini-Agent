@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Harness execution boundary tests."""
 
+import hashlib
 import unittest
 from unittest.mock import patch
 
@@ -289,6 +290,45 @@ class HarnessExecutionBoundaryTest(unittest.TestCase):
 
 
 class GovernedToolExecutorTest(unittest.TestCase):
+    def test_execute_python_audits_code_hash_without_source(self):
+        audits = []
+        code = "print('audit-source-secret')"
+        owner = GovernedToolExecutor(
+            type("FixedPolicy", (), {
+                "decide": lambda self, *args: ToolPolicyDecision(action="allow")
+            })(),
+            lambda *args: {"success": True, "result": "done"},
+            audit=audits.append,
+        )
+
+        result = owner.execute("execute_python", {"code": code}, {"mode": "agent"})
+
+        self.assertTrue(result["success"])
+        start_record = next(record for record in audits if record.get("phase") == "start")
+        self.assertEqual(start_record["code_sha256"], hashlib.sha256(code.encode("utf-8")).hexdigest())
+        self.assertNotIn("audit-source-secret", str(audits))
+
+    def test_timeout_consistency_metadata_is_audited(self):
+        audits = []
+        owner = GovernedToolExecutor(
+            type("FixedPolicy", (), {
+                "decide": lambda self, *args: ToolPolicyDecision(action="allow")
+            })(),
+            lambda *args: {
+                "success": False,
+                "error": "timed out",
+                "thread_still_running": True,
+                "scene_consistency": "unknown",
+            },
+            audit=audits.append,
+        )
+
+        result = owner.execute("execute_python", {"code": "pass"}, {"mode": "agent"})
+
+        self.assertFalse(result["success"])
+        self.assertTrue(audits[-1]["thread_still_running"])
+        self.assertEqual(audits[-1]["scene_consistency"], "unknown")
+
     def test_allow_sanitizes_result_and_audits_metadata_only(self):
         audits = []
         calls = []

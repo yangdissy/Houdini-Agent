@@ -45,6 +45,12 @@ SCENE_MUTATION_TOOLS = frozenset({
 
 HIGH_RISK_TOOLS = frozenset(DESTRUCTIVE_TOOLS | CODE_EXEC_TOOLS)
 
+# Skills that implement their own narrower write authorization contract.
+# install_houdini_skill separates source installation from explicit activation.
+CONTROLLED_WRITE_SKILLS = frozenset({
+    "install_houdini_skill",
+})
+
 SENSITIVE_ARG_KEYS = frozenset({
     'api_key',
     'apikey',

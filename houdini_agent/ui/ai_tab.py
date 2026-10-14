@@ -165,6 +165,8 @@ class AITab(
     _updatePlanStep = QtCore.Signal(str, str, str)   # Plan 模式：更新步骤状态 (step_id, status, result_summary)
     _askQuestionRequest = QtCore.Signal()             # Plan 模式：ask_question 请求（参数通过属性传递）
     _episodicRecorded = QtCore.Signal(str)            # 任务反思完成：写入 episodic 记忆 (episodic_id)
+    _memoryMigrationRequired = QtCore.Signal()
+    _memoryMigrationFinished = QtCore.Signal(bool, str)
 
     def __init__(self, parent=None, workspace_dir: Optional[Path] = None, username: Optional[str] = None):
         super().__init__(parent)
@@ -173,6 +175,8 @@ class AITab(
         user_paths = UserPaths(self._username)
         self._user_paths = user_paths
         user_paths.ensure_dirs()
+        from ..skills import set_current_user
+        set_current_user(self._username)
 
         try:
             self.client = AIClient(username=self._username)
@@ -252,8 +256,6 @@ class AITab(
         # 用户切换请求（在停止后执行）
         self._pending_user_switch: Optional[str] = None
         
-        self._init_memory_system()
-        
         # 思考长度限制（已禁用，允许完整思考）
         self._max_thinking_length = float('inf')  # 不限制思考长度
         self._thinking_length_warning = float('inf')  # 不警告
@@ -312,7 +314,10 @@ class AITab(
             result_queue=self._tool_result_queue,
             main_timeout=self._TOOL_MAIN_THREAD_TIMEOUT,
             batch_timeout=60.0,
-            record_event=lambda event: self._append_session_diagnostics_records([event]),
+            record_event=lambda event: self._append_session_diagnostics_records(
+                [event], session_id=event.get('session_id')
+            ),
+            session_id_provider=lambda: self._agent_session_id or self._session_id,
         )
         self._configure_external_mcp_adapter()
         self._addThinking.connect(self._on_add_thinking)
@@ -331,6 +336,9 @@ class AITab(
         self._updatePlanStep.connect(self._on_update_plan_step, QtCore.Qt.QueuedConnection)
         self._askQuestionRequest.connect(self._on_render_ask_question, QtCore.Qt.QueuedConnection)
         self._episodicRecorded.connect(self._on_episodic_recorded, QtCore.Qt.QueuedConnection)
+        self._memoryMigrationRequired.connect(self._on_memory_migration_required, QtCore.Qt.QueuedConnection)
+        self._memoryMigrationFinished.connect(self._on_memory_migration_finished, QtCore.Qt.QueuedConnection)
+        self._init_memory_system()
 
         # ── 流式 VEX 预览状态 ──
         self._streaming_preview = None          # 当前的 StreamingCodePreview widget
@@ -340,18 +348,18 @@ class AITab(
         # 构建并缓存系统提示词（完整版：首轮；核心版：续接轮）
         self._system_prompt_think = self._build_system_prompt(with_thinking=True)
         self._system_prompt_no_think = self._build_system_prompt(with_thinking=False)
-        self._cached_prompt_think = self.token_optimizer.optimize_system_prompt(
-            self._system_prompt_think, max_length=1800
+        self._cached_prompt_think = self._build_budgeted_system_prompt(
+            with_thinking=True, full_rules=True
         )
-        self._cached_prompt_no_think = self.token_optimizer.optimize_system_prompt(
-            self._system_prompt_no_think, max_length=1500
+        self._cached_prompt_no_think = self._build_budgeted_system_prompt(
+            with_thinking=False, full_rules=True
         )
         # 核心规则子集版（续接轮使用，节省 ~2000 tokens/轮）
-        self._cached_prompt_core_think = self.token_optimizer.optimize_system_prompt(
-            self._build_system_prompt(with_thinking=True, full_rules=False), max_length=1200
+        self._cached_prompt_core_think = self._build_budgeted_system_prompt(
+            with_thinking=True, full_rules=False
         )
-        self._cached_prompt_core_no_think = self.token_optimizer.optimize_system_prompt(
-            self._build_system_prompt(with_thinking=False, full_rules=False), max_length=1000
+        self._cached_prompt_core_no_think = self._build_budgeted_system_prompt(
+            with_thinking=False, full_rules=False
         )
         # 兼容旧引用
         self._system_prompt = self._system_prompt_think
@@ -458,18 +466,18 @@ class AITab(
         """语言切换后重建系统提示词（含 Ask/Agent 模式强制语言规则）"""
         self._system_prompt_think = self._build_system_prompt(with_thinking=True)
         self._system_prompt_no_think = self._build_system_prompt(with_thinking=False)
-        self._cached_prompt_think = self.token_optimizer.optimize_system_prompt(
-            self._system_prompt_think, max_length=1800
+        self._cached_prompt_think = self._build_budgeted_system_prompt(
+            with_thinking=True, full_rules=True
         )
-        self._cached_prompt_no_think = self.token_optimizer.optimize_system_prompt(
-            self._system_prompt_no_think, max_length=1800
+        self._cached_prompt_no_think = self._build_budgeted_system_prompt(
+            with_thinking=False, full_rules=True
         )
         # 核心规则子集版同步重建
-        self._cached_prompt_core_think = self.token_optimizer.optimize_system_prompt(
-            self._build_system_prompt(with_thinking=True, full_rules=False), max_length=1200
+        self._cached_prompt_core_think = self._build_budgeted_system_prompt(
+            with_thinking=True, full_rules=False
         )
-        self._cached_prompt_core_no_think = self.token_optimizer.optimize_system_prompt(
-            self._build_system_prompt(with_thinking=False, full_rules=False), max_length=1000
+        self._cached_prompt_core_no_think = self._build_budgeted_system_prompt(
+            with_thinking=False, full_rules=False
         )
         self._system_prompt = self._system_prompt_think
         self._cached_optimized_system_prompt = self._cached_prompt_think
@@ -532,6 +540,18 @@ class AITab(
 
     def _build_system_prompt(self, with_thinking: bool = True, full_rules: bool = True) -> str:
         return build_system_prompt(with_thinking=with_thinking, full_rules=full_rules)
+
+    def _build_budgeted_system_prompt(
+        self,
+        with_thinking: bool = True,
+        full_rules: bool = True,
+    ) -> str:
+        from houdini_agent.core.prompt_manager import build_budgeted_system_prompt
+
+        return build_budgeted_system_prompt(
+            with_thinking=with_thinking,
+            full_rules=full_rules,
+        ).prompt
 
     def _build_ui(self):
         # ---- 全局 QSS（由 ThemeEngine 从模板渲染） ----

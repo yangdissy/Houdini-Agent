@@ -1,0 +1,90 @@
+# Copernicus and OpenCL production notes
+
+These notes capture Houdini 21 behavior reported from production use. Treat node
+parameter names and host behavior as version-specific: verify them against the
+installed Houdini help and a small cooked network before relying on them.
+
+## OpenCL COP kernel structure
+
+Use Houdini's `#bind` directives with the `@KERNEL` macro instead of declaring a
+manual `kernel void` entry point. Houdini generates the signature, global IDs,
+bounds handling, and buffer bindings. A manual kernel can bypass this integration
+and show a pink result or fail to receive the expected resolution and layers.
+
+Common bindings include an optional input such as `#bind layer src? float4 val=0`
+and a write-only output such as `#bind layer !&C float4`. Enable the node options
+for globals that the kernel uses: `options_time` for `@Time`,
+`options_timeinc` for `@TimeInc`, and `options_iteration` for `@Iteration`.
+
+## Iterative neighbor reads require write-back isolation
+
+An iterative OpenCL COP that reads neighboring pixels and writes persistent state
+must not assume all work-items observe the same generation of that state. Mixed
+old and new neighbor values make the result order-dependent.
+
+Use a gather pass in `@KERNEL` to read neighbors and write a scratch layer, then a
+write-back pass in `@WRITEBACK` to update each state pixel from its own scratch
+value. Enable `usewritebackkernel`, `options_iteration`, and the required iteration
+count on the node. A single pass that both reads neighbors and writes state has
+Gauss-Seidel-like behavior and should only be used when that behavior is accepted
+and visually verified.
+
+## Laplacian stability
+
+For explicit diffusion with timestep 1, an unnormalized 5-point stencil
+`L + R + U + D - 4*C` generally requires a diffusion coefficient below 0.25.
+A normalized 9-point stencil using 0.2 for four orthogonal neighbors and 0.05 for
+four diagonal neighbors has total positive weight 1 and supports larger steps.
+Still test the full update equation: reaction terms, boundary rules, precision,
+and additional fields can impose stricter stability limits.
+
+## OpenCL differs from GLSL
+
+OpenCL `fract` requires a second argument for the integer part; use
+`x - floor(x)` when only the fractional value is needed. `fmod` preserves the
+sign of its first argument, so negative coordinates need deliberate handling for
+periodic patterns. Construct vectors explicitly, for example `(float3)(1.0f)`,
+use float suffixes where appropriate, and do not rely on GLSL `.rgb` aliases.
+
+## Copernicus VEX coordinates
+
+Legacy COP2 globals such as `@IX`, `@IY`, `@XRES`, and `@YRES` can be zero in a
+Copernicus VEX Wrangle and produce a black image without an explanatory error.
+Use `@P` for position and `volumeres(0, 0)` for resolution, then derive UV or
+aspect-correct image coordinates explicitly. Verify the actual layer values, not
+only the viewer visualization.
+
+## OpenCL COP node setup
+
+For a generative OpenCL COP, provide resolution through the Copernicus network or
+a connected resolution-bearing input, mark the image input optional, and bind a
+writeable output layer. Let `#bind` directives control bindings when the node is
+configured for that mode. Do not assume parameter menu indices are stable across
+Houdini versions; inspect the installed node parameter templates before setting
+them through HOM.
+
+## Copernicus output capture
+
+Do not use Scene Viewer `viewwrite` as proof that a Copernicus image is correct.
+Viewport capture can require the Scene Viewer to be the active pane, and a tool
+may report success even when no image file is produced. Render Copernicus output
+through a ROP Image Output COP (`rop_image` in Houdini 21), then verify that the
+expected file exists and can be decoded. `rop_comp` belongs to the legacy COP2
+workflow and is not the Copernicus output node.
+
+## Debugging checklist
+
+- Pink output: check for a manual kernel signature, missing layer bindings, or
+  missing resolution flow.
+- Black VEX output: replace legacy `@IX` and `@IY` usage with `@P` and
+  `volumeres()`.
+- Undefined `@Time` or `@Iteration`: enable the corresponding node option.
+- Iteration has no feedback: enable the write-back kernel and confirm state is a
+  read-write layer.
+- Simulation explodes or collapses: reduce timestep or diffusion coefficients,
+  normalize the stencil, and inspect boundary behavior.
+- A compile error remains after editing: make a harmless source change to test
+  whether the OpenCL program cache was invalidated, then inspect the current cook
+  error rather than trusting a stale UI message.
+- Capture reports success with no file: render through `rop_image` and validate
+  the output path.

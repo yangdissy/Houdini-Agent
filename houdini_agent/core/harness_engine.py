@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .harness_policy_config import (
+    CONTROLLED_WRITE_SKILLS,
     HIGH_RISK_TOOLS,
     PYTHON_DANGEROUS_PATTERNS,
     SECRET_REDACTION_PATTERNS,
@@ -403,6 +404,13 @@ class HarnessToolPolicyEngine:
 
         mode = context.get("mode", "agent")
         confirm_mode = bool(context.get("confirm_mode", False))
+        skill_params = safe_args.get("params") if isinstance(safe_args.get("params"), dict) else {}
+        controlled_skill_action = skill_params.get("action") or skill_params.get("mode", "preview")
+        controlled_skill_write = (
+            tool_name == "run_skill"
+            and safe_args.get("skill_name") in CONTROLLED_WRITE_SKILLS
+            and controlled_skill_action == "preview"
+        )
         if tool_name == "remember_memory":
             if int(context.get("remember_memory_calls") or 0) >= 1:
                 return self._decision(
@@ -466,10 +474,27 @@ class HarnessToolPolicyEngine:
                 required_control="deny",
             )
 
+        if (
+                mode in {"agent", "plan"}
+                and tool_name == "run_skill"
+                and safe_args.get("skill_name") in CONTROLLED_WRITE_SKILLS
+                and controlled_skill_action in {"install", "activate"}):
+            return self._decision(
+                "ask",
+                f"Skill action '{controlled_skill_action}' requires confirmation: {safe_args.get('skill_name')}",
+                risk_factors=[RiskFactor(
+                    "controlled_skill_write_confirmation",
+                    "warning",
+                    f"Controlled Skill action requires confirmation: {controlled_skill_action}",
+                    0.7,
+                )],
+                required_control="confirm",
+            )
+
         # confirm_mode=True means Step Confirm is enabled: high-risk tools must
         # ask the user before execution. confirm_mode=False is Direct Execute
         # (HIGH-RISK), where the user has opted out of confirmation prompts.
-        if mode in {"agent", "plan"} and meta.requires_confirmation and confirm_mode:
+        if mode in {"agent", "plan"} and meta.requires_confirmation and confirm_mode and not controlled_skill_write:
             if tool_name == "set_update_mode":
                 return self._decision(
                     "ask",
@@ -627,11 +652,16 @@ class GovernedToolExecutor:
             return {"success": False, "error": f"Unsupported policy action: {action}"}
 
         started_at = time.time()
-        self._record_audit({
+        start_audit = {
             "event_type": "tool_call", "phase": "start", "tool": tool_name,
             "action": action, "mode": context.get("mode", "agent"),
             "args_keys": sorted(str(key) for key in exec_args.keys()),
-        })
+        }
+        if tool_name == "execute_python" and isinstance(exec_args.get("code"), str):
+            start_audit["code_sha256"] = hashlib.sha256(
+                exec_args["code"].encode("utf-8", errors="replace")
+            ).hexdigest()
+        self._record_audit(start_audit)
         try:
             result = self._execute(tool_name, exec_args, action == "ask")
         except Exception:
@@ -651,6 +681,8 @@ class GovernedToolExecutor:
             "success": bool(result.get("success")),
             "verification_status": verification_status,
             "error_code": error_code,
+            "thread_still_running": bool(result.get("thread_still_running", False)),
+            "scene_consistency": str(result.get("scene_consistency") or ""),
             "duration_ms": int(max(0.0, time.time() - started_at) * 1000),
         })
 

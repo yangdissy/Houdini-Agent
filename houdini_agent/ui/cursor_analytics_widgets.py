@@ -324,8 +324,7 @@ class TokenAnalyticsPanel(QtWidgets.QDialog):
         reqs = stats.get('requests', 0)
         total = stats.get('total_tokens', 0)
         cost = stats.get('estimated_cost', 0.0)
-        cache_total = cache_r + cache_w
-        hit_rate = (cache_r / cache_total * 100) if cache_total > 0 else 0
+        hit_rate = (cache_r / total_in * 100) if total_in > 0 else 0
 
         # 平均延迟
         latencies = [r.get('latency', 0) for r in records if r.get('latency', 0) > 0]

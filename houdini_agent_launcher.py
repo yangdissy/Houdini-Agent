@@ -24,8 +24,15 @@ def _cleanup_legacy_modules():
 _ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 _LIB_DIR = os.path.join(_ROOT_DIR, 'lib')
 
-_VERSIONED_LIB_DIR = os.path.join(
-    _LIB_DIR, f'python{sys.version_info.major}{sys.version_info.minor}'
+_PYTHON_LIB_NAME = f'python{sys.version_info.major}{sys.version_info.minor}'
+_VERSIONED_LIB_CANDIDATES = (
+    os.path.join(_LIB_DIR, f'{_PYTHON_LIB_NAME}_embed_complete'),
+    os.path.join(_LIB_DIR, f'{_PYTHON_LIB_NAME}_embed'),
+    os.path.join(_LIB_DIR, _PYTHON_LIB_NAME),
+)
+_VERSIONED_LIB_DIR = next(
+    (path for path in _VERSIONED_LIB_CANDIDATES if os.path.isdir(path)),
+    _VERSIONED_LIB_CANDIDATES[-1],
 )
 
 if os.path.exists(_LIB_DIR):

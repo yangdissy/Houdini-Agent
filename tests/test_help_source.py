@@ -13,14 +13,24 @@ import unittest
 import zipfile
 from pathlib import Path
 
+import numpy as np
+
+from houdini_agent import skills
 from houdini_agent.utils.help_source import (
     find_help_dir,
     get_page,
     iter_pages,
     parse_wiki,
 )
-from houdini_agent.skills import search_houdini_help
 from houdini_agent.utils.doc_rag import HoudiniDocIndex
+
+
+_SEARCH_DESCRIPTOR = skills._parse_skill_markdown(
+    Path(__file__).resolve().parents[1]
+    / "houdini_agent" / "skills" / "docs"
+    / "search_houdini_help" / "SKILL.md"
+)
+search_houdini_help = skills._load_descriptor_entrypoint(_SEARCH_DESCRIPTOR)
 
 
 # ---------------------------------------------------------------
@@ -183,6 +193,53 @@ class HelpChainTest(unittest.TestCase):
         self.assertIn("not found", hidden["error"])
         self.assertIn("attribwrangle", index.node_index)
         self.assertTrue((self._cache / "houdini_doc_index.json").exists())
+
+
+class _SemanticEmbedder:
+    is_semantic = True
+
+    @staticmethod
+    def encode(text):
+        return np.array([1.0, 0.0], dtype=np.float32)
+
+    @staticmethod
+    def encode_batch(texts):
+        rows = []
+        for text in texts:
+            rows.append([1.0, 0.0] if "Pyro" in text else [0.0, 1.0])
+        return np.array(rows, dtype=np.float32)
+
+    @staticmethod
+    def batch_cosine_similarity(query, matrix):
+        return matrix @ query
+
+
+class KnowledgeSemanticSearchTest(unittest.TestCase):
+    def test_cross_language_query_can_recall_english_chunk(self):
+        temp_dir = Path(tempfile.mkdtemp())
+        try:
+            doc_dir = temp_dir / "docs"
+            doc_dir.mkdir()
+            (doc_dir / "knowledge.txt").write_text(
+                "## Pyro collision setup\n"
+                "Configure collision geometry and a static object for the smoke simulation.\n\n"
+                "## UV workflow\n"
+                "Create UV coordinates and pack texture islands for rendering.\n",
+                encoding="utf-8",
+            )
+            index = HoudiniDocIndex(
+                help_dir=str(temp_dir / "missing-help"),
+                cache_dir=str(temp_dir / "cache"),
+                doc_dir=str(doc_dir),
+                embedder=_SemanticEmbedder(),
+            )
+
+            results = index.search_knowledge("如何设置烟雾碰撞", top_k=1)
+
+            self.assertEqual(results[0]["name"], "Pyro collision setup")
+            self.assertIn("semantic=1.00", results[0]["rank_reason"])
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------
