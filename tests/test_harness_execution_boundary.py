@@ -2,6 +2,7 @@
 """Harness execution boundary tests."""
 
 import hashlib
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -49,16 +50,6 @@ class _ControlStub:
 
 
 class _ThreadStub:
-    last_args = None
-
-    def __init__(self, target, args, daemon):
-        self.__class__.last_args = args
-
-    def start(self):
-        pass
-
-
-class _ThreadStub:
     last_target = None
     last_args = None
 
@@ -73,7 +64,12 @@ class _ThreadStub:
 class HarnessExecutionBoundaryTest(unittest.TestCase):
     def _make_tab(self):
         tab = object.__new__(AITab)
+        cache_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cache_dir.cleanup)
         tab.client = _ClientStub()
+        tab._cache_dir = cache_dir.name
+        tab._session_id = "test-session"
+        tab._agent_session_id = None
         tab._harness_v2_enabled = True
         tab._tool_policy_engine = HarnessToolPolicyEngine()
         tab._harness_state = None
@@ -135,6 +131,37 @@ class HarnessExecutionBoundaryTest(unittest.TestCase):
 
         self.assertFalse(result["success"])
         self.assertEqual(confirmations[0][0], "execute_shell")
+
+    def test_archival_failure_preserves_successful_tool_result(self):
+        tab = self._make_tab()
+        tab._agent_mode = True
+        diagnostics = []
+        tab._append_session_diagnostics_records = lambda records, *args, **kwargs: diagnostics.extend(records)
+        tab._execute_tool_impl = lambda *args, **kwargs: {"success": True, "result": "created"}
+
+        with patch(
+            "houdini_agent.core.tool_result_store.ToolResultStore.archive_if_large",
+            side_effect=RuntimeError("secret-value"),
+        ):
+            result = AITab._execute_tool_with_todo(tab, "create_node", node_type="null")
+
+        self.assertEqual(result, {"success": True, "result": "created"})
+        self.assertEqual(diagnostics[-1]["error_code"], "archive_failed")
+        self.assertNotIn("secret-value", repr(diagnostics))
+
+    def test_archival_failure_preserves_original_tool_error(self):
+        tab = self._make_tab()
+        tab._agent_mode = True
+        tab._execute_tool_impl = lambda *args, **kwargs: {"success": False, "error": "original error"}
+
+        with patch(
+            "houdini_agent.core.tool_result_store.ToolResultStore.archive_if_large",
+            side_effect=OSError("storage error"),
+        ):
+            result = AITab._execute_tool_with_todo(tab, "get_network_structure", network_path="/obj")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "original error")
 
     def test_start_agent_run_captures_user_message_in_thread_params(self):
         tab = self._make_tab()

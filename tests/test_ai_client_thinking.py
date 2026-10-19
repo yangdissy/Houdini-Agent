@@ -17,6 +17,71 @@ def _call(tool_name, args=None):
 
 
 class AIClientThinkingHintTest(unittest.TestCase):
+    @staticmethod
+    def _loop_client(streams):
+        client = object.__new__(AIClient)
+        client._tool_executor = mock.Mock()
+        client._tool_executor.execute.return_value = {"success": True}
+        client._stop_event = mock.Mock()
+        client._stop_event.is_set.return_value = False
+        client._get_streaming_tool_executor = mock.Mock()
+        stream_executor = client._get_streaming_tool_executor.return_value
+        stream_executor.reset.return_value = None
+        stream_executor.execute_round.return_value = {
+            "results_ordered": [{"success": True}],
+            "dedup_flags": [False],
+            "early_skip_count": 0,
+        }
+        client._sanitize_working_messages = lambda messages: messages
+        client._ensure_context_within_budget = lambda messages, tools, limit: None
+        client.chat_stream = mock.Mock(side_effect=[iter(stream) for stream in streams])
+        return client
+
+    def test_agent_loop_rechecks_once_after_tools_before_finishing(self):
+        client = self._loop_client([
+            [
+                {"type": "tool_call", "tool_call": {
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "inspect_node", "arguments": "{}"},
+                }},
+                {"type": "done", "usage": {}},
+            ],
+            [{"type": "content", "content": "Next I will verify."}, {"type": "done", "usage": {}}],
+            [{"type": "content", "content": "Complete."}, {"type": "done", "usage": {}}],
+        ])
+        resume = mock.Mock(side_effect=["Check completion and continue if needed", None])
+
+        result = client.agent_loop_stream(
+            messages=[{"role": "user", "content": "inspect and verify"}],
+            model="test-model",
+            provider="test-provider",
+            tools_override=[{"type": "function", "function": {"name": "inspect_node"}}],
+            on_incomplete=resume,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.chat_stream.call_count, 3)
+        self.assertEqual(resume.call_count, 2)
+        self.assertEqual(result["final_content"].strip(), "Complete.")
+
+    def test_agent_loop_does_not_recheck_first_round_plain_answer(self):
+        client = self._loop_client([
+            [{"type": "content", "content": "Answer."}, {"type": "done", "usage": {}}],
+        ])
+        resume = mock.Mock(return_value="continue")
+
+        result = client.agent_loop_stream(
+            messages=[{"role": "user", "content": "question"}],
+            model="test-model",
+            provider="test-provider",
+            tools_override=[],
+            on_incomplete=resume,
+        )
+
+        self.assertTrue(result["ok"])
+        resume.assert_not_called()
+        self.assertEqual(client.chat_stream.call_count, 1)
+
     def test_lexical_embedder_does_not_probe_semantic_model(self):
         with mock.patch.object(LocalEmbedder, "_try_load_model") as try_load:
             embedder = LocalEmbedder(load_semantic_model=False)
@@ -25,9 +90,9 @@ class AIClientThinkingHintTest(unittest.TestCase):
         self.assertEqual(embedder._backend, "fallback")
 
     def test_gpt5_models_use_default_temperature(self):
-        self.assertTrue(AIClient.requires_temperature_one("gpt-5.5"))
+        self.assertTrue(AIClient.requires_temperature_one("gpt-5.6"))
         self.assertTrue(AIClient.requires_temperature_one("gpt-5.3-codex"))
-        self.assertEqual(AIClient._payload_temperature("gpt-5.5", 0.17), 1)
+        self.assertEqual(AIClient._payload_temperature("gpt-5.6", 0.17), 1)
 
     def test_legacy_kimi_k3_display_id_normalizes_to_api_model(self):
         self.assertEqual(AIClient._normalize_model_id("k3[1m]"), "k3")
@@ -342,6 +407,7 @@ class AIClientContextTrimTest(unittest.TestCase):
             iter([{"type": "content", "content": "done"}, {"type": "done", "usage": {}}]),
         ])
         tools = [{"type": "function", "function": {"name": "inspect_node"}}]
+        content_updates = []
 
         result = client.agent_loop_stream(
             messages=[
@@ -352,6 +418,7 @@ class AIClientContextTrimTest(unittest.TestCase):
             model="test-model",
             provider="test-provider",
             tools_override=tools,
+            on_content=content_updates.append,
             max_iterations=2,
             context_limit=10000,
         )
@@ -360,6 +427,8 @@ class AIClientContextTrimTest(unittest.TestCase):
         self.assertEqual(client.chat_stream.call_count, 2)
         self.assertIs(client._progressive_trim.call_args.kwargs["tools"], tools)
         self.assertEqual(client._progressive_trim.call_args.kwargs["trim_level"], 1)
+        self.assertTrue(any("请求体过大" in update for update in content_updates))
+        self.assertFalse(any("上下文超限" in update for update in content_updates))
 
     def test_request_body_budget_removes_old_images_before_current_image(self):
         old_image = "data:image/png;base64," + ("A" * 2500)
@@ -420,6 +489,33 @@ class AIClientContextTrimTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(client.chat_stream.call_count, 1)
         self.assertIn("请求体过大", result["error"])
+
+    def test_json_mode_http_413_aborts_without_context_overflow_message(self):
+        client = object.__new__(AIClient)
+        client._tool_executor = mock.Mock()
+        client._stop_event = mock.Mock()
+        client._stop_event.is_set.return_value = False
+        client._sanitize_working_messages = lambda messages: messages
+        client._ensure_context_within_budget = lambda messages, tools, limit: None
+        client._progressive_trim = mock.Mock(side_effect=lambda messages, history, **kwargs: list(messages))
+        client.chat_stream = mock.Mock(return_value=iter([
+            {"type": "error", "error": "HTTP 413 Request Entity Too Large"},
+        ]))
+        content_updates = []
+
+        result = client.agent_loop_json_mode(
+            messages=[{"role": "user", "content": "inspect"}],
+            model="test-model",
+            provider="test-provider",
+            tools_override=[],
+            on_content=content_updates.append,
+            max_iterations=4,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(client.chat_stream.call_count, 1)
+        self.assertIn("请求体过大", result["error"])
+        self.assertFalse(any("上下文超限" in update for update in content_updates))
 
 
 if __name__ == "__main__":

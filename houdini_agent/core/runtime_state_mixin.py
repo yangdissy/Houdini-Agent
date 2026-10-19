@@ -14,6 +14,15 @@ from ..utils.dev_feature_toggles import DEV_FEATURE_TOGGLES, is_toggle_enabled
 
 
 class RuntimeStateMixin:
+    @staticmethod
+    def _should_reflect_on_result(result: dict) -> bool:
+        if not result.get('ok', True):
+            return False
+        if result.get('tool_calls_history'):
+            return True
+        final_content = result.get('final_content', '')
+        return isinstance(final_content, str) and bool(final_content.strip())
+
     _TAB_RUNNING_PREFIX = "\u25cf "
 
     @staticmethod
@@ -490,7 +499,7 @@ class RuntimeStateMixin:
                     f"Harness: tools={total_tools}, dedup={dedup_hits}, skip={early_skips}, failed={failed_tools}"
                 )
 
-        if self._memory_initialized and tool_calls_history:
+        if self._memory_initialized and self._should_reflect_on_result(result):
             reflect_params = getattr(self, '_last_agent_params', {})
             def do_reflect():
                 self._reflect_after_task(result, reflect_params)

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import queue
+import hashlib
+import json
 import sys
 import threading
 import time
@@ -16,6 +18,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 ToolResult = Dict[str, object]
 ToolBatch = List[Tuple[str, dict]]
 OPERATION_ID_KEY = "_ha_operation_id"
+RECEIPT_PROTOCOL_VERSION = 1
 
 
 class HoudiniMainThreadExecutor:
@@ -30,6 +33,7 @@ class HoudiniMainThreadExecutor:
         batch_timeout: float = 60.0,
         record_event: Optional[Callable[[dict], None]] = None,
         session_id_provider: Optional[Callable[[], str]] = None,
+        identity_provider: Optional[Callable[[], dict]] = None,
         max_receipts: int = 32,
     ):
         self._emit_tool_request = emit_tool_request
@@ -39,6 +43,7 @@ class HoudiniMainThreadExecutor:
         self._batch_timeout = batch_timeout
         self._record_event_callback = record_event
         self._session_id_provider = session_id_provider
+        self._identity_provider = identity_provider
         self._lock = threading.Lock()
         self._receipt_lock = threading.Lock()
         self._operation_ids = count(1)
@@ -84,7 +89,7 @@ class HoudiniMainThreadExecutor:
                 return guard
 
             operation_id = next(self._operation_ids)
-            receipt = self._create_receipt(operation_id, tool_name, 1)
+            receipt = self._create_receipt(operation_id, tool_name, 1, kwargs)
             if receipt is None:
                 return {"success": False, "error": "Operation receipt capacity reached; refusing new Houdini execution"}
             self._active_operation_id = operation_id
@@ -304,7 +309,13 @@ class HoudiniMainThreadExecutor:
             receipts = sorted(self._receipts.values(), key=lambda item: item["updated_at"])
             return [dict(item) for item in receipts[-bounded_limit:]]
 
-    def _create_receipt(self, correlation_id: int, tool_name: str, batch_size: int) -> Optional[dict]:
+    def _create_receipt(
+        self,
+        correlation_id: int,
+        tool_name: str,
+        batch_size: int,
+        arguments: Optional[dict] = None,
+    ) -> Optional[dict]:
         with self._receipt_lock:
             terminal = sorted(
                 (item for item in self._receipts.values() if item["state"] in {"completed", "failed"}),
@@ -323,7 +334,16 @@ class HoudiniMainThreadExecutor:
                     session_id = str(self._session_id_provider() or "unknown")
                 except Exception:
                     session_id = "unknown"
+            identity = {}
+            if self._identity_provider is not None:
+                try:
+                    provided = self._identity_provider()
+                    identity = dict(provided) if isinstance(provided, dict) else {}
+                except Exception:
+                    identity = {}
             receipt = {
+                "protocol_version": RECEIPT_PROTOCOL_VERSION,
+                "request_ref": public_id,
                 "operation_id": public_id,
                 "kind": "houdini_tool",
                 "tool_name": str(tool_name),
@@ -338,8 +358,14 @@ class HoudiniMainThreadExecutor:
                 "error_code": "",
                 "result_available": False,
                 "session_id": session_id,
+                "arguments_sha256": self._arguments_sha256(arguments),
+                "contract_version": self._tool_contract_version(tool_name),
                 "revision": 1,
             }
+            for key in ("executor_id", "houdini_version", "scene_id", "hip_path"):
+                value = identity.get(key)
+                if value is not None:
+                    receipt[key] = str(value)
             self._receipts[public_id] = receipt
             self._receipt_ids_by_correlation[correlation_id] = public_id
             self._record_receipt_event(receipt)
@@ -364,6 +390,22 @@ class HoudiniMainThreadExecutor:
 
     def _record_receipt_event(self, receipt: dict) -> None:
         self._record_event("operation_receipt", **dict(receipt))
+
+    @staticmethod
+    def _arguments_sha256(arguments: Optional[dict]) -> str:
+        try:
+            payload = json.dumps(arguments or {}, sort_keys=True, separators=(",", ":"), default=str)
+        except Exception:
+            payload = repr(arguments or {})
+        return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+
+    @staticmethod
+    def _tool_contract_version(tool_name: str) -> str:
+        try:
+            from ..utils.tool_registry import get_tool_registry
+            return get_tool_registry().contract_version(tool_name)
+        except Exception:
+            return "unknown"
 
     def _attach_receipt_to_result(self, correlation_id: int, result):
         if not isinstance(result, dict):

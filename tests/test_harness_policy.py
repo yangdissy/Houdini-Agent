@@ -4,6 +4,7 @@
 import unittest
 
 from houdini_agent.core.harness_engine import (
+    GovernedToolExecutor,
     HarnessToolPolicyEngine,
     ToolArgumentValidator,
     build_tool_retry_key,
@@ -28,7 +29,10 @@ def _core_registry():
         "get_geometry_summary": ["node_path"], "temporary_auto_validate_geometry": ["node_path"],
         "connect_nodes": ["from_path", "to_path"], "suggest_connection": ["from_path", "to_path"],
         "create_named_null": ["name"], "cook_node": ["node_path"],
+        "cook_sample_frames": ["node_path", "frames"],
+        "delete_node": ["node_path"],
         "get_node_connections": ["node_path"], "set_update_mode": ["mode"],
+        "upsert_spare_parameter": ["node_path", "name", "label", "parameter_type"],
     }
     optional_path_properties = {
         "find_nodes": ["root_path"], "get_scene_snapshot": ["root_path"],
@@ -45,7 +49,11 @@ def _core_registry():
                 "description": name,
                 "parameters": {
                     "type": "object",
-                    "properties": {key: {"type": "string"} for key in property_names},
+                    "properties": {
+                        key: ({"type": "array", "items": {"type": "number"}}
+                              if key == "frames" else {"type": "string"})
+                        for key in property_names
+                    },
                     "required": required.get(name, []),
                 },
             },
@@ -55,7 +63,7 @@ def _core_registry():
             schema,
             modes={"agent", "ask", "plan_executing"},
             risk_level="high" if name in HIGH_RISK_TOOLS else "normal",
-            requires_confirmation=name in (SCENE_MUTATION_TOOLS | HIGH_RISK_TOOLS | {"run_skill", "set_update_mode"}),
+            requires_confirmation=name in ((SCENE_MUTATION_TOOLS - {"execute_python"}) | HIGH_RISK_TOOLS | {"run_skill", "set_update_mode"}),
             path_kinds={
                 key: "file" if key in {"file_path", "output_path"} else "node"
                 for key in property_names
@@ -66,10 +74,29 @@ def _core_registry():
 
 
 class HarnessPolicyConfigTest(unittest.TestCase):
+    def test_cook_sample_frames_requires_one_confirmation_before_running(self):
+        registry = _core_registry()
+        engine = HarnessToolPolicyEngine(get_tool_meta=registry.get_meta)
+        args = {"node_path": "/obj/geo1/OUT", "frames": [1.0, 2.0]}
+
+        pending = engine.decide(
+            "cook_sample_frames", args,
+            {"mode": "agent", "confirmed": False, "confirm_mode": False},
+        )
+        confirmed = engine.decide(
+            "cook_sample_frames", args,
+            {"mode": "agent", "confirmed": True, "confirm_mode": False},
+        )
+
+        self.assertEqual(pending.action, "ask")
+        self.assertIn("wait patiently", pending.reason)
+        self.assertEqual(confirmed.action, "allow")
+
     def test_high_risk_groups_are_confirmed(self):
         self.assertTrue(DESTRUCTIVE_TOOLS <= HIGH_RISK_TOOLS)
         self.assertTrue(CODE_EXEC_TOOLS <= HIGH_RISK_TOOLS)
         registry = _core_registry()
+        self.assertEqual(registry.get_meta("execute_python").risk_level, "high")
         self.assertTrue(registry.get_meta("execute_python").requires_confirmation)
         self.assertTrue(registry.get_meta("save_hip").requires_confirmation)
 
@@ -101,6 +128,15 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         self.registry = _core_registry()
         self.policy = HarnessToolPolicyEngine(get_tool_meta=self.registry.get_meta)
 
+    @staticmethod
+    def _high_risk_args(tool_name):
+        return {
+            "delete_node": {"node_path": "/obj/nonexistent"},
+            "execute_python": {"code": "print(1)"},
+            "execute_shell": {"command": "echo test"},
+            "save_hip": {},
+        }[tool_name]
+
     def test_unknown_tool_fails_closed(self):
         decision = self.policy.decide("unknown_tool", {}, {"mode": "agent"})
         self.assertEqual(decision.action, "deny")
@@ -111,8 +147,154 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         self.assertEqual(decision.action, "deny")
         self.assertIn("Ask mode", decision.reason)
 
+    def test_ask_mode_allows_confirmed_high_risk_tool(self):
+        decision = self.policy.decide(
+            "execute_shell",
+            {"command": "dir"},
+            {"mode": "ask", "confirmed": True},
+        )
+        self.assertEqual(decision.action, "allow")
+
+    def test_confirmed_high_risk_tool_reaches_execution(self):
+        calls = []
+        owner = GovernedToolExecutor(
+            self.policy,
+            lambda name, args, confirmed: calls.append((name, args, confirmed)) or {"success": True},
+            confirm=lambda name, args: True,
+        )
+
+        result = owner.execute(
+            "execute_shell",
+            {"command": "dir"},
+            {"mode": "agent", "confirm_mode": True},
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(calls, [("execute_shell", {"command": "dir"}, True)])
+
+    def test_all_high_risk_tools_execute_after_user_confirmation(self):
+        calls = []
+        confirmations = []
+        owner = GovernedToolExecutor(
+            self.policy,
+            lambda name, args, confirmed: calls.append((name, args, confirmed)) or {"success": True},
+            confirm=lambda name, args: confirmations.append(name) or True,
+        )
+
+        for tool_name in sorted(HIGH_RISK_TOOLS):
+            result = owner.execute(
+                tool_name,
+                self._high_risk_args(tool_name),
+                {"mode": "agent", "confirm_mode": True},
+            )
+            self.assertTrue(result["success"], tool_name)
+
+        self.assertEqual(confirmations, sorted(HIGH_RISK_TOOLS))
+        self.assertEqual([name for name, _args, _confirmed in calls], sorted(HIGH_RISK_TOOLS))
+        self.assertTrue(all(confirmed for _name, _args, confirmed in calls))
+
+    def test_all_high_risk_tools_execute_in_direct_execute_mode(self):
+        calls = []
+        confirmations = []
+        owner = GovernedToolExecutor(
+            self.policy,
+            lambda name, args, confirmed: calls.append((name, args, confirmed)) or {"success": True},
+            confirm=lambda name, args: confirmations.append(name) or True,
+        )
+
+        for tool_name in sorted(HIGH_RISK_TOOLS):
+            result = owner.execute(
+                tool_name,
+                self._high_risk_args(tool_name),
+                {"mode": "agent", "confirm_mode": False},
+            )
+            self.assertTrue(result["success"], tool_name)
+
+        self.assertEqual(confirmations, [])
+        self.assertEqual([name for name, _args, _confirmed in calls], sorted(HIGH_RISK_TOOLS))
+        self.assertTrue(all(not confirmed for _name, _args, confirmed in calls))
+
+    def test_cancelled_high_risk_tool_does_not_execute(self):
+        calls = []
+        owner = GovernedToolExecutor(
+            self.policy,
+            lambda name, args, confirmed: calls.append((name, args, confirmed)) or {"success": True},
+            confirm=lambda name, args: False,
+        )
+
+        result = owner.execute(
+            "execute_shell",
+            {"command": "dir"},
+            {"mode": "agent", "confirm_mode": True},
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(calls, [])
+
+    def test_confirmed_force_cook_reaches_execution_once(self):
+        calls = []
+        confirmations = []
+        owner = GovernedToolExecutor(
+            self.policy,
+            lambda name, args, confirmed: calls.append((name, args, confirmed)) or {"success": True},
+            confirm=lambda name, args: confirmations.append((name, args)) or True,
+        )
+
+        result = owner.execute(
+            "cook_node",
+            {"node_path": "/obj/geo1/OUT", "force": True},
+            {"mode": "agent", "confirm_mode": True},
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(len(confirmations), 1)
+        self.assertEqual(calls, [(
+            "cook_node",
+            {"node_path": "/obj/geo1/OUT", "force": True},
+            True,
+        )])
+
+    def test_cancelled_force_cook_does_not_execute(self):
+        calls = []
+        owner = GovernedToolExecutor(
+            self.policy,
+            lambda name, args, confirmed: calls.append((name, args, confirmed)) or {"success": True},
+            confirm=lambda name, args: False,
+        )
+
+        result = owner.execute(
+            "cook_node",
+            {"node_path": "/obj/geo1/OUT", "force": True},
+            {"mode": "agent", "confirm_mode": False},
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(calls, [])
+
     def test_agent_mode_allows_high_risk_without_confirm_mode(self):
         decision = self.policy.decide("execute_shell", {"command": "dir"}, {"mode": "agent"})
+        self.assertEqual(decision.action, "allow")
+
+    def test_agent_mode_allows_execute_python_without_confirm_mode(self):
+        decision = self.policy.decide(
+            "execute_python",
+            {"code": "print(1)"},
+            {"mode": "agent", "confirm_mode": False, "plan_phase": "completed"},
+        )
+        self.assertEqual(decision.action, "allow")
+
+    def test_agent_mode_allows_spare_parameter_without_confirm_mode(self):
+        decision = self.policy.decide(
+            "upsert_spare_parameter",
+            {
+                "node_path": "/obj/geo1/CTRL",
+                "name": "flower_open",
+                "label": "花开",
+                "parameter_type": "float",
+            },
+            {"mode": "agent", "confirm_mode": False},
+        )
+
         self.assertEqual(decision.action, "allow")
 
     def test_confirm_mode_asks_for_high_risk_tool(self):
@@ -126,6 +308,14 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         self.assertGreater(decision.risk_score, 0.0)
         self.assertIn("high_risk_confirmation", decision.matched_rules)
         self.assertEqual(decision.required_control, "confirm")
+
+    def test_plan_executing_mode_uses_confirmation_policy(self):
+        decision = self.policy.decide(
+            "execute_shell",
+            {"command": "dir"},
+            {"mode": "plan_executing", "confirm_mode": True},
+        )
+        self.assertEqual(decision.action, "ask")
 
     def test_install_houdini_skill_requires_confirmation_for_write_actions(self):
         preview = self.policy.decide(

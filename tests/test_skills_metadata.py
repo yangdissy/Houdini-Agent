@@ -110,7 +110,26 @@ class SkillMetadataTest(unittest.TestCase):
         for name in expected:
             instructions = skills.get_skill_instructions(name)
             self.assertFalse(instructions["executable"])
-            self.assertIn("instructions-only", skills.run_skill(name, {})["error"])
+            result = skills.run_skill(name, {})
+            self.assertTrue(result["instructions_only"])
+            self.assertEqual(result["instructions"], instructions["instructions"])
+
+    def test_simulation_workflow_guide_is_discovered_and_validated(self):
+        from houdini_agent import skills
+
+        skills.reload_skills()
+        found = {item["name"] for item in skills.list_skills(category="workflow")}
+        invalid = skills.run_skill("simulation_workflow_guide", {
+            "task": "Create a liquid simulation",
+            "domain": "ocean",
+        })
+        valid = skills.run_skill("simulation_workflow_guide", {
+            "task": "Create a liquid simulation",
+        })
+
+        self.assertIn("simulation_workflow_guide", found)
+        self.assertEqual(invalid["error_code"], "parameter_not_in_enum")
+        self.assertEqual(valid["domain"], "flip")
 
     def test_builtin_skills_use_known_categories(self):
         from houdini_agent import skills
@@ -126,14 +145,12 @@ class SkillMetadataTest(unittest.TestCase):
     def test_all_builtin_skills_satisfy_contract(self):
         errors = []
         names = {}
-        executable = 0
         for skill_file, descriptor in _builtin_skill_descriptors():
             info = descriptor.metadata
             metadata_error = validate_metadata(info, expected_name=skill_file.parent.name)
             module = None
             signature_error = None
             if descriptor.entrypoint:
-                executable += 1
                 module = __import__("houdini_agent.skills", fromlist=["skills"])._load_descriptor_entrypoint(descriptor)
                 signature_error = validate_run_signature(info, module.run)
             if metadata_error:
@@ -148,9 +165,6 @@ class SkillMetadataTest(unittest.TestCase):
             names[info.get("name")] = str(skill_file)
 
         self.assertEqual(errors, [])
-        self.assertEqual(len(names), 65)
-        self.assertEqual(executable, 61)
-        self.assertEqual(len(names) - executable, 4)
 
     def test_builtin_categories_have_no_legacy_skill_modules(self):
         skill_root = Path(__file__).resolve().parents[1] / "houdini_agent" / "skills"

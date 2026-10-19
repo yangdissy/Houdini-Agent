@@ -138,16 +138,18 @@ class ManualUpdateModeDirectiveTest(unittest.TestCase):
 
         AITab._start_agent_run(tab, {
             "use_agent": True,
-            "plan_mode": True,
-            "plan_executing": True,
-            "plan_data": {"title": "Test Plan"},
+            "plan_mode": False,
+            "execution_context": {
+                "type": "confirmed_plan",
+                "plan_data": {"title": "Test Plan"},
+            },
         }, inject_scene=False)
 
         params = tab._captured_agent_params
-        self.assertTrue(params["plan_mode"])
-        self.assertTrue(params["plan_executing"])
+        self.assertFalse(params["plan_mode"])
+        self.assertEqual(params["execution_context"]["type"], "confirmed_plan")
         self.assertFalse(params["confirm_mode"])
-        self.assertEqual(params["plan_data"]["title"], "Test Plan")
+        self.assertEqual(params["execution_context"]["plan_data"]["title"], "Test Plan")
         # Plan 直接执行不再擅自切 Auto；保持用户/Cook Guard 的原模式。
         self.assertEqual(hou_stub.set_modes, [])
 
@@ -167,6 +169,13 @@ class ManualUpdateModeDirectiveTest(unittest.TestCase):
         tab = object.__new__(AITab)
         captured = {}
 
+        class _ModeCombo:
+            def __init__(self):
+                self.index = 2
+
+            def setCurrentIndex(self, index):
+                self.index = index
+
         class _PlanViewer:
             def __init__(self):
                 self.confirmed = False
@@ -175,6 +184,7 @@ class ManualUpdateModeDirectiveTest(unittest.TestCase):
                 self.confirmed = True
 
         tab._active_plan_viewer = _PlanViewer()
+        tab.mode_combo = _ModeCombo()
         tab._session_id = "session"
         tab._plan_manager = mock.Mock()
         tab._conversation_history = []
@@ -185,14 +195,53 @@ class ManualUpdateModeDirectiveTest(unittest.TestCase):
         AITab._on_plan_confirmed(tab, plan_data)
 
         self.assertEqual(tab._plan_phase, "executing")
+        self.assertEqual(tab.mode_combo.index, 0)
         self.assertTrue(tab._active_plan_viewer.confirmed)
         tab._plan_manager.confirm_plan.assert_called_once_with("session")
         self.assertEqual(len(tab._conversation_history), 1)
         self.assertIn("Build Test Network", tab._conversation_history[0]["content"])
         self.assertTrue(captured["use_agent"])
-        self.assertTrue(captured["plan_mode"])
-        self.assertTrue(captured["plan_executing"])
-        self.assertIs(captured["plan_data"], plan_data)
+        self.assertFalse(captured["plan_mode"])
+        self.assertEqual(captured["execution_context"]["type"], "confirmed_plan")
+        self.assertIs(captured["execution_context"]["plan_data"], plan_data)
+
+    @mock.patch("houdini_agent.core.plan_mixin.QtWidgets.QMessageBox.critical")
+    def test_plan_confirm_failure_shows_dialog_and_preserves_state(self, critical):
+        tab = object.__new__(AITab)
+        viewer = mock.Mock()
+        tab._active_plan_viewer = viewer
+        tab._session_id = "session"
+        tab._plan_manager = mock.Mock()
+        tab._plan_manager.confirm_plan.side_effect = OSError("private path")
+        tab._plan_phase = "awaiting_confirmation"
+        tab._start_agent_run = mock.Mock()
+
+        AITab._on_plan_confirmed(tab, {})
+
+        critical.assert_called_once()
+        self.assertNotIn("private path", critical.call_args.args[2])
+        self.assertEqual(tab._plan_phase, "awaiting_confirmation")
+        self.assertIs(tab._active_plan_viewer, viewer)
+        viewer.set_confirmed.assert_not_called()
+        tab._start_agent_run.assert_not_called()
+
+    @mock.patch("houdini_agent.core.plan_mixin.QtWidgets.QMessageBox.critical")
+    def test_plan_reject_failure_shows_dialog_and_preserves_state(self, critical):
+        tab = object.__new__(AITab)
+        viewer = mock.Mock()
+        tab._active_plan_viewer = viewer
+        tab._session_id = "session"
+        tab._plan_manager = mock.Mock()
+        tab._plan_manager.reject_plan.side_effect = OSError("private path")
+        tab._plan_phase = "awaiting_confirmation"
+
+        AITab._on_plan_rejected(tab)
+
+        critical.assert_called_once()
+        self.assertNotIn("private path", critical.call_args.args[2])
+        self.assertEqual(tab._plan_phase, "awaiting_confirmation")
+        self.assertIs(tab._active_plan_viewer, viewer)
+        viewer.set_rejected.assert_not_called()
 
 
 if __name__ == "__main__":

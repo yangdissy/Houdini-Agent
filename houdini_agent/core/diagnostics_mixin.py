@@ -210,10 +210,11 @@ class DiagnosticsMixin:
         return {
             key: row.get(key)
             for key in (
-                'operation_id', 'kind', 'tool_name', 'state', 'created_at',
+                'protocol_version', 'request_ref', 'operation_id', 'kind', 'tool_name', 'state', 'created_at',
                 'updated_at', 'batch_size', 'wait_status', 'thread_still_running',
                 'scene_consistency', 'success', 'error_code', 'result_available',
-                'revision', 'recorded_at',
+                'session_id', 'arguments_sha256', 'contract_version', 'executor_id',
+                'houdini_version', 'scene_id', 'hip_path', 'revision', 'recorded_at',
             )
             if row.get(key) is not None
         }
@@ -331,6 +332,13 @@ class DiagnosticsMixin:
         for item in operation_items:
             item.update(self._project_interrupted_receipt(item))
 
+        try:
+            from ..utils.tool_registry import get_tool_registry
+            registry = get_tool_registry()
+            registered_tool_names = sorted(registry._tools)
+        except Exception:
+            registered_tool_names = []
+
         return {
             'schema_version': 1,
             'exported_at': datetime.now().isoformat(),
@@ -355,6 +363,10 @@ class DiagnosticsMixin:
                 'harness_v2_enabled': bool(getattr(self, '_harness_v2_enabled', False)),
                 'policy_retry_limit': getattr(self, '_policy_retry_limit', None),
                 'pending_user_switch': getattr(self, '_pending_user_switch', None),
+                'registered_tool_names': registered_tool_names,
+                'last_selected_tool_names': list(
+                    getattr(self, '_last_selected_tool_names', []) or []
+                ),
             },
             'external_jobs': {
                 'module_available': external_jobs_available,

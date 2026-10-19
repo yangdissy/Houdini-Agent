@@ -91,6 +91,9 @@ def normalize_openai_parameters(
     if max_tokens:
         parameters[capabilities.max_tokens_parameter] = max_tokens
 
+    if capabilities.model.lower().startswith("gpt-5.6") and tools_present:
+        parameters["reasoning_effort"] = "none"
+
     if capabilities.glm47 and provider_id == "glm" and enable_thinking:
         parameters["thinking"] = {"type": "enabled"}
         if tools_present:

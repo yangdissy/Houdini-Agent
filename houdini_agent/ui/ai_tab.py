@@ -213,6 +213,7 @@ class AITab(
         
         # 缓存管理
         self._session_id = str(uuid.uuid4())[:8]  # 当前会话 ID
+        self._executor_id = uuid.uuid4().hex
         self._session_created_at = datetime.now().isoformat()
         self._cache_dir = user_paths.conversations_dir()
         self._cache_dir.mkdir(parents=True, exist_ok=True)
@@ -318,6 +319,7 @@ class AITab(
                 [event], session_id=event.get('session_id')
             ),
             session_id_provider=lambda: self._agent_session_id or self._session_id,
+            identity_provider=self._operation_identity,
         )
         self._configure_external_mcp_adapter()
         self._addThinking.connect(self._on_add_thinking)

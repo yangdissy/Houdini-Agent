@@ -404,6 +404,7 @@ class HarnessToolPolicyEngine:
 
         mode = context.get("mode", "agent")
         confirm_mode = bool(context.get("confirm_mode", False))
+        confirmed = bool(context.get("confirmed", False))
         skill_params = safe_args.get("params") if isinstance(safe_args.get("params"), dict) else {}
         controlled_skill_action = skill_params.get("action") or skill_params.get("mode", "preview")
         controlled_skill_write = (
@@ -466,7 +467,7 @@ class HarnessToolPolicyEngine:
                 required_control="confirm",
             )
 
-        if mode == "ask" and meta.risk_level == "high":
+        if mode == "ask" and not confirmed and (meta.risk_level == "high" or tool_name == "execute_python"):
             return self._decision(
                 "deny",
                 f"Ask mode blocked tool: {tool_name}",
@@ -494,7 +495,7 @@ class HarnessToolPolicyEngine:
         # confirm_mode=True means Step Confirm is enabled: high-risk tools must
         # ask the user before execution. confirm_mode=False is Direct Execute
         # (HIGH-RISK), where the user has opted out of confirmation prompts.
-        if mode in {"agent", "plan"} and meta.requires_confirmation and confirm_mode and not controlled_skill_write:
+        if mode in {"agent", "plan", "plan_executing"} and meta.requires_confirmation and confirm_mode and not confirmed and not controlled_skill_write:
             if tool_name == "set_update_mode":
                 return self._decision(
                     "ask",
@@ -531,12 +532,33 @@ class HarnessToolPolicyEngine:
         # cook_node force=true 触发硬复位（bypass 切换 + 清 cache + 强制 cook），
         # 可能长时间阻塞 Houdini 主线程。无论是否开启 confirm_mode，都要求用户确认，
         # 防止模型绕过工具描述直接硬 cook 导致界面卡死。
-        if tool_name == "cook_node" and bool(safe_args.get("force")) and mode in {"agent", "plan"}:
+        if (
+            tool_name == "cook_node"
+            and bool(safe_args.get("force"))
+            and mode in {"agent", "plan", "plan_executing"}
+            and not confirmed):
             return self._decision(
                 "ask",
                 "cook_node force=true may block Houdini; requires confirmation",
                 patched_args=safe_args if safe_args != args else None,
                 risk_factors=[RiskFactor("cook_force_confirmation", "warning", "cook_node force=true may block Houdini", 0.8)],
+                required_control="confirm",
+            )
+
+        if (
+            tool_name == "cook_sample_frames"
+            and mode in {"agent", "plan", "plan_executing"}
+            and not confirmed):
+            return self._decision(
+                "ask",
+                "cook_sample_frames may make Houdini unresponsive while cooking; please wait patiently after confirming",
+                patched_args=safe_args if safe_args != args else None,
+                risk_factors=[RiskFactor(
+                    "cook_sample_frames_confirmation",
+                    "warning",
+                    "Sample frame cooks may temporarily block Houdini; wait patiently",
+                    0.8,
+                )],
                 required_control="confirm",
             )
 
@@ -629,6 +651,21 @@ class GovernedToolExecutor:
             self._record_trace("tool_policy_ask", tool=tool_name, confirmed=confirmed)
             if not confirmed:
                 return {"success": False, "error": reason or f"Tool confirmation cancelled: {tool_name}"}
+            confirmed_context = dict(context)
+            confirmed_context["confirmed"] = True
+            try:
+                confirmed_decision = self._policy_engine.decide(tool_name, exec_args, confirmed_context)
+            except Exception:
+                self._record_decision(tool_name, "deny", "confirmed_policy_error")
+                return {"success": False, "error": "Confirmed tool policy evaluation failed; execution denied"}
+            self._record_decision(tool_name, confirmed_decision.action, confirmed_decision.reason or "confirmed")
+            if confirmed_decision.action != "allow":
+                return {
+                    "success": False,
+                    "error": confirmed_decision.reason or f"Confirmed tool blocked by policy: {tool_name}",
+                }
+            if confirmed_decision.patched_args is not None:
+                exec_args = confirmed_decision.patched_args
 
         if action == "retry":
             if decision.patched_args is None:

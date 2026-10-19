@@ -85,6 +85,23 @@ class SelectionWatchPolicyTest(unittest.TestCase):
         self.assertIsNone(runtime._selection_watch_cb)
         self.assertEqual(hou_stub.ui.callbacks, [])
 
+    def test_zero_tool_success_is_eligible_for_reflection(self):
+        self.assertTrue(RuntimeStateMixin._should_reflect_on_result({
+            "ok": True,
+            "final_content": "Completed without tools",
+            "tool_calls_history": [],
+        }))
+        self.assertFalse(RuntimeStateMixin._should_reflect_on_result({
+            "ok": False,
+            "final_content": "Provider failed",
+            "tool_calls_history": [],
+        }))
+        self.assertFalse(RuntimeStateMixin._should_reflect_on_result({
+            "ok": True,
+            "final_content": "   ",
+            "tool_calls_history": [],
+        }))
+
     def test_selection_change_stops_agent_when_enabled(self):
         os.environ["HOUDINI_AGENT_SELECTION_WATCH"] = "true"
         hou_stub = _HouStub(["/obj/geo1/start"])

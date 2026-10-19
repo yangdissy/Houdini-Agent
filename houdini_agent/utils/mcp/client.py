@@ -10,6 +10,7 @@ import sys
 import re
 import time
 import json
+import math
 import fnmatch
 import itertools
 import difflib
@@ -82,6 +83,7 @@ except ImportError:
 
 from .settings import read_settings
 from ..scoped_validation import ScopedValidationOperationResult, ScopedValidationTransaction
+from houdini_agent.utils.node_catalog import build_node_catalog, catalog_to_node_index
 
 # 导入 RAG 检索系统
 try:
@@ -1334,15 +1336,7 @@ class HoudiniMCP:
         
         index: Dict[str, List[Tuple[str, str, str]]] = {}
         try:
-            for cat_name, cat in hou.nodeTypeCategories().items():
-                cat_lower = cat_name.lower()
-                index[cat_lower] = []
-                for type_name, node_type in cat.nodeTypes().items():
-                    try:
-                        desc = node_type.description()
-                        index[cat_lower].append((type_name, desc, f"{cat_lower}/{type_name}"))
-                    except Exception:
-                        continue
+            index = catalog_to_node_index(build_node_catalog(hou))
             
             HoudiniMCP._node_types_cache = index
             HoudiniMCP._node_types_cache_time = _time.time()
@@ -3688,6 +3682,145 @@ class HoudiniMCP:
         except Exception as exc:
             return False, f"设置标志失败: {exc}"
 
+    def inspect_frame_range_risk(self, node_path: str,
+                                 frames: List[float]) -> Tuple[bool, Dict[str, Any]]:
+        """静态检查少量采样帧的 cook 风险，不求值节点或改变当前帧。"""
+        if hou is None:
+            return False, {"error": "未检测到 Houdini API"}
+        if not isinstance(frames, list) or not 1 <= len(frames) <= 3:
+            return False, {"error": "frames 必须是包含 1 到 3 个显式帧的列表"}
+        normalized_frames = []
+        for frame in frames:
+            if isinstance(frame, bool) or not isinstance(frame, (int, float)):
+                return False, {"error": "frames 只能包含有限数字"}
+            value = float(frame)
+            if not math.isfinite(value):
+                return False, {"error": "frames 只能包含有限数字"}
+            normalized_frames.append(value)
+
+        node = hou.node(node_path)
+        if node is None:
+            return False, {"error": f"未找到节点: {node_path}"}
+
+        findings = []
+        seen = set()
+        pending = [node]
+        scanned = 0
+        high_risk_terms = {
+            "solver", "dop", "pyro", "flip", "vellum", "mpm", "volume", "vdb",
+            "rop", "top", "filecache", "file_cache", "python",
+        }
+        try:
+            while pending and scanned < 64:
+                current = pending.pop()
+                current_path = str(current.path())
+                if current_path in seen:
+                    continue
+                seen.add(current_path)
+                scanned += 1
+                node_type = current.type()
+                type_name = str(node_type.name())
+                category_name = str(node_type.category().name())
+                searchable = (type_name + " " + category_name).lower()
+                matched = sorted(term for term in high_risk_terms if term in searchable)
+                if matched:
+                    findings.append({
+                        "code": "known_high_risk_node",
+                        "severity": "high",
+                        "node_path": current_path,
+                        "evidence": {"type_name": type_name, "category": category_name,
+                                     "matched_terms": matched},
+                    })
+                pending.extend(item for item in current.inputs() if item is not None)
+        except Exception as exc:
+            return True, {
+                "risk_level": "unknown",
+                "scan_complete": False,
+                "node_path": node_path,
+                "frames": normalized_frames,
+                "findings": [{
+                    "code": "metadata_unavailable",
+                    "severity": "high",
+                    "node_path": node_path,
+                    "evidence": str(exc),
+                }],
+            }
+
+        scan_complete = not pending
+        if not scan_complete:
+            findings.append({
+                "code": "upstream_scan_truncated",
+                "severity": "high",
+                "node_path": node_path,
+                "evidence": {"max_nodes": 64},
+            })
+        return True, {
+            "risk_level": "high" if findings else "low",
+            "scan_complete": scan_complete,
+            "node_path": node_path,
+            "frames": normalized_frames,
+            "target_metadata": {
+                "scanned_nodes": scanned,
+            },
+            "findings": findings,
+            "limitations": [
+                "Low means no known static risk was found; it does not guarantee a safe cook."
+            ],
+        }
+
+    def cook_sample_frames(self, node_path: str,
+                           frames: List[float]) -> Tuple[bool, Dict[str, Any]]:
+        """预检后连续 cook 最多三个显式帧。"""
+        preflight_ok, preflight = self.inspect_frame_range_risk(node_path, frames)
+        if (not preflight_ok or preflight.get("risk_level") != "low"
+                or not preflight.get("scan_complete", False)):
+            return False, {
+                "status": "blocked",
+                "error": "静态预检未能证明该采样 cook 可低风险执行",
+                "preflight": preflight,
+            }
+        node = hou.node(node_path)
+        original_frame = float(hou.frame())
+        frame_reports = []
+        execution_error = None
+        restore_error = None
+        try:
+            for frame in preflight["frames"]:
+                hou.setFrame(frame)
+                started = time.perf_counter()
+                node.cook(force=False)
+                frame_reports.append({
+                    "frame": frame,
+                    "cook_succeeded": True,
+                    "cook_time_ms": round((time.perf_counter() - started) * 1000.0, 3),
+                    "errors": list(node.errors()) if hasattr(node, "errors") else [],
+                    "warnings": list(node.warnings()) if hasattr(node, "warnings") else [],
+                })
+        except Exception as exc:
+            execution_error = str(exc)
+        finally:
+            try:
+                hou.setFrame(original_frame)
+            except Exception as exc:
+                restore_error = str(exc)
+
+        completed = execution_error is None and restore_error is None
+        report = {
+            "status": "completed" if completed else "failed",
+            "node_path": node_path,
+            "frames": frame_reports,
+            "preflight": preflight,
+            "original_frame": original_frame,
+            "restore_succeeded": restore_error is None,
+            "warning": "Houdini may remain unresponsive during a frame cook; wait patiently.",
+        }
+        if execution_error is not None:
+            report["error"] = execution_error
+        if restore_error is not None:
+            report["restore_error"] = restore_error
+            report["scene_consistency"] = "unknown"
+        return completed, report
+
     def cook_node(self, node_path: str, force: bool = False) -> Tuple[bool, Dict[str, Any]]:
         """Cook 节点并返回 cook 后诊断。
 
@@ -3828,6 +3961,131 @@ class HoudiniMCP:
                 "instances": instances,
             },
         }
+
+    def upsert_spare_parameter(
+        self,
+        node_path: str,
+        name: str,
+        label: str,
+        parameter_type: str,
+        default: Any = 0.0,
+        minimum: Optional[float] = None,
+        maximum: Optional[float] = None,
+        size: Optional[int] = None,
+        menu_items: Optional[List[str]] = None,
+        menu_labels: Optional[List[str]] = None,
+        replace: bool = False,
+    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """Create or explicitly replace one common spare parameter."""
+        if hou is None:
+            return False, "未检测到 Houdini API", None
+        node = hou.node(node_path)
+        if node is None:
+            return False, f"未找到节点: {node_path}", None
+        if not name or not name.replace("_", "a").isalnum() or name[0].isdigit():
+            return False, f"无效的参数名: {name}", None
+        parameter_type = str(parameter_type).strip().lower()
+        supported_types = {"float", "int", "toggle", "string", "menu", "vector2", "vector3", "vector4", "color"}
+        if parameter_type not in supported_types:
+            return False, f"暂不支持参数类型: {parameter_type}", None
+        if minimum is not None and maximum is not None and minimum > maximum:
+            return False, "参数最小值不能大于最大值", None
+
+        tuple_sizes = {"vector2": 2, "vector3": 3, "vector4": 4}
+        tuple_size = tuple_sizes.get(parameter_type)
+        if parameter_type == "color":
+            tuple_size = 3 if size is None else int(size)
+            if tuple_size not in (3, 4):
+                return False, "color 参数 size 只能是 3 或 4", None
+        if tuple_size is not None:
+            if not isinstance(default, (list, tuple)) or len(default) != tuple_size:
+                return False, f"{parameter_type} 参数需要 {tuple_size} 个默认值", None
+
+        normalized_menu_items: List[str] = []
+        normalized_menu_labels: List[str] = []
+        if parameter_type == "menu":
+            normalized_menu_items = [str(item) for item in (menu_items or [])]
+            normalized_menu_labels = [str(item) for item in (menu_labels or normalized_menu_items)]
+            if not normalized_menu_items:
+                return False, "menu 参数至少需要一个 menu_items", None
+            if len(normalized_menu_items) != len(normalized_menu_labels):
+                return False, "menu_items 与 menu_labels 数量必须一致", None
+            default = str(default)
+            if default not in normalized_menu_items:
+                return False, "menu 默认值必须是 menu_items 中的 token", None
+
+        try:
+            group = node.parmTemplateGroup()
+            existing = group.find(name)
+        except Exception as exc:
+            return False, f"读取 ParmTemplateGroup 失败: {exc}", None
+        if existing is not None and not replace:
+            return False, f"参数 {name} 已存在；如需替换请设置 replace=true", None
+
+        try:
+            if parameter_type == "float":
+                template_kwargs = {"default_value": (float(default),)}
+                if minimum is not None:
+                    template_kwargs["min"] = float(minimum)
+                if maximum is not None:
+                    template_kwargs["max"] = float(maximum)
+                template = hou.FloatParmTemplate(name, label or name, 1, **template_kwargs)
+            elif parameter_type == "int":
+                template_kwargs = {"default_value": (int(default),)}
+                if minimum is not None:
+                    template_kwargs["min"] = int(minimum)
+                if maximum is not None:
+                    template_kwargs["max"] = int(maximum)
+                template = hou.IntParmTemplate(name, label or name, 1, **template_kwargs)
+            elif parameter_type == "toggle":
+                template = hou.ToggleParmTemplate(name, label or name, default_value=bool(default))
+            elif parameter_type == "string":
+                template = hou.StringParmTemplate(name, label or name, 1, default_value=(str(default),))
+            elif parameter_type == "menu":
+                template = hou.MenuParmTemplate(
+                    name, label or name,
+                    menu_items=tuple(normalized_menu_items),
+                    menu_labels=tuple(normalized_menu_labels),
+                    default_value=str(default),
+                )
+            else:
+                template_kwargs = {
+                    "default_value": tuple(float(item) for item in default),
+                    "naming_scheme": hou.parmNamingScheme.RGBA if parameter_type == "color" else hou.parmNamingScheme.XYZW,
+                }
+                if minimum is not None:
+                    template_kwargs["min"] = float(minimum)
+                if maximum is not None:
+                    template_kwargs["max"] = float(maximum)
+                template = hou.FloatParmTemplate(name, label or name, tuple_size, **template_kwargs)
+            operation = "replaced" if existing is not None else "created"
+            if existing is not None:
+                group.replace(name, template)
+            else:
+                group.append(template)
+            node.setParmTemplateGroup(group)
+            parm = node.parm(name)
+            if parm is None:
+                return False, f"写入后未找到参数: {name}", None
+        except Exception as exc:
+            return False, f"写入 Spare Parameter 失败: {exc}", None
+
+        data = {
+            "node_path": node_path,
+            "parameter_path": parm.path(),
+            "name": name,
+            "label": label or name,
+            "parameter_type": parameter_type,
+            "operation": operation,
+            "default": default,
+            "minimum": minimum,
+            "maximum": maximum,
+            "size": tuple_size or 1,
+        }
+        if parameter_type == "menu":
+            data["menu_items"] = normalized_menu_items
+            data["menu_labels"] = normalized_menu_labels
+        return True, f"已{('替换' if operation == 'replaced' else '创建')}参数 {parm.path()}", data
 
     def insert_multiparm_instance(self, node_path: str, param_name: str, index: int
                                   ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
@@ -4819,6 +5077,30 @@ class HoudiniMCP:
             result["result"] = result["data"]
         return result
 
+    def _tool_upsert_spare_parameter(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        required = ("node_path", "name", "label", "parameter_type")
+        if any(key not in args for key in required):
+            return {"success": False, "error": "缺少 node_path、name、label 或 parameter_type 参数"}
+        ok, message, data = self.upsert_spare_parameter(
+            node_path=str(args.get("node_path", "")),
+            name=str(args.get("name", "")),
+            label=str(args.get("label", "")),
+            parameter_type=str(args.get("parameter_type", "")),
+            default=args.get("default", 0.0),
+            minimum=args.get("minimum"),
+            maximum=args.get("maximum"),
+            size=args.get("size"),
+            menu_items=args.get("menu_items"),
+            menu_labels=args.get("menu_labels"),
+            replace=bool(args.get("replace", False)),
+        )
+        return {
+            "success": ok,
+            "result": data if ok else "",
+            "data": data if ok else None,
+            "error": "" if ok else message,
+        }
+
     def _tool_insert_multiparm_instance(self, args: Dict[str, Any]) -> Dict[str, Any]:
         node_path = str(args.get("node_path", ""))
         param_name = str(args.get("param_name", ""))
@@ -5300,6 +5582,24 @@ class HoudiniMCP:
             result["verification"] = verification
         return result
 
+    def _tool_inspect_frame_range_risk(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_path = args.get("node_path", "")
+        if not node_path:
+            return {"success": False, "error": "缺少 node_path 参数"}
+        ok, data = self.inspect_frame_range_risk(node_path, args.get("frames"))
+        if ok:
+            return {"success": True, "result": "静态采样 cook 风险检查完成", "data": data}
+        return {"success": False, "error": str(data.get("error", "风险检查失败")), "data": data}
+
+    def _tool_cook_sample_frames(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        node_path = args.get("node_path", "")
+        if not node_path:
+            return {"success": False, "error": "缺少 node_path 参数"}
+        ok, data = self.cook_sample_frames(node_path, args.get("frames"))
+        if ok:
+            return {"success": True, "result": "采样帧 cook 完成", "data": data}
+        return {"success": False, "error": str(data.get("error", "采样帧 cook 失败")), "data": data}
+
     def _tool_cook_node(self, args: Dict[str, Any]) -> Dict[str, Any]:
         node_path = args.get("node_path", "")
         if not node_path:
@@ -5726,6 +6026,20 @@ class HoudiniMCP:
         error_parts.append(f"执行时间: {result.get('execution_time', 0):.3f}s")
         return {"success": False, "error": "\n".join(error_parts), "result": partial_output}
 
+    def _tool_inspect_python(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        code = str(args.get("code") or "")
+        if not code.strip():
+            return {"success": False, "error": "缺少 code 参数"}
+        violation = self._readonly_python_violation(code)
+        if violation:
+            return {"success": False, "error": f"只读 Python 已拒绝: {violation}"}
+        return self._tool_execute_python(args)
+
+    @staticmethod
+    def _readonly_python_violation(code: str) -> str:
+        from houdini_agent.core.readonly_python import readonly_python_violation
+        return readonly_python_violation(code)
+
     def _tool_temporary_auto_validate_geometry(self, args: Dict[str, Any]) -> Dict[str, Any]:
         node_path = str(args.get("node_path") or "").strip()
         if not node_path:
@@ -5736,11 +6050,13 @@ class HoudiniMCP:
         transaction = ScopedValidationTransaction(
             hou.updateModeSetting,
             hou.setUpdateMode,
-            lambda: (
-                getattr(hou.updateMode, "AutoUpdate", None)
-                or getattr(hou.updateMode, "AlwaysUpdate", None)
-                or getattr(hou.updateMode, "Auto", None)
-            ),
+            lambda: next((
+                mode for mode in (
+                    getattr(hou.updateMode, "AutoUpdate", None),
+                    getattr(hou.updateMode, "AlwaysUpdate", None),
+                    getattr(hou.updateMode, "Auto", None),
+                ) if mode is not None
+            ), None),
         )
 
         def validate_target():
@@ -5911,8 +6227,17 @@ class HoudiniMCP:
         page = int(args.get("page", 1))
         timeout = min(int(args.get("timeout", 30)), 120)  # 最大 120 秒
 
+        # 工作目录同时参与分页身份，避免相同命令在不同目录串页。
+        cwd = args.get("cwd", "")
+        if not cwd:
+            cwd = str(Path(__file__).parent.parent.parent.parent)
+        cwd = os.path.normcase(os.path.abspath(cwd))
+        if not os.path.isdir(cwd):
+            return {"success": False, "error": f"工作目录不存在: {cwd}"}
+
         # 分页快速路径
-        cmd_hash = hashlib.md5(command.encode()).hexdigest()[:12]
+        cache_identity = json.dumps([command, cwd], ensure_ascii=False, separators=(",", ":"))
+        cmd_hash = hashlib.md5(cache_identity.encode("utf-8")).hexdigest()[:12]
         cache_key = f"shell:{cmd_hash}"
         if page > 1 and cache_key in self._tool_page_cache:
             hint = f'execute_shell(command="...同上...", page={page})'
@@ -5923,14 +6248,6 @@ class HoudiniMCP:
         security_msg = self._check_shell_security(command)
         if security_msg:
             return {"success": False, "error": security_msg}
-
-        # 工作目录
-        cwd = args.get("cwd", "")
-        if not cwd:
-            # 默认：项目根目录
-            cwd = str(Path(__file__).parent.parent.parent.parent)
-        if not os.path.isdir(cwd):
-            return {"success": False, "error": f"工作目录不存在: {cwd}"}
 
         # ★ 获取停止事件引用（从 AIClient 传入，用于检测用户中断）
         stop_event = getattr(self, '_stop_event', None)
@@ -5947,8 +6264,6 @@ class HoudiniMCP:
             )
             if sys.platform == 'win32':
                 popen_kwargs.update(
-                    encoding='utf-8',
-                    errors='replace',
                     env={**os.environ, 'PYTHONIOENCODING': 'utf-8'},
                     creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
                 )
@@ -5956,6 +6271,30 @@ class HoudiniMCP:
                 popen_kwargs.update(text=True)
             
             proc = subprocess.Popen(command, **popen_kwargs)
+
+            stdout_chunks = []
+            stderr_chunks = []
+            reader_errors = []
+
+            def drain_stream(stream, chunks):
+                try:
+                    while True:
+                        chunk = stream.read(65536)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                except Exception as exc:
+                    reader_errors.append(exc)
+
+            import threading
+            stdout_reader = threading.Thread(
+                target=drain_stream, args=(proc.stdout, stdout_chunks), daemon=True,
+            )
+            stderr_reader = threading.Thread(
+                target=drain_stream, args=(proc.stderr, stderr_chunks), daemon=True,
+            )
+            stdout_reader.start()
+            stderr_reader.start()
             
             # ★ 轮询等待：每 0.5s 检查一次停止标志和超时
             deadline = start_time + timeout
@@ -5963,12 +6302,18 @@ class HoudiniMCP:
                 # 检查用户中断
                 if stop_event and stop_event.is_set():
                     self._kill_process_tree(proc)
+                    proc.wait(timeout=5)
+                    stdout_reader.join(timeout=5)
+                    stderr_reader.join(timeout=5)
                     elapsed = time.time() - start_time
                     return {"success": False, "error": f"命令被用户中断\n命令: {command}\n已运行: {elapsed:.1f}s"}
                 
                 # 检查超时
                 if time.time() > deadline:
                     self._kill_process_tree(proc)
+                    proc.wait(timeout=5)
+                    stdout_reader.join(timeout=5)
+                    stderr_reader.join(timeout=5)
                     elapsed = time.time() - start_time
                     return {"success": False, "error": f"命令超时（{timeout}s 限制）\n命令: {command}\n耗时: {elapsed:.2f}s"}
                 
@@ -5978,9 +6323,32 @@ class HoudiniMCP:
                 except subprocess.TimeoutExpired:
                     pass
             
-            # 进程已结束，读取输出
-            stdout, stderr = proc.communicate(timeout=5)
+            stdout_reader.join(timeout=5)
+            stderr_reader.join(timeout=5)
+            if stdout_reader.is_alive() or stderr_reader.is_alive():
+                raise RuntimeError("Shell 输出读取线程未能停止")
+            if reader_errors:
+                raise RuntimeError(f"Shell 输出读取失败: {reader_errors[0]}")
+
+            if sys.platform == 'win32':
+                stdout = b''.join(stdout_chunks)
+                stderr = b''.join(stderr_chunks)
+            else:
+                stdout = ''.join(stdout_chunks)
+                stderr = ''.join(stderr_chunks)
             elapsed = time.time() - start_time
+
+            if sys.platform == 'win32':
+                def decode_output(value):
+                    if not isinstance(value, bytes):
+                        return value
+                    try:
+                        return value.decode('utf-8')
+                    except UnicodeDecodeError:
+                        return value.decode('mbcs', errors='replace')
+
+                stdout = decode_output(stdout)
+                stderr = decode_output(stderr)
 
             # 组装输出
             parts = []
@@ -6286,13 +6654,16 @@ class HoudiniMCP:
                     "name": s.get("name", ""),
                     "description": s.get("description", ""),
                     "risk_level": s.get("risk_level", "low"),
+                    "executable": bool(s.get("executable", True)),
                     "parameters": param_list,
                 })
             total = sum(len(v) for v in grouped.values())
             cats = ", ".join(f"{c}({len(v)})" for c, v in sorted(grouped.items()))
             hint = (
                 f"共 {total} 个 Skill，分 {len(grouped)} 类：{cats}。"
-                f"调用方式：run_skill(skill_name=\"<name>\", params={{...}})。"
+                f"使用方式：对 executable=true 的 Skill，run_skill 会执行专用脚本；"
+                f"对 executable=false 的 Skill，run_skill 会读取必须遵循的方法说明。"
+                f"调用格式均为 run_skill(skill_name=\"<name>\", params={{...}})。"
                 f"可用 list_skills(category=\"<类名>\") 只看某一类。"
                 f"risk_level != low 的 Skill 会改场景/建图，Plan 规划阶段不可用（仅执行阶段）。"
             )
@@ -6700,6 +7071,7 @@ class HoudiniMCP:
         "get_parameter_schema": "_tool_get_parameter_schema",
         "find_parameter_references": "_tool_find_parameter_references",
         "list_multiparm_instances": "_tool_list_multiparm_instances",
+        "upsert_spare_parameter": "_tool_upsert_spare_parameter",
         "insert_multiparm_instance": "_tool_insert_multiparm_instance",
         "remove_multiparm_instance": "_tool_remove_multiparm_instance",
         "create_object_merges_batch": "_tool_create_object_merges_batch",
@@ -6718,6 +7090,8 @@ class HoudiniMCP:
         "create_named_null": "_tool_create_named_null",
         "validate_node_network": "_tool_validate_node_network",
         "preview_layout_nodes": "_tool_preview_layout_nodes",
+        "inspect_frame_range_risk": "_tool_inspect_frame_range_risk",
+        "cook_sample_frames": "_tool_cook_sample_frames",
         "cook_node": "_tool_cook_node",
         "delete_node": "_tool_delete_node",
         "rename_node": "_tool_rename_node",
@@ -6746,6 +7120,7 @@ class HoudiniMCP:
         "find_nodes_by_param": "_tool_find_nodes_by_param",
         "save_hip": "_tool_save_hip",
         "undo_redo": "_tool_undo_redo",
+        "inspect_python": "_tool_inspect_python",
         "execute_python": "_tool_execute_python",
         "execute_shell": "_tool_execute_shell",
         "check_errors": "_tool_check_errors",

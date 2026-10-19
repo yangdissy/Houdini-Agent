@@ -51,7 +51,9 @@ class ChatViewMixin:
         )
         response.createWrangleRequested.connect(self._on_create_wrangle)
         response.nodePathClicked.connect(self._navigate_to_node)
-        response.feedbackGiven.connect(self._on_user_feedback)
+        response.feedbackGiven.connect(
+            lambda positive, resp=response: self._on_user_feedback(resp, positive)
+        )
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, response)
         self._current_response = response
         self._scroll_to_bottom(force=True)
@@ -128,9 +130,8 @@ class ChatViewMixin:
         except RuntimeError:
             pass
 
-    def _on_user_feedback(self, positive: bool):
+    def _on_user_feedback(self, resp, positive: bool):
         """主线程：用户在某条 AI 回复上点了 👍/👎。"""
-        resp = getattr(self, '_current_response', None)
         if resp is None:
             return
         episodic_id = getattr(resp, '_episodic_id', None)
@@ -153,6 +154,12 @@ class ChatViewMixin:
             if result.get('error'):
                 print(f"[Feedback] 应用反馈失败: {result['error']}")
                 return
+            tracker = getattr(self, '_growth_tracker', None)
+            if tracker is not None:
+                growth_result = tracker.apply_user_feedback(episodic_id, positive)
+                if growth_result.get('error'):
+                    print(f"[Feedback] 同步成长指标失败: {growth_result['error']}")
+                    return
             kind = "👍" if positive else "👎"
             self._show_toast(f"{kind} 已记录", 1500)
         except Exception as e:

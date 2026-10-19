@@ -42,7 +42,7 @@ class DiagnosticsPayloadTest(unittest.TestCase):
         tab._harness_trace_records = [{"round": i} for i in range(600)]
         tab._call_records = [{"call": i} for i in range(150)]
         tab._current_provider = lambda: "of3d"
-        tab.model_combo = type("ModelCombo", (), {"currentText": lambda self: "gpt-5.5"})()
+        tab.model_combo = type("ModelCombo", (), {"currentText": lambda self: "gpt-5.6"})()
         tab._harness_state = type(
             "HarnessState",
             (),

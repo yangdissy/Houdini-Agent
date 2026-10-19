@@ -79,9 +79,9 @@ def launch_houdini_agent():
             traceback.print_exc()
             return None
 
-    # 开发模式：清理缓存的 main / houdini_agent 模块，强制重新加载
+    # 开发模式：清理整个包，确保新拆分出的 mixin、Registry 和 schema 都从磁盘重载。
     for mod_name in list(sys.modules.keys()):
-        if mod_name == 'main' or mod_name.startswith('houdini_agent'):
+        if mod_name == 'main' or mod_name == 'houdini_agent' or mod_name.startswith('houdini_agent.'):
             del sys.modules[mod_name]
 
     try:
@@ -123,7 +123,17 @@ def launch_houdini_agent():
         sys.modules["main"] = main
         _spec.loader.exec_module(main)
 
-        return main.show_tool()
+        # launcher 已完整重建包；避免 main.show_tool() 再做一次局部 reload，
+        # 否则 ai_tab 可能绑定到新旧 mixin 类的混合版本。
+        previous_dev_reload = os.environ.get("HOUDINI_AGENT_DEV_RELOAD")
+        os.environ["HOUDINI_AGENT_DEV_RELOAD"] = "0"
+        try:
+            return main.show_tool()
+        finally:
+            if previous_dev_reload is None:
+                os.environ.pop("HOUDINI_AGENT_DEV_RELOAD", None)
+            else:
+                os.environ["HOUDINI_AGENT_DEV_RELOAD"] = previous_dev_reload
     except Exception as e:
         print(f"Failed to launch Houdini Agent: {e}")
         import traceback

@@ -114,6 +114,8 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
     # ---- OpenAI ----
     'gpt-5.2':              {'input': 2.50,  'input_cache': 1.25,  'output': 10.00},
     'gpt-5.3-codex':        {'input': 3.00,  'input_cache': 1.50,  'output': 12.00},
+    # GPT-5.6 Terra Standard，短上下文（<=272K），USD / 1M tokens。
+    'gpt-5.6':              {'input': 2.00,  'input_cache': 0.20, 'output': 12.00},
     'o3':                   {'input': 10.00, 'input_cache': 2.50,  'output': 40.00, 'reasoning': 40.00},
     'o3-mini':              {'input': 1.10,  'input_cache': 0.55,  'output': 4.40,  'reasoning': 4.40},
     'o4-mini':              {'input': 1.10,  'input_cache': 0.275, 'output': 4.40,  'reasoning': 4.40},

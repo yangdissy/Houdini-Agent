@@ -131,13 +131,26 @@ class HoudiniMainThreadExecutorTest(unittest.TestCase):
             result_queue=result_queue,
             record_event=events.append,
             session_id_provider=lambda: "session-a",
+            identity_provider=lambda: {
+                "executor_id": "executor-a",
+                "houdini_version": "21.0.440",
+                "scene_id": "scene-a",
+                "hip_path": "/projects/a.hip",
+            },
         )
 
         result = executor.execute("get_network_structure", {"node_path": "/obj/private-value"})
 
         receipt = result["operation_receipt"]
         self.assertEqual(receipt["state"], "completed")
+        self.assertEqual(receipt["protocol_version"], 1)
+        self.assertEqual(receipt["request_ref"], receipt["operation_id"])
         self.assertEqual(receipt["session_id"], "session-a")
+        self.assertEqual(receipt["executor_id"], "executor-a")
+        self.assertEqual(receipt["houdini_version"], "21.0.440")
+        self.assertEqual(receipt["scene_id"], "scene-a")
+        self.assertEqual(len(receipt["arguments_sha256"]), 64)
+        self.assertIn("contract_version", receipt)
         self.assertTrue(receipt["result_available"])
         self.assertNotIn("/obj/private-value", repr(events))
         receipt_events = [event for event in events if event.get("event_type") == "operation_receipt"]

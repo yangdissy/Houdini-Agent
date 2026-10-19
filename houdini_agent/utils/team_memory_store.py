@@ -15,6 +15,7 @@ vs fallback n-gram 哈希）的向量不在同一语义空间，因此只在同�
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import sqlite3
@@ -46,9 +47,13 @@ def _user_team_db_path(username: str) -> Path:
     return UserPaths(username).memory_dir() / "team_memory.db"
 
 
-def _snapshot_version(path: Path) -> Tuple[int, int]:
+def _snapshot_version(path: Path) -> Tuple[int, int, bytes]:
     stat = path.stat()
-    return stat.st_size, stat.st_mtime_ns
+    digest = hashlib.blake2b(digest_size=16)
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return stat.st_size, stat.st_mtime_ns, digest.digest()
 
 
 def _sync_local_team_db(shared_path: Path, local_path: Path) -> bool:

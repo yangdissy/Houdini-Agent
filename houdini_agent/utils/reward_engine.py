@@ -113,7 +113,7 @@ class RewardEngine:
 
         # 犯错后纠正的加成
         if had_error_correction and success:
-            reward = min(1.0, reward * 1.2)
+            reward = max(self.strengthen_threshold, min(1.0, reward * 1.2))
 
         # 裁剪到 [0, 1]
         reward = max(0.0, min(1.0, reward))

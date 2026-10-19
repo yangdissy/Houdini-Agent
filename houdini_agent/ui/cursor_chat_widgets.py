@@ -282,31 +282,39 @@ class ThinkingSection(CollapsibleSection):
         # 初始高度为一行（紧凑），流式输入时会动态增大
         self._line_h = QtGui.QFontMetrics(self._text_font).lineSpacing()
         self.thinking_label.setFixedHeight(self._line_h + 12)
+        self.thinking_label.document().documentLayout().documentSizeChanged.connect(
+            self._on_document_size_changed
+        )
         self.content_layout.addWidget(self.thinking_label)
         
         # 标题样式
         self.header.setObjectName("thinkHeader")
     
     def _update_height(self):
-        """根据视觉行数（含自动换行）动态调整高度。
-        
-        与 ChatInput._adjust_height 相同的可靠方案：
-        逐块遍历 block.layout().lineCount() 统计真实视觉行数。
-        """
+        """根据当前 viewport 宽度下的真实文档高度调整控件高度。"""
         doc = self.thinking_label.document()
-        visual_lines = 0
-        block = doc.begin()
-        while block.isValid():
-            bl = block.layout()
-            if bl and bl.lineCount() > 0:
-                visual_lines += bl.lineCount()
-            else:
-                visual_lines += 1
-            block = block.next()
-        visual_lines = max(1, visual_lines)
-        
-        desired = self._line_h * visual_lines + 12   # 12 = padding
+        viewport_width = self.thinking_label.viewport().width()
+        if viewport_width <= 0:
+            safe_single_shot(0, self, '_update_height')
+            return
+        doc.setTextWidth(viewport_width)
+        desired = int(doc.size().height()) + 12
         self.thinking_label.setFixedHeight(min(max(desired, self._line_h + 12), self._MAX_HEIGHT_PX))
+
+    def _on_document_size_changed(self, _size):
+        safe_single_shot(0, self, '_update_height')
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        safe_single_shot(0, self, '_update_height')
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        safe_single_shot(0, self, '_update_height')
+
+    def expand(self):
+        super().expand()
+        safe_single_shot(0, self, '_update_height')
     
     def _scroll_to_bottom(self):
         """滚动到底部"""

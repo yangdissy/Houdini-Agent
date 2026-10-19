@@ -17,6 +17,8 @@
 
 import json
 import math
+import os
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field, asdict
@@ -24,7 +26,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .memory_store import MemoryStore, get_memory_store
-from .reward_engine import TAG_ERROR_CORRECTION, TAG_UNRESOLVED_ERROR
+from .reward_engine import (
+    TAG_ERROR_CORRECTION,
+    TAG_UNRESOLVED_ERROR,
+    TAG_USER_PRAISED,
+    TAG_USER_REJECTED,
+)
 from shared.user_paths import UserPaths, normalize_username
 
 # ============================================================
@@ -43,6 +50,7 @@ WINDOW_SIZE = 30  # 最近 N 个任务的滚动窗口
 @dataclass
 class TaskMetric:
     """单个任务的度量数据"""
+    episodic_id: str = ""
     timestamp: float = 0.0
     success: bool = True
     error_count: int = 0
@@ -77,6 +85,7 @@ class GrowthTracker:
     def __init__(self, store: Optional[MemoryStore] = None, file_path: Optional[Path] = None):
         self.store = store or get_memory_store()
         self._file_path = file_path or _GROWTH_FILE
+        self._lock = threading.RLock()
 
         # 滚动窗口
         self._metrics: deque = deque(maxlen=WINDOW_SIZE * 2)  # 保留 2 倍以计算趋势
@@ -92,6 +101,12 @@ class GrowthTracker:
 
         # 个性特征
         self.personality = PersonalityTraits()
+        self._personality_evidence: Dict[str, int] = {
+            "efficiency_bias": 0,
+            "risk_tolerance": 0,
+            "verbosity": 0,
+            "proactivity": 0,
+        }
 
         # 总任务计数
         self._total_tasks: int = 0
@@ -105,20 +120,59 @@ class GrowthTracker:
 
     def record_task(self, metric: TaskMetric):
         """记录一个任务的度量数据"""
-        if metric.timestamp == 0.0:
-            metric.timestamp = time.time()
+        if not math.isfinite(metric.reward):
+            raise ValueError("task metric reward must be finite")
 
-        self._metrics.append(metric)
-        self._total_tasks += 1
+        metric.error_count = max(0, int(metric.error_count))
+        metric.retry_count = max(0, int(metric.retry_count))
+        metric.tool_call_count = max(0, int(metric.tool_call_count))
+        metric.reward = max(0.0, min(1.0, float(metric.reward)))
+        metric.tags = list(dict.fromkeys(metric.tags or []))
 
-        # 更新技能置信度
-        self._update_skill_confidence(metric)
+        with self._lock:
+            if metric.timestamp == 0.0:
+                metric.timestamp = time.time()
 
-        # 更新个性
-        self._update_personality(metric)
+            self._metrics.append(metric)
+            self._total_tasks += 1
 
-        # 自动保存
-        self._save()
+            self._update_skill_confidence(metric)
+            self._update_personality(metric)
+            self._save()
+
+    def apply_user_feedback(self, episodic_id: str, positive: bool) -> Dict:
+        """把用户反馈同步到对应的任务指标。"""
+        if not episodic_id:
+            return {"error": "episodic_id is required"}
+
+        with self._lock:
+            for metric in reversed(self._metrics):
+                if metric.episodic_id != episodic_id:
+                    continue
+                metric.reward = 0.85 if positive else 0.15
+                old_tag = TAG_USER_REJECTED if positive else TAG_USER_PRAISED
+                new_tag = TAG_USER_PRAISED if positive else TAG_USER_REJECTED
+                repeated = new_tag in metric.tags and old_tag not in metric.tags
+                metric.tags = [
+                    tag for tag in metric.tags
+                    if tag not in (TAG_USER_PRAISED, TAG_USER_REJECTED)
+                ]
+                metric.tags.append(new_tag)
+                if not repeated:
+                    direction = 1.0 if positive else -1.0
+                    self.personality.proactivity = max(
+                        0.0, min(1.0, self.personality.proactivity + direction * 0.10)
+                    )
+                    self._personality_evidence["proactivity"] += 1
+                    if metric.tool_call_count > 0:
+                        self.personality.efficiency_bias = max(
+                            -1.0, min(1.0, self.personality.efficiency_bias + direction * 0.10)
+                        )
+                        self._personality_evidence["efficiency_bias"] += 1
+                self._save()
+                return {"reward": metric.reward, "tags": list(metric.tags)}
+
+        return {"error": f"task metric not found: {episodic_id}"}
 
     # ==========================================================
     # 趋势计算
@@ -130,6 +184,9 @@ class GrowthTracker:
         Returns:
             {
                 "error_rate": float,           # 当前错误率
+                "incident_rate": float,        # 发生过工具错误的任务比例
+                "recovered_error_rate": float, # 出错但最终成功的任务比例
+                "unresolved_failure_rate": float,  # 最终未解决的任务比例
                 "error_rate_trend": float,      # 错误率趋势 (负 = 改善)
                 "success_rate": float,          # 当前成功率
                 "success_rate_trend": float,    # 成功率趋势 (正 = 改善)
@@ -140,15 +197,23 @@ class GrowthTracker:
                 "avg_tool_calls": float,        # 平均工具调用次数
                 "tool_efficiency": float,        # 工具效率分 (高 = 更高效)
                 "tool_efficiency_trend": float,  # 工具效率趋势 (正 = 改善)
+                "tool_efficiency_sample_count": int,  # 当前窗口有效工具任务数
+                "tool_efficiency_bucket_counts": Dict[str, int],
                 "avg_retries": float,           # 平均重试次数
                 "retry_trend": float,            # 重试趋势 (负 = 改善)
                 "growth_score": float,          # 综合成长分数
                 "total_tasks": int,             # 总任务数
+                "recent_sample_count": int,     # 当前窗口样本数
+                "baseline_sample_count": int,   # 基线窗口样本数
+                "trend_reliable": bool,         # 是否有两个完整窗口
             }
         """
         if not self._metrics:
             return {
                 "error_rate": 0.0,
+                "incident_rate": 0.0,
+                "recovered_error_rate": 0.0,
+                "unresolved_failure_rate": 0.0,
                 "error_rate_trend": 0.0,
                 "success_rate": 1.0,
                 "success_rate_trend": 0.0,
@@ -159,29 +224,41 @@ class GrowthTracker:
                 "avg_tool_calls": 0.0,
                 "tool_efficiency": 1.0,
                 "tool_efficiency_trend": 0.0,
+                "tool_efficiency_sample_count": 0,
+                "tool_efficiency_bucket_counts": {"simple_tool": 0, "complex_tool": 0},
                 "avg_retries": 0.0,
                 "retry_trend": 0.0,
                 "growth_score": 0.0,
                 "total_tasks": self._total_tasks,
+                "recent_sample_count": 0,
+                "baseline_sample_count": 0,
+                "trend_reliable": False,
             }
 
         metrics = list(self._metrics)
-        n = len(metrics)
-        half = n // 2
-
-        # 当前窗口 (后半部分)
-        recent = metrics[half:] if half > 0 else metrics
-        # 历史窗口 (前半部分)
-        older = metrics[:half] if half > 0 else []
+        recent = metrics[-WINDOW_SIZE:]
+        older = metrics[-WINDOW_SIZE * 2:-WINDOW_SIZE]
+        trend_reliable = len(recent) == WINDOW_SIZE and len(older) == WINDOW_SIZE
 
         # 当前指标
         error_rate = sum(1 for m in recent if m.error_count > 0) / max(len(recent), 1)
+        recovered_error_rate = sum(
+            1 for m in recent if m.error_count > 0 and m.success
+        ) / max(len(recent), 1)
+        unresolved_failure_rate = sum(
+            1 for m in recent if not m.success
+        ) / max(len(recent), 1)
         success_rate = sum(1 for m in recent if m.success) / max(len(recent), 1)
         avg_reward = sum(m.reward for m in recent) / max(len(recent), 1)
         error_density = sum(m.error_count for m in recent) / max(len(recent), 1)
         avg_tool_calls = sum(m.tool_call_count for m in recent) / max(len(recent), 1)
         avg_retries = sum(m.retry_count for m in recent) / max(len(recent), 1)
-        tool_efficiency = sum(self._tool_efficiency_score(m) for m in recent) / max(len(recent), 1)
+        recent_tool_metrics = [m for m in recent if m.tool_call_count > 0]
+        recent_tool_buckets = self._tool_efficiency_buckets(recent_tool_metrics)
+        tool_efficiency = (
+            sum(self._tool_efficiency_score(m) for m in recent_tool_metrics)
+            / max(len(recent_tool_metrics), 1)
+        )
 
         # 趋势 (与旧窗口对比)
         if older:
@@ -190,13 +267,25 @@ class GrowthTracker:
             old_avg_reward = sum(m.reward for m in older) / max(len(older), 1)
             old_error_density = sum(m.error_count for m in older) / max(len(older), 1)
             old_avg_retries = sum(m.retry_count for m in older) / max(len(older), 1)
-            old_tool_efficiency = sum(self._tool_efficiency_score(m) for m in older) / max(len(older), 1)
+            older_tool_metrics = [m for m in older if m.tool_call_count > 0]
+            older_tool_buckets = self._tool_efficiency_buckets(older_tool_metrics)
             error_rate_trend = error_rate - old_error_rate   # 负 = 改善
             success_rate_trend = success_rate - old_success_rate  # 正 = 改善
             reward_trend = avg_reward - old_avg_reward  # 正 = 改善
             error_density_trend = error_density - old_error_density  # 负 = 改善
             retry_trend = avg_retries - old_avg_retries  # 负 = 改善
-            tool_efficiency_trend = tool_efficiency - old_tool_efficiency  # 正 = 改善
+            comparable_deltas = []
+            for bucket_name, bucket_metrics in recent_tool_buckets.items():
+                old_bucket_metrics = older_tool_buckets[bucket_name]
+                if not bucket_metrics or not old_bucket_metrics:
+                    continue
+                current_score = sum(self._tool_efficiency_score(m) for m in bucket_metrics) / len(bucket_metrics)
+                old_score = sum(self._tool_efficiency_score(m) for m in old_bucket_metrics) / len(old_bucket_metrics)
+                comparable_deltas.extend([current_score - old_score] * len(bucket_metrics))
+            tool_efficiency_trend = (
+                sum(comparable_deltas) / len(comparable_deltas)
+                if comparable_deltas else 0.0
+            )
         else:
             error_rate_trend = 0.0
             success_rate_trend = 0.0
@@ -205,19 +294,23 @@ class GrowthTracker:
             retry_trend = 0.0
             tool_efficiency_trend = 0.0
 
-        # 综合成长分数 = 质量改善 + 成功改善 + 低错误/低重试/高效率改善。
-        # reward 是最接近任务质量的连续信号，因此权重最高；rate 类指标保留方向性。
-        growth_score = (
-            reward_trend * 0.45
-            + success_rate_trend * 0.25
-            - error_rate_trend * 0.15
-            - error_density_trend * 0.10
-            - retry_trend * 0.03
-            + tool_efficiency_trend * 0.02
-        )
+        # reward 已包含成功、效率和错误惩罚，不再与原始信号重复计权。
+        growth_score = 0.0
+        if trend_reliable:
+            growth_score = (
+                success_rate_trend * 0.45
+                - error_rate_trend * 0.20
+                - max(-1.0, min(1.0, error_density_trend)) * 0.15
+                - max(-1.0, min(1.0, retry_trend)) * 0.10
+                + tool_efficiency_trend * 0.10
+            )
+            growth_score = max(-1.0, min(1.0, growth_score))
 
         return {
             "error_rate": round(error_rate, 3),
+            "incident_rate": round(error_rate, 3),
+            "recovered_error_rate": round(recovered_error_rate, 3),
+            "unresolved_failure_rate": round(unresolved_failure_rate, 3),
             "error_rate_trend": round(error_rate_trend, 3),
             "success_rate": round(success_rate, 3),
             "success_rate_trend": round(success_rate_trend, 3),
@@ -228,10 +321,18 @@ class GrowthTracker:
             "avg_tool_calls": round(avg_tool_calls, 1),
             "tool_efficiency": round(tool_efficiency, 3),
             "tool_efficiency_trend": round(tool_efficiency_trend, 3),
+            "tool_efficiency_sample_count": len(recent_tool_metrics),
+            "tool_efficiency_bucket_counts": {
+                name: len(bucket_metrics)
+                for name, bucket_metrics in recent_tool_buckets.items()
+            },
             "avg_retries": round(avg_retries, 1),
             "retry_trend": round(retry_trend, 3),
             "growth_score": round(growth_score, 3),
             "total_tasks": self._total_tasks,
+            "recent_sample_count": len(recent),
+            "baseline_sample_count": len(older),
+            "trend_reliable": trend_reliable,
         }
 
     @staticmethod
@@ -240,6 +341,14 @@ class GrowthTracker:
         tc = max(0, metric.tool_call_count)
         rc = max(0, metric.retry_count)
         return 1.0 / (1.0 + 0.35 * math.log1p(tc) + 0.3 * rc)
+
+    @staticmethod
+    def _tool_efficiency_buckets(metrics: List[TaskMetric]) -> Dict[str, List[TaskMetric]]:
+        buckets = {"simple_tool": [], "complex_tool": []}
+        for metric in metrics:
+            bucket = "complex_tool" if metric.tool_call_count > 10 else "simple_tool"
+            buckets[bucket].append(metric)
+        return buckets
 
     # ==========================================================
     # 技能置信度
@@ -301,22 +410,27 @@ class GrowthTracker:
         if metric.success and metric.tool_call_count <= 3:
             # 高效成功 → 效率偏向增加
             self.personality.efficiency_bias += alpha
+            self._personality_evidence["efficiency_bias"] += 1
         elif not metric.success and metric.retry_count > 2:
             # 失败重试多 → 效率偏向降低（需要更多探索）
             self.personality.efficiency_bias -= alpha
+            self._personality_evidence["efficiency_bias"] += 1
 
         # 风险容忍度
         if TAG_ERROR_CORRECTION in metric.tags:
             # 犯错后纠正 → 提高风险容忍度
             self.personality.risk_tolerance = min(1.0, self.personality.risk_tolerance + alpha)
+            self._personality_evidence["risk_tolerance"] += 1
         elif TAG_UNRESOLVED_ERROR in metric.tags:
             # 未解决的错误 → 降低风险容忍度
             self.personality.risk_tolerance = max(0.0, self.personality.risk_tolerance - alpha)
+            self._personality_evidence["risk_tolerance"] += 1
 
         # 主动性
         if "complex_task" in metric.tags and metric.success:
             # 复杂任务成功 → 提高主动性
             self.personality.proactivity = min(1.0, self.personality.proactivity + alpha * 0.5)
+            self._personality_evidence["proactivity"] += 1
 
         # 限制范围
         self.personality.efficiency_bias = max(-1.0, min(1.0, self.personality.efficiency_bias))
@@ -329,22 +443,29 @@ class GrowthTracker:
         """生成个性描述文本（注入 system prompt）"""
         p = self.personality
         skills = self._skill_confidence
+        trait_parts = []
 
         # 效率偏向描述
-        if p.efficiency_bias > 0.3:
-            style = "效率优先, 偏向简洁直接的解决方案"
-        elif p.efficiency_bias < -0.3:
-            style = "探索创新, 偏向尝试多种方案"
-        else:
-            style = "均衡风格, 兼顾效率与探索"
+        if self._personality_evidence["efficiency_bias"] >= 5:
+            if p.efficiency_bias > 0.3:
+                trait_parts.append("效率优先, 偏向简洁直接的解决方案")
+            elif p.efficiency_bias < -0.3:
+                trait_parts.append("探索创新, 偏向尝试多种方案")
 
         # 风险描述
-        if p.risk_tolerance > 0.7:
-            risk = "高风险容忍度"
-        elif p.risk_tolerance < 0.3:
-            risk = "低风险容忍度, 偏保守"
-        else:
-            risk = "中等风险容忍度"
+        if self._personality_evidence["risk_tolerance"] >= 5:
+            if p.risk_tolerance > 0.7:
+                trait_parts.append("可逆、低影响操作中可适度探索")
+            elif p.risk_tolerance < 0.3:
+                trait_parts.append("优先采用保守稳定的方案")
+
+        if self._personality_evidence["proactivity"] >= 5:
+            if p.proactivity > 0.7:
+                trait_parts.append("可主动补充相关建议")
+            elif p.proactivity < 0.3:
+                trait_parts.append("只回答明确提出的问题")
+
+        traits_text = ", ".join(trait_parts) if trait_parts else "尚无足够证据形成稳定风格"
 
         # 技能描述
         skill_parts = []
@@ -354,7 +475,8 @@ class GrowthTracker:
         skills_text = ", ".join(skill_parts) if skill_parts else "暂无数据"
 
         return (
-            f"[Self-Awareness] 当前风格偏好: {style}, {risk}。\n"
+            f"[Self-Awareness] 当前风格偏好: {traits_text}。"
+            "自动偏好不得覆盖用户规则、工具授权或高影响操作确认。\n"
             f"技能置信度: {skills_text}"
         )
 
@@ -365,26 +487,33 @@ class GrowthTracker:
     def _save(self):
         """保存成长数据到文件"""
         try:
-            self._file_path.parent.mkdir(parents=True, exist_ok=True)
-            data = {
-                "total_tasks": self._total_tasks,
-                "skill_confidence": self._skill_confidence,
-                "personality": self.personality.to_dict(),
-                "metrics": [
-                    {
-                        "timestamp": m.timestamp,
-                        "success": m.success,
-                        "error_count": m.error_count,
-                        "retry_count": m.retry_count,
-                        "tool_call_count": m.tool_call_count,
-                        "reward": m.reward,
-                        "tags": m.tags,
-                    }
-                    for m in self._metrics
-                ],
-            }
-            with open(self._file_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            with self._lock:
+                self._file_path.parent.mkdir(parents=True, exist_ok=True)
+                data = {
+                    "total_tasks": self._total_tasks,
+                    "skill_confidence": self._skill_confidence,
+                    "personality": self.personality.to_dict(),
+                    "personality_evidence": self._personality_evidence,
+                    "metrics": [
+                        {
+                            "episodic_id": m.episodic_id,
+                            "timestamp": m.timestamp,
+                            "success": m.success,
+                            "error_count": m.error_count,
+                            "retry_count": m.retry_count,
+                            "tool_call_count": m.tool_call_count,
+                            "reward": m.reward,
+                            "tags": m.tags,
+                        }
+                        for m in self._metrics
+                    ],
+                }
+                temp_path = self._file_path.with_suffix(self._file_path.suffix + ".tmp")
+                with open(temp_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(str(temp_path), str(self._file_path))
         except Exception as e:
             print(f"[GrowthTracker] 保存失败: {e}")
 
@@ -399,9 +528,15 @@ class GrowthTracker:
             self._total_tasks = data.get("total_tasks", 0)
             self._skill_confidence.update(data.get("skill_confidence", {}))
             self.personality = PersonalityTraits.from_dict(data.get("personality", {}))
+            evidence = data.get("personality_evidence", {})
+            for trait_name in self._personality_evidence:
+                self._personality_evidence[trait_name] = max(
+                    0, int(evidence.get(trait_name, 0))
+                )
 
             for m_data in data.get("metrics", []):
                 self._metrics.append(TaskMetric(
+                    episodic_id=m_data.get("episodic_id", ""),
                     timestamp=m_data.get("timestamp", 0),
                     success=m_data.get("success", True),
                     error_count=m_data.get("error_count", 0),

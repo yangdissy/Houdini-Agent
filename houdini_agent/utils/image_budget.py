@@ -10,7 +10,11 @@ _LARGE_IMAGE_PIXELS = 2_000_000
 
 def shared_image_budget(image_count: int, total_bytes: int = MAX_IMAGE_BYTES) -> int:
     """Return the per-image raw-byte budget for one multimodal user turn."""
-    return max(1, total_bytes // max(1, image_count))
+    if image_count <= 0:
+        raise ValueError("image_count must be positive")
+    if total_bytes <= 0:
+        raise ValueError("total_bytes must be positive")
+    return max(1, total_bytes // image_count)
 
 
 def preferred_image_format(width: int, height: int, has_alpha: bool) -> Tuple[str, str, int]:
@@ -30,6 +34,9 @@ def encode_image_within_limit(
     max_bytes: int = MAX_IMAGE_BYTES,
 ) -> Tuple[bytes, str]:
     """Encode an image, reducing JPEG quality and dimensions until it fits."""
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+
     raw_bytes = encode(image, image_format, initial_quality)
     if len(raw_bytes) <= max_bytes:
         return raw_bytes, media_type
@@ -45,8 +52,10 @@ def encode_image_within_limit(
                 )
                 return raw_bytes, 'image/jpeg'
         smaller = resize(working, 0.8)
-        if smaller is working:
+        if (smaller.width(), smaller.height()) == (working.width(), working.height()):
             break
         working = smaller
 
-    raise ValueError("图片压缩后仍超过 2.5MB，请裁剪图片后重试")
+    raise ValueError(
+        f"图片压缩后仍超过 {max_bytes / (1024 * 1024):.2f}MB，请裁剪图片后重试"
+    )

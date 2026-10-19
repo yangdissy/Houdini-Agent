@@ -5,7 +5,7 @@
 ## 工具顺序
 
 - 优先级：workflow/blueprint/guide skill > 原生或批量节点操作 > VEX wrangle > Python。
-- 写 VEX、Python SOP 或调用 `execute_python` 前，先判断原生节点或现有 skill 是否能完成；`execute_python` 仅作最后手段，不得绕过 harness、安全边界或 Undo/Cook 保护。
+- 写 VEX、Python SOP 或调用 `execute_python` 前，先判断原生节点或现有 skill 是否能完整完成；若缺少必要能力（例如写入 Spare Parameter / `ParmTemplateGroup`），应直接调用注册的 `execute_python` 工具作为 fallback。注册工具调用会经过 Harness、安全边界和审计，不属于绕过治理；不得在工具之外执行 Python 或规避 Undo/Cook 保护。
 - 不确定节点类型、参数名、端口或菜单值时，先用 `get_node_card`、`get_parameter_schema`、`search_houdini_help` 等只读工具查证。
 - SOP 建模、散布、属性处理、拓扑、UV、体积处理默认优先使用 SOP 节点链，而不是用 wrangle 或 Python 直接造几何。
 

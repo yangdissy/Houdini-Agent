@@ -413,6 +413,7 @@ def list_skills(category: Optional[str] = None, query: Optional[str] = None,
         info = dict(getattr(mod, "SKILL_INFO", {}))
         info.setdefault("name", name)
         info.setdefault("category", "other")
+        info["executable"] = not isinstance(mod, SkillDescriptor) or bool(mod.entrypoint)
         if category and info.get("category") != category:
             continue
         result.append(info)
@@ -482,7 +483,11 @@ def run_skill(skill_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
 
     if isinstance(mod, SkillDescriptor):
         if not mod.entrypoint:
-            return {"error": f"Skill '{skill_name}' is instructions-only."}
+            return {
+                "name": skill_name,
+                "instructions": mod.instructions,
+                "instructions_only": True,
+            }
         try:
             loaded_module = _load_descriptor_entrypoint(mod)
         except Exception as exc:

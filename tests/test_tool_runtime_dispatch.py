@@ -59,6 +59,25 @@ def test_mcp_dispatch_uses_registered_runtime_for_list_skills():
     handler.assert_called_once_with({})
 
 
+def test_list_skills_marks_instructions_only_usage():
+    client = HoudiniMCP()
+    listed = [{
+        "name": "decompose_houdini_task",
+        "category": "workflow",
+        "description": "Decompose complex Houdini work.",
+        "risk_level": "low",
+        "parameters": {},
+        "executable": False,
+    }]
+
+    with mock.patch("houdini_agent.utils.mcp.client._list_skills", return_value=listed):
+        result = client._tool_list_skills({"query": "复杂 Houdini 任务"})
+
+    assert result["success"] is True
+    assert '"executable": false' in result["result"]
+    assert "读取必须遵循的方法说明" in result["result"]
+
+
 def test_mcp_set_user_binds_skill_registry_user():
     client = HoudiniMCP()
 

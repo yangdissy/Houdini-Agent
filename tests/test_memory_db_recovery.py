@@ -13,6 +13,7 @@ from houdini_agent.utils.memory_sqlite import (
 )
 from houdini_agent.utils.memory_store import MemoryStore, SemanticRecord
 from shared.user_paths import UserPaths
+from tests.test_memory_schema_migrations import create_legacy_database
 from tests.test_team_memory import FakeEmbedder
 
 
@@ -25,19 +26,24 @@ class MemoryDbRecoveryTest(unittest.TestCase):
                 paths = UserPaths("recovery_tester")
                 leftover = paths.legacy_local_memory_db()
                 leftover.parent.mkdir(parents=True, exist_ok=True)
-                leftover_store = MemoryStore(db_path=leftover, embedder=FakeEmbedder())
-                leftover_store.add_semantic(SemanticRecord(rule="恢复这条记忆", category="preference"))
-                leftover_store.close()
+                create_legacy_database(leftover)
 
                 result = restore_legacy_local_memory_db(paths)
 
                 self.assertEqual(result.status, "restored")
                 restored = MemoryStore(db_path=paths.memory_db(), embedder=FakeEmbedder())
                 try:
-                    rules = [rec.rule for rec in restored.get_all_semantic()]
-                    self.assertIn("恢复这条记忆", rules)
+                    record = restored.get_semantic("semantic-1")
+                    self.assertEqual(record.rule, "legacy rule")
+                    self.assertEqual(record.abstraction_level, 2)
                 finally:
                     restored.close()
+                conn = sqlite3.connect(str(paths.memory_db()))
+                try:
+                    version = conn.execute("PRAGMA user_version").fetchone()[0]
+                finally:
+                    conn.close()
+                self.assertEqual(version, MemoryStore.SCHEMA_VERSION)
                 self.assertTrue(leftover.exists())
 
     def test_does_not_overwrite_conflicting_authoritative_database(self):

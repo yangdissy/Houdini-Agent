@@ -124,19 +124,24 @@ class MemoryMixin:
                 query_parts.append(' '.join(selected_types))
         return '\n'.join(part for part in query_parts if part)
 
-    def _reinforce_pending_memories(self, reward: float):
-        """仅在任务获得正向结果后强化本轮实际召回的个人记忆。"""
+    def _reinforce_pending_memories(self, reward: float, task_success=None):
+        """结算本轮实际召回的个人记忆。"""
         pending = getattr(self, '_pending_memory_reinforcement', None)
         self._pending_memory_reinforcement = None
-        if reward <= 0 or not pending or not self._memory_store:
+        if not pending or not self._memory_store:
             return
 
-        for record_id in pending.get('semantic_ids', []):
-            self._memory_store.increment_semantic_activation(record_id)
-        for record_id, importance in pending.get('episodic', []):
-            self._memory_store.update_episodic_importance(
-                record_id, min(5.0, importance * 1.05)
-            )
+        if reward > 0:
+            for record_id in pending.get('semantic_ids', []):
+                self._memory_store.increment_semantic_activation(record_id)
+            for record_id, importance in pending.get('episodic', []):
+                self._memory_store.update_episodic_importance(
+                    record_id, min(5.0, importance * 1.05)
+                )
+
+        if task_success is not None:
+            for record_id in pending.get('procedural_ids', []):
+                self._memory_store.update_procedural_usage(record_id, bool(task_success))
 
     def _activate_long_term_memory(self, user_message: str, scene_context: dict = None) -> str:
         """动态记忆激活 — 分层 chunk 检索
@@ -276,6 +281,10 @@ class MemoryMixin:
                     (item.record_id, item.source.importance) for item in selected
                     if item.kind == "episodic" and item.record_id and item.source
                 ],
+                "procedural_ids": [
+                    item.record_id for item in selected
+                    if item.kind == "procedural" and item.record_id
+                ],
             }
 
             if not selected:
@@ -373,7 +382,9 @@ class MemoryMixin:
                     break
 
             # 判断成功 / 失败
-            success = result.get('ok', True) and error_count < len(tool_calls) * 0.5
+            success = bool(result.get('ok', True)) and (
+                not tool_calls or error_count < len(tool_calls) * 0.5
+            )
 
             # 结果摘要
             result_summary = ""
@@ -398,11 +409,15 @@ class MemoryMixin:
                 model=agent_params.get('model', 'deepseek-v4-flash'),
                 provider=agent_params.get('provider', 'deepseek'),
             )
-            self._reinforce_pending_memories(reflect_result.get('reward', 0.0))
+            self._reinforce_pending_memories(
+                reflect_result.get('reward', 0.0),
+                task_success=success,
+            )
 
             # 更新 Growth Tracker
             if self._growth_tracker:
                 metric = TaskMetric(
+                    episodic_id=reflect_result.get('episodic_id', ''),
                     success=success,
                     error_count=error_count,
                     retry_count=retry_count,
@@ -422,6 +437,11 @@ class MemoryMixin:
                 print(f"[Memory] 反思完成: reward={reflect_result['reward']:.2f}, "
                       f"tags={reflect_result.get('tags', [])}, "
                       f"deep_reflected={reflect_result.get('deep_reflected', False)}")
+                if reflect_result.get('deep_reflection_error'):
+                    print(
+                        "[Memory] 深度反思未写入: "
+                        f"reason={reflect_result['deep_reflection_error']}"
+                    )
 
             # ★ 通知主线程：本次任务的 episodic 记忆已写入（供用户反馈按钮定位）
             episodic_id = reflect_result.get('episodic_id')

@@ -7,6 +7,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
+from tests.test_import_smoke import _install_qt_stubs, _install_thirdparty_stubs
+
+_install_thirdparty_stubs()
+_install_qt_stubs()
+
 from houdini_agent.core.plan_mixin import PlanMixin
 from houdini_agent.utils.plan_manager import PlanManager
 from houdini_agent.utils.plan_runtime import PlanQualityGate, PlanRuntime
@@ -251,6 +256,33 @@ class PlanLifecycleTest(unittest.TestCase):
             restarted._session_id = "a"
             restarted._restore_plan_projection()
             self.assertEqual(restarted._plan_phase, "awaiting_confirmation")
+
+    def test_restore_projection_is_idempotent_for_active_plan(self):
+        with TemporaryDirectory() as temp_dir:
+            manager = PlanManager(Path(temp_dir))
+            with mock.patch.object(manager, "_quality_gate", return_value=PlanQualityGate()):
+                plan = manager.create_plan("session", _plan_data())
+                other_plan = manager.create_plan("other", _plan_data())
+
+            render_signal = mock.Mock()
+            tab = type("PlanAdapter", (PlanMixin,), {})()
+            tab._plan_manager = manager
+            tab._session_id = "session"
+            tab._active_plan_viewer = mock.Mock()
+            tab._projected_plan_key = ("session", plan["plan_id"])
+            tab._renderPlanViewer = render_signal
+
+            restored = tab._restore_plan_projection()
+
+            self.assertEqual(restored["plan_id"], plan["plan_id"])
+            self.assertEqual(tab._plan_phase, "awaiting_confirmation")
+            render_signal.emit.assert_not_called()
+            self.assertIsNotNone(tab._active_plan_viewer)
+
+            tab._session_id = "other"
+            tab._restore_plan_projection()
+
+            render_signal.emit.assert_called_once_with(other_plan)
 
 
 if __name__ == "__main__":

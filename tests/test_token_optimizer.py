@@ -98,6 +98,13 @@ class MatchPricingTest(unittest.TestCase):
     def test_unknown_returns_default(self):
         self.assertEqual(_match_pricing("totally-unknown-model"), _DEFAULT_PRICING)
 
+    def test_gpt_56_uses_terra_standard_pricing(self):
+        self.assertEqual(_match_pricing("gpt-5.6"), {
+            "input": 2.0,
+            "input_cache": 0.2,
+            "output": 12.0,
+        })
+
 
 class CalculateCostTest(unittest.TestCase):
     def test_zero_tokens(self):
@@ -129,6 +136,14 @@ class CalculateCostTest(unittest.TestCase):
     def test_free_ollama_model(self):
         cost = calculate_cost("qwen2.5:14b", input_tokens=1_000_000, output_tokens=1_000_000)
         self.assertEqual(cost, 0.0)
+
+    def test_gpt_56_terra_input_output_cost(self):
+        cost = calculate_cost("gpt-5.6", input_tokens=1_000_000, output_tokens=1_000_000)
+        self.assertEqual(cost, 14.0)
+
+    def test_gpt_56_terra_cached_input_cost(self):
+        cost = calculate_cost("gpt-5.6", cache_hit=1_000_000)
+        self.assertEqual(cost, 0.2)
 
     def test_from_stats_aliases(self):
         cost = calculate_cost_from_stats(

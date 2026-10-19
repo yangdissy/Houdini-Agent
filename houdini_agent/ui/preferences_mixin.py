@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 """Preferences, model selection, and token statistics helpers for AITab."""
 
-import json
-
 from houdini_agent.qt_compat import QtWidgets, QtGui, QSettings
+from houdini_agent.core.agent_request_assembly import (
+    has_prior_completed_turn,
+    prepare_history_for_request,
+)
 from houdini_agent.ui.cursor_theme import CursorTheme
 from houdini_agent.ui.font_settings_dialog import FontSettingsDialog
 from houdini_agent.ui.i18n import tr
+from houdini_agent.utils.ultra_optimizer import UltraOptimizer
 from houdini_agent.utils.token_optimizer import CompressionStrategy
 
 
@@ -51,14 +54,30 @@ class PreferencesMixin:
         return int(tokens)
 
     def _calculate_context_tokens(self) -> int:
-        """计算当前上下文的总 token 数（含工具定义）"""
-        if not hasattr(self, '_tools_token_cache'):
-            from houdini_agent.utils.ai_client import HOUDINI_TOOLS
-            tools_json = json.dumps(HOUDINI_TOOLS, ensure_ascii=False)
-            self._tools_token_cache = self.token_optimizer.estimate_tokens(tools_json)
+        """估算下一轮请求的 token 数（含当前模式的实际工具定义）。"""
+        has_history = has_prior_completed_turn(self._conversation_history)
+        use_think = self.think_check.isChecked()
+        if has_history:
+            system_prompt = (
+                self._cached_prompt_core_think
+                if use_think else self._cached_prompt_core_no_think
+            )
+        else:
+            system_prompt = self._cached_prompt_think if use_think else self._cached_prompt_no_think
 
-        total = self._tools_token_cache
-        total += self.token_optimizer.estimate_tokens(self._system_prompt)
+        from houdini_agent.utils.tool_registry import get_tool_registry
+        registry = get_tool_registry()
+        if self._agent_mode:
+            tools = self._select_agent_tools_for_message(
+                self._latest_user_message(), use_web=self.web_check.isChecked()
+            )
+        else:
+            mode = "plan_planning" if self._plan_mode else "ask"
+            tools = UltraOptimizer.optimize_tool_definitions(
+                registry.get_tools_for_mode(mode)
+            )
+
+        total = self.token_optimizer.estimate_tokens(system_prompt)
         if self._context_summary:
             total += self.token_optimizer.estimate_tokens(self._context_summary)
         history = [
@@ -68,7 +87,15 @@ class PreferencesMixin:
                 and message.get('content') == self._context_summary
             )
         ]
-        total += self.token_optimizer.calculate_message_tokens(history)
+        history = prepare_history_for_request(
+            history,
+            supports_vision=self._current_model_supports_vision(),
+            fix_alternation=self._fix_message_alternation,
+            tool_result_text=lambda name, content: tr('ai.tool_result', name, content),
+            image_placeholder=tr('ai.image_msg'),
+            summarize_tool_content=self.client._summarize_tool_content,
+        )
+        total += self.token_optimizer.calculate_message_tokens(history, tools=tools)
         return total
 
     def _save_model_preference(self):

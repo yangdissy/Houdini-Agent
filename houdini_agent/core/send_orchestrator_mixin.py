@@ -19,13 +19,39 @@ from houdini_agent.core.agent_request_assembly import (
     build_context,
     finalize_context_request,
     has_prior_completed_turn,
-    normalize_history,
+    prepare_history_for_request,
 )
 from houdini_agent.utils.plan_manager import (
     PLAN_TOOL_CREATE,
     PLAN_TOOL_UPDATE_STEP,
     PLAN_TOOL_ASK_QUESTION,
 )
+
+
+def _confirmed_plan_tools(base_tools: List[dict]) -> List[dict]:
+    tools = list(base_tools)
+    names = {tool.get('function', {}).get('name') for tool in tools}
+    if PLAN_TOOL_UPDATE_STEP.get('function', {}).get('name') not in names:
+        tools.append(PLAN_TOOL_UPDATE_STEP)
+    return tools
+
+
+def _single_agent_resume_callback():
+    resumed = False
+
+    def _check_incomplete():
+        nonlocal resumed
+        if resumed:
+            return None
+        resumed = True
+        return (
+            "[Execution Check] Re-check the user's original request against the tool results. "
+            "If every requested change is complete and verified, give the final answer now. "
+            "If anything remains, continue immediately by calling the required tools; "
+            "do not only describe the next step."
+        )
+
+    return _check_incomplete
 
 
 class SendOrchestratorMixin:
@@ -168,6 +194,11 @@ class SendOrchestratorMixin:
                 if t.get('function', {}).get('name') not in ('web_search', 'fetch_webpage')
             ]
 
+        self._last_selected_tool_names = [
+            tool.get('function', {}).get('name', '')
+            for tool in selected
+            if tool.get('function', {}).get('name')
+        ]
         return UltraOptimizer.optimize_tool_definitions(selected)
 
     def _run_agent(self, agent_params: dict):
@@ -192,7 +223,8 @@ class SendOrchestratorMixin:
         scene_context = agent_params.get('scene_context', {})
         supports_vision = agent_params.get('supports_vision', True)
         plan_mode = agent_params.get('plan_mode', False)
-        plan_executing = agent_params.get('plan_executing', False)
+        execution_context = agent_params.get('execution_context') or {}
+        confirmed_plan_execution = execution_context.get('type') == 'confirmed_plan'
         confirm_mode = agent_params.get('confirm_mode', True)
         if self._harness_v2_enabled:
             self._harness_state = HarnessRuntimeState(session_id=self._session_id)
@@ -226,16 +258,15 @@ class SendOrchestratorMixin:
             if not use_agent and not plan_mode:
                 sys_prompt = sys_prompt + tr('ai.ask_mode_prompt')
             
-            # ★ Plan 模式：追加规划或执行阶段提示词
-            if plan_mode:
-                if plan_executing:
-                    sys_prompt = sys_prompt + tr('ai.plan_mode_execution_prompt')
-                else:
-                    self._plan_phase = 'planning'
-                    sys_prompt = sys_prompt + tr('ai.plan_mode_planning_prompt')
+            # ★ Plan 规划保持独立模式；确认后由 Agent 携带 Plan 执行上下文。
+            if confirmed_plan_execution:
+                sys_prompt = sys_prompt + tr('ai.plan_mode_execution_prompt')
+            elif plan_mode:
+                self._plan_phase = 'planning'
+                sys_prompt = sys_prompt + tr('ai.plan_mode_planning_prompt')
             
             # ★ Agent 模式：追加复杂任务建议切换 Plan 的提示
-            if use_agent and not plan_mode:
+            if use_agent and not plan_mode and not confirmed_plan_execution:
                 sys_prompt = sys_prompt + tr('ai.agent_suggest_plan_prompt')
                 # ★ 直接执行模式：抑制模型主动逐步征询确认，一次性完成整条流程
                 if not confirm_mode:
@@ -283,12 +314,13 @@ class SendOrchestratorMixin:
             # - 只清理内部元数据字段（thinking, python_shells 等）
             # - 压缩只在超限时由 _progressive_trim / auto_optimize 处理
             
-            history_to_send = normalize_history(
+            history_to_send = prepare_history_for_request(
                 self._conversation_history,
                 supports_vision=supports_vision,
                 fix_alternation=self._fix_message_alternation,
                 tool_result_text=lambda name, content: tr('ai.tool_result', name, content),
                 image_placeholder=tr('ai.image_msg'),
+                summarize_tool_content=self.client._summarize_tool_content,
             )
             
             dynamic_sections = []
@@ -319,7 +351,7 @@ class SendOrchestratorMixin:
                     ))
             
             # 5. ★ Plan 上下文注入（仅在 Plan 执行阶段 + 当前 session 匹配时）
-            if plan_mode and plan_executing:
+            if confirmed_plan_execution:
                 try:
                     plan_ctx = self._get_plan_manager().get_plan_for_context(self._session_id)
                     if plan_ctx:
@@ -386,16 +418,12 @@ class SendOrchestratorMixin:
                         sleep_thread.start()
             
             # 工具必须先选定，messages 与实际 tools 才能共同参与预算。
-            if plan_mode and not plan_executing:
+            if plan_mode:
                 from ..utils.tool_registry import get_tool_registry
                 plan_filtered = get_tool_registry().get_tools_for_mode("plan_planning")
                 tools = UltraOptimizer.optimize_tool_definitions(plan_filtered)
-            elif plan_mode and plan_executing:
-                exec_tools = list(HOUDINI_TOOLS)
-                exec_names = {t.get('function', {}).get('name') for t in exec_tools}
-                for plan_tool in (PLAN_TOOL_UPDATE_STEP, PLAN_TOOL_ASK_QUESTION):
-                    if plan_tool.get('function', {}).get('name') not in exec_names:
-                        exec_tools.append(plan_tool)
+            elif confirmed_plan_execution:
+                exec_tools = _confirmed_plan_tools(HOUDINI_TOOLS)
                 tools = UltraOptimizer.optimize_tool_definitions(exec_tools)
             elif not use_agent:
                 from ..utils.tool_registry import get_tool_registry
@@ -470,10 +498,10 @@ class SendOrchestratorMixin:
             try:
                 from ..utils.tool_registry import get_tool_registry
                 _reg = get_tool_registry()
-                _mode = "plan_executing" if plan_mode and plan_executing else (
+                _mode = "plan_executing" if confirmed_plan_execution else (
                     "plan_planning" if plan_mode else ("agent" if use_agent else "ask")
                 )
-                registry_tools = _reg.get_tools_for_mode(_mode)
+                registry_tools = _reg.get_non_core_tools_for_mode(_mode)
             except Exception:
                 pass
             request = finalize_context_request(
@@ -495,7 +523,7 @@ class SendOrchestratorMixin:
             tools = request.tools
             
             # ★ Plan 模式的静默工具集合（不在 UI 中显示的工具）
-            _silent = self._SILENT_TOOLS | self._PLAN_SILENT_TOOLS if plan_mode else self._SILENT_TOOLS
+            _silent = self._SILENT_TOOLS | self._PLAN_SILENT_TOOLS if (plan_mode or confirmed_plan_execution) else self._SILENT_TOOLS
             
             # ★ 通用回调：每轮 API 迭代开始时显示 "Generating..." 状态
             # 第1轮也显示，填补 Send → 首字之间的空白
@@ -504,13 +532,13 @@ class SendOrchestratorMixin:
                 if self._harness_state:
                     self._harness_state.iteration = i
             
-            if plan_mode:
+            if plan_mode or confirmed_plan_execution:
                 # ★ Plan 模式：使用 agent loop（规划或执行阶段均走此分支）
-                _max_iter = 999 if plan_executing else 20
+                _max_iter = 999 if confirmed_plan_execution else 20
                 
                 # ★ Plan 续接回调：逻辑和状态统一由 PlanMixin._check_plan_resume 管理
                 _plan_resume_callback = None
-                if plan_executing:
+                if confirmed_plan_execution:
                     self._init_plan_resume_state()
                     _plan_resume_callback = self._check_plan_resume
                 
@@ -544,6 +572,9 @@ class SendOrchestratorMixin:
                 )
             elif use_agent:
                 # ★ Agent 模式：完整 agent loop，可创建/修改/删除节点
+                _agent_loop_kwargs = {}
+                if self.client._supports_function_calling(provider, model):
+                    _agent_loop_kwargs['on_incomplete'] = _single_agent_resume_callback()
                 result = self.client.agent_loop_auto(
                     messages=messages,
                     model=model,
@@ -568,6 +599,7 @@ class SendOrchestratorMixin:
                         self._toolArgsDelta.emit(name, delta, acc)
                     ),
                     on_iteration_start=_on_iter,
+                    **_agent_loop_kwargs,
                 )
             elif tools:
                 # ★ Ask 模式：仍用 agent loop 但只提供只读工具

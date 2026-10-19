@@ -15,6 +15,9 @@ from houdini_agent.core.houdini_main_thread_executor import OPERATION_ID_KEY
 
 class ToolExecutionMixin:
     def _registry_execution_mode(self) -> str:
+        execution_context = getattr(self, '_last_agent_params', {}).get('execution_context') or {}
+        if execution_context.get('type') == 'confirmed_plan':
+            return "plan_executing"
         if self._plan_mode:
             return "plan_planning" if self._plan_phase == "planning" else "plan_executing"
         return "agent" if self._agent_mode else "ask"
@@ -255,7 +258,7 @@ class ToolExecutionMixin:
 
     def _execute_tool_with_policy(self, tool_name: str, kwargs: dict) -> dict:
         """Execute one tool through the shared governed execution owner."""
-        mode = 'plan' if self._plan_mode else ('agent' if self._agent_mode else 'ask')
+        mode = self._registry_execution_mode()
         context = {
             'mode': mode,
             'plan_phase': self._plan_phase,
@@ -290,6 +293,21 @@ class ToolExecutionMixin:
             retry_limit=self._policy_retry_limit,
         )
         result = owner.execute(tool_name, kwargs, context)
+        if isinstance(result, dict) and tool_name != "read_tool_result":
+            try:
+                from .tool_result_store import ToolResultStore
+                session_id = self._agent_session_id or self._session_id
+                result = ToolResultStore(self._cache_dir, session_id).archive_if_large(tool_name, result)
+            except Exception:
+                try:
+                    self._append_session_diagnostics_records([{
+                        "event_type": "tool_result_archival",
+                        "tool": tool_name,
+                        "success": False,
+                        "error_code": "archive_failed",
+                    }])
+                except Exception:
+                    pass
         if tool_name == "remember_memory":
             self._remember_memory_calls = int(getattr(self, "_remember_memory_calls", 0) or 0) + 1
         if not result.get('success'):
@@ -433,19 +451,23 @@ class ToolExecutionMixin:
                 return {"success": True, "result": f"Updated todo {todo_id} to {status}"}
 
             elif tool_name == "get_operation_status":
-                operation_id = str(kwargs.get("operation_id") or "").strip()
-                if not operation_id:
-                    return {"success": False, "error": "operation_id is required"}
-                receipt = executor.get_operation_status(operation_id) if executor is not None else None
+                request_ref = str(kwargs.get("request_ref") or kwargs.get("operation_id") or "").strip()
+                if not request_ref:
+                    return {"success": False, "error": "request_ref is required"}
+                receipt = executor.get_operation_status(request_ref) if executor is not None else None
                 if receipt is None:
                     session_id = self._agent_session_id or self._session_id
                     receipt = next((
                         item for item in self._read_operation_receipts(session_id)
-                        if item.get("operation_id") == operation_id
+                        if item.get("request_ref") == request_ref or item.get("operation_id") == request_ref
                     ), None)
+                state = str((receipt or {}).get("state") or "unknown")
                 return {
                     "success": receipt is not None,
                     "result": receipt,
+                    "request_ref": request_ref,
+                    "replay_safe": state == "not_started",
+                    "recovery_status": state,
                     "error": "Operation receipt not found" if receipt is None else "",
                 }
 
@@ -459,6 +481,54 @@ class ToolExecutionMixin:
                     session_id = self._agent_session_id or self._session_id
                     receipts = self._read_operation_receipts(session_id)[-limit:]
                 return {"success": True, "result": receipts}
+
+            elif tool_name == "inspect_tool_contract":
+                name = str(kwargs.get("name") or "").strip()
+                if not name:
+                    return {"success": False, "error": "name is required"}
+                from ..utils.tool_registry import get_tool_registry
+                contract = get_tool_registry().inspect_contract(name)
+                return {
+                    "success": contract is not None,
+                    "result": contract,
+                    "error": "Tool contract not found" if contract is None else "",
+                }
+
+            elif tool_name == "search_tool_contracts":
+                try:
+                    limit = max(1, min(int(kwargs.get("limit", 20)), 100))
+                except (TypeError, ValueError):
+                    return {"success": False, "error": "limit must be an integer from 1 to 100"}
+                tags = kwargs.get("tags") or []
+                if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
+                    return {"success": False, "error": "tags must be an array of strings"}
+                from ..utils.tool_registry import get_tool_registry
+                contracts = get_tool_registry().search_contracts(
+                    query=str(kwargs.get("query") or ""),
+                    mode=str(kwargs.get("mode") or ""),
+                    tags=set(tags),
+                    limit=limit,
+                )
+                return {"success": True, "result": contracts}
+
+            elif tool_name == "read_tool_result":
+                result_ref = str(kwargs.get("result_ref") or "").strip()
+                if not result_ref:
+                    return {"success": False, "error": "result_ref is required"}
+                try:
+                    offset = int(kwargs.get("offset", 0))
+                    limit = int(kwargs.get("limit", 6000))
+                    from .tool_result_store import ToolResultStore
+                    session_id = self._agent_session_id or self._session_id
+                    result = ToolResultStore(self._cache_dir, session_id).read(
+                        result_ref=result_ref,
+                        pointer=str(kwargs.get("pointer") or ""),
+                        offset=offset,
+                        limit=limit,
+                    )
+                    return result
+                except (FileNotFoundError, KeyError, IndexError, ValueError, TypeError) as exc:
+                    return {"success": False, "error": f"Unable to read tool result: {exc}"}
             
             # 不依赖 hou 的工具 → 直接在后台线程执行（避免阻塞 UI）
             if meta.runtime == "local":
@@ -498,6 +568,26 @@ class ToolExecutionMixin:
             return result
 
         return {"success": False, "error": f"Houdini 主线程执行器不可用，拒绝执行 {tool_name}"}
+
+    def _operation_identity(self) -> dict:
+        """Return non-sensitive runtime identity recorded with operation receipts."""
+        import hashlib
+
+        identity = {"executor_id": str(getattr(self, "_executor_id", "unknown"))}
+        try:
+            import hou  # type: ignore
+            hip_path = str(hou.hipFile.path() or "")
+            houdini_version = str(hou.applicationVersionString())
+            session_id = str(self._agent_session_id or self._session_id or "unknown")
+            scene_material = "\0".join((identity["executor_id"], session_id, hip_path))
+            identity.update({
+                "houdini_version": houdini_version,
+                "hip_path": hip_path,
+                "scene_id": "scene_" + hashlib.sha256(scene_material.encode("utf-8")).hexdigest()[:24],
+            })
+        except Exception:
+            identity.update({"houdini_version": "unknown", "hip_path": "", "scene_id": "unknown"})
+        return identity
 
     def _execute_tools_batch_in_main_thread(self, batch: list) -> list:
         """在主线程批量执行只读工具（减少 N 次信号往返为 1 次）

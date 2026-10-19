@@ -145,6 +145,7 @@ class MemoryStore:
     """三层记忆 SQLite 存储 + Embedding 向量检索"""
 
     EMBEDDING_BACKUP_RETENTION = 3
+    SCHEMA_VERSION = 1
 
     def __init__(self, db_path: Optional[Path] = None, embedder: Optional[LocalEmbedder] = None):
         self.db_path = db_path or _DB_PATH
@@ -238,6 +239,11 @@ class MemoryStore:
                     self._force_delete = True
                     self._init_db_with_conn()
                 else:
+                    try:
+                        if self._conn:
+                            self._conn.close()
+                    finally:
+                        self._conn = None
                     raise
 
     def _init_db_with_conn(self):
@@ -292,8 +298,7 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_procedural_priority ON procedural_memory(priority);
         """)
             conn.commit()
-            # ── DB migration: 添加 abstraction_level 列（兼容旧数据库） ──
-            self._migrate_add_abstraction_level(conn)
+            self._migrate_schema(conn)
             self._validate_embedding_metadata(conn)
 
     def _validate_embedding_metadata(self, conn: sqlite3.Connection) -> None:
@@ -364,18 +369,44 @@ class MemoryStore:
                 print(f"[Memory] 删除旧向量备份失败 {path.name}: {exc}")
         return deleted
 
-    @staticmethod
-    def _migrate_add_abstraction_level(conn: sqlite3.Connection):
-        """为 semantic_memory 表添加 abstraction_level 列（兼容旧 DB）"""
-        try:
-            cols = [row[1] for row in conn.execute("PRAGMA table_info(semantic_memory)").fetchall()]
-            if "abstraction_level" not in cols:
-                conn.execute("ALTER TABLE semantic_memory ADD COLUMN abstraction_level INTEGER DEFAULT 2")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_semantic_abstraction ON semantic_memory(abstraction_level)")
+    @classmethod
+    def _migrate_schema(cls, conn: sqlite3.Connection) -> None:
+        """按 ``PRAGMA user_version`` 顺序升级数据库结构。"""
+        current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if current_version > cls.SCHEMA_VERSION:
+            raise sqlite3.DatabaseError(
+                f"memory schema version {current_version} is newer than supported "
+                f"version {cls.SCHEMA_VERSION}"
+            )
+
+        migrations = {
+            1: cls._migrate_v1_add_abstraction_level,
+        }
+        for version in range(current_version + 1, cls.SCHEMA_VERSION + 1):
+            migration = migrations[version]
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                migration(conn)
+                conn.execute(f"PRAGMA user_version={version}")
                 conn.commit()
-                print("[MemoryStore] Migration: 已添加 abstraction_level 列")
-        except Exception as e:
-            print(f"[MemoryStore] Migration 失败 (非致命): {e}")
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+
+    @staticmethod
+    def _migrate_v1_add_abstraction_level(conn: sqlite3.Connection) -> None:
+        """为 semantic memory 添加抽象层级。"""
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(semantic_memory)").fetchall()]
+        if "abstraction_level" not in cols:
+            conn.execute(
+                "ALTER TABLE semantic_memory "
+                "ADD COLUMN abstraction_level INTEGER DEFAULT 2"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_semantic_abstraction "
+            "ON semantic_memory(abstraction_level)"
+        )
 
     def close(self):
         with self._db_lock:
@@ -546,6 +577,50 @@ class MemoryStore:
         self._commit()
         return record.id
 
+    def upsert_semantic(
+        self,
+        record: SemanticRecord,
+        duplicate_threshold: float = 0.80,
+        confidence_increment: float = 0.1,
+    ) -> Tuple[SemanticRecord, bool]:
+        """写入新规则，或合并重复规则的来源与强化信号。"""
+        with self._db_lock:
+            existing = self.find_duplicate_semantic(
+                record.rule,
+                threshold=duplicate_threshold,
+                category=record.category,
+                abstraction_level=record.abstraction_level,
+            )
+            if existing is None:
+                self.add_semantic(record)
+                return record, True
+
+            source_episodes = list(dict.fromkeys(
+                existing.source_episodes + record.source_episodes
+            ))
+            confidence = min(1.0, existing.confidence + confidence_increment)
+            now = time.time()
+            self._get_conn().execute(
+                """
+                UPDATE semantic_memory
+                SET source_episodes=?, confidence=?,
+                    activation_count=activation_count + 1, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    json.dumps(source_episodes, ensure_ascii=False),
+                    confidence,
+                    now,
+                    existing.id,
+                ),
+            )
+            self._get_conn().commit()
+            existing.source_episodes = source_episodes
+            existing.confidence = confidence
+            existing.activation_count += 1
+            existing.updated_at = now
+            return existing, False
+
     def get_semantic(self, record_id: str) -> Optional[SemanticRecord]:
         """根据 ID 获取抽象知识"""
         row = self._fetchone("SELECT * FROM semantic_memory WHERE id=?", (record_id,))
@@ -606,7 +681,13 @@ class MemoryStore:
         )
         self._commit()
 
-    def find_duplicate_semantic(self, rule_text: str, threshold: float = 0.85) -> Optional[SemanticRecord]:
+    def find_duplicate_semantic(
+        self,
+        rule_text: str,
+        threshold: float = 0.85,
+        category: Optional[str] = None,
+        abstraction_level: Optional[int] = None,
+    ) -> Optional[SemanticRecord]:
         """查找是否已存在高度相似的规则（去重用）
 
         注意：去重必须用纯相似度 sim，不能用 search_semantic 返回的 combined
@@ -616,7 +697,19 @@ class MemoryStore:
             print(f"[MemoryStore] {self.embedding_diagnostic}")
             return None
         query_vec = self.embedder.encode(rule_text)
-        rows = self._fetchall("SELECT id, embedding FROM semantic_memory")
+        where_parts = []
+        params = []
+        if category is not None:
+            where_parts.append("category=?")
+            params.append(category)
+        if abstraction_level is not None:
+            where_parts.append("abstraction_level=?")
+            params.append(abstraction_level)
+        where_sql = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+        rows = self._fetchall(
+            "SELECT id, embedding FROM semantic_memory" + where_sql,
+            tuple(params),
+        )
         if not rows:
             return None
 

@@ -43,6 +43,51 @@ def test_full_prompt_adds_extended_guidance_once(monkeypatch):
     assert sections[2].required is False
 
 
+def test_full_prompt_delegates_execute_python_confirmation_to_harness():
+    sections = build_system_prompt_sections(
+        with_thinking=False,
+        full_rules=True,
+        language='en',
+    )
+    prompt = ''.join(section.content for section in sections)
+
+    assert 'execute_python requires user confirmation' not in prompt
+    assert 'do not ask the user for a separate prose confirmation' in prompt
+    assert 'confirmation mode and Harness policy' in prompt
+
+
+def test_core_prompt_requires_governed_python_for_missing_scene_capabilities():
+    sections = build_system_prompt_sections(
+        with_thinking=False,
+        full_rules=False,
+        language='en',
+    )
+    prompt = ''.join(section.content for section in sections)
+
+    assert 'Use upsert_spare_parameter' in prompt
+    assert 'call execute_python directly as the governed fallback' in prompt
+    assert 'not supported by upsert_spare_parameter' in prompt
+    assert 'is not bypassing governance' in prompt
+
+
+def test_core_prompt_requires_result_verification_at_task_completion():
+    sections = build_system_prompt_sections(
+        with_thinking=False,
+        full_rules=False,
+        language='en',
+    )
+    prompt = ''.join(section.content for section in sections)
+
+    assert 'Task Completion Verification (MUST follow)' in prompt
+    assert 'final Plan step' in prompt
+    assert 'about to claim the task is complete' in prompt
+    assert 'run_skill(skill_name="verify_agent_result"' in prompt
+    assert 'temporary_auto_validate_geometry' in prompt
+    assert 'restores the exact original mode' in prompt
+    assert 'current mode is Auto and freshness is established, do not call it' in prompt
+    assert 'not a node-creation hook' in prompt
+
+
 def test_budget_keeps_required_sections_whole_and_omits_optional(monkeypatch):
     sections = [
         PromptSection('persona', 'PERSONA'),

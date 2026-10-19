@@ -19,6 +19,11 @@ class _ModeValue:
         return self._name
 
 
+class _FalsyModeValue(_ModeValue):
+    def __bool__(self):
+        return False
+
+
 class _UpdateMode:
     Manual = _ModeValue("Manual")
     AutoUpdate = _ModeValue("AutoUpdate")
@@ -255,6 +260,28 @@ class GeometryValidationSignalsTest(unittest.TestCase):
         self.assertTrue(result["freshness"]["read_succeeded"])
         self.assertTrue(result["restore_attempted"])
         self.assertTrue(result["restore_succeeded"])
+
+    def test_temporary_auto_validation_preserves_falsy_auto_update_mode(self):
+        auto_mode = _FalsyModeValue("AutoUpdate")
+
+        class FalsyAutoUpdateMode:
+            AutoUpdate = auto_mode
+            Manual = _ModeValue("Manual")
+
+        hou_stub = _HouStub(auto_mode)
+        hou_stub.updateMode = FalsyAutoUpdateMode
+        mcp_client.hou = hou_stub
+        client = object.__new__(mcp_client.HoudiniMCP)
+        node = _Node(_Geometry(point_count=4, primitive_count=1, vertex_count=4))
+        client._resolve_geometry_node = lambda node_path: (node, None)
+        client._jsonable_value = lambda value: value
+
+        result = client._tool_temporary_auto_validate_geometry({"node_path": "/obj/geo1/OUT"})
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["original_update_mode"], "AutoUpdate")
+        self.assertEqual(result["restored_update_mode"], "AutoUpdate")
+        self.assertEqual(hou_stub.set_modes, [auto_mode, auto_mode])
 
     def test_temporary_auto_validate_geometry_requires_target(self):
         mcp_client.hou = _HouStub(_UpdateMode.Manual)

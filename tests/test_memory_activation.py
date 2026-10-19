@@ -6,7 +6,7 @@ from houdini_agent.utils.memory_activation import (
     MemoryActivationCandidate,
     MemoryActivationSelector,
 )
-from houdini_agent.utils.memory_store import EpisodicRecord, SemanticRecord
+from houdini_agent.utils.memory_store import EpisodicRecord, ProceduralRecord, SemanticRecord
 from houdini_agent.utils.team_memory_store import TeamSemanticRecord
 
 
@@ -63,6 +63,7 @@ class FakeMemoryStore:
         self.embedder = FakeEmbedder()
         self.semantic_activations = []
         self.episodic_updates = []
+        self.procedural_updates = []
 
     def search_by_level(self, query, level, top_k=3, threshold=0.0):
         if level == 1:
@@ -84,13 +85,27 @@ class FakeMemoryStore:
         )]
 
     def search_procedural(self, query, top_k=2):
-        return []
+        if "cook node" not in query:
+            return []
+        return [(
+            ProceduralRecord(
+                id="p1",
+                strategy_name="validate_before_cook",
+                description="Validate the node path before cooking",
+                priority=0.8,
+                success_rate=0.75,
+            ),
+            0.5,
+        )]
 
     def increment_semantic_activation(self, record_id):
         self.semantic_activations.append(record_id)
 
     def update_episodic_importance(self, record_id, new_importance):
         self.episodic_updates.append((record_id, new_importance))
+
+    def update_procedural_usage(self, record_id, success):
+        self.procedural_updates.append((record_id, success))
 
 
 class FakeTeamMemoryStore:
@@ -127,7 +142,11 @@ class MemoryMixinActivationTest(unittest.TestCase):
         self.assertEqual(mixin._memory_store.episodic_updates, [])
         self.assertEqual(
             mixin._pending_memory_reinforcement,
-            {"semantic_ids": ["s1"], "episodic": [("e1", 1.0)]},
+            {
+                "semantic_ids": ["s1"],
+                "episodic": [("e1", 1.0)],
+                "procedural_ids": ["p1"],
+            },
         )
 
     def test_positive_task_result_reinforces_pending_memories(self):
@@ -138,10 +157,26 @@ class MemoryMixinActivationTest(unittest.TestCase):
             "episodic": [("e1", 1.0)],
         }
 
-        mixin._reinforce_pending_memories(0.5)
+        mixin._reinforce_pending_memories(0.5, task_success=True)
 
         self.assertEqual(mixin._memory_store.semantic_activations, ["s1"])
         self.assertEqual(mixin._memory_store.episodic_updates, [("e1", 1.05)])
+        self.assertIsNone(mixin._pending_memory_reinforcement)
+
+    def test_task_outcome_updates_selected_procedural_memory(self):
+        mixin = MemoryMixin()
+        mixin._memory_store = FakeMemoryStore()
+        mixin._pending_memory_reinforcement = {
+            "semantic_ids": ["s1"],
+            "episodic": [("e1", 1.0)],
+            "procedural_ids": ["p1"],
+        }
+
+        mixin._reinforce_pending_memories(0.0, task_success=False)
+
+        self.assertEqual(mixin._memory_store.semantic_activations, [])
+        self.assertEqual(mixin._memory_store.episodic_updates, [])
+        self.assertEqual(mixin._memory_store.procedural_updates, [("p1", False)])
         self.assertIsNone(mixin._pending_memory_reinforcement)
 
     def test_non_positive_task_result_discards_pending_memories(self):
@@ -156,6 +191,7 @@ class MemoryMixinActivationTest(unittest.TestCase):
 
         self.assertEqual(mixin._memory_store.semantic_activations, [])
         self.assertEqual(mixin._memory_store.episodic_updates, [])
+        self.assertEqual(mixin._memory_store.procedural_updates, [])
         self.assertIsNone(mixin._pending_memory_reinforcement)
 
     def test_memory_query_includes_previous_user_goal(self):
@@ -181,6 +217,7 @@ class MemoryMixinActivationTest(unittest.TestCase):
 
     def test_activate_long_term_memory_includes_relevant_team_memory(self):
         mixin = MemoryMixin()
+        mixin._username = "tester"
         mixin._memory_initialized = True
         mixin._memory_store = FakeMemoryStore()
 

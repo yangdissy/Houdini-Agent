@@ -206,8 +206,16 @@ class ActionCommandsMixin:
                     gm = self._growth_tracker.get_growth_metrics()
                     lines.append(f"\n📈 **成长指标:**")
                     lines.append(f"  - 成功率: {gm.get('success_rate', 0):.1%}")
-                    lines.append(f"  - 错误率: {gm.get('error_rate', 0):.1%}")
-                    lines.append(f"  - 成长分: {gm.get('growth_score', 0):.2f}")
+                    lines.append(f"  - 工具错误事件率: {gm.get('incident_rate', 0):.1%}")
+                    lines.append(f"  - 纠错成功率: {gm.get('recovered_error_rate', 0):.1%}")
+                    if gm.get('trend_reliable', False):
+                        lines.append(f"  - 成长分: {gm.get('growth_score', 0):.2f}")
+                    else:
+                        lines.append(
+                            f"  - 趋势: 样本不足 "
+                            f"({gm.get('recent_sample_count', 0)}/30 当前, "
+                            f"{gm.get('baseline_sample_count', 0)}/30 基线)"
+                        )
                     lines.append(f"  - 任务数: {gm.get('total_tasks', 0)}")
                 except Exception:
                     pass
@@ -420,7 +428,15 @@ class ActionCommandsMixin:
                 gm = self._growth_tracker.get_growth_metrics()
                 lines.append(f"\n**成长指标:**")
                 lines.append(f"  - 成功率: {gm.get('success_rate', 0):.1%}")
-                lines.append(f"  - 成长分: {gm.get('growth_score', 0):.2f}")
+                lines.append(f"  - 工具错误事件率: {gm.get('incident_rate', 0):.1%}")
+                if gm.get('trend_reliable', False):
+                    lines.append(f"  - 成长分: {gm.get('growth_score', 0):.2f}")
+                else:
+                    lines.append(
+                        f"  - 趋势: 样本不足 "
+                        f"({gm.get('recent_sample_count', 0)}/30 当前, "
+                        f"{gm.get('baseline_sample_count', 0)}/30 基线)"
+                    )
                 lines.append(f"  - 累计任务: {gm.get('total_tasks', 0)}")
             except Exception:
                 pass

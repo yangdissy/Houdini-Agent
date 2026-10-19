@@ -10,6 +10,7 @@ ToolRegistry — 统一工具注册中心
 """
 
 import json
+import hashlib
 import threading
 import traceback
 from pathlib import Path
@@ -87,6 +88,8 @@ _ASK_TOOLS = frozenset({
     'perf_start_profile', 'perf_stop_and_report',
     'search_memory', 'capture_viewport', 'visual_review', 'preview_layout_nodes',
     'get_operation_status', 'list_operation_receipts',
+    'inspect_tool_contract', 'search_tool_contracts', 'read_tool_result',
+    'inspect_python', 'inspect_frame_range_risk',
 })
 
 # Plan 规划阶段白名单
@@ -105,7 +108,9 @@ _PLAN_PLANNING_TOOLS = frozenset({
     'perf_start_profile', 'perf_stop_and_report',
     'search_memory', 'capture_viewport', 'visual_review', 'preview_layout_nodes',
     'get_operation_status', 'list_operation_receipts',
-    'create_plan', 'ask_question',
+    'inspect_tool_contract', 'search_tool_contracts', 'read_tool_result',
+    'inspect_python',
+    'create_plan', 'ask_question', 'inspect_frame_range_risk',
 })
 
 # 只读标签推断
@@ -115,22 +120,24 @@ _READONLY_TOOLS = frozenset({
     'get_geometry_summary', 'get_geometry_points', 'get_geometry_primitives',
     'get_usd_prim_info', 'get_usd_layer_stack', 'get_top_network_status',
     'list_top_work_items', 'get_top_errors', 'build_pdg_expression',
-    'temporary_auto_validate_geometry', 'get_scene_snapshot',
+    'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
     'check_errors',
     'verify_network', 'web_search', 'fetch_webpage',
     'search_local_doc', 'get_houdini_node_doc', 'list_skills',
-    'perf_start_profile', 'perf_stop_and_report',
     'capture_viewport', 'visual_review', 'search_memory', 'preview_layout_nodes',
     'get_operation_status', 'list_operation_receipts',
+    'inspect_tool_contract', 'search_tool_contracts', 'read_tool_result',
+    'inspect_python', 'inspect_frame_range_risk',
 })
 
 _HIGH_RISK_TOOLS = HIGH_RISK_TOOLS
-_CORE_CONFIRM_TOOLS = frozenset(SCENE_MUTATION_TOOLS | HIGH_RISK_TOOLS | {"set_update_mode"})
+_CORE_CONFIRM_TOOLS = frozenset((SCENE_MUTATION_TOOLS - {"execute_python"}) | HIGH_RISK_TOOLS | {"set_update_mode"})
 
 _LOCAL_RUNTIME_TOOLS = frozenset({
     "execute_shell", "search_local_doc", "list_skills",
     "get_operation_status", "list_operation_receipts",
+    "inspect_tool_contract", "search_tool_contracts", "read_tool_result",
 })
 
 _CONCURRENCY_SAFE_TOOLS = frozenset({
@@ -176,18 +183,22 @@ _EXTERNAL_MCP_VISIBLE_TOOLS = frozenset({
 _MUTATING_TOOLS = frozenset({
     'create_node', 'create_nodes_batch', 'create_named_null', 'delete_node',
     'rename_node', 'set_node_parameter', 'set_parameter_expression', 'set_parameter_reference',
+    'upsert_spare_parameter',
     'insert_multiparm_instance',
     'remove_multiparm_instance',
     'create_object_merges_batch',
     'batch_set_parameters', 'connect_nodes', 'disconnect_nodes', 'copy_node',
     'create_wrangle_node', 'set_display_flag', 'set_node_flags', 'layout_nodes',
     'create_network_box', 'add_nodes_to_box', 'set_network_box_comment',
-    'execute_python', 'save_hip',
+    'execute_python', 'save_hip', 'cook_sample_frames',
     'run_skill', 'undo_redo',
 })
 
 _EXECUTION_BARRIER_TOOLS = frozenset(
-    set(_MUTATING_TOOLS) | {"set_update_mode", "temporary_auto_validate_geometry"}
+    set(_MUTATING_TOOLS) | {
+        "set_update_mode", "temporary_auto_validate_geometry",
+        "perf_start_profile", "perf_stop_and_report",
+    }
 )
 
 _NODE_PATH_KEYS = frozenset({
@@ -211,7 +222,7 @@ def _infer_path_kinds(schema: dict) -> Dict[str, str]:
 
 _COOK_TRIGGERING_TOOLS = frozenset({
     'connect_nodes', 'set_display_flag', 'set_node_parameter',
-    'batch_set_parameters', 'execute_python', 'run_skill',
+    'batch_set_parameters', 'execute_python', 'run_skill', 'cook_sample_frames',
 })
 
 _COOK_BEFORE_READ_TOOLS = frozenset({
@@ -232,7 +243,7 @@ _DEFAULT_HISTORY_QUERY_TOOLS = frozenset({
 })
 
 _DEFAULT_COMPRESSION_OPERATION_TOOLS = frozenset({
-    'create_node', 'create_nodes_batch', 'create_named_null', 'connect_nodes', 'cook_node',
+    'create_node', 'create_nodes_batch', 'create_named_null', 'connect_nodes', 'cook_node', 'cook_sample_frames',
     'set_node_parameter', 'create_wrangle_node',
 })
 
@@ -244,7 +255,7 @@ _DEFAULT_THINKING_SIMPLE_SUCCESS_TOOLS = frozenset({
 })
 
 _DEFAULT_THINKING_DEEP_TOOLS = frozenset({
-    'connect_nodes', 'cook_node', 'create_named_null', 'delete_node', 'disconnect_nodes', 'rename_node', 'preview_layout_nodes',
+    'connect_nodes', 'cook_node', 'cook_sample_frames', 'create_named_null', 'delete_node', 'disconnect_nodes', 'rename_node', 'preview_layout_nodes',
     'set_node_parameter', 'batch_set_parameters', 'create_nodes_batch',
     'create_wrangle_node', 'copy_node', 'set_display_flag', 'set_node_flags',
     'execute_python', 'execute_shell', 'save_hip', 'run_skill',
@@ -445,6 +456,14 @@ class ToolRegistry:
                     result.append(meta.schema)
             return result
 
+    def get_non_core_tools_for_mode(self, mode: str) -> List[dict]:
+        """返回指定模式下启用的插件、Skill 和用户工具 schema。"""
+        with self._lock:
+            return [
+                meta.schema for meta in self._tools.values()
+                if meta.enabled and mode in meta.modes and meta.source != "core"
+            ]
+
     def get_executable_tool_names(self, mode: str, runtimes: Optional[Set[str]] = None) -> Set[str]:
         """Return the enabled tools reachable in ``mode`` and the current runtime."""
         allowed_runtimes = set(runtimes or {"houdini", "local"})
@@ -502,6 +521,76 @@ class ToolRegistry:
     def get_meta(self, name: str) -> Optional[ToolMeta]:
         """获取工具的完整元数据（含 risk_level / tags / modes 等）"""
         return self._tools.get(name)
+
+    def inspect_contract(self, name: str) -> Optional[Dict[str, Any]]:
+        """Return the public, serializable contract for one registered tool."""
+        with self._lock:
+            meta = self._tools.get(str(name or ""))
+            if meta is None:
+                return None
+            contract = {
+                "name": meta.name,
+                "schema": meta.schema,
+                "source": meta.source,
+                "plugin_name": meta.plugin_name,
+                "tags": sorted(meta.tags),
+                "modes": sorted(meta.modes),
+                "enabled": bool(meta.enabled),
+                "concurrency_safe": bool(meta.concurrency_safe),
+                "risk_level": meta.risk_level,
+                "runtime": meta.runtime,
+                "requires_confirmation": bool(meta.requires_confirmation),
+                "path_kinds": dict(sorted(meta.path_kinds.items())),
+                "mutating": bool(meta.mutating),
+                "undo": bool(meta.undo),
+                "cook_triggering": bool(meta.cook_triggering),
+                "cook_before_read": bool(meta.cook_before_read),
+                "cache_invalidation": bool(meta.cache_invalidation),
+                "execution_barrier": bool(meta.execution_barrier),
+                "external_mcp_visible": bool(meta.external_mcp_visible),
+            }
+            contract["contract_version"] = self._contract_hash(contract)
+            return contract
+
+    def search_contracts(
+        self,
+        query: str = "",
+        mode: str = "",
+        tags: Optional[Set[str]] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Search public tool contracts without exposing executable handlers."""
+        needle = str(query or "").strip().lower()
+        required_tags = {str(tag).strip().lower() for tag in (tags or set()) if str(tag).strip()}
+        bounded_limit = min(100, max(1, int(limit)))
+        with self._lock:
+            names = sorted(self._tools)
+        results = []
+        for name in names:
+            contract = self.inspect_contract(name)
+            if contract is None:
+                continue
+            if mode and mode not in contract["modes"]:
+                continue
+            if required_tags and not required_tags.issubset(set(contract["tags"])):
+                continue
+            function = contract["schema"].get("function", {})
+            haystack = " ".join((name, str(function.get("description") or ""), " ".join(contract["tags"]))).lower()
+            if needle and needle not in haystack:
+                continue
+            results.append(contract)
+            if len(results) >= bounded_limit:
+                break
+        return results
+
+    def contract_version(self, name: str) -> str:
+        contract = self.inspect_contract(name)
+        return str(contract.get("contract_version")) if contract is not None else "unknown"
+
+    @staticmethod
+    def _contract_hash(contract: Dict[str, Any]) -> str:
+        payload = json.dumps(contract, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
+        return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def get_tool_names_for_mode(self, mode: str, runtime: Optional[str] = None) -> Set[str]:
         """Return enabled tool names for a mode without exposing schema internals."""
@@ -758,14 +847,15 @@ class ToolRegistry:
         'query': {
             'get_network_structure', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
             'suggest_connection', 'preview_node_operation', 'validate_node_network', 'find_nodes',
-            'get_geometry_summary', 'temporary_auto_validate_geometry', 'get_scene_snapshot',
+            'get_geometry_summary', 'get_geometry_points', 'get_geometry_primitives',
+            'temporary_auto_validate_geometry', 'get_scene_snapshot',
             'verify_network', 'read_selection',
             'search_memory',
             'capture_viewport',
         },
         'create': {
             'create_node', 'create_nodes_batch', 'create_wrangle_node',
-            'connect_nodes', 'copy_node', 'create_named_null',
+            'create_object_merges_batch', 'connect_nodes', 'copy_node', 'create_named_null',
             'verify_network',
         },
         'connection': {
@@ -774,7 +864,14 @@ class ToolRegistry:
         },
         'parameter': {
             'get_parameter_schema', 'inspect_node',
+            'find_parameter_references', 'list_multiparm_instances',
             'set_node_parameter', 'set_parameter_expression', 'batch_set_parameters',
+            'set_parameter_reference', 'upsert_spare_parameter',
+            'insert_multiparm_instance', 'remove_multiparm_instance',
+        },
+        'parameter_ui': {
+            'get_parameter_schema', 'inspect_node', 'upsert_spare_parameter',
+            'execute_python',
         },
         'flags': {
             'inspect_node', 'preview_node_operation', 'set_node_flags', 'set_update_mode',
@@ -782,10 +879,11 @@ class ToolRegistry:
         },
         'validate': {
             'inspect_node', 'get_node_connections', 'validate_node_network',
+            'check_errors',
             'verify_network', 'get_geometry_summary', 'temporary_auto_validate_geometry',
         },
         'cook': {
-            'inspect_node', 'cook_node', 'verify_network', 'validate_node_network',
+            'inspect_node', 'cook_node', 'check_errors', 'verify_network', 'validate_node_network',
         },
         'null': {
             'create_named_null', 'get_node_connections', 'suggest_connection',
@@ -793,7 +891,7 @@ class ToolRegistry:
         },
         'modify': {
             'set_node_parameter', 'set_parameter_expression', 'batch_set_parameters',
-            'set_node_flags', 'set_update_mode',
+            'upsert_spare_parameter', 'set_node_flags', 'set_update_mode',
         },
         'operation': {
             'get_network_structure', 'inspect_node', 'get_parameter_schema',
@@ -850,6 +948,10 @@ class ToolRegistry:
                        '连接', '接线', '断开', '输入', '输出', '端口', '插到'],
         'parameter': ['parameter', 'parm', 'param', 'value', 'menu', 'tuple',
                       '参数', '取值', '菜单', '数值'],
+        'parameter_ui': ['spare parameter', 'parmtemplate', 'parameter interface',
+                 'folder set', 'multiparm', 'ramp parameter',
+                 '备用参数', '自定义参数', '参数界面', '参数模板',
+                 '文件夹参数', '多参数', '渐变参数'],
         'flags': ['flag', 'display flag', 'render flag', 'bypass', 'template', 'lock',
                   '显示标志', '渲染标志', '旁路', '模板', '锁定', '选中'],
         'validate': ['validate', 'verify', 'diagnose', 'error', 'warning', 'issue', 'problem',
@@ -883,20 +985,22 @@ class ToolRegistry:
     # Agent 模式应始终具备最小写操作能力；Ask 模式仍保持只读。
     _AGENT_ALWAYS_TOOLS = frozenset({
         'create_node', 'create_nodes_batch', 'create_wrangle_node',
-        'set_node_parameter', 'batch_set_parameters', 'set_node_flags',
+        'set_node_parameter', 'batch_set_parameters', 'upsert_spare_parameter', 'set_node_flags',
         'connect_nodes', 'disconnect_nodes', 'delete_node', 'rename_node',
         'layout_nodes', 'copy_node', 'create_named_null',
         'set_update_mode',
-    })
+    }) | (HIGH_RISK_TOOLS - {'execute_python'})
 
     _TOOL_DEPENDENCIES: Dict[str, Set[str]] = {
         'connect_nodes': {'get_node_connections', 'suggest_connection', 'preview_node_operation'},
         'disconnect_nodes': {'get_node_connections', 'preview_node_operation'},
         'set_node_parameter': {'inspect_node', 'get_parameter_schema'},
         'batch_set_parameters': {'inspect_node', 'get_parameter_schema'},
+        'upsert_spare_parameter': {'inspect_node', 'get_parameter_schema'},
         'set_node_flags': {'inspect_node', 'preview_node_operation', 'validate_node_network'},
         'create_node': {'get_network_structure', 'search_node_types'},
         'create_nodes_batch': {'get_network_structure', 'search_node_types', 'verify_network'},
+        'create_object_merges_batch': {'get_network_structure'},
         'create_wrangle_node': {'get_network_structure', 'get_houdini_node_doc'},
         'create_named_null': {'get_node_connections', 'suggest_connection', 'preview_node_operation', 'validate_node_network'},
         'layout_nodes': {'get_network_structure'},

@@ -3,6 +3,7 @@
 
 import unittest
 import sys
+from pathlib import Path
 from unittest import mock
 
 from houdini_agent.core.harness_policy_config import (
@@ -36,6 +37,47 @@ class CoreToolContractTest(unittest.TestCase):
                 description = meta.schema.get("function", {}).get("description", "")
                 self.assertTrue(description.strip())
 
+    def test_execute_python_confirmation_follows_harness_policy(self):
+        description = self.registry.get_meta("execute_python").schema["function"]["description"]
+
+        self.assertNotIn("需要用户确认", description)
+        self.assertIn("确认模式", description)
+
+    def test_execute_python_allows_governed_fallback_for_missing_scene_capabilities(self):
+        description = self.registry.get_meta("execute_python").schema["function"]["description"]
+
+        self.assertNotIn("禁止使用场景：1)节点/参数操作", description)
+        self.assertIn("Spare Parameter", description)
+        self.assertIn("ParmTemplateGroup", description)
+        self.assertIn("必须直接调用 execute_python", description)
+        self.assertIn("不属于绕过治理", description)
+
+    def test_scene_tool_guidance_does_not_request_prose_confirmation(self):
+        root = Path(__file__).resolve().parents[1]
+        security_rules = (root / "rules" / "security_boundaries.md").read_text(encoding="utf-8")
+        main_rules = (root / "rules" / "MainRules.md").read_text(encoding="utf-8")
+        work_rules = (root / "rules" / "houdini_work_discipline.md").read_text(encoding="utf-8")
+
+        forbidden = (
+            "执行代码前，必须先向用户说明将要执行的具体操作，确认后再运行",
+            "执行前必须告知用户将删除的节点名称并得到确认",
+            "执行前须列出将影响的节点范围，得到用户确认后再运行",
+            "如需要请求确认",
+        )
+        combined_rules = security_rules + main_rules + work_rules
+        for phrase in forbidden:
+            with self.subTest(phrase=phrase):
+                self.assertNotIn(phrase, combined_rules)
+
+        for tool_name in ("insert_multiparm_instance", "remove_multiparm_instance"):
+            with self.subTest(tool=tool_name):
+                description = self.registry.get_meta(tool_name).schema["function"]["description"]
+                self.assertNotIn("需要确认", description)
+                self.assertIn("Harness", description)
+
+            self.assertIn("Spare Parameter", work_rules)
+            self.assertIn("不属于绕过治理", work_rules)
+
     def test_usage_hints_are_generated_from_schema_parameter_names(self):
         for tool_name in ("create_wrangle_node", "semantic_search_nodes"):
             with self.subTest(tool=tool_name):
@@ -57,15 +99,22 @@ class CoreToolContractTest(unittest.TestCase):
         self.assertIn("description=", semantic_usage)
         self.assertNotIn("query=", semantic_usage)
 
-    def test_ask_mode_contains_only_readonly_core_tools(self):
+    def test_ask_mode_contains_only_readonly_or_controlled_state_tools(self):
         ask_names = {
             schema["function"]["name"]
             for schema in self.registry.get_tools_for_mode("ask")
         }
+        controlled_state_tools = {
+            "temporary_auto_validate_geometry",
+            "perf_start_profile",
+            "perf_stop_and_report",
+        }
         for name in ask_names:
             with self.subTest(tool=name):
                 tags = self.registry._tools[name].tags
-                self.assertTrue("readonly" in tags or "task" in tags)
+                self.assertTrue(
+                    "readonly" in tags or "task" in tags or name in controlled_state_tools
+                )
 
     def test_high_risk_core_tools_require_confirmation(self):
         core_names = set(self.registry._tools)
@@ -104,6 +153,16 @@ class CoreToolContractTest(unittest.TestCase):
         self.assertIn("temporary_auto_validate_geometry", core_names)
         self.assertNotIn("temporary_auto_validate_geometry", HIGH_RISK_TOOLS)
         self.assertFalse(self.registry._tools["temporary_auto_validate_geometry"].requires_confirmation)
+        profile = self.registry.build_streaming_executor_profile()
+        self.assertNotIn("temporary_auto_validate_geometry", profile["batch_readonly_tools"])
+        self.assertIn("temporary_auto_validate_geometry", profile["execution_barrier_tools"])
+
+    def test_perf_tools_are_stateful_execution_barriers(self):
+        profile = self.registry.build_streaming_executor_profile()
+        for name in ("perf_start_profile", "perf_stop_and_report"):
+            with self.subTest(tool=name):
+                self.assertNotIn(name, profile["batch_readonly_tools"])
+                self.assertIn(name, profile["execution_barrier_tools"])
 
     def test_set_update_mode_tool_is_registered_but_not_code_exec(self):
         core_names = set(self.registry._tools)
@@ -169,6 +228,29 @@ class CoreToolContractTest(unittest.TestCase):
         handler_name = HoudiniMCP._TOOL_DISPATCH.get("insert_multiparm_instance")
         self.assertTrue(callable(getattr(HoudiniMCP, handler_name, None)))
 
+    def test_spare_parameter_tool_is_governed_mutation(self):
+        self.assertIn("upsert_spare_parameter", SCENE_MUTATION_TOOLS)
+        meta = self.registry._tools["upsert_spare_parameter"]
+        properties = meta.schema["function"]["parameters"]["properties"]
+        self.assertEqual(
+            set(properties["parameter_type"]["enum"]),
+            {"float", "int", "toggle", "string", "menu", "vector2", "vector3", "vector4", "color"},
+        )
+        self.assertIn("menu_items", properties)
+        self.assertIn("menu_labels", properties)
+        self.assertIn("size", properties)
+        self.assertTrue(meta.requires_confirmation)
+        self.assertTrue(meta.undo)
+        self.assertTrue(meta.mutating)
+        self.assertEqual(meta.path_kinds["node_path"], "node")
+        ask_names = {
+            schema["function"]["name"]
+            for schema in self.registry.get_tools_for_mode("ask")
+        }
+        self.assertNotIn("upsert_spare_parameter", ask_names)
+        handler_name = HoudiniMCP._TOOL_DISPATCH.get("upsert_spare_parameter")
+        self.assertTrue(callable(getattr(HoudiniMCP, handler_name, None)))
+
     def test_multiparm_remove_tool_is_governed_mutation(self):
         self.assertIn("remove_multiparm_instance", SCENE_MUTATION_TOOLS)
         meta = self.registry._tools["remove_multiparm_instance"]
@@ -205,6 +287,7 @@ class CoreToolContractTest(unittest.TestCase):
         ai_internal_tools = {
             "web_search", "fetch_webpage", "add_todo", "update_todo",
             "get_operation_status", "list_operation_receipts",
+            "inspect_tool_contract", "search_tool_contracts", "read_tool_result",
         }
         non_mcp_internal_dispatch = {
             "set_display_flag", "get_node_inputs", "list_network_boxes",
@@ -253,7 +336,10 @@ class CoreToolContractTest(unittest.TestCase):
         self.assertEqual(self.registry.get_meta("get_parameter_schema").required_args(), ("node_path",))
         self.assertEqual(self.registry.get_meta("get_parameter_schema").path_kinds["node_path"], "node")
         self.assertEqual(self.registry.get_meta("save_hip").path_kinds["file_path"], "file")
-        for name in ("get_operation_status", "list_operation_receipts"):
+        for name in (
+            "get_operation_status", "list_operation_receipts",
+            "inspect_tool_contract", "search_tool_contracts", "read_tool_result",
+        ):
             with self.subTest(tool=name):
                 meta = self.registry.get_meta(name)
                 self.assertEqual(meta.runtime, "local")

@@ -19,6 +19,7 @@ CODE_EXEC_TOOLS = frozenset({
 })
 
 SCENE_MUTATION_TOOLS = frozenset({
+    "execute_python",
     "create_wrangle_node",
     "create_node",
     "create_nodes_batch",
@@ -27,12 +28,14 @@ SCENE_MUTATION_TOOLS = frozenset({
     "set_node_parameter",
     "set_parameter_expression",
     "set_parameter_reference",
+    "upsert_spare_parameter",
     "insert_multiparm_instance",
     "remove_multiparm_instance",
     "create_object_merges_batch",
     "batch_set_parameters",
     "connect_nodes",
     "cook_node",
+    "cook_sample_frames",
     "copy_node",
     "set_display_flag",
     "disconnect_nodes",

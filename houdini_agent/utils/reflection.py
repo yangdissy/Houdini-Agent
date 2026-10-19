@@ -10,11 +10,13 @@
 """
 
 import json
+import math
 import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .memory_store import (
+    MEMORY_CATEGORIES,
     MemoryStore,
     EpisodicRecord,
     SemanticRecord,
@@ -190,6 +192,118 @@ class ReflectionModule:
         self._recent_error_counts: List[int] = []  # 最近 N 个任务的错误次数
         self._max_recent = 10
 
+    @staticmethod
+    def _finite_number(value: Any, default: float, minimum: float, maximum: float) -> float:
+        if isinstance(value, bool):
+            return default
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(number):
+            return default
+        return max(minimum, min(maximum, number))
+
+    @classmethod
+    def _normalize_semantic_rules(
+        cls,
+        value: Any,
+        default_confidence: float,
+        default_level: int = 2,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+
+        rules = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            rule = item.get("rule")
+            if not isinstance(rule, str):
+                continue
+            rule = rule.strip()[:120]
+            if not rule:
+                continue
+            category = item.get("category", "general")
+            if category not in MEMORY_CATEGORIES:
+                category = "general"
+            confidence = cls._finite_number(
+                item.get("confidence"), default_confidence, 0.0, 1.0
+            )
+            level = int(cls._finite_number(
+                item.get("abstraction_level"), float(default_level), 0.0, 5.0
+            ))
+            rules.append({
+                "rule": rule,
+                "category": category,
+                "confidence": confidence,
+                "abstraction_level": level,
+            })
+        return rules
+
+    @staticmethod
+    def _normalize_text_list(value: Any, max_length: int = 120) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        return [
+            item.strip()[:max_length]
+            for item in value
+            if isinstance(item, str) and item.strip()
+        ]
+
+    @classmethod
+    def _normalize_strategy_updates(cls, value: Any) -> List[Dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        updates = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            delta = cls._finite_number(item.get("priority_delta"), 0.0, -1.0, 1.0)
+            if delta:
+                updates.append({"name": name.strip(), "priority_delta": delta})
+        return updates
+
+    @classmethod
+    def _normalize_skill_confidence(cls, value: Any) -> Dict[str, float]:
+        if not isinstance(value, dict):
+            return {}
+        result = {}
+        for name, confidence in value.items():
+            if not isinstance(name, str) or not name.strip() or isinstance(confidence, bool):
+                continue
+            try:
+                number = float(confidence)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                result[name.strip()] = max(0.0, min(1.0, number))
+        return result
+
+    @classmethod
+    def _normalize_procedural_strategies(cls, value: Any) -> List[Dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        strategies = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            description = item.get("description")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            if not isinstance(description, str) or not description.strip():
+                continue
+            strategies.append({
+                "name": name.strip(),
+                "description": description.strip(),
+                "conditions": cls._normalize_text_list(item.get("conditions")),
+            })
+        return strategies
+
     # ==========================================================
     # 规则反思（每次任务后，零成本）
     # ==========================================================
@@ -247,9 +361,6 @@ class ReflectionModule:
         # 去重
         tags = list(dict.fromkeys(tags))
         episodic.tags = tags
-
-        # 更新数据库
-        self.store.update_episodic_tags(episodic.id, tags)
 
         return episodic
 
@@ -345,8 +456,14 @@ class ReflectionModule:
             if should_deep_reflect and ai_client is not None:
                 try:
                     deep_result = self._deep_reflect(ai_client, model, provider)
-                    result["deep_reflected"] = True
+                    result["deep_reflected"] = deep_result.get("success", False)
                     result["new_rules"] = deep_result.get("new_rules", [])
+                    if deep_result.get("error"):
+                        result["deep_reflection_error"] = deep_result["error"]
+                    if deep_result.get("strategy_updates"):
+                        result["strategy_updates"] = deep_result["strategy_updates"]
+                    if deep_result.get("skill_confidence"):
+                        result["skill_confidence"] = deep_result["skill_confidence"]
                 except Exception as e:
                     print(f"[Reflection] LLM 深度反思失败: {e}")
                     traceback.print_exc()
@@ -395,13 +512,10 @@ class ReflectionModule:
         Returns:
             {"new_rules": [...], "strategy_updates": [...]}
         """
-        # 重置计数器
-        self._task_count_since_reflect = 0
-
         # 获取最近的 episodic 记忆
         recent_episodes = self.store.get_recent_episodic(limit=DEEP_REFLECT_INTERVAL * 2)
         if not recent_episodes:
-            return {"new_rules": []}
+            return {"success": False, "new_rules": []}
 
         # 构建摘要
         summaries = []
@@ -440,17 +554,25 @@ class ReflectionModule:
                     full_response += chunk.get("content", "")
                 elif chunk.get("type") == "error":
                     print(f"[Reflection] LLM 反思错误: {chunk.get('error')}")
-                    return {"new_rules": []}
+                    return {"success": False, "new_rules": []}
         except Exception as e:
             print(f"[Reflection] LLM 调用失败: {e}")
-            return {"new_rules": []}
+            return {"success": False, "new_rules": []}
 
         # 解析 JSON 响应
-        return self._parse_reflection_response(full_response, recent_episodes)
+        result = self._parse_reflection_response(full_response, recent_episodes)
+        if result.get("success"):
+            self._task_count_since_reflect = 0
+        return result
 
     def _parse_reflection_response(self, response: str, source_episodes: List[EpisodicRecord]) -> Dict:
         """解析 LLM 反思响应并写入记忆"""
-        result = {"new_rules": [], "strategy_updates": []}
+        result = {
+            "success": False,
+            "new_rules": [],
+            "strategy_updates": [],
+            "error": "",
+        }
 
         # 清理 JSON
         text = response.strip()
@@ -464,71 +586,77 @@ class ReflectionModule:
 
         try:
             data = json.loads(text)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as initial_error:
             # 尝试提取 JSON 部分
             import re
             json_match = re.search(r'\{[\s\S]*\}', text)
             if json_match:
                 try:
                     data = json.loads(json_match.group())
-                except json.JSONDecodeError:
-                    print(f"[Reflection] 无法解析反思响应")
+                except json.JSONDecodeError as extracted_error:
+                    result["error"] = "invalid_json"
+                    print(
+                        "[Reflection] 无法解析反思响应: "
+                        f"chars={len(text)}, starts_object={text.startswith('{')}, "
+                        f"ends_object={text.endswith('}')}, "
+                        f"error_pos={extracted_error.pos}"
+                    )
                     return result
             else:
-                print(f"[Reflection] 反思响应中未找到 JSON")
+                result["error"] = "json_object_not_found"
+                print(
+                    "[Reflection] 反思响应中未找到 JSON: "
+                    f"chars={len(text)}, error_pos={initial_error.pos}"
+                )
                 return result
 
+        if not isinstance(data, dict):
+            result["error"] = "json_root_not_object"
+            return result
+
         source_ids = [ep.id for ep in source_episodes]
+        semantic_rules = self._normalize_semantic_rules(
+            data.get("semantic_rules"), default_confidence=0.6
+        )
+        strategy_updates = self._normalize_strategy_updates(data.get("strategy_updates"))
 
         # 1. 处理 semantic rules（含 abstraction_level）
-        for rule_data in data.get("semantic_rules", []):
-            rule_text = rule_data if isinstance(rule_data, str) else rule_data.get("rule", "")
-            if not rule_text:
-                continue
-
-            category = rule_data.get("category", "general") if isinstance(rule_data, dict) else "general"
-            confidence = rule_data.get("confidence", 0.6) if isinstance(rule_data, dict) else 0.6
-            abs_level = rule_data.get("abstraction_level", 2) if isinstance(rule_data, dict) else 2
-            # 限制精炼长度
-            rule_text = rule_text[:120]
-
-            # 检查是否已有高度相似的规则
-            existing = self.store.find_duplicate_semantic(rule_text, threshold=0.80)
-            if existing:
-                # 增强已有规则的置信度
-                new_conf = min(1.0, existing.confidence + 0.1)
-                self.store.update_semantic_confidence(existing.id, new_conf)
-                self.store.increment_semantic_activation(existing.id)
-                print(f"[Reflection] 强化已有规则: {existing.rule[:50]}... (conf={new_conf:.2f})")
-            else:
-                # 创建新规则
-                record = SemanticRecord(
-                    rule=rule_text,
-                    source_episodes=source_ids[:5],
-                    confidence=confidence,
-                    category=category,
-                    abstraction_level=max(0, min(5, abs_level)),
-                )
-                self.store.add_semantic(record)
+        for rule_data in semantic_rules:
+            rule_text = rule_data["rule"]
+            record = SemanticRecord(
+                rule=rule_text,
+                source_episodes=source_ids[:5],
+                confidence=rule_data["confidence"],
+                category=rule_data["category"],
+                abstraction_level=rule_data["abstraction_level"],
+            )
+            saved, created = self.store.upsert_semantic(
+                record,
+                duplicate_threshold=0.80,
+                confidence_increment=0.1,
+            )
+            if created:
                 result["new_rules"].append(rule_text)
                 print(f"[Reflection] 新规则: {rule_text[:50]}...")
+            else:
+                print(f"[Reflection] 强化已有规则: {saved.rule[:50]}... (conf={saved.confidence:.2f})")
 
         # 2. 处理策略更新
-        for update in data.get("strategy_updates", []):
-            name = update.get("name", "")
-            priority_delta = update.get("priority_delta", 0.0)
-            if name and priority_delta != 0:
-                existing = self.store.get_procedural_by_name(name)
-                if existing:
-                    self.store.update_procedural_priority(existing.id, priority_delta)
-                    result["strategy_updates"].append(update)
-                    print(f"[Reflection] 策略更新: {name} priority += {priority_delta}")
+        for update in strategy_updates:
+            name = update["name"]
+            priority_delta = update["priority_delta"]
+            existing = self.store.get_procedural_by_name(name)
+            if existing:
+                self.store.update_procedural_priority(existing.id, priority_delta)
+                result["strategy_updates"].append(update)
+                print(f"[Reflection] 策略更新: {name} priority += {priority_delta}")
 
         # 3. 处理技能置信度（存入 growth tracker，通过外部调用）
-        skill_conf = data.get("skill_confidence", {})
+        skill_conf = self._normalize_skill_confidence(data.get("skill_confidence"))
         if skill_conf:
             result["skill_confidence"] = skill_conf
 
+        result["success"] = True
         return result
 
     # ==========================================================
@@ -578,6 +706,14 @@ class ReflectionModule:
             if not data:
                 return result
 
+            if not isinstance(data, dict):
+                return result
+
+            semantic_rules = self._normalize_semantic_rules(
+                data.get("semantic_rules"), default_confidence=0.7
+            )
+            key_facts = self._normalize_text_list(data.get("key_facts"))
+
             # 1. 写入 episodic 记忆（对话级摘要）
             summary = data.get("episodic_summary", "")
             if summary:
@@ -593,43 +729,39 @@ class ReflectionModule:
                 result["episodic_id"] = episodic.id
 
             # 2. 写入 semantic 规则（含 abstraction_level）
-            for rule_data in data.get("semantic_rules", []):
-                rule_text = rule_data.get("rule", "") if isinstance(rule_data, dict) else str(rule_data)
-                if not rule_text:
-                    continue
-                category = rule_data.get("category", "general") if isinstance(rule_data, dict) else "general"
-                confidence = rule_data.get("confidence", 0.7) if isinstance(rule_data, dict) else 0.7
-                abs_level = rule_data.get("abstraction_level", 2) if isinstance(rule_data, dict) else 2
-                # 限制精炼长度
-                rule_text = rule_text[:120]
-
-                existing = self.store.find_duplicate_semantic(rule_text, threshold=0.80)
-                if existing:
-                    new_conf = min(1.0, existing.confidence + 0.1)
-                    self.store.update_semantic_confidence(existing.id, new_conf)
-                    self.store.increment_semantic_activation(existing.id)
-                else:
-                    record = SemanticRecord(
-                        rule=rule_text,
-                        confidence=confidence,
-                        category=category,
-                        abstraction_level=max(0, min(5, abs_level)),
-                    )
-                    self.store.add_semantic(record)
+            for rule_data in semantic_rules:
+                rule_text = rule_data["rule"]
+                record = SemanticRecord(
+                    rule=rule_text,
+                    source_episodes=[result["episodic_id"]] if result["episodic_id"] else [],
+                    confidence=rule_data["confidence"],
+                    category=rule_data["category"],
+                    abstraction_level=rule_data["abstraction_level"],
+                )
+                _, created = self.store.upsert_semantic(
+                    record,
+                    duplicate_threshold=0.80,
+                    confidence_increment=0.1,
+                )
+                if created:
                     result["new_rules"].append(rule_text)
 
             # 3. key_facts → 追加为 level=1 核心偏好 semantic 规则
-            for fact in data.get("key_facts", []):
-                if fact and len(fact) > 5:
-                    existing = self.store.find_duplicate_semantic(fact, threshold=0.80)
-                    if not existing:
-                        record = SemanticRecord(
-                            rule=fact[:120],
-                            confidence=0.8,
-                            category="preference",
-                            abstraction_level=1,
-                        )
-                        self.store.add_semantic(record)
+            for fact in key_facts:
+                if len(fact) > 5:
+                    record = SemanticRecord(
+                        rule=fact[:120],
+                        source_episodes=[result["episodic_id"]] if result["episodic_id"] else [],
+                        confidence=0.8,
+                        category="preference",
+                        abstraction_level=1,
+                    )
+                    _, created = self.store.upsert_semantic(
+                        record,
+                        duplicate_threshold=0.80,
+                        confidence_increment=0.1,
+                    )
+                    if created:
                         result["new_rules"].append(fact[:120])
 
             result["success"] = True
@@ -685,6 +817,14 @@ class ReflectionModule:
             if not data:
                 return result
 
+            semantic_rules = self._normalize_semantic_rules(
+                data.get("semantic_rules"), default_confidence=0.8
+            )
+            procedural_strategies = self._normalize_procedural_strategies(
+                data.get("procedural_strategies")
+            )
+            key_facts = self._normalize_text_list(data.get("key_facts"))
+
             # 1. 写入 episodic 记忆（深度摘要）
             summary = data.get("episodic_summary", "")
             if summary:
@@ -700,42 +840,31 @@ class ReflectionModule:
                 result["episodic_id"] = episodic.id
 
             # 2. 写入 semantic 规则（含 abstraction_level）
-            for rule_data in data.get("semantic_rules", []):
-                rule_text = rule_data.get("rule", "") if isinstance(rule_data, dict) else str(rule_data)
-                if not rule_text:
-                    continue
-                category = rule_data.get("category", "general") if isinstance(rule_data, dict) else "general"
-                confidence = rule_data.get("confidence", 0.8) if isinstance(rule_data, dict) else 0.8
-                abs_level = rule_data.get("abstraction_level", 2) if isinstance(rule_data, dict) else 2
-                # 限制精炼长度
-                rule_text = rule_text[:120]
-
-                existing = self.store.find_duplicate_semantic(rule_text, threshold=0.80)
-                if existing:
-                    new_conf = min(1.0, existing.confidence + 0.15)
-                    self.store.update_semantic_confidence(existing.id, new_conf)
-                    self.store.increment_semantic_activation(existing.id)
-                else:
-                    record = SemanticRecord(
-                        rule=rule_text,
-                        confidence=confidence,
-                        category=category,
-                        abstraction_level=max(0, min(5, abs_level)),
-                    )
-                    self.store.add_semantic(record)
+            for rule_data in semantic_rules:
+                rule_text = rule_data["rule"]
+                record = SemanticRecord(
+                    rule=rule_text,
+                    source_episodes=[result["episodic_id"]] if result["episodic_id"] else [],
+                    confidence=rule_data["confidence"],
+                    category=rule_data["category"],
+                    abstraction_level=rule_data["abstraction_level"],
+                )
+                _, created = self.store.upsert_semantic(
+                    record,
+                    duplicate_threshold=0.80,
+                    confidence_increment=0.15,
+                )
+                if created:
                     result["new_rules"].append(rule_text)
 
             # 3. 写入 procedural 策略
-            for strat_data in data.get("procedural_strategies", []):
-                name = strat_data.get("name", "")
-                desc = strat_data.get("description", "")
-                if not name or not desc:
-                    continue
+            for strat_data in procedural_strategies:
+                name = strat_data["name"]
+                desc = strat_data["description"]
 
                 existing = self.store.get_procedural_by_name(name)
                 if existing:
-                    # 策略已存在 → 更新使用统计
-                    self.store.update_procedural_usage(existing.id, success=True)
+                    continue
                 else:
                     record = ProceduralRecord(
                         strategy_name=name,
@@ -747,17 +876,21 @@ class ReflectionModule:
                     result["new_strategies"].append(name)
 
             # 4. key_facts → level=1 核心偏好
-            for fact in data.get("key_facts", []):
-                if fact and len(fact) > 5:
-                    existing = self.store.find_duplicate_semantic(fact, threshold=0.80)
-                    if not existing:
-                        record = SemanticRecord(
-                            rule=fact[:120],
-                            confidence=0.85,
-                            category="preference",
-                            abstraction_level=1,
-                        )
-                        self.store.add_semantic(record)
+            for fact in key_facts:
+                if len(fact) > 5:
+                    record = SemanticRecord(
+                        rule=fact[:120],
+                        source_episodes=[result["episodic_id"]] if result["episodic_id"] else [],
+                        confidence=0.85,
+                        category="preference",
+                        abstraction_level=1,
+                    )
+                    _, created = self.store.upsert_semantic(
+                        record,
+                        duplicate_threshold=0.80,
+                        confidence_increment=0.15,
+                    )
+                    if created:
                         result["new_rules"].append(fact[:120])
 
             result["success"] = True
@@ -779,8 +912,10 @@ class ReflectionModule:
     @staticmethod
     def _messages_to_text(messages: List[Dict], max_chars: int = 4000) -> str:
         """将消息列表转换为可读文本（供 LLM 分析）"""
-        parts = []
-        total = 0
+        if max_chars <= 0:
+            return ""
+
+        lines = []
         for msg in messages:
             role = msg.get('role', 'unknown')
             content = msg.get('content', '')
@@ -821,13 +956,33 @@ class ReflectionModule:
             else:
                 continue
 
-            if total + len(line) > max_chars:
-                parts.append("... (更早的内容已省略)")
-                break
-            parts.append(line)
-            total += len(line) + 1
+            lines.append(line)
 
-        return "\n".join(parts)
+        if not lines:
+            return ""
+
+        full_text = "\n".join(lines)
+        if len(full_text) <= max_chars:
+            return full_text
+
+        omitted = "... (更早的内容已省略)"
+        available = max_chars - len(omitted) - 1
+        if available <= 0:
+            return omitted[:max_chars]
+
+        selected = []
+        total = 0
+        for line in reversed(lines):
+            separator = 1 if selected else 0
+            if total + separator + len(line) > available:
+                if not selected:
+                    selected.append(line[:available])
+                break
+            selected.append(line)
+            total += separator + len(line)
+
+        selected.reverse()
+        return omitted + "\n" + "\n".join(selected)
 
     def _call_llm(self, ai_client: Any, prompt: str, model: str,
                   provider: str, max_tokens: int = 1500) -> str:
@@ -874,12 +1029,14 @@ class ReflectionModule:
             text = text.strip()
 
         try:
-            return json.loads(text)
+            data = json.loads(text)
+            return data if isinstance(data, dict) else None
         except json.JSONDecodeError:
             json_match = re.search(r'\{[\s\S]*\}', text)
             if json_match:
                 try:
-                    return json.loads(json_match.group())
+                    data = json.loads(json_match.group())
+                    return data if isinstance(data, dict) else None
                 except json.JSONDecodeError:
                     pass
             print(f"[Sleep] 无法解析 JSON 响应")

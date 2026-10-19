@@ -256,6 +256,20 @@ class RegisterAndQueryTest(unittest.TestCase):
         self.reg.set_enabled("a", False)
         self.assertEqual(self.reg.get_tools_for_mode("agent"), [])
 
+    def test_non_core_tools_for_mode_excludes_core_and_disabled_tools(self):
+        self.reg.register("core", _schema("core"), source="core", modes={"agent"})
+        self.reg.register("plugin", _schema("plugin"), source="plugin", modes={"agent"})
+        self.reg.register("skill", _schema("skill"), source="skill", modes={"ask"})
+        self.reg.register("disabled", _schema("disabled"), source="plugin", modes={"agent"})
+        self.reg.set_enabled("disabled", False)
+
+        names = [
+            schema["function"]["name"]
+            for schema in self.reg.get_non_core_tools_for_mode("agent")
+        ]
+
+        self.assertEqual(names, ["plugin"])
+
     def test_get_tool_schemas_by_names(self):
         self.reg.register("a", _schema("a"), modes={"agent"})
         self.reg.register("b", _schema("b"), modes={"agent"})
@@ -489,7 +503,10 @@ class IntentTest(unittest.TestCase):
 
     def test_parameter_request_selects_schema_before_mutation(self):
         # create_network_box 不在 _AGENT_ALWAYS_TOOLS，用它验证意图过滤对非兜底工具生效
-        for name in ("set_node_parameter", "get_parameter_schema", "inspect_node", "create_network_box"):
+        for name in (
+            "set_node_parameter", "get_parameter_schema", "inspect_node",
+            "create_network_box",
+        ):
             self.reg.register(name, _schema(name), modes={"agent"})
 
         names = {
@@ -501,6 +518,54 @@ class IntentTest(unittest.TestCase):
         self.assertIn("get_parameter_schema", names)
         self.assertIn("inspect_node", names)
         self.assertNotIn("create_network_box", names)
+
+    def test_parameter_interface_request_selects_execute_python_fallback(self):
+        for name in ("upsert_spare_parameter", "get_parameter_schema", "inspect_node", "execute_python"):
+            self.reg.register(name, _schema(name), modes={"agent"})
+
+        names = {
+            s["function"]["name"]
+            for s in self.reg.select_tools_for_request("创建 Ramp 和 Folder 参数界面", "agent")
+        }
+
+        self.assertIn("upsert_spare_parameter", names)
+        self.assertIn("execute_python", names)
+
+    def test_parameter_request_exposes_reference_and_multiparm_tools(self):
+        expected = {
+            "find_parameter_references", "list_multiparm_instances",
+            "insert_multiparm_instance", "remove_multiparm_instance",
+            "set_parameter_reference",
+        }
+        for name in expected:
+            self.reg.register(name, _schema(name), modes={"agent"})
+
+        names = {
+            s["function"]["name"]
+            for s in self.reg.select_tools_for_request("查询参数引用并修改 multiparm 实例", "agent")
+        }
+        self.assertTrue(expected <= names)
+
+    def test_query_request_exposes_precise_geometry_tools(self):
+        for name in ("get_geometry_points", "get_geometry_primitives"):
+            self.reg.register(name, _schema(name), modes={"agent"})
+
+        names = {
+            s["function"]["name"]
+            for s in self.reg.select_tools_for_request("查看几何点和 primitive 属性", "agent")
+        }
+        self.assertIn("get_geometry_points", names)
+        self.assertIn("get_geometry_primitives", names)
+
+    def test_create_request_exposes_object_merge_batch_tool(self):
+        for name in ("create_object_merges_batch", "get_network_structure"):
+            self.reg.register(name, _schema(name), modes={"agent"})
+
+        names = {
+            s["function"]["name"]
+            for s in self.reg.select_tools_for_request("批量创建 object merge", "agent")
+        }
+        self.assertIn("create_object_merges_batch", names)
 
     def test_named_null_request_gets_safe_helper_tools(self):
         for name in (
@@ -534,7 +599,7 @@ class IntentTest(unittest.TestCase):
         self.assertIn("preview_node_operation", names)
         self.assertIn("get_node_connections", names)
 
-    def test_high_risk_tools_not_selected_without_explicit_code_or_file_intent(self):
+    def test_high_risk_tools_are_available_for_policy_confirmation(self):
         for name in ("execute_shell", "execute_python", "save_hip", "get_network_structure"):
             self.reg.register(name, _schema(name), modes={"agent"})
 
@@ -544,9 +609,9 @@ class IntentTest(unittest.TestCase):
         }
 
         self.assertIn("get_network_structure", names)
-        self.assertNotIn("execute_shell", names)
+        self.assertIn("execute_shell", names)
         self.assertNotIn("execute_python", names)
-        self.assertNotIn("save_hip", names)
+        self.assertIn("save_hip", names)
 
     def test_execute_optimization_prefers_dedicated_network_tools(self):
         for name in (
@@ -611,6 +676,19 @@ class ModeAllowanceTest(unittest.TestCase):
 
     def test_is_tool_allowed_unknown(self):
         self.assertFalse(self.reg.is_tool_allowed_in_mode("missing", "agent"))
+
+    def test_contract_query_is_stable_and_reflects_runtime_governance(self):
+        contract = self.reg.inspect_contract("ro")
+
+        self.assertEqual(contract["name"], "ro")
+        self.assertEqual(contract["runtime"], "houdini")
+        self.assertIn("ask", contract["modes"])
+        self.assertTrue(contract["contract_version"].startswith("sha256:"))
+        self.assertEqual(self.reg.contract_version("ro"), contract["contract_version"])
+        self.assertEqual([item["name"] for item in self.reg.search_contracts(mode="ask")], ["ro"])
+
+        self.reg.set_enabled("ro", False)
+        self.assertNotEqual(self.reg.contract_version("ro"), contract["contract_version"])
 
 
 class StreamingProfileTest(unittest.TestCase):

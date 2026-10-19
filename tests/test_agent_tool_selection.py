@@ -36,8 +36,8 @@ class AgentToolSelectionTest(unittest.TestCase):
         self.assertIn("create_node", names)
         self.assertIn("get_network_structure", names)
         self.assertIn("add_todo", names)
-        self.assertNotIn("execute_shell", names)
-        self.assertNotIn("save_hip", names)
+        self.assertIn("execute_shell", names)
+        self.assertIn("save_hip", names)
         self.assertNotIn("web_search", names)
         self.assertNotIn("fetch_webpage", names)
 
@@ -54,7 +54,35 @@ class AgentToolSelectionTest(unittest.TestCase):
         self.assertLess(len(tools), len(HOUDINI_TOOLS))
         self.assertIn("execute_python", names)
         self.assertIn("get_network_structure", names)
-        self.assertNotIn("save_hip", names)
+        self.assertIn("save_hip", names)
+
+    def test_agent_mode_spare_parameter_request_exposes_dedicated_tool(self):
+        tab = object.__new__(AITab)
+
+        tools = AITab._select_agent_tools_for_message(
+            tab,
+            "在 CTRL_FLOWER_ANIM 创建 flower_open 自定义参数并修改 petal_targets",
+            use_web=False,
+        )
+        names = _tool_names(tools)
+
+        self.assertIn("upsert_spare_parameter", names)
+        self.assertIn("get_parameter_schema", names)
+        self.assertIn("execute_python", names)
+        self.assertIn("upsert_spare_parameter", tab._last_selected_tool_names)
+
+    def test_agent_mode_keeps_spare_parameter_tool_without_keyword_match(self):
+        tab = object.__new__(AITab)
+
+        tools = AITab._select_agent_tools_for_message(
+            tab,
+            "继续完成 CTRL_FLOWER_ANIM，并让 petal_targets 使用 auto_open",
+            use_web=False,
+        )
+        names = _tool_names(tools)
+
+        self.assertIn("upsert_spare_parameter", names)
+        self.assertIn("get_parameter_schema", names)
 
     def test_explicit_remember_request_exposes_write_tool(self):
         tab = object.__new__(AITab)

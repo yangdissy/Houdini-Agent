@@ -630,8 +630,32 @@ HOUDINI_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "upsert_spare_parameter",
+            "description": "在已有 Houdini 节点上创建或显式替换常用 Spare Parameter。支持 float、int、toggle、string、menu、vector2/3/4、color；写入 ParmTemplateGroup 后会读回参数路径验证。复杂布局、Ramp 和 Multiparm 模板请使用 execute_python。是否确认由当前确认模式和 Harness 策略决定。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "目标节点的完整 Houdini 路径"},
+                    "name": {"type": "string", "description": "内部参数名，只允许字母、数字和下划线且不能以数字开头"},
+                    "label": {"type": "string", "description": "界面显示标签"},
+                    "parameter_type": {"type": "string", "enum": ["float", "int", "toggle", "string", "menu", "vector2", "vector3", "vector4", "color"], "description": "参数类型"},
+                    "default": {"description": "默认值；数值/布尔/字符串按类型传入，vector 和 color 使用数字数组"},
+                    "minimum": {"type": "number", "description": "可选最小值"},
+                    "maximum": {"type": "number", "description": "可选最大值"},
+                    "size": {"type": "integer", "enum": [3, 4], "description": "color 分量数量，默认 3"},
+                    "menu_items": {"type": "array", "items": {"type": "string"}, "description": "menu token 列表"},
+                    "menu_labels": {"type": "array", "items": {"type": "string"}, "description": "menu 显示标签；省略时使用 token"},
+                    "replace": {"type": "boolean", "description": "同名参数存在时是否替换，默认 false"}
+                },
+                "required": ["node_path", "name", "label", "parameter_type"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "insert_multiparm_instance",
-            "description": "在 Multiparm 的指定零基索引插入一个实例。写入场景、需要确认并支持 Houdini Undo。",
+            "description": "在 Multiparm 的指定零基索引插入一个实例。写入场景并支持 Houdini Undo；是否确认由当前确认模式和 Harness 策略决定。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -647,7 +671,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "remove_multiparm_instance",
-            "description": "删除 Multiparm 指定零基索引处的一个实例。写入场景、需要确认并支持 Houdini Undo。",
+            "description": "删除 Multiparm 指定零基索引处的一个实例。写入场景并支持 Houdini Undo；是否确认由当前确认模式和 Harness 策略决定。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -983,6 +1007,36 @@ HOUDINI_TOOLS = [
                     "current": {"type": "boolean", "description": "true=设为当前节点并选中；false 无操作"}
                 },
                 "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_frame_range_risk",
+            "description": "只读静态检查目标节点及上游网络的采样 cook 风险。不改变当前帧、不 cook、不求值几何。frames 必须显式给出 1 到 3 帧。low 只表示未发现已知静态风险，不保证实际 cook 安全。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "目标节点完整路径"},
+                    "frames": {"type": "array", "items": {"type": "number"}, "minItems": 1, "maxItems": 3, "description": "要评估的 1 到 3 个显式帧"}
+                },
+                "required": ["node_path", "frames"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cook_sample_frames",
+            "description": "先执行静态风险预检，再按给定顺序连续 cook 1 到 3 个显式帧。一次确认覆盖本次全部帧，不逐帧确认。执行期间 Houdini 可能长时间卡顿或暂时无响应，请耐心等待；单个 C++ cook 无法由 Python 安全中断。高风险、未知或扫描不完整时拒绝执行。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "目标节点完整路径"},
+                    "frames": {"type": "array", "items": {"type": "number"}, "minItems": 1, "maxItems": 3, "description": "按该顺序连续 cook 的 1 到 3 个显式帧"}
+                },
+                "required": ["node_path", "frames"]
             }
         }
     },
@@ -1441,8 +1495,23 @@ HOUDINI_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "inspect_python",
+            "description": "在 Houdini 主线程执行只读 Python 观察代码。AST 检查会拒绝已知 HOM 写调用及属性/下标赋值；不能用于修改场景。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "只读 Python 代码"},
+                    "page": {"type": "integer", "description": "页码（从1开始）"}
+                },
+                "required": ["code"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "execute_python",
-            "description": "【最后手段】在 Houdini Python Shell 中执行任意 Python 代码。需要用户确认，有安全风险。绝大多数 Houdini 操作都有专用工具，优先使用专用工具。禁止使用场景：1)节点/参数操作——用 create_node、set_node_parameter、connect_nodes 等；2)VEX 编写——用 create_wrangle_node 或 set_node_parameter(parm_name='snippet')；3)几何体/属性查询——用 run_skill(analyze_geometry_attribs 等) 或 get_geometry_summary；4)节点查询——用 inspect_node、get_network_structure、find_nodes；5)节点重命名——用 rename_node。仅在确实没有专用工具可以完成任务时才使用此工具。输出较长时支持分页，用相同 code 和不同 page 翻页。",
+            "description": "【受治理的最后手段】在 Houdini Python Shell 中执行 Python 代码。是否需要确认由 Harness 治理策略和当前确认模式决定；当策略允许执行时，必须直接调用 execute_python，不要通过文字重复索要授权。通过本工具调用仍会经过参数校验、危险代码拦截、审计和 Harness 决策，不属于绕过治理。专用工具能够完整完成操作时必须优先使用；如果专用工具缺少任务所需的关键能力，则使用 execute_python，例如创建或修改 Spare Parameter、ParmTemplateGroup 等当前没有专用写入接口的 HOM 操作。已有完整专用接口的场景不得改用 Python：VEX 编写使用 create_wrangle_node 或 set_node_parameter(parm_name='snippet')；几何体/属性查询使用 run_skill 或 get_geometry_summary；节点查询使用 inspect_node、get_network_structure 或 find_nodes；节点重命名使用 rename_node。输出较长时支持分页，用相同 code 和不同 page 翻页。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1908,13 +1977,13 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_operation_status",
-            "description": "按 operation receipt ID 查询当前进程或当前会话诊断日志中的最新只读状态。不会修改 Houdini 场景。",
+            "description": "按 request_ref 查询原请求的最新状态，用于超时或响应丢失后的安全恢复。只读取原 receipt，绝不重新执行请求。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "operation_id": {"type": "string", "description": "operation receipt ID"}
+                    "request_ref": {"type": "string", "description": "原请求返回的 request_ref"}
                 },
-                "required": ["operation_id"]
+                "required": ["request_ref"]
             }
         }
     },
@@ -1929,6 +1998,54 @@ HOUDINI_TOOLS = [
                     "limit": {"type": "integer", "description": "最多返回数量，默认20，范围1-100"}
                 },
                 "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_tool_contract",
+            "description": "读取一个已注册工具的当前真实 schema、模式、runtime、风险和执行语义。不会执行该工具。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "精确工具名"}
+                },
+                "required": ["name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_tool_contracts",
+            "description": "按名称、描述、标签或模式搜索当前 Registry 中的真实工具契约。不会执行任何工具。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "名称、描述或标签关键词"},
+                    "mode": {"type": "string", "description": "可选模式过滤"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "必须全部满足的标签"},
+                    "limit": {"type": "integer", "description": "最多返回数量，默认20，范围1-100"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_tool_result",
+            "description": "读取当前用户和会话中归档的大型工具结果，支持 RFC 6901 JSON Pointer 与字符分页。不会执行 Houdini 操作。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "result_ref": {"type": "string", "description": "工具返回的 result_ref"},
+                    "pointer": {"type": "string", "description": "可选 RFC 6901 JSON Pointer，默认读取完整结果"},
+                    "offset": {"type": "integer", "description": "字符偏移，默认0"},
+                    "limit": {"type": "integer", "description": "本页字符数，默认6000，范围1-16000"}
+                },
+                "required": ["result_ref"]
             }
         }
     }
@@ -2404,7 +2521,7 @@ class AIClient:
 
         return stripped
 
-    _MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
+    _MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
 
     @staticmethod
     def _request_body_size(messages: list, tools: Optional[list] = None) -> int:
@@ -4216,6 +4333,7 @@ class AIClient:
                           on_tool_result: Optional[Callable[[str, dict, dict], None]] = None,
                           on_tool_args_delta: Optional[Callable[[str, str, str], None]] = None,
                           on_iteration_start: Optional[Callable[[int], None]] = None,
+                          on_incomplete: Optional[Callable[[], Optional[str]]] = None,
                           on_plan_incomplete: Optional[Callable[[], Optional[str]]] = None,
                           context_limit: int = 128000) -> Dict[str, Any]:
         """流式 Agent Loop
@@ -4229,11 +4347,9 @@ class AIClient:
             on_tool_result: 工具结果回调 (name, args, result) -> None
             on_iteration_start: 每轮 API 请求开始时的回调 (iteration) -> None
                                 用于 UI 显示 "Generating..." 等待状态
-            on_plan_incomplete: Plan 未完成检测回调 () -> Optional[str]
-                                当 AI 返回纯文本（无 tool_calls）时调用此回调。
-                                如果 Plan 尚有未完成步骤，返回一条提醒消息字符串，
-                                agent loop 会将其注入为 user 消息并继续迭代。
-                                如果 Plan 已全部完成或不需要续接，返回 None。
+            on_incomplete: 未完成检测回调 () -> Optional[str]。当 AI 在工具执行后
+                           返回纯文本时调用；返回提醒消息则注入为 user 消息并继续。
+            on_plan_incomplete: on_incomplete 的兼容别名。
             context_limit: 上下文 token 上限（默认 128000），用于主动压缩判断
         
         Returns:
@@ -4245,6 +4361,7 @@ class AIClient:
         
         model = self._normalize_model_id(model)
         working_messages = list(messages)
+        incomplete_callback = on_incomplete or on_plan_incomplete
         
         # ── 预处理：非视觉模型剥离所有 image_url 内容 ──
         if not supports_vision:
@@ -4528,7 +4645,8 @@ class AIClient:
                             # ---- 真正的上下文超限：渐进式裁剪 ----
                             print(f"[AI Client] 上下文超限，进行渐进式裁剪 (第{server_error_retries}次)")
                             if on_content:
-                                on_content(f"\n[上下文超限，正在智能裁剪后重试 ({server_error_retries}/{max_server_retries})...]\n")
+                                reason = "请求体过大" if is_http_413 else "上下文超限"
+                                on_content(f"\n[{reason}，正在智能裁剪后重试 ({server_error_retries}/{max_server_retries})...]\n")
                             
                             old_len = len(working_messages)
                             old_body_size = self._request_body_size(working_messages, effective_tools)
@@ -4669,11 +4787,11 @@ class AIClient:
                 # ★ Plan 续接检测：AI 输出了纯文本，但 Plan 可能还有未完成步骤
                 # 通过回调询问 UI 层 Plan 是否已完成
                 _plan_resume_msg = None
-                if on_plan_incomplete and iteration > 1:
+                if incomplete_callback and iteration > 1 and tool_calls_history:
                     try:
-                        _plan_resume_msg = on_plan_incomplete()
+                        _plan_resume_msg = incomplete_callback()
                     except Exception as _pe:
-                        print(f"[AI Client] on_plan_incomplete error: {_pe}")
+                        print(f"[AI Client] on_incomplete error: {_pe}")
                 
                 if _plan_resume_msg:
                     # Plan 尚未完成 → 将 AI 的当前回复存入历史，注入提醒消息，继续循环
@@ -5367,6 +5485,7 @@ class AIClient:
                         'request too large', 'payload too large',
                         'context window', 'input too long',
                     )) or ('http 413' in err_lower)
+                    is_http_413 = 'http 413' in err_lower
                     is_server_transient = any(k in err_msg for k in (
                         'HTTP 502', 'HTTP 503', 'HTTP 529', '压缩失败', 'no available'
                     ))
@@ -5384,15 +5503,30 @@ class AIClient:
                             }
                         
                         if is_context_exceeded:
-                            # 上下文超限：立即裁剪
-                            if on_content:
-                                on_content(f"\n[上下文超限，智能裁剪后重试 ({server_error_retries}/{max_server_retries})...]\n")
+                            old_body_size = self._request_body_size(working_messages, effective_tools)
                             working_messages = self._progressive_trim(
                                 working_messages, tool_calls_history,
                                 trim_level=server_error_retries,
                                 supports_vision=supports_vision,
                                 tools=effective_tools,
                             )
+                            new_body_size = self._request_body_size(working_messages, effective_tools)
+                            if is_http_413 and new_body_size >= old_body_size:
+                                return {
+                                    'ok': False,
+                                    'error': (
+                                        "请求体过大，且自动裁剪未能缩小请求。"
+                                        "请减少当前消息中的图片数量或裁剪图片后重试。"
+                                    ),
+                                    'content': full_content,
+                                    'tool_calls_history': tool_calls_history,
+                                    'call_records': call_records,
+                                    'iterations': iteration,
+                                    'usage': total_usage,
+                                }
+                            if on_content:
+                                reason = "请求体过大" if is_http_413 else "上下文超限"
+                                on_content(f"\n[{reason}，智能裁剪后重试 ({server_error_retries}/{max_server_retries})...]\n")
                         else:
                             # 临时服务器错误：等待，第2次开始才裁剪
                             wait_seconds = 5 * server_error_retries

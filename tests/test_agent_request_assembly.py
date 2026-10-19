@@ -9,6 +9,7 @@ from houdini_agent.core.agent_request_assembly import (
     has_prior_completed_turn,
     normalize_history,
     normalize_provider_messages,
+    prepare_history_for_request,
 )
 
 
@@ -61,6 +62,33 @@ class AgentRequestAssemblyTest(unittest.TestCase):
         self.assertTrue(result[0]['content'].startswith('legacy='))
         self.assertEqual(len(result[0]['content']), len('legacy=' ) + 500)
 
+    def test_request_history_compacts_old_tool_results_without_mutating_history(self):
+        history = []
+        for index in range(4):
+            history.extend([
+                {'role': 'user', 'content': 'request %d' % index},
+                {'role': 'assistant', 'content': None, 'tool_calls': [{
+                    'id': 'call_%d' % index,
+                    'function': {'name': 'inspect_node', 'arguments': '{}'},
+                }]},
+                {'role': 'tool', 'tool_call_id': 'call_%d' % index, 'content': str(index) * 250},
+            ])
+
+        result = prepare_history_for_request(
+            history,
+            supports_vision=False,
+            fix_alternation=lambda messages: messages,
+            tool_result_text=lambda name, content: '%s=%s' % (name, content),
+            image_placeholder='image removed',
+            summarize_tool_content=lambda content, limit: content[:limit] + '...[summary]',
+            protect_recent_rounds=3,
+        )
+
+        tool_results = [message['content'] for message in result if message['role'] == 'tool']
+        self.assertTrue(tool_results[0].endswith('...[summary]'))
+        self.assertEqual(tool_results[1:], [str(index) * 250 for index in range(1, 4)])
+        self.assertEqual(history[2]['content'], '0' * 250)
+
     def test_reasoning_assistant_normalization_preserves_tool_call_none(self):
         result = normalize_provider_messages([{
             'role': 'assistant',
@@ -91,6 +119,29 @@ class AgentRequestAssemblyTest(unittest.TestCase):
         }
         tools = finalize_tools([], [visual_review], supports_vision=False)
         self.assertEqual(tools, [])
+
+    def test_selected_tools_are_not_expanded_without_registry_supplements(self):
+        selected = {
+            'type': 'function',
+            'function': {'name': 'create_node', 'description': 'create'},
+        }
+        tools = finalize_tools([selected], [], supports_vision=True)
+        self.assertEqual(tools, [selected])
+
+    def test_registry_supplement_is_added_without_duplicates(self):
+        selected = {
+            'type': 'function',
+            'function': {'name': 'create_node', 'description': 'create'},
+        }
+        plugin = {
+            'type': 'function',
+            'function': {'name': 'plugin_tool', 'description': 'plugin'},
+        }
+        tools = finalize_tools([selected], [selected, plugin], supports_vision=True)
+        self.assertEqual(
+            [tool['function']['name'] for tool in tools],
+            ['create_node', 'plugin_tool'],
+        )
 
     def test_final_messages_stay_normalized_after_pruning(self):
         assistant_call = {

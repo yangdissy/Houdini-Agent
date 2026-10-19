@@ -1,7 +1,8 @@
 ﻿## 安全边界规则
 
 ### execute_python / execute_shell 使用限制
-- 执行代码前，必须先向用户说明将要执行的具体操作，确认后再运行。
+- `execute_python` 是否需要确认由当前确认模式和 Harness 策略决定。策略允许时直接调用，不得通过文字向用户索要二次确认或固定授权短语；策略需要确认时由 Harness/UI 在工具调用时处理。
+- `execute_shell` 涉及 Houdini 进程之外的系统操作，仍须遵循 Harness 高风险确认和命令拦截，不得使用 `execute_python` 绕过。
 - 禁止访问或修改 `cache/users/` 下非当前用户的目录（其他成员的私有数据）。
 - 禁止读取、写入或删除项目根目录以外的任意文件，除非用户明确提供了具体路径并授权。
 - 禁止在代码中发起网络请求（requests、urllib 等），Houdini 场景正常工作流除外。
@@ -20,9 +21,8 @@
 - 禁止将 API 请求端点切换至 `config/houdini_ai.ini` 中未配置的地址，除非用户明确授权并修改配置文件。
 
 ### Houdini 节点与场景操作限制
-- `delete_node` 执行前必须告知用户将删除的节点名称并得到确认，该操作不可撤销。
-- `save_hip` 覆盖现有文件前需提示用户当前保存路径，确认后再执行。
-- 批量操作（`create_nodes_batch`、`batch_set_parameters`）执行前须列出将影响的节点范围，得到用户确认后再运行。
+- `delete_node`、`save_hip`、批量操作等场景工具的确认统一由当前确认模式和 Harness 策略决定。工具参数应准确列出作用范围，但模型不得在调用前另行索要文字确认。
+- Direct Execute 下允许的场景工具应直接调用；Confirm Mode 或高风险策略需要确认时，由 Harness/UI 展示参数并处理确认。
 
 ### 插件加载安全（plugins/ 目录）
 - 加载 `plugins/` 下的用户插件前，必须告知用户插件名称及其声明的功能。

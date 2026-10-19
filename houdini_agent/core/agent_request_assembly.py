@@ -12,6 +12,9 @@ from houdini_agent.utils.token_optimizer import (
     ContextPruneResult,
     DynamicContextSection,
     build_context_assembly,
+    compress_old_round_tool_results,
+    flatten_context_rounds,
+    plan_context_rounds,
     prune_context_assembly_to_token_target,
 )
 
@@ -81,6 +84,32 @@ def normalize_history(
         elif role == 'system':
             normalized.append(msg)
     return fix_alternation(normalized)
+
+
+def prepare_history_for_request(
+    history: Sequence[dict],
+    supports_vision: bool,
+    fix_alternation: Callable[[List[dict]], List[dict]],
+    tool_result_text: Callable[[str, str], str],
+    image_placeholder: str,
+    summarize_tool_content: Optional[Callable[[str, int], str]],
+    protect_recent_rounds: int = 3,
+) -> List[dict]:
+    """Normalize a request copy and compact stale tool output outside recent rounds."""
+    normalized = normalize_history(
+        history,
+        supports_vision=supports_vision,
+        fix_alternation=fix_alternation,
+        tool_result_text=tool_result_text,
+        image_placeholder=image_placeholder,
+    )
+    rounds = plan_context_rounds(normalized, protect_recent_rounds=0).rounds
+    compress_old_round_tool_results(
+        rounds,
+        protect_recent_rounds=protect_recent_rounds,
+        summarize_fn=summarize_tool_content,
+    )
+    return flatten_context_rounds(rounds)
 
 
 def normalize_provider_messages(messages: Sequence[dict], is_reasoning_model: bool) -> List[dict]:

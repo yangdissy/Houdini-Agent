@@ -143,7 +143,7 @@ class ImageMixin:
                 QtCore.Qt.SmoothTransformation,
             ),
             initial_quality=quality,
-            max_bytes=max_bytes or cls._MAX_IMAGE_BYTES,
+            max_bytes=cls._MAX_IMAGE_BYTES if max_bytes is None else max_bytes,
         )
 
     def _add_pending_image(self, b64_data: str, media_type: str):

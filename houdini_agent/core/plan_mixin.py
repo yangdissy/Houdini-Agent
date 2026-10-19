@@ -32,7 +32,7 @@ PlanMixin — Plan 模式工具处理相关方法
 import queue
 import threading
 
-from houdini_agent.qt_compat import QtCore
+from houdini_agent.qt_compat import QtCore, QtWidgets
 
 from ..ui.i18n import tr
 from ..utils.plan_manager import get_plan_manager
@@ -54,6 +54,10 @@ class PlanMixin:
         """Derive the UI phase and projection from the current session's Plan file."""
         plan = self._get_plan_manager().load_plan(self._session_id)
         status = plan.get('status', 'draft') if plan else ''
+        plan_key = (
+            (self._session_id, plan.get('plan_id'))
+            if plan and plan.get('plan_id') else None
+        )
         phase_by_status = {
             'draft': 'awaiting_confirmation',
             'confirmed': 'executing',
@@ -62,9 +66,17 @@ class PlanMixin:
             'blocked': 'blocked',
         }
         self._plan_phase = phase_by_status.get(status, 'idle')
-        self._active_plan_viewer = None
-        if plan and status != 'rejected' and hasattr(self, '_renderPlanViewer'):
+        already_projected = (
+            plan_key is not None
+            and getattr(self, '_projected_plan_key', None) == plan_key
+            and getattr(self, '_active_plan_viewer', None) is not None
+        )
+        if plan and status != 'rejected' and not already_projected and hasattr(self, '_renderPlanViewer'):
+            self._active_plan_viewer = None
             self._renderPlanViewer.emit(plan)
+        elif not plan or status == 'rejected':
+            self._active_plan_viewer = None
+            self._projected_plan_key = None
         return plan
 
     # ------------------------------------------------------------------
@@ -296,6 +308,9 @@ class PlanMixin:
                 viewer.planRejected.connect(self._on_plan_rejected)
                 self._active_plan_viewer = viewer
                 self.chat_layout.insertWidget(self.chat_layout.count() - 1, viewer)
+            self._projected_plan_key = (
+                self._session_id, plan_data.get('plan_id')
+            )
             self._scroll_to_bottom(force=True)
         except Exception as e:
             print(f"[Plan] Render PlanViewer error: {e}")
@@ -314,12 +329,19 @@ class PlanMixin:
         try:
             plan_data = self._get_plan_manager().confirm_plan(self._session_id)
         except Exception as exc:
-            if hasattr(self, '_addStatus'):
-                self._addStatus.emit(f"Plan confirm failed: {exc}")
+            print(f"[Plan] Confirm failed: {exc}")
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Plan Confirm Failed",
+                "Plan confirmation could not be saved. Please try again.",
+            )
             return
         if not plan_data:
             return
         self._plan_phase = 'executing'
+        # Plan 已确认后使用 Agent 执行；同步顶部模式控件及其内部状态。
+        if hasattr(self, 'mode_combo'):
+            self.mode_combo.setCurrentIndex(0)
         # 禁用 PlanViewer 按钮（防止重复点击）
         if self._active_plan_viewer:
             self._active_plan_viewer.set_confirmed()
@@ -331,10 +353,12 @@ class PlanMixin:
         })
 
         self._start_agent_run({
-            'use_agent': True,          # 执行阶段用完整工具
-            'plan_mode': True,
-            'plan_executing': True,     # 标记为 Plan 执行阶段
-            'plan_data': plan_data,
+            'use_agent': True,
+            'plan_mode': False,
+            'execution_context': {
+                'type': 'confirmed_plan',
+                'plan_data': plan_data,
+            },
         }, user_message=exec_msg)
 
     def _on_plan_rejected(self):
@@ -342,8 +366,12 @@ class PlanMixin:
         try:
             plan = self._get_plan_manager().reject_plan(self._session_id)
         except Exception as exc:
-            if hasattr(self, '_addStatus'):
-                self._addStatus.emit(f"Plan reject failed: {exc}")
+            print(f"[Plan] Reject failed: {exc}")
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Plan Reject Failed",
+                "Plan rejection could not be saved. Please try again.",
+            )
             return
         if not plan:
             return
@@ -351,6 +379,7 @@ class PlanMixin:
         if self._active_plan_viewer:
             self._active_plan_viewer.set_rejected()
         self._active_plan_viewer = None
+        self._projected_plan_key = None
 
     # ------------------------------------------------------------------
     # Plan 续接：检测 AI 提前终止但 Plan 未完成

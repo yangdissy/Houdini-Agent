@@ -22,6 +22,8 @@ kinefx_pipeline = _run("setup_kinefx_pipeline")
 material_lookdev = _run("setup_material_lookdev")
 pdg_pipeline = _run("setup_pdg_batch_pipeline")
 procedural_modeling = _run("procedural_modeling_guide")
+setup_dynamics = _run("setup_dynamics_sim")
+simulation_workflow = _run("simulation_workflow_guide")
 usd_scene_assembly = _run("usd_scene_assembly_guide")
 
 
@@ -93,6 +95,58 @@ def test_procedural_modeling_only_routes_complex_work_to_decomposition():
     assert "handoff_houdini_network" in complex_result["recommended_existing_skills"]
 
 
+def test_setup_dynamics_preserves_existing_solver_blueprints():
+    expected_nodes = {
+        "rbd": ["rbdconfigure", "rbdbulletsolver", "output"],
+        "flip": ["flipsolver", "particlefluidsurface", "output"],
+        "vellum": ["vellumconfigurecloth", "vellumsolver", "output"],
+    }
+
+    for domain, node_types in expected_nodes.items():
+        result = setup_dynamics("/obj/geo1/SOURCE", domain)
+        assert [item["type"] for item in result["nodes"]] == node_types
+        assert result["execution"]["tool"] == "create_nodes_batch"
+
+
+def test_simulation_workflow_routes_supported_domains_and_aliases():
+    cases = {
+        "Create whitewater for an animated boat": "flip",
+        "Simulate a softbody creature": "vellum",
+        "Fracture a concrete wall with Bullet": "rbd",
+        "Create a deep snow simulation": "mpm",
+    }
+
+    for task, expected_domain in cases.items():
+        result = simulation_workflow(task)
+        assert result["domain"] == expected_domain
+        assert result["routing_reason"]
+        assert result["module_boundaries"]
+        assert result["recommended_workflow"]
+        assert result["help_scopes"]
+        assert result["verification"]
+
+
+def test_simulation_guide_requires_risk_check_before_sample_cook():
+    result = simulation_workflow(task="test a vellum cloth", domain="vellum")
+    workflow = " ".join(result["recommended_workflow"])
+
+    assert "inspect_frame_range_risk" in workflow
+    assert "cook_sample_frames" in workflow
+    assert "at most three" in workflow
+    assert "wait patiently" in workflow
+
+
+def test_simulation_workflow_keeps_mpm_read_only_and_hands_pyro_off():
+    mpm = simulation_workflow("Simulate wet sand", domain="mpm")
+    pyro = simulation_workflow("Create a smoke plume")
+
+    assert "nodes" not in mpm
+    assert "execution" not in mpm
+    assert "setup_dynamics_sim" not in mpm["recommended_existing_skills"]
+    assert pyro["domain"] == "pyro"
+    assert pyro["handoff_skill"] == "setup_pyro_sim"
+
+
 def test_usd_guide_exposes_observable_module_boundaries():
     result = usd_scene_assembly("Assemble a hero asset for Karma")
 
@@ -107,6 +161,7 @@ def test_structured_skill_recommendations_resolve_to_registry():
         kinefx_pipeline("/obj/character/SKELETON", "rig"),
         material_lookdev("hero", mode="karma"),
         procedural_modeling("Build a modular city", complexity="complex"),
+        simulation_workflow("Simulate wet sand", domain="mpm"),
         usd_scene_assembly("Assemble a hero asset for Karma"),
     ]
     registered = {item["name"] for item in skills.list_skills()}
