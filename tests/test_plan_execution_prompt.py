@@ -15,6 +15,18 @@ from houdini_agent.core.prompt_manager import build_budgeted_system_prompt
 
 
 class PlanExecutionPromptTest(unittest.TestCase):
+    def test_organization_execution_preserves_scope_and_unknown_health(self):
+        chinese = _ZH['ai.plan_mode_execution_prompt']
+        english = _EN['ai.plan_mode_execution_prompt']
+
+        for prompt in (chinese, english):
+            self.assertIn('health=unknown', prompt)
+            self.assertIn('display/render', prompt)
+        self.assertIn('缺失缓存只标注', chinese)
+        self.assertIn('未经计划授权', chinese)
+        self.assertIn('missing caches only need annotation', english)
+        self.assertIn('outside the confirmed plan', english)
+
     def test_plan_contracts_match_structured_outcomes(self):
         from houdini_agent.utils.plan_manager import PLAN_TOOL_ASK_QUESTION, PLAN_TOOL_CREATE, PLAN_TOOL_UPDATE_STEP
         questions = PLAN_TOOL_ASK_QUESTION["function"]["parameters"]["properties"]["questions"]

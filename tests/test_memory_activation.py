@@ -96,6 +96,7 @@ class FakeMemoryStore:
     def __init__(self):
         self.embedder = FakeEmbedder()
         self.semantic_activations = []
+        self.semantic_settlements = []
         self.episodic_updates = []
         self.procedural_updates = []
         self.quality_policy = {"unused_decay": 0.97}
@@ -140,7 +141,8 @@ class FakeMemoryStore:
     def record_recall(self, pending, cited, session_id, reward):
         self.recall_events.append((pending, cited, session_id, reward))
 
-    def settle_semantic_usage(self, record_id, cited, reward):
+    def settle_semantic_usage(self, record_id, cited, reward, task_success=None):
+        self.semantic_settlements.append((record_id, cited, reward, task_success))
         if cited and reward > 0:
             self.semantic_activations.append(record_id)
 
@@ -200,6 +202,7 @@ class MemoryMixinActivationTest(unittest.TestCase):
         mixin._reinforce_pending_memories(0.5, task_success=True, final_content="Done\n[mem-used: M1,M2]")
 
         self.assertEqual(mixin._memory_store.semantic_activations, ["s1"])
+        self.assertEqual(mixin._memory_store.semantic_settlements, [("s1", True, 0.5, True)])
         self.assertEqual(mixin._memory_store.episodic_updates, [("e1", 1.05)])
         self.assertIsNone(mixin._pending_memory_reinforcement)
 

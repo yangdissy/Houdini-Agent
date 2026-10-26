@@ -61,6 +61,7 @@ class ExternalMCPExecutionAdapter:
         self._username = username
         self._stopped = threading.Event()
         self._retry_counts: Dict[str, int] = {}
+        self._audit_state: Dict[str, bool] = {}
         self._call_counts: Dict[str, int] = {}
         self._call_count_lock = threading.Lock()
         self._concurrency = threading.BoundedSemaphore(settings.max_concurrent_calls)
@@ -186,11 +187,15 @@ class ExternalMCPExecutionAdapter:
                 confirm=self._confirm,
                 audit=lambda record: self._record(context, record),
                 retry_counts=self._retry_counts,
+                audit_state=self._audit_state,
+                get_tool_meta=self._registry.get_meta,
             )
             return owner.execute(tool_name, dict(args or {}), {
                 "mode": context.mode,
                 "confirm_mode": True,
                 "external_mcp": True,
+                "session_id": context.session_id,
+                "run_id": context.correlation_id,
             })
         finally:
             if long_running_acquired:
@@ -266,9 +271,10 @@ class ExternalMCPExecutionAdapter:
                     return "External MCP node path is outside configured write roots"
         return None
 
-    def _record(self, context: ExternalMCPContext, record: Dict[str, Any]) -> None:
+    def _record(self, context: ExternalMCPContext, record: Dict[str, Any]) -> bool:
         if self._audit is None:
-            return
+            self._audit_state["degraded"] = True
+            return False
         safe_record = dict(record)
         safe_record.update({
             "session_id": context.session_id,
@@ -278,6 +284,9 @@ class ExternalMCPExecutionAdapter:
             "external_mcp": True,
         })
         try:
-            self._audit(safe_record)
+            if self._audit(safe_record) is not False:
+                return True
         except Exception:
             pass
+        self._audit_state["degraded"] = True
+        return False

@@ -143,7 +143,7 @@ class MemoryMixin:
             record_id = item['record_id']
             used = alias in cited
             if item['kind'] == 'semantic':
-                store.settle_semantic_usage(record_id, used, reward)
+                store.settle_semantic_usage(record_id, used, reward, task_success=task_success)
             elif item['kind'] == 'episodic':
                 record = store.get_episodic(record_id)
                 if record is None:

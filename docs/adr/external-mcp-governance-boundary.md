@@ -59,6 +59,31 @@ and feature detection fail closed. Results and exceptions pass through the
 shared result guardrail and sanitization path. Runtime capabilities hide tools
 whose handler, optional module, or required Houdini version is unavailable.
 
+## Audit Failure Contract
+
+Internal, batch, Web, and external MCP execution share mandatory governance.
+`HOUDINI_AGENT_HARNESS_V2=false` no longer disables that contract. Tool audit
+records include host-owned call/run identity, policy version, matched rules,
+confirmation outcomes, and execution terminals; argument values and prompt text
+are not audit payloads. External calls retain their correlation IDs.
+
+Audit failure is distinct from invalid governance configuration. Only explicitly
+registered low-risk, non-mutating readonly tools may continue with
+`audit_status=degraded` and an audit warning. Unknown or writing tools are denied
+before dispatch if policy/start audit cannot be written. Audit failure latches
+for the current internal run or external adapter lifetime.
+
+If a write has already run when its result audit fails, its actual success,
+verification, operation receipt, and consistency metadata are preserved.
+`replay_safe=false` prohibits automatically repeating that write, and subsequent
+writes are denied. Readonly inspection may continue. Process starts also require
+preflight audit; cancellation, shutdown, and safety cleanup are never blocked by
+a logging failure. The JSONL writer is append-only, not tamper-proof storage.
+
+External MCP keeps its existing fixed capability manifest and stricter
+allowlist, risk, confirmation, and write-root controls. Internal dynamic schema
+discovery cannot expand those permissions.
+
 ## Shutdown
 
 Stopping the server permanently closes its adapter before waiting for the HTTP

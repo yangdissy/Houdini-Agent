@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from houdini_agent.utils.mcp.external_jobs import (
     ExternalJobSpec,
@@ -61,6 +62,27 @@ class ExternalProcessJobAdapterTest(unittest.TestCase):
         self.assertEqual(current["exit_code"], 0)
         self.assertEqual(current["artifacts"][0]["path"], "result.json")
         self.assertEqual(current["result"], {"ok": True})
+
+    def test_audit_failure_prevents_process_start(self):
+        self.adapter._audit = lambda record: False
+        with mock.patch("houdini_agent.utils.mcp.external_jobs.subprocess.Popen") as process:
+            with self.assertRaises(OSError):
+                self.adapter.start("session-a", "test_worker", {"mode": "success"})
+        process.assert_not_called()
+
+    def test_post_start_audit_failure_preserves_job_and_blocks_new_starts(self):
+        def audit(record):
+            return record["event_type"] == "job_policy"
+
+        self.adapter._audit = audit
+        operation = self.adapter.start("session-a", "test_worker", {"mode": "success"})
+        current = self.wait_terminal(operation["operation_id"])
+
+        self.assertEqual(current["state"], "completed")
+        self.assertEqual(current["audit_status"], "degraded")
+        self.assertFalse(current["replay_safe"])
+        with self.assertRaises(OSError):
+            self.adapter.start("session-a", "test_worker", {"mode": "success"})
 
     def test_nonzero_exit_is_failed_not_cancelled(self):
         operation = self.adapter.start("session-a", "test_worker", {"mode": "failure"})

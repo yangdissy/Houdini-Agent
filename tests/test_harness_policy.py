@@ -2,6 +2,9 @@
 """Harness V2 policy tests."""
 
 import unittest
+import json
+import tempfile
+from pathlib import Path
 
 from houdini_agent.core.harness_engine import (
     GovernedToolExecutor,
@@ -74,6 +77,70 @@ def _core_registry():
 
 
 class HarnessPolicyConfigTest(unittest.TestCase):
+    def test_unknown_tool_reference_invalidates_registered_policy(self):
+        from houdini_agent.core.harness_policy_config import load_security_policy
+
+        source = Path(__file__).resolve().parents[1] / "config" / "security_policy.json"
+        data = json.loads(source.read_text(encoding="utf-8"))
+        data["tool_policy"]["risk_overrides"]["misspelled_tool"] = "high"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "policy.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            registry = ToolRegistry(policy=load_security_policy(path))
+        self.assertFalse(registry.validate_policy_references())
+        engine = HarnessToolPolicyEngine(get_tool_meta=registry.get_meta)
+        decision = engine.decide("get_network_structure", {"network_path": "/obj"}, {"mode": "agent"})
+        self.assertEqual(decision.action, "deny")
+        self.assertIn("policy_unavailable", decision.matched_rules)
+
+    def test_malformed_policy_shapes_and_rules_fail_closed(self):
+        from houdini_agent.core.harness_policy_config import load_security_policy
+
+        source = Path(__file__).resolve().parents[1] / "config" / "security_policy.json"
+        data = json.loads(source.read_text(encoding="utf-8"))
+        invalid_action = json.loads(json.dumps(data))
+        invalid_action["tool_policy"]["confirmation_rules"][0]["action"] = "execute"
+        invalid_regex = json.loads(json.dumps(data))
+        invalid_regex["tool_policy"]["python_dangerous_patterns"][0][0] = "["
+        for payload in (None, [], {}, invalid_action, invalid_regex):
+            with self.subTest(payload=type(payload).__name__), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "policy.json"
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                policy = load_security_policy(path)
+                self.assertEqual(policy.error, "policy_unavailable")
+
+    def test_invalid_policy_denies_even_readonly_tools(self):
+        from houdini_agent.core.harness_policy_config import load_security_policy
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "policy.json"
+            path.write_text('{"broken": true}', encoding="utf-8")
+            policy = load_security_policy(path)
+        engine = HarnessToolPolicyEngine(policy=policy)
+
+        decision = engine.decide("get_network_structure", {"network_path": "/obj"}, {"mode": "agent"})
+
+        self.assertEqual(decision.action, "deny")
+        self.assertIn("policy_unavailable", decision.matched_rules)
+
+    def test_declarative_risk_override_changes_registered_tool(self):
+        from houdini_agent.core.harness_policy_config import load_security_policy
+
+        source = Path(__file__).resolve().parents[1] / "config" / "security_policy.json"
+        data = json.loads(source.read_text(encoding="utf-8"))
+        data["tool_policy"]["risk_overrides"]["create_node"] = "high"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "policy.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            policy = load_security_policy(path)
+        registry = ToolRegistry(policy=policy)
+        registry.register_core_tools([{
+            "type": "function", "function": {"name": "create_node", "parameters": {}},
+        }])
+
+        self.assertEqual(registry.get_meta("create_node").risk_level, "high")
+        self.assertNotEqual(policy.version, "unavailable")
+
     def test_cook_sample_frames_requires_one_confirmation_before_running(self):
         registry = _core_registry()
         engine = HarnessToolPolicyEngine(get_tool_meta=registry.get_meta)
@@ -91,6 +158,25 @@ class HarnessPolicyConfigTest(unittest.TestCase):
         self.assertEqual(pending.action, "ask")
         self.assertIn("wait patiently", pending.reason)
         self.assertEqual(confirmed.action, "allow")
+
+    def test_declarative_argument_rule_controls_actual_decision(self):
+        from houdini_agent.core.harness_policy_config import load_security_policy
+
+        source = Path(__file__).resolve().parents[1] / "config" / "security_policy.json"
+        data = json.loads(source.read_text(encoding="utf-8"))
+        for rule in data["tool_policy"]["confirmation_rules"]:
+            if rule["id"] == "cook_force_confirmation":
+                rule["action"] = "deny"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "policy.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            policy = load_security_policy(path)
+        engine = HarnessToolPolicyEngine(policy=policy, get_tool_meta=_core_registry().get_meta)
+
+        decision = engine.decide("cook_node", {"node_path": "/obj/geo1", "force": True}, {"mode": "agent"})
+
+        self.assertEqual(decision.action, "deny")
+        self.assertEqual(decision.matched_rules, ["cook_force_confirmation"])
 
     def test_high_risk_groups_are_confirmed(self):
         self.assertTrue(DESTRUCTIVE_TOOLS <= HIGH_RISK_TOOLS)
@@ -161,6 +247,7 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
             self.policy,
             lambda name, args, confirmed: calls.append((name, args, confirmed)) or {"success": True},
             confirm=lambda name, args: True,
+            audit=lambda record: None,
         )
 
         result = owner.execute(
@@ -179,6 +266,7 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
             self.policy,
             lambda name, args, confirmed: calls.append((name, args, confirmed)) or {"success": True},
             confirm=lambda name, args: confirmations.append(name) or True,
+            audit=lambda record: None,
         )
 
         for tool_name in sorted(HIGH_RISK_TOOLS):
@@ -200,6 +288,7 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
             self.policy,
             lambda name, args, confirmed: calls.append((name, args, confirmed)) or {"success": True},
             confirm=lambda name, args: confirmations.append(name) or True,
+            audit=lambda record: None,
         )
 
         for tool_name in sorted(HIGH_RISK_TOOLS):
@@ -220,6 +309,7 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
             self.policy,
             lambda name, args, confirmed: calls.append((name, args, confirmed)) or {"success": True},
             confirm=lambda name, args: False,
+            audit=lambda record: None,
         )
 
         result = owner.execute(
@@ -238,6 +328,7 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
             self.policy,
             lambda name, args, confirmed: calls.append((name, args, confirmed)) or {"success": True},
             confirm=lambda name, args: confirmations.append((name, args)) or True,
+            audit=lambda record: None,
         )
 
         result = owner.execute(
@@ -260,6 +351,7 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
             self.policy,
             lambda name, args, confirmed: calls.append((name, args, confirmed)) or {"success": True},
             confirm=lambda name, args: False,
+            audit=lambda record: None,
         )
 
         result = owner.execute(

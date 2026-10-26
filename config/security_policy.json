@@ -1,4 +1,116 @@
 {
+  "schema_version": 1,
+  "policy_id": "houdini-agent-tools",
+  "tool_policy": {
+    "risk_overrides": {},
+    "destructive_tools": ["delete_node", "save_hip"],
+    "code_exec_tools": ["execute_python", "execute_shell"],
+    "scene_mutation_tools": [
+      "execute_python", "create_wrangle_node", "create_node", "create_nodes_batch", "create_named_null",
+      "rename_node", "set_node_parameter", "set_parameter_expression", "set_parameter_reference", "upsert_spare_parameter",
+      "insert_multiparm_instance", "remove_multiparm_instance", "create_object_merges_batch", "batch_set_parameters",
+      "connect_nodes", "cook_node", "cook_sample_frames", "copy_node", "set_display_flag", "disconnect_nodes",
+      "set_node_flags", "create_network_box", "add_nodes_to_box", "set_network_box_comment", "layout_nodes"
+    ],
+    "confirmation_tools": [
+      "delete_node", "save_hip", "execute_python", "execute_shell", "create_wrangle_node", "create_node",
+      "create_nodes_batch", "create_named_null", "rename_node", "set_node_parameter", "set_parameter_expression",
+      "set_parameter_reference", "upsert_spare_parameter", "insert_multiparm_instance", "remove_multiparm_instance",
+      "create_object_merges_batch", "batch_set_parameters", "connect_nodes", "cook_node", "cook_sample_frames",
+      "copy_node", "set_display_flag", "disconnect_nodes", "set_node_flags", "create_network_box",
+      "add_nodes_to_box", "set_network_box_comment", "layout_nodes", "set_update_mode"
+    ],
+    "mode_tools": {
+      "ask": [
+        "get_network_structure", "get_node_parameters", "get_parameter_schema", "find_parameter_references", "list_multiparm_instances",
+        "inspect_node", "get_node_connections", "suggest_connection", "preview_node_operation", "validate_node_network",
+        "list_children", "find_nodes", "get_geometry_summary", "get_geometry_points", "get_geometry_primitives",
+        "get_usd_prim_info", "get_usd_layer_stack", "get_top_network_status", "list_top_work_items", "get_top_errors", "build_pdg_expression",
+        "temporary_auto_validate_geometry", "get_scene_snapshot", "read_selection", "search_node_types", "semantic_search_nodes",
+        "check_errors", "verify_network", "web_search", "fetch_webpage", "search_local_doc", "get_houdini_node_doc", "list_skills",
+        "add_todo", "update_todo", "perf_start_profile", "perf_stop_and_report", "search_memory", "capture_viewport", "visual_review",
+        "preview_layout_nodes", "get_operation_status", "list_operation_receipts", "inspect_tool_contract", "search_tool_contracts",
+        "read_tool_result", "inspect_python", "inspect_frame_range_risk"
+      ],
+      "plan_planning": [
+        "get_network_structure", "get_node_parameters", "get_parameter_schema", "find_parameter_references", "list_multiparm_instances",
+        "inspect_node", "get_node_connections", "suggest_connection", "preview_node_operation", "validate_node_network",
+        "list_children", "find_nodes", "get_geometry_summary", "get_geometry_points", "get_geometry_primitives",
+        "get_usd_prim_info", "get_usd_layer_stack", "get_top_network_status", "list_top_work_items", "get_top_errors", "build_pdg_expression",
+        "temporary_auto_validate_geometry", "get_scene_snapshot", "read_selection", "search_node_types", "semantic_search_nodes",
+        "check_errors", "verify_network", "web_search", "fetch_webpage", "search_local_doc", "get_houdini_node_doc", "list_skills", "run_skill",
+        "add_todo", "update_todo", "perf_start_profile", "perf_stop_and_report", "search_memory", "capture_viewport", "visual_review",
+        "preview_layout_nodes", "get_operation_status", "list_operation_receipts", "inspect_tool_contract", "search_tool_contracts",
+        "read_tool_result", "inspect_python", "create_plan", "ask_question", "inspect_frame_range_risk"
+      ]
+    },
+    "controlled_write_skills": ["install_houdini_skill"],
+    "memory_calls_per_request": 1,
+    "allow_readonly_audit_degradation": true,
+    "confirmation_rules": [
+      {
+        "id": "explicit_memory_review", "tools": ["remember_memory"],
+        "modes": ["agent", "plan", "plan_executing"], "action": "ask", "score": 0.3,
+        "message": "remember_memory writes long-term memory; review summarized content before confirming"
+      },
+      {
+        "id": "controlled_skill_write_confirmation", "tools": ["run_skill"],
+        "modes": ["agent", "plan", "plan_executing"], "skill_names": ["install_houdini_skill"],
+        "skill_actions": ["install", "activate"], "action": "ask", "score": 0.7,
+        "message": "Controlled Skill write requires confirmation"
+      },
+      {
+        "id": "cook_force_confirmation", "tools": ["cook_node"],
+        "modes": ["agent", "plan", "plan_executing"], "arguments": {"force": true},
+        "action": "ask", "score": 0.8,
+        "message": "cook_node force=true may block Houdini; requires confirmation"
+      },
+      {
+        "id": "cook_sample_frames_confirmation", "tools": ["cook_sample_frames"],
+        "modes": ["agent", "plan", "plan_executing"], "action": "ask", "score": 0.8,
+        "message": "cook_sample_frames may make Houdini unresponsive while cooking; please wait patiently after confirming"
+      }
+    ],
+    "private_user_path_pattern": "(?i)(?:^|[^\\w])cache/+users(?:/+([^/\\s'\"<>;,)]+))?",
+    "sensitive_arg_keys": [
+      "api_key", "apikey", "access_key", "auth_token", "authorization", "bearer_token", "client_secret",
+      "credential", "credentials", "password", "private_key", "secret", "secret_key", "token"
+    ],
+    "sensitive_value_patterns": [
+      ["\\bsk-[A-Za-z0-9_\\-]{16,}\\b", "openai_style_api_key"],
+      ["\\b(?:api[_-]?key|password|passwd|pwd|secret|token)[\"']?\\s*[:=]", "sensitive_assignment"],
+      ["-----BEGIN [A-Z ]*PRIVATE KEY-----", "private_key_block"],
+      ["\\bBearer\\s+[A-Za-z0-9._\\-]{16,}\\b", "bearer_token"]
+    ],
+    "secret_redaction_patterns": [
+      ["\\bsk-[A-Za-z0-9_\\-]{8,}\\b", "[REDACTED_API_KEY]"],
+      ["\\bBearer\\s+[A-Za-z0-9._\\-]{8,}\\b", "Bearer [REDACTED_TOKEN]"],
+      ["(?i)\\b(api[_-]?key|password|passwd|pwd|secret|token)[\"']?\\s*[:=]\\s*(?:\"[^\"\\n]*\"|'[^'\\n]*'|[^\\s,;]+)", "\\1=[REDACTED]"],
+      ["-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", "[REDACTED_PRIVATE_KEY]"]
+    ],
+    "python_blocked_modules": ["subprocess", "importlib", "requests", "urllib", "socket", "http.client"],
+    "python_blocked_calls": [
+      "os.remove", "os.unlink", "os.rmdir", "os.removedirs", "os.system", "shutil.rmtree", "pathlib.Path.unlink",
+      "pathlib.Path.rmdir", "pathlib.Path.write_text", "pathlib.Path.write_bytes", "__import__", "exec", "eval", "compile"
+    ],
+    "python_dangerous_patterns": [
+      ["\\bos\\.remove\\b", "python_os_remove"], ["\\bos\\.rmdir\\b", "python_os_rmdir"],
+      ["\\bshutil\\.rmtree\\b", "python_shutil_rmtree"], ["\\bos\\.system\\b", "python_os_system"],
+      ["\\bsubprocess\\b", "python_subprocess"], ["\\b__import__\\b", "python_dynamic_import"],
+      ["\\bhou\\.exit\\b", "python_hou_exit"], ["\\bhou\\.hipFile\\.clear\\b", "python_hip_clear"]
+    ],
+    "shell_dangerous_patterns": [
+      ["\\brm\\s+.*-r", "shell_rm_recursive"], ["\\brm\\s+.*-f", "shell_rm_force"],
+      ["\\b(?:rmdir|rd)\\s+[^\\r\\n;&|]*/s\\b", "shell_rmdir_recursive"],
+      ["\\bdel\\s+[^\\r\\n;&|]*/[sq]\\b", "shell_del_recursive"],
+      ["\\bformat\\s+[a-zA-Z]:", "shell_format_disk"], ["\\breg\\s+(delete|add)", "shell_registry_edit"],
+      ["\\bshutdown\\b", "shell_shutdown"], ["\\breboot\\b", "shell_reboot"], ["\\brunas\\b", "shell_runas"],
+      ["\\bsudo\\b", "shell_sudo"], ["\\bnetsh\\b", "shell_netsh"], ["\\btaskkill\\s+/f", "shell_taskkill_force"],
+      ["\\b(?:Remove-Item|ri|rm|del|erase|rd|rmdir)\\s+[^\\r\\n;&|]*-Recurse\\b", "shell_powershell_recursive_delete"],
+      ["Invoke-Expression", "shell_invoke_expression"], ["\\biex\\b", "shell_iex"], ["\\bdiskpart\\b", "shell_diskpart"],
+      ["%0\\|%0", "shell_fork_bomb_cmd"], [":\\(\\)\\{.*\\}", "shell_fork_bomb_sh"]
+    ]
+  },
   "injection_patterns": [
     ["instruction_override", "\\b(?:ignore|disregard|forget)\\s+(?:(?:all|the|any)\\s+)?(?:previous|prior|above|earlier|system)\\s+(?:instructions?|rules?|prompts?)\\b"],
     ["instruction_override_zh", "(?:\u5ffd\u7565|\u65e0\u89c6|\u5fd8\u8bb0)(?:\u6240\u6709)?(?:\u4e4b\u524d|\u5148\u524d|\u4ee5\u524d|\u4e0a\u9762|\u7cfb\u7edf)(?:\u7684|\u6240\u6709)?(?:\u6307\u4ee4|\u89c4\u5219|\u63d0\u793a)"],

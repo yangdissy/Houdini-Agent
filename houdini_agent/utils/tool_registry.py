@@ -16,9 +16,9 @@ import threading
 import traceback
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
-from ..core.harness_policy_config import HIGH_RISK_TOOLS, SCENE_MUTATION_TOOLS
+from ..core.harness_policy_config import get_security_policy
 
 
 # ─────────────────────────────────────────────
@@ -73,47 +73,6 @@ class ToolRegistrationError(ValueError):
 # 模式推断辅助（仅用于核心工具自动注册）
 # ─────────────────────────────────────────────
 
-# Ask 模式白名单（只读 / 查询工具）
-_ASK_TOOLS = frozenset({
-    'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'find_parameter_references', 'list_multiparm_instances', 'inspect_node', 'get_node_connections',
-    'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
-    'get_geometry_summary', 'get_geometry_points', 'get_geometry_primitives',
-    'get_usd_prim_info', 'get_usd_layer_stack', 'get_top_network_status',
-    'list_top_work_items', 'get_top_errors', 'build_pdg_expression',
-    'temporary_auto_validate_geometry', 'get_scene_snapshot',
-    'read_selection', 'search_node_types', 'semantic_search_nodes',
-    'check_errors',
-    'verify_network', 'web_search', 'fetch_webpage',
-    'search_local_doc', 'get_houdini_node_doc', 'list_skills',
-    'add_todo', 'update_todo',
-    'perf_start_profile', 'perf_stop_and_report',
-    'search_memory', 'capture_viewport', 'visual_review', 'preview_layout_nodes',
-    'get_operation_status', 'list_operation_receipts',
-    'inspect_tool_contract', 'search_tool_contracts', 'read_tool_result',
-    'inspect_python', 'inspect_frame_range_risk',
-})
-
-# Plan 规划阶段白名单
-_PLAN_PLANNING_TOOLS = frozenset({
-    'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'find_parameter_references', 'list_multiparm_instances', 'inspect_node', 'get_node_connections',
-    'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
-    'get_geometry_summary', 'get_geometry_points', 'get_geometry_primitives',
-    'get_usd_prim_info', 'get_usd_layer_stack', 'get_top_network_status',
-    'list_top_work_items', 'get_top_errors', 'build_pdg_expression',
-    'temporary_auto_validate_geometry', 'get_scene_snapshot',
-    'read_selection', 'search_node_types', 'semantic_search_nodes',
-    'check_errors',
-    'verify_network', 'web_search', 'fetch_webpage',
-    'search_local_doc', 'get_houdini_node_doc', 'list_skills', 'run_skill',
-    'add_todo', 'update_todo',
-    'perf_start_profile', 'perf_stop_and_report',
-    'search_memory', 'capture_viewport', 'visual_review', 'preview_layout_nodes',
-    'get_operation_status', 'list_operation_receipts',
-    'inspect_tool_contract', 'search_tool_contracts', 'read_tool_result',
-    'inspect_python',
-    'create_plan', 'ask_question', 'inspect_frame_range_risk',
-})
-
 # 只读标签推断
 _READONLY_TOOLS = frozenset({
     'get_network_structure', 'get_node_parameters', 'get_parameter_schema', 'find_parameter_references', 'list_multiparm_instances', 'inspect_node', 'get_node_connections',
@@ -132,11 +91,8 @@ _READONLY_TOOLS = frozenset({
     'inspect_python', 'inspect_frame_range_risk',
 })
 
-_HIGH_RISK_TOOLS = HIGH_RISK_TOOLS
-_CORE_CONFIRM_TOOLS = frozenset((SCENE_MUTATION_TOOLS - {"execute_python"}) | HIGH_RISK_TOOLS | {"set_update_mode"})
-
 _LOCAL_RUNTIME_TOOLS = frozenset({
-    "execute_shell", "search_local_doc", "list_skills",
+    "execute_shell", "search_local_doc", "list_skills", "web_search", "fetch_webpage",
     "get_operation_status", "list_operation_receipts",
     "inspect_tool_contract", "search_tool_contracts", "read_tool_result",
 })
@@ -283,13 +239,15 @@ def build_default_tool_execution_profile() -> Dict[str, Set[str]]:
     }
 
 
-def _infer_modes(name: str) -> Set[str]:
+def _infer_modes(name: str, policy=None) -> Set[str]:
     """根据工具名自动推断适用模式"""
     modes = {"agent", "plan_executing"}  # 所有工具默认可在 Agent 和 Plan 执行阶段使用
-    if name in _ASK_TOOLS:
-        modes.add("ask")
-    if name in _PLAN_PLANNING_TOOLS:
-        modes.add("plan_planning")
+    snapshot = policy if policy is not None else get_security_policy()
+    if snapshot.error:
+        return set()
+    for mode, names in snapshot.tools["mode_tools"].items():
+        if name in names:
+            modes.add(mode)
     return modes
 
 
@@ -334,9 +292,14 @@ def _infer_concurrency_safe(name: str) -> bool:
     return name in _READONLY_TOOLS or name in _CONCURRENCY_SAFE_TOOLS
 
 
-def _infer_risk_level(name: str) -> str:
+def _infer_risk_level(name: str, policy=None) -> str:
     """Infer risk level for policy and UI display."""
-    if name in _HIGH_RISK_TOOLS:
+    snapshot = policy if policy is not None else get_security_policy()
+    if snapshot.error:
+        return "high"
+    if name in snapshot.tools["risk_overrides"]:
+        return snapshot.tools["risk_overrides"][name]
+    if name in snapshot.tools["destructive_tools"] or name in snapshot.tools["code_exec_tools"]:
         return "high"
     if name in _READONLY_TOOLS:
         return "low"
@@ -359,7 +322,8 @@ class ToolRegistry:
       - modes: set[str]  例如 {"agent", "ask", "plan_planning", "plan_executing"}
     """
 
-    def __init__(self):
+    def __init__(self, policy=None):
+        self.policy = policy if policy is not None else get_security_policy()
         self._lock = threading.Lock()
         self._tools: Dict[str, ToolMeta] = {}       # name -> ToolMeta
         self._disabled_tools: Set[str] = set()       # 持久化禁用列表
@@ -445,8 +409,29 @@ class ToolRegistry:
 
     # ---------- 查询 ----------
 
+    def validate_policy_references(self) -> bool:
+        """Validate configured tool references after the core catalog is registered."""
+        if self.policy.error:
+            return False
+        tools = self.policy.tools
+        references = set(tools["risk_overrides"])
+        for key in ("destructive_tools", "code_exec_tools", "scene_mutation_tools", "confirmation_tools"):
+            references.update(tools[key])
+        for names in tools["mode_tools"].values():
+            references.update(names)
+        for rule in tools["confirmation_rules"]:
+            references.update(rule["tools"])
+        with self._lock:
+            known = set(self._tools) | _READONLY_TOOLS | _MUTATING_TOOLS | {"run_skill", "list_skills", "create_plan", "ask_question", "update_plan_step"}
+        if references - known:
+            self.policy = replace(self.policy, error="policy_unavailable")
+            return False
+        return True
+
     def get_tools_for_mode(self, mode: str, runtime: Optional[str] = None) -> List[dict]:
         """按模式获取工具 schema 列表（仅返回启用的工具）"""
+        if self.policy.error:
+            return []
         with self._lock:
             result = []
             for meta in self._tools.values():
@@ -508,6 +493,8 @@ class ToolRegistry:
 
     def authorize_dispatch(self, name: str, mode: str, runtime: str) -> Dict[str, Any]:
         """Authorize a dispatch against registration, enabled, mode and runtime facts."""
+        if self.policy.error:
+            return {"allowed": False, "error": "Security policy unavailable; execution denied"}
         with self._lock:
             meta = self._tools.get(name)
             if meta is None:
@@ -522,6 +509,8 @@ class ToolRegistry:
 
     def get_meta(self, name: str) -> Optional[ToolMeta]:
         """获取工具的完整元数据（含 risk_level / tags / modes 等）"""
+        if self.policy.error:
+            return None
         return self._tools.get(name)
 
     def inspect_contract(self, name: str) -> Optional[Dict[str, Any]]:
@@ -560,11 +549,14 @@ class ToolRegistry:
         mode: str = "",
         tags: Optional[Set[str]] = None,
         limit: int = 20,
+        enabled_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """Search public tool contracts without exposing executable handlers."""
         needle = str(query or "").strip().lower()
         required_tags = {str(tag).strip().lower() for tag in (tags or set()) if str(tag).strip()}
         bounded_limit = min(100, max(1, int(limit)))
+        terms = re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]+", needle)
+        intent_names = set().union(*(self._INTENT_TOOL_GROUPS.get(intent, set()) for intent in self.classify_intent(needle)))
         with self._lock:
             names = sorted(self._tools)
         results = []
@@ -572,18 +564,23 @@ class ToolRegistry:
             contract = self.inspect_contract(name)
             if contract is None:
                 continue
+            if enabled_only and not contract["enabled"]:
+                continue
             if mode and mode not in contract["modes"]:
                 continue
             if required_tags and not required_tags.issubset(set(contract["tags"])):
                 continue
             function = contract["schema"].get("function", {})
             haystack = " ".join((name, str(function.get("description") or ""), " ".join(contract["tags"]))).lower()
-            if needle and needle not in haystack:
+            score = (1000 if needle == name.lower() else 100 if needle and needle in haystack else 0)
+            score += sum(5 for term in terms if len(term) > 1 and term in haystack)
+            if name in intent_names:
+                score += 1
+            if needle and not score:
                 continue
-            results.append(contract)
-            if len(results) >= bounded_limit:
-                break
-        return results
+            results.append((score, name, contract))
+        results.sort(key=lambda item: (-item[0], item[1]))
+        return [item[2] for item in results[:bounded_limit]]
 
     def contract_version(self, name: str) -> str:
         contract = self.inspect_contract(name)
@@ -815,11 +812,11 @@ class ToolRegistry:
                     handler=None,
                     source="core",
                     tags=_infer_tags(name),
-                    modes=_infer_modes(name),
+                    modes=_infer_modes(name, self.policy),
                     concurrency_safe=_infer_concurrency_safe(name),
-                    risk_level=_infer_risk_level(name),
+                    risk_level=_infer_risk_level(name, self.policy),
                     runtime="local" if name in _LOCAL_RUNTIME_TOOLS else "houdini",
-                    requires_confirmation=name in _CORE_CONFIRM_TOOLS,
+                    requires_confirmation=name in self.policy.tools.get("confirmation_tools", ()),
                     path_kinds=_infer_path_kinds(tool_def),
                     mutating=name in _MUTATING_TOOLS,
                     undo=name in _MUTATING_TOOLS,
@@ -843,8 +840,7 @@ class ToolRegistry:
     # 工具按功能分组
     _INTENT_TOOL_GROUPS: Dict[str, Set[str]] = {
         'base': {
-            'get_network_structure', 'read_selection', 'verify_network',
-            'search_memory',
+            'get_network_structure', 'read_selection', 'search_tool_contracts',
             # 大结果折叠后只能靠 read_tool_result 读回；回执工具用于超时后的状态确认
             'read_tool_result', 'get_operation_status', 'list_operation_receipts',
         },
@@ -997,15 +993,6 @@ class ToolRegistry:
 
     _DEFAULT_INTENT_GROUPS = frozenset({'base', 'task'})
 
-    # Agent 模式应始终具备最小写操作能力；Ask 模式仍保持只读。
-    _AGENT_ALWAYS_TOOLS = frozenset({
-        'create_node', 'create_nodes_batch', 'create_wrangle_node',
-        'set_node_parameter', 'batch_set_parameters', 'upsert_spare_parameter', 'set_node_flags',
-        'connect_nodes', 'disconnect_nodes', 'delete_node', 'rename_node',
-        'layout_nodes', 'copy_node', 'create_named_null',
-        'set_update_mode', 'visual_review',
-    }) | HIGH_RISK_TOOLS
-
     _TOOL_DEPENDENCIES: Dict[str, Set[str]] = {
         'connect_nodes': {'get_node_connections', 'suggest_connection', 'preview_node_operation'},
         'disconnect_nodes': {'get_node_connections', 'preview_node_operation'},
@@ -1072,8 +1059,11 @@ class ToolRegistry:
     def select_tools_for_request(self, user_message: str, mode: str = 'agent',
                                  extra_names: Optional[Iterable[str]] = None) -> List[dict]:
         """Classify a user request and return the smallest useful tool schema set."""
+        message = (user_message or "").lower()
+        mentioned = {name for name in self.get_tool_names_for_mode(mode)
+                     if re.search(r"(?<![a-z0-9_])" + re.escape(name.lower()) + r"(?![a-z0-9_])", message)}
         return self.get_tools_for_intent(
-            self.classify_intent(user_message or ""), mode=mode, extra_names=extra_names
+            self.classify_intent(user_message or ""), mode=mode, extra_names=mentioned | set(extra_names or ())
         )
 
     def get_tools_for_intent(self, intents: Set[str], mode: str = 'agent',
@@ -1084,6 +1074,8 @@ class ToolRegistry:
         extra_names 为调用方要求保留的工具（如本会话已暴露/已调用过的）。
         只返回该 mode 下允许且启用的工具。
         """
+        if self.policy.error:
+            return []
         # 始终包含基础工具组
         active_groups = set(self._DEFAULT_INTENT_GROUPS) | intents
 
@@ -1091,14 +1083,15 @@ class ToolRegistry:
         target_names: Set[str] = set()
         for group in active_groups:
             target_names |= self._INTENT_TOOL_GROUPS.get(group, set())
-        if mode == 'agent':
-            target_names |= self._AGENT_ALWAYS_TOOLS
-        target_names = self._expand_tool_dependencies(target_names)
-
         # Skill 元工具始终可用：skill 通过 run_skill/list_skills 暴露（非独立工具），
         # 不属于任何意图组，必须显式纳入，否则会被意图过滤剔除。
         target_names |= {'run_skill', 'list_skills'}
+        if mode == 'plan_planning':
+            target_names |= {'create_plan', 'ask_question'}
+        elif mode == 'plan_executing':
+            target_names.add('update_plan_step')
         target_names |= set(extra_names or ())
+        target_names = self._expand_tool_dependencies(target_names)
 
         # 过滤：必须在指定 mode 中且启用
         with self._lock:

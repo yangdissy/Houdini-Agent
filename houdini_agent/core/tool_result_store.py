@@ -46,6 +46,10 @@ class ToolResultStore:
             "sha256": sha256,
             "content_type": "application/json",
             **({"operation_receipt": result["operation_receipt"]} if "operation_receipt" in result else {}),
+            **{key: result[key] for key in (
+                "audit_status", "audit_warning", "audit_call_id", "replay_safe", "operation_id", "request_ref",
+                "scene_consistency", "thread_still_running", "verification", "error_code",
+            ) if key in result},
         }
 
     def read(self, result_ref: str, pointer: str = "", offset: int = 0, limit: int = 6000) -> Dict[str, Any]:

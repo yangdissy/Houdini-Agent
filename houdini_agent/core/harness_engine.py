@@ -12,44 +12,27 @@ import json
 import os
 import re
 import time
+import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .harness_policy_config import (
-    CONTROLLED_WRITE_SKILLS,
     EXECUTION_ERROR_FAMILY_PATTERN,
     EXECUTION_FAILURE_LIMIT,
     EXECUTION_FAILURE_RECOVERY_HINT,
     EXECUTION_RECOVERY_TOOLS,
-    HIGH_RISK_TOOLS,
-    PRIVATE_USER_PATH_PATTERN,
-    PYTHON_BLOCKED_CALLS,
-    PYTHON_BLOCKED_MODULES,
-    PYTHON_DANGEROUS_PATTERNS,
     SECRET_REDACTION_PATTERNS,
     SENSITIVE_ARG_KEYS,
-    SENSITIVE_VALUE_PATTERNS,
-    SHELL_DANGEROUS_PATTERNS,
+    get_security_policy,
 )
 
-
-def _parse_bool(value: str, default: bool = False) -> bool:
-    text = (value or "").strip().lower()
-    if not text:
-        return default
-    if text in {"1", "true", "yes", "on"}:
-        return True
-    if text in {"0", "false", "no", "off"}:
-        return False
-    return default
+_AUDIT_CONTEXT: ContextVar = ContextVar("tool_audit_context", default=None)
 
 
 def is_harness_v2_enabled(default: bool = True) -> bool:
-    """Read Harness V2 switch from environment variable.
-
-    HOUDINI_AGENT_HARNESS_V2=true|false  (default: enabled)
-    """
-    return _parse_bool(os.getenv("HOUDINI_AGENT_HARNESS_V2", ""), default=default)
+    """Governance is mandatory; the legacy environment switch is ignored."""
+    return True
 
 
 def build_tool_retry_key(tool_name: str, args: Optional[Dict[str, Any]]) -> str:
@@ -184,6 +167,8 @@ class HarnessRuntimeState:
     """Small state container for runtime tracing."""
 
     session_id: str = ""
+    run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    audit_state: Dict[str, bool] = field(default_factory=dict)
     started_at: float = field(default_factory=time.time)
     iteration: int = 0
     retries: int = 0
@@ -214,7 +199,8 @@ class ToolArgumentValidator:
         "/cop",
     })
 
-    def __init__(self, get_tool_meta=None):
+    def __init__(self, get_tool_meta=None, policy=None):
+        self.policy = policy if policy is not None else get_security_policy()
         if get_tool_meta is None:
             from houdini_agent.utils.tool_registry import get_tool_registry
             get_tool_meta = get_tool_registry().get_meta
@@ -273,7 +259,7 @@ class ToolArgumentValidator:
         if tool_name == "execute_python":
             reason = self._check_python_code(str(safe_args.get("code") or "")) or self._match_patterns(
                 str(safe_args.get("code") or ""),
-                PYTHON_DANGEROUS_PATTERNS,
+                self.policy.tools["python_dangerous_patterns"],
                 "Tool input guardrail blocked dangerous Python",
             )
             if reason:
@@ -284,7 +270,7 @@ class ToolArgumentValidator:
         if tool_name == "execute_shell":
             reason = self._match_patterns(
                 str(safe_args.get("command") or ""),
-                SHELL_DANGEROUS_PATTERNS,
+                self.policy.tools["shell_dangerous_patterns"],
                 "Tool input guardrail blocked dangerous shell command",
                 flags=re.IGNORECASE,
             )
@@ -295,8 +281,7 @@ class ToolArgumentValidator:
 
         return ToolValidationResult(args=safe_args, issues=issues)
 
-    @staticmethod
-    def _check_python_code(code: str) -> str:
+    def _check_python_code(self, code: str) -> str:
         try:
             tree = ast.parse(code)
         except (SyntaxError, ValueError):
@@ -307,13 +292,13 @@ class ToolArgumentValidator:
             if isinstance(node, ast.Import):
                 for item in node.names:
                     aliases[item.asname or item.name.split('.')[0]] = item.name if item.asname else item.name.split('.')[0]
-                    if any(item.name == module or item.name.startswith(module + '.') for module in PYTHON_BLOCKED_MODULES):
+                    if any(item.name == module or item.name.startswith(module + '.') for module in self.policy.tools["python_blocked_modules"]):
                         return "Tool input guardrail blocked dangerous Python module: " + item.name
             elif isinstance(node, ast.ImportFrom):
                 module = node.module or ""
                 for item in node.names:
                     aliases[item.asname or item.name] = module + '.' + item.name
-                if any(module == blocked or module.startswith(blocked + '.') for blocked in PYTHON_BLOCKED_MODULES):
+                if any(module == blocked or module.startswith(blocked + '.') for blocked in self.policy.tools["python_blocked_modules"]):
                     return "Tool input guardrail blocked dangerous Python module: " + module
 
         def resolve(node: ast.AST) -> str:
@@ -329,7 +314,7 @@ class ToolArgumentValidator:
             if not isinstance(node, ast.Call):
                 continue
             name = resolve(node.func)
-            if name in PYTHON_BLOCKED_CALLS:
+            if name in self.policy.tools["python_blocked_calls"]:
                 return "Tool input guardrail blocked dangerous Python call: " + name
             if name in {"open", "builtins.open", "io.open", "pathlib.Path.open"}:
                 mode_index = 0 if name == "pathlib.Path.open" else 1
@@ -346,12 +331,12 @@ class ToolArgumentValidator:
     def _check_sensitive_args(self, args: Dict[str, Any]) -> str:
         for key, value in self._walk_args(args):
             key_text = str(key or "").strip().lower()
-            if key_text in SENSITIVE_ARG_KEYS or key_text.endswith(("_api_key", "_token", "_password", "_secret")):
+            if key_text in self.policy.tools["sensitive_arg_keys"] or key_text.endswith(("_api_key", "_token", "_password", "_secret")):
                 return f"Tool input guardrail blocked sensitive argument: {key}"
             if isinstance(value, str):
                 reason = self._match_patterns(
                     value,
-                    SENSITIVE_VALUE_PATTERNS,
+                    self.policy.tools["sensitive_value_patterns"],
                     "Tool input guardrail blocked sensitive value",
                     flags=re.IGNORECASE,
                 )
@@ -436,11 +421,18 @@ class HarnessToolPolicyEngine:
     The default policy is conservative and only blocks obviously invalid calls.
     """
 
-    def __init__(self, validator: Optional[ToolArgumentValidator] = None, get_tool_meta=None):
-        self.validator = validator or ToolArgumentValidator(get_tool_meta=get_tool_meta)
+    def __init__(self, validator: Optional[ToolArgumentValidator] = None, get_tool_meta=None, policy=None):
+        owner = getattr(get_tool_meta, "__self__", None)
+        self.policy = policy if policy is not None else getattr(owner, "policy", get_security_policy())
+        self.validator = validator or ToolArgumentValidator(get_tool_meta=get_tool_meta, policy=self.policy)
         self._get_tool_meta = get_tool_meta or self.validator._get_tool_meta
 
     def decide(self, tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> ToolPolicyDecision:
+        if self.policy.error:
+            return self._decision(
+                "deny", "Security policy unavailable; execution denied",
+                risk_factors=[RiskFactor("policy_unavailable", "error", "Security policy unavailable", 1.0)],
+            )
         validation = self.validator.validate(tool_name, args)
         safe_args = validation.args
 
@@ -449,7 +441,7 @@ class HarnessToolPolicyEngine:
             if not isinstance(value, str):
                 continue
             normalized = re.sub(r'/+', '/', value.replace('\\', '/'))
-            for match in re.finditer(PRIVATE_USER_PATH_PATTERN, normalized):
+            for match in re.finditer(self.policy.tools["private_user_path_pattern"], normalized):
                 owner = (match.group(1) or "").casefold()
                 if not username or owner != username or "/../" in normalized:
                     return self._decision(
@@ -479,11 +471,11 @@ class HarnessToolPolicyEngine:
         controlled_skill_action = skill_params.get("action") or skill_params.get("mode", "preview")
         controlled_skill_write = (
             tool_name == "run_skill"
-            and safe_args.get("skill_name") in CONTROLLED_WRITE_SKILLS
+            and safe_args.get("skill_name") in self.policy.tools["controlled_write_skills"]
             and controlled_skill_action == "preview"
         )
         if tool_name == "remember_memory":
-            if int(context.get("remember_memory_calls") or 0) >= 1:
+            if int(context.get("remember_memory_calls") or 0) >= self.policy.tools["memory_calls_per_request"]:
                 return self._decision(
                     "deny",
                     "remember_memory is limited to one call per request",
@@ -522,21 +514,6 @@ class HarnessToolPolicyEngine:
                     )],
                     required_control="deny",
                 )
-            # ★ 写长期记忆前必须经用户确认：确认框会展示 LLM 总结的 content
-            #   （长度上限由 explicit_memory._MAX_CONTENT_LENGTH 保证），
-            #   用户可核对内容是否准确后再放行写入。
-            return self._decision(
-                "ask",
-                "remember_memory writes long-term memory; review summarized content before confirming",
-                risk_factors=[RiskFactor(
-                    "explicit_memory_review",
-                    "info",
-                    "review summarized memory content before writing",
-                    0.3,
-                )],
-                required_control="confirm",
-            )
-
         if mode == "ask" and not confirmed and (meta.risk_level == "high" or tool_name == "execute_python"):
             return self._decision(
                 "deny",
@@ -545,21 +522,22 @@ class HarnessToolPolicyEngine:
                 required_control="deny",
             )
 
-        if (
-                mode in {"agent", "plan"}
-                and tool_name == "run_skill"
-                and safe_args.get("skill_name") in CONTROLLED_WRITE_SKILLS
-                and controlled_skill_action in {"install", "activate"}):
+        for rule in self.policy.tools["confirmation_rules"]:
+            if tool_name not in rule["tools"] or mode not in rule["modes"]:
+                continue
+            if rule["action"] == "ask" and confirmed:
+                continue
+            if any(safe_args.get(key) != value for key, value in rule.get("arguments", {}).items()):
+                continue
+            if "skill_names" in rule and safe_args.get("skill_name") not in rule["skill_names"]:
+                continue
+            if "skill_actions" in rule and controlled_skill_action not in rule["skill_actions"]:
+                continue
             return self._decision(
-                "ask",
-                f"Skill action '{controlled_skill_action}' requires confirmation: {safe_args.get('skill_name')}",
-                risk_factors=[RiskFactor(
-                    "controlled_skill_write_confirmation",
-                    "warning",
-                    f"Controlled Skill action requires confirmation: {controlled_skill_action}",
-                    0.7,
-                )],
-                required_control="confirm",
+                rule["action"], rule["message"],
+                patched_args=safe_args if safe_args != args else None,
+                risk_factors=[RiskFactor(rule["id"], "warning", rule["message"], rule["score"])],
+                required_control="confirm" if rule["action"] == "ask" else "deny",
             )
 
         # Ownership 检查必须先于通用确认返回：修改非本 session agent 创建节点时，
@@ -606,39 +584,6 @@ class HarnessToolPolicyEngine:
                     required_control="retry",
                 )
 
-        # cook_node force=true 触发硬复位（bypass 切换 + 清 cache + 强制 cook），
-        # 可能长时间阻塞 Houdini 主线程。无论是否开启 confirm_mode，都要求用户确认，
-        # 防止模型绕过工具描述直接硬 cook 导致界面卡死。
-        if (
-            tool_name == "cook_node"
-            and bool(safe_args.get("force"))
-            and mode in {"agent", "plan", "plan_executing"}
-            and not confirmed):
-            return self._decision(
-                "ask",
-                "cook_node force=true may block Houdini; requires confirmation",
-                patched_args=safe_args if safe_args != args else None,
-                risk_factors=[RiskFactor("cook_force_confirmation", "warning", "cook_node force=true may block Houdini", 0.8)],
-                required_control="confirm",
-            )
-
-        if (
-            tool_name == "cook_sample_frames"
-            and mode in {"agent", "plan", "plan_executing"}
-            and not confirmed):
-            return self._decision(
-                "ask",
-                "cook_sample_frames may make Houdini unresponsive while cooking; please wait patiently after confirming",
-                patched_args=safe_args if safe_args != args else None,
-                risk_factors=[RiskFactor(
-                    "cook_sample_frames_confirmation",
-                    "warning",
-                    "Sample frame cooks may temporarily block Houdini; wait patiently",
-                    0.8,
-                )],
-                required_control="confirm",
-            )
-
         if safe_args != args:
             factors = [RiskFactor("args_normalized", "info", "Arguments normalized", 0.0)]
             if foreign_factor is not None:
@@ -659,8 +604,8 @@ class HarnessToolPolicyEngine:
 
         return self._decision("allow")
 
-    @staticmethod
     def _foreign_node_factor(
+        self,
         tool_name: str,
         safe_args: Dict[str, Any],
         context: Dict[str, Any],
@@ -671,10 +616,8 @@ class HarnessToolPolicyEngine:
         Policy layer does not query hou; it only compares declared node path
         arguments against the session's agent-created set from context.
         """
-        from .harness_policy_config import SCENE_MUTATION_TOOLS
-
         # DESTRUCTIVE_TOOLS（delete_node 等）不在 SCENE_MUTATION_TOOLS 里，单独放行
-        if tool_name not in SCENE_MUTATION_TOOLS and tool_name != "delete_node":
+        if tool_name not in self.policy.tools["scene_mutation_tools"] and tool_name != "delete_node":
             return None
         if tool_name.startswith("create_") or tool_name in {"layout_nodes", "execute_python"}:
             return None
@@ -753,6 +696,8 @@ class GovernedToolExecutor:
         retry_counts=None,
         retry_limit=2,
         execution_failures: Optional[Dict[str, Tuple[str, int]]] = None,
+        audit_state: Optional[Dict[str, bool]] = None,
+        get_tool_meta=None,
     ):
         self._policy_engine = policy_engine
         self._execute = execute
@@ -762,8 +707,40 @@ class GovernedToolExecutor:
         self._retry_counts = retry_counts if retry_counts is not None else {}
         self._retry_limit = retry_limit
         self._execution_failures = execution_failures if execution_failures is not None else {}
+        self._audit_state = audit_state if audit_state is not None else {}
+        self._get_tool_meta = get_tool_meta
 
     def execute(self, tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        identity = {
+            "call_id": uuid.uuid4().hex,
+            "run_id": str(context.get("run_id") or ""),
+            "session_id": str(context.get("session_id") or ""),
+            "mode": context.get("mode", "agent"),
+            "iteration": context.get("iteration", 0),
+            "__terminal": False,
+            "__executed": False,
+        }
+        token = _AUDIT_CONTEXT.set(identity)
+        try:
+            result = self._execute_call(tool_name, args, context)
+            if not identity["__terminal"]:
+                self._record_audit({
+                    "event_type": "tool_call", "phase": "result", "tool": tool_name,
+                    "success": bool(result.get("success")),
+                    "execution_status": "executed" if identity["__executed"] else "not_started",
+                    "error_code": result.get("error_code", "policy_denied" if not result.get("success") else ""),
+                })
+            if self._audit_state.get("degraded"):
+                result["audit_status"] = "degraded"
+                result["audit_warning"] = "Tool audit is incomplete; writes are blocked for this run."
+                if identity["__executed"] and not self._allows_unaudited_read(tool_name):
+                    result["replay_safe"] = False
+                    result["audit_call_id"] = identity["call_id"]
+            return result
+        finally:
+            _AUDIT_CONTEXT.reset(token)
+
+    def _execute_call(self, tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         safe_args = dict(args or {})
         try:
             decision = self._policy_engine.decide(tool_name, safe_args, context)
@@ -774,7 +751,13 @@ class GovernedToolExecutor:
         action = decision.action
         reason = decision.reason or ""
         exec_args = decision.patched_args if decision.patched_args is not None else safe_args
-        self._record_decision(tool_name, action, reason)
+        audited = self._record_decision(tool_name, action, reason, decision)
+
+        if (not audited or self._audit_state.get("degraded")) and action != "deny" and not self._allows_unaudited_read(tool_name):
+            return {
+                "success": False, "error": "Tool audit unavailable; write execution denied",
+                "error_code": "audit_unavailable", "audit_status": "degraded",
+            }
 
         if action == "deny":
             return {"success": False, "error": reason or f"Tool blocked by policy: {tool_name}"}
@@ -796,16 +779,20 @@ class GovernedToolExecutor:
 
         if action == "ask":
             if self._confirm is None:
-                return {"success": False, "error": "Tool confirmation unavailable; execution denied"}
+                return {"success": False, "error": "Tool confirmation unavailable; execution denied", "error_code": "confirmation_unavailable"}
+            confirmation_code = "confirmation_cancelled"
             try:
                 confirmed = bool(self._confirm(tool_name, exec_args))
             except Exception:
-                import traceback
-                print(f"[Harness] confirm callback raised for {tool_name}:\n{traceback.format_exc()}")
+                confirmation_code = "confirmation_error"
                 confirmed = False
+            self._record_audit({
+                "event_type": "tool_confirmation", "tool": tool_name,
+                "action": "confirmed" if confirmed else confirmation_code,
+            })
             self._record_trace("tool_policy_ask", tool=tool_name, confirmed=confirmed)
             if not confirmed:
-                return {"success": False, "error": reason or f"Tool confirmation cancelled: {tool_name}"}
+                return {"success": False, "error": reason or f"Tool confirmation cancelled: {tool_name}", "error_code": confirmation_code}
             confirmed_context = dict(context)
             confirmed_context["confirmed"] = True
             try:
@@ -813,7 +800,7 @@ class GovernedToolExecutor:
             except Exception:
                 self._record_decision(tool_name, "deny", "confirmed_policy_error")
                 return {"success": False, "error": "Confirmed tool policy evaluation failed; execution denied"}
-            self._record_decision(tool_name, confirmed_decision.action, confirmed_decision.reason or "confirmed")
+            self._record_decision(tool_name, confirmed_decision.action, confirmed_decision.reason or "confirmed", confirmed_decision)
             if confirmed_decision.action != "allow":
                 return {
                     "success": False,
@@ -854,6 +841,9 @@ class GovernedToolExecutor:
                 exec_args["code"].encode("utf-8", errors="replace")
             ).hexdigest()
         self._record_audit(start_audit)
+        if self._audit_state.get("degraded") and not self._allows_unaudited_read(tool_name):
+            return {"success": False, "error": "Tool audit unavailable; write execution denied", "error_code": "audit_unavailable"}
+        _AUDIT_CONTEXT.get()["__executed"] = True
         try:
             result = self._execute(tool_name, exec_args, action == "ask")
         except Exception:
@@ -910,6 +900,8 @@ class GovernedToolExecutor:
             "error_code": error_code,
             "thread_still_running": bool(result.get("thread_still_running", False)),
             "scene_consistency": str(result.get("scene_consistency") or ""),
+            "operation_id": str(result.get("operation_id") or (result.get("operation_receipt") or {}).get("operation_id") or "")
+            if isinstance(result.get("operation_receipt", {}), dict) else "",
             "duration_ms": int(max(0.0, time.time() - started_at) * 1000),
         })
 
@@ -918,12 +910,29 @@ class GovernedToolExecutor:
             self._retry_counts.pop(retry_key, None)
         return result
 
-    def _record_decision(self, tool_name: str, action: str, reason: str):
+    def _record_decision(self, tool_name: str, action: str, reason: str, decision=None) -> bool:
         self._record_trace("tool_policy", tool=tool_name, action=action, reason=reason)
-        self._record_audit({
+        rules = list(decision.matched_rules) if decision is not None else []
+        return self._record_audit({
             "event_type": "tool_policy", "tool": tool_name,
-            "action": action, "reason_code": reason,
+            "action": action,
+            "reason_code": reason if re.fullmatch(r"[a-z][a-z0-9_]*", reason) else (rules[0] if rules else "policy_" + action),
+            "matched_rules": rules,
+            "risk_score": decision.risk_score if decision is not None else 0.0,
+            "required_control": decision.required_control if decision is not None else action,
+            "policy_id": getattr(self._policy_engine, "policy", get_security_policy()).data.get("policy_id", "unavailable"),
+            "policy_version": getattr(self._policy_engine, "policy", get_security_policy()).version,
         })
+
+    def _allows_unaudited_read(self, tool_name: str) -> bool:
+        try:
+            from houdini_agent.utils.tool_registry import get_tool_registry
+            get_meta = self._get_tool_meta or get_tool_registry().get_meta
+            meta = get_meta(tool_name)
+            policy = getattr(self._policy_engine, "policy", get_security_policy())
+            return bool(not policy.error and policy.tools["allow_readonly_audit_degradation"] and meta and "readonly" in meta.tags and not meta.mutating and meta.risk_level == "low")
+        except Exception:
+            return False
 
     def _record_trace(self, event: str, **fields):
         if self._trace is not None:
@@ -932,9 +941,18 @@ class GovernedToolExecutor:
             except Exception:
                 pass
 
-    def _record_audit(self, record: Dict[str, Any]):
+    def _record_audit(self, record: Dict[str, Any]) -> bool:
+        identity = _AUDIT_CONTEXT.get() or {}
+        if record.get("phase") == "result":
+            identity["__terminal"] = True
+        payload = {key: value for key, value in identity.items() if not key.startswith("__")}
+        payload.update(record)
+        payload.update({"schema_version": 2, "timestamp": round(time.time(), 3)})
         if self._audit is not None:
             try:
-                self._audit(record)
+                if self._audit(payload) is not False:
+                    return True
             except Exception:
                 pass
+        self._audit_state["degraded"] = True
+        return False

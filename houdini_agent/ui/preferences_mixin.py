@@ -65,18 +65,21 @@ class PreferencesMixin:
         else:
             system_prompt = self._cached_prompt_think if use_think else self._cached_prompt_no_think
 
-        from houdini_agent.utils.tool_registry import get_tool_registry
-        registry = get_tool_registry()
-        if self._agent_mode:
+        exposure = getattr(self, '_tool_exposure', None)
+        if exposure is not None and getattr(self, '_agent_session_id', None) == self._session_id:
+            tools = exposure.snapshot()
+        elif self._agent_mode:
             tools = self._select_agent_tools_for_message(
                 self._latest_user_message(), use_web=self.web_check.isChecked()
             )
         else:
             mode = "plan_planning" if self._plan_mode else "ask"
-            tools = UltraOptimizer.optimize_tool_definitions(
-                registry.get_tools_for_mode(mode)
+            tools = self._select_agent_tools_for_message(
+                self._latest_user_message(), use_web=self.web_check.isChecked(), mode=mode
             )
 
+        from ..core.agent_request_assembly import finalize_tools
+        tools = finalize_tools(tools, [], self._current_model_supports_vision())
         total = self.token_optimizer.estimate_tokens(system_prompt)
         if self._context_summary:
             total += self.token_optimizer.estimate_tokens(self._context_summary)

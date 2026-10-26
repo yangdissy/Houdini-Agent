@@ -110,6 +110,9 @@ mod.show_tool()
 - Harness 在执行前统一完成参数规范化、风险判定和 `allow` / `deny` / `ask` / `retry` 决策；batch 中每一项都独立经过同一治理链。
 - 修改场景、文件或长期记忆等操作支持人工确认；确认超时、回调异常、策略歧义和授权失败均 fail closed。
 - 主线程执行、Cook Guard、撤销语义、结果清洗和 append-only 审计由统一执行边界协调。
+- 工具风险、模式白名单、确认条件和输入安全规则集中在 `config/security_policy.json`。配置损坏时全部工具拒绝执行；修改后需重启 Houdini 或重新加载模块，不在运行中热更新。
+- 工具审计不可写时，仅明确声明为低风险只读的工具可降级并返回告警；写操作在执行前被拒绝。已经执行、但结果日志写入失败的操作保留真实结果并禁止自动重放，本轮后续写操作也会被阻止。
+- `HOUDINI_AGENT_HARNESS_V2=false` 不再关闭统一治理与审计。
 
 ### 会话与 Plan 可靠性
 
@@ -123,6 +126,7 @@ mod.show_tool()
 - 普通发送、手动压缩和 HTTP 413 恢复共用 round-safe 裁剪，不会拆散 assistant tool call 与对应 tool result。
 - `Aggressive`、`Balanced`、`Conservative` 同时控制自动裁剪目标和近期轮次保护比例，而不只是界面选项。
 - 工具 schema 计入最终 token budget；当前轮图片受保护，旧轮图片可按预算剥离。
+- 工具定义按单次运行加载，不再跨整个会话累积。缺少工具时，Agent 可调用 `search_tool_contracts(load=true)` 搜索并加载，下一轮才可使用；原生工具调用与 JSON 回退遵守相同的模式、Web、视觉和预算约束。
 - 发送边界会捕获本轮用户消息快照，后台 Harness 不再从可变历史中误读上一轮意图。
 
 ### 个人记忆、反馈与 Team Memory

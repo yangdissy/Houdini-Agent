@@ -1,52 +1,129 @@
 # -*- coding: utf-8 -*-
-"""Shared policy constants for Harness V2.
-
-Keep risk-related tool classification in one place so policy checks and
-registry metadata stay consistent.
-"""
+"""Validated security policy snapshots and compatibility names for tool governance."""
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Mapping
 
-DESTRUCTIVE_TOOLS = frozenset({
-    "delete_node",
-    "save_hip",
-})
 
-CODE_EXEC_TOOLS = frozenset({
-    "execute_python",
-    "execute_shell",
-})
+POLICY_PATH = Path(__file__).resolve().parents[2] / "config" / "security_policy.json"
 
-SCENE_MUTATION_TOOLS = frozenset({
-    "execute_python",
-    "create_wrangle_node",
-    "create_node",
-    "create_nodes_batch",
-    "create_named_null",
-    "rename_node",
-    "set_node_parameter",
-    "set_parameter_expression",
-    "set_parameter_reference",
-    "upsert_spare_parameter",
-    "insert_multiparm_instance",
-    "remove_multiparm_instance",
-    "create_object_merges_batch",
-    "batch_set_parameters",
-    "connect_nodes",
-    "cook_node",
-    "cook_sample_frames",
-    "copy_node",
-    "set_display_flag",
-    "disconnect_nodes",
-    "set_node_flags",
-    "create_network_box",
-    "add_nodes_to_box",
-    "set_network_box_comment",
-    "layout_nodes",
-})
 
-HIGH_RISK_TOOLS = frozenset(DESTRUCTIVE_TOOLS | CODE_EXEC_TOOLS)
+def _freeze(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze(child) for key, child in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(child) for child in value)
+    return value
+
+
+@dataclass(frozen=True)
+class SecurityPolicy:
+    data: Mapping[str, Any]
+    version: str
+    error: str = ""
+
+    @property
+    def tools(self) -> Mapping[str, Any]:
+        return self.data.get("tool_policy", {})
+
+
+def load_security_policy(path: Path = POLICY_PATH) -> SecurityPolicy:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("schema_version") != 1 or not isinstance(data.get("policy_id"), str) or not data["policy_id"].strip():
+            raise ValueError("Invalid security policy header")
+        tools = data["tool_policy"]
+        if not isinstance(tools, dict) or not isinstance(tools.get("risk_overrides"), dict):
+            raise ValueError("Invalid tool policy")
+        if any(value not in {"low", "normal", "high"} for value in tools["risk_overrides"].values()):
+            raise ValueError("Invalid tool risk")
+        for section in ("destructive_tools", "code_exec_tools", "scene_mutation_tools", "confirmation_tools", "controlled_write_skills", "sensitive_arg_keys", "python_blocked_modules", "python_blocked_calls"):
+            values = tools[section]
+            if not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values):
+                raise ValueError("Invalid tool policy list")
+        if not isinstance(tools["mode_tools"], dict) or set(tools["mode_tools"]) != {"ask", "plan_planning"}:
+            raise ValueError("Invalid tool modes")
+        for names in tools["mode_tools"].values():
+            if not isinstance(names, list) or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_]\w*", name) for name in names):
+                raise ValueError("Invalid mode tool list")
+        if type(tools["memory_calls_per_request"]) is not int or tools["memory_calls_per_request"] < 1:
+            raise ValueError("Invalid memory call limit")
+        if type(tools["allow_readonly_audit_degradation"]) is not bool:
+            raise ValueError("Invalid audit degradation policy")
+        re.compile(tools["private_user_path_pattern"])
+        for section in ("sensitive_value_patterns", "secret_redaction_patterns", "python_dangerous_patterns", "shell_dangerous_patterns"):
+            if not isinstance(tools[section], list):
+                raise ValueError("Invalid tool pattern list")
+            for pattern, identifier in tools[section]:
+                if not isinstance(pattern, str) or not isinstance(identifier, str):
+                    raise ValueError("Invalid tool pattern")
+                re.compile(pattern)
+        identifiers = set()
+        if not isinstance(tools["confirmation_rules"], list) or not tools["confirmation_rules"]:
+            raise ValueError("Missing confirmation rules")
+        for rule in tools["confirmation_rules"]:
+            if not isinstance(rule, dict):
+                raise ValueError("Invalid confirmation rule")
+            if set(rule) - {"id", "tools", "modes", "action", "score", "message", "arguments", "skill_names", "skill_actions"}:
+                raise ValueError("Unknown confirmation rule field")
+            if rule["id"] in identifiers or not re.fullmatch(r"[a-z][a-z0-9_]*", rule["id"]):
+                raise ValueError("Invalid confirmation rule ID")
+            identifiers.add(rule["id"])
+            if rule["action"] not in {"ask", "deny"} or not isinstance(rule["message"], str):
+                raise ValueError("Invalid confirmation rule action")
+            if not isinstance(rule["score"], (int, float)) or not 0 <= rule["score"] <= 1:
+                raise ValueError("Invalid confirmation rule score")
+            if not isinstance(rule["tools"], list) or not rule["tools"] or any(not isinstance(name, str) for name in rule["tools"]):
+                raise ValueError("Invalid confirmation rule tools")
+            if not isinstance(rule["modes"], list) or not rule["modes"] or set(rule["modes"]) - {"agent", "ask", "plan", "plan_planning", "plan_executing"}:
+                raise ValueError("Invalid confirmation rule modes")
+            if not isinstance(rule.get("arguments", {}), dict):
+                raise ValueError("Invalid confirmation rule arguments")
+            for key in ("skill_names", "skill_actions"):
+                if key in rule and (not isinstance(rule[key], list) or any(not isinstance(value, str) for value in rule[key])):
+                    raise ValueError("Invalid confirmation skill condition")
+        for section in ("injection_patterns", "memory_patterns"):
+            if not isinstance(data[section], list) or not data[section]:
+                raise ValueError("Missing security patterns")
+            for rule, pattern in data[section]:
+                if not isinstance(rule, str) or not rule or not isinstance(pattern, str):
+                    raise ValueError("Invalid security pattern")
+                re.compile(pattern, re.IGNORECASE)
+        encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        return SecurityPolicy(_freeze(data), "sha256:" + hashlib.sha256(encoded).hexdigest())
+    except (OSError, ValueError, KeyError, TypeError, re.error):
+        return SecurityPolicy(MappingProxyType({}), "unavailable", "policy_unavailable")
+
+
+@lru_cache(maxsize=1)
+def get_security_policy() -> SecurityPolicy:
+    return load_security_policy()
+
+
+def __getattr__(name: str) -> Any:
+    tools = get_security_policy().tools
+    if name == "HIGH_RISK_TOOLS":
+        return frozenset(tools.get("destructive_tools", ())) | frozenset(tools.get("code_exec_tools", ()))
+    sections = {
+        "DESTRUCTIVE_TOOLS": "destructive_tools", "CODE_EXEC_TOOLS": "code_exec_tools",
+        "SCENE_MUTATION_TOOLS": "scene_mutation_tools", "CONTROLLED_WRITE_SKILLS": "controlled_write_skills",
+        "SENSITIVE_ARG_KEYS": "sensitive_arg_keys", "PYTHON_BLOCKED_MODULES": "python_blocked_modules",
+        "PYTHON_BLOCKED_CALLS": "python_blocked_calls", "PRIVATE_USER_PATH_PATTERN": "private_user_path_pattern",
+        "SENSITIVE_VALUE_PATTERNS": "sensitive_value_patterns", "SECRET_REDACTION_PATTERNS": "secret_redaction_patterns",
+        "PYTHON_DANGEROUS_PATTERNS": "python_dangerous_patterns", "SHELL_DANGEROUS_PATTERNS": "shell_dangerous_patterns",
+    }
+    if name not in sections:
+        raise AttributeError(name)
+    value = tools.get(sections[name], "" if name == "PRIVATE_USER_PATH_PATTERN" else ())
+    return frozenset(value) if name.endswith(("_TOOLS", "_SKILLS", "_KEYS", "_MODULES", "_CALLS")) else value
 
 EXECUTION_FAILURE_LIMIT = 2
 EXECUTION_ERROR_FAMILY_PATTERN = r"(?m)^\s*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*(?:Error|Exception)|OperationFailed|ObjectWasDeleted|InvalidNodeType):"
@@ -65,88 +142,6 @@ EXECUTION_FAILURE_RECOVERY_HINT = (
     "Do not keep rewriting code or repeating the call. Inspect the relevant node/parameters "
     "or read the relevant documentation/tool contract with a read-only tool before retrying. "
     "If no new evidence is available, report the blocker to the user."
-)
-
-# Skills that implement their own narrower write authorization contract.
-# install_houdini_skill separates source installation from explicit activation.
-CONTROLLED_WRITE_SKILLS = frozenset({
-    "install_houdini_skill",
-})
-
-PRIVATE_USER_PATH_PATTERN = r'(?i)(?:^|[^\w])cache/+users(?:/+([^/\s\'"<>;,)]+))?'
-
-SENSITIVE_ARG_KEYS = frozenset({
-    'api_key',
-    'apikey',
-    'access_key',
-    'auth_token',
-    'authorization',
-    'bearer_token',
-    'client_secret',
-    'credential',
-    'credentials',
-    'password',
-    'private_key',
-    'secret',
-    'secret_key',
-    'token',
-})
-
-SENSITIVE_VALUE_PATTERNS = (
-    (r'\bsk-[A-Za-z0-9_\-]{16,}\b', 'openai_style_api_key'),
-    (r'\b(?:api[_-]?key|password|passwd|pwd|secret|token)["\']?\s*[:=]', 'sensitive_assignment'),
-    (r'-----BEGIN [A-Z ]*PRIVATE KEY-----', 'private_key_block'),
-    (r'\bBearer\s+[A-Za-z0-9._\-]{16,}\b', 'bearer_token'),
-)
-
-SECRET_REDACTION_PATTERNS = (
-    (r'\bsk-[A-Za-z0-9_\-]{8,}\b', '[REDACTED_API_KEY]'),
-    (r'\bBearer\s+[A-Za-z0-9._\-]{8,}\b', 'Bearer [REDACTED_TOKEN]'),
-    (r'(?i)\b(api[_-]?key|password|passwd|pwd|secret|token)["\']?\s*[:=]\s*(?:"[^"\n]*"|\'[^\'\n]*\'|[^\s,;]+)', r'\1=[REDACTED]'),
-    (r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----', '[REDACTED_PRIVATE_KEY]'),
-)
-
-PYTHON_BLOCKED_MODULES = frozenset({
-    'subprocess', 'importlib', 'requests', 'urllib', 'socket', 'http.client',
-})
-
-PYTHON_BLOCKED_CALLS = frozenset({
-    'os.remove', 'os.unlink', 'os.rmdir', 'os.removedirs', 'os.system',
-    'shutil.rmtree', 'pathlib.Path.unlink', 'pathlib.Path.rmdir',
-    'pathlib.Path.write_text', 'pathlib.Path.write_bytes',
-    '__import__', 'exec', 'eval', 'compile',
-})
-
-PYTHON_DANGEROUS_PATTERNS = (
-    (r'\bos\.remove\b', 'python_os_remove'),
-    (r'\bos\.rmdir\b', 'python_os_rmdir'),
-    (r'\bshutil\.rmtree\b', 'python_shutil_rmtree'),
-    (r'\bos\.system\b', 'python_os_system'),
-    (r'\bsubprocess\b', 'python_subprocess'),
-    (r'\b__import__\b', 'python_dynamic_import'),
-    (r'\bhou\.exit\b', 'python_hou_exit'),
-    (r'\bhou\.hipFile\.clear\b', 'python_hip_clear'),
-)
-
-SHELL_DANGEROUS_PATTERNS = (
-    (r'\brm\s+.*-r', 'shell_rm_recursive'),
-    (r'\brm\s+.*-f', 'shell_rm_force'),
-    (r'\b(?:rmdir|rd)\s+[^\r\n;&|]*/s\b', 'shell_rmdir_recursive'),
-    (r'\bdel\s+[^\r\n;&|]*/[sq]\b', 'shell_del_recursive'),
-    (r'\bformat\s+[a-zA-Z]:', 'shell_format_disk'),
-    (r'\breg\s+(delete|add)', 'shell_registry_edit'),
-    (r'\bshutdown\b', 'shell_shutdown'),
-    (r'\breboot\b', 'shell_reboot'),
-    (r'\brunas\b', 'shell_runas'),
-    (r'\bsudo\b', 'shell_sudo'),
-    (r'\bnetsh\b', 'shell_netsh'),
-    (r'\btaskkill\s+/f', 'shell_taskkill_force'),
-    (r'\b(?:Remove-Item|ri|rm|del|erase|rd|rmdir)\s+[^\r\n;&|]*-Recurse\b', 'shell_powershell_recursive_delete'),
-    (r'Invoke-Expression', 'shell_invoke_expression'),
-    (r'\biex\b', 'shell_iex'),
-    (r'\bdiskpart\b', 'shell_diskpart'),
-    (r'%0\|%0', 'shell_fork_bomb_cmd'),
-    (r':\(\)\{.*\}', 'shell_fork_bomb_sh'),
 )
 
 # 静默工具：不在执行列表 UI 中显示

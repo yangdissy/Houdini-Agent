@@ -17,19 +17,25 @@ _POLICY_PATH = Path(__file__).resolve().parents[2] / "config" / "memory_quality_
 
 def load_quality_policy() -> dict[str, Any]:
     policy = json.loads(_POLICY_PATH.read_text(encoding="utf-8"))
-    for key in ("trial_confidence_cap", "unused_decay", "confidence_increment"):
+    policy.setdefault("promotion_reward_threshold", 0.6)
+    policy.setdefault("negative_citation_decay", 0.9)
+    policy.setdefault("generic_patterns", [])
+    for key in ("trial_confidence_cap", "unused_decay", "negative_citation_decay", "confidence_increment"):
         value = policy[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 < value <= 1:
             raise ValueError(f"Invalid memory policy: {key}")
+    value = policy["promotion_reward_threshold"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+        raise ValueError("Invalid memory policy: promotion_reward_threshold")
     for key in ("promotion_citations", "min_rule_chars", "max_rule_chars"):
         if type(policy[key]) is not int or policy[key] < 1:
             raise ValueError(f"Invalid memory policy: {key}")
     if policy["min_rule_chars"] > policy["max_rule_chars"]:
         raise ValueError("Invalid memory rule length limits")
-    for key in ("blocked_patterns", "generic_rules"):
+    for key in ("blocked_patterns", "generic_rules", "generic_patterns"):
         if not isinstance(policy[key], list) or not all(isinstance(item, str) for item in policy[key]):
             raise ValueError(f"Invalid memory policy: {key}")
-    for pattern in policy["blocked_patterns"]:
+    for pattern in policy["blocked_patterns"] + policy["generic_patterns"]:
         re.compile(pattern)
     return policy
 

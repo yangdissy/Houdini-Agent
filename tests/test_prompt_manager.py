@@ -91,6 +91,33 @@ def test_core_prompt_requires_result_verification_at_task_completion():
     assert 'not a node-creation hook' in prompt
 
 
+def test_core_and_fallback_use_request_scoped_verification(monkeypatch):
+    for fallback in (False, True):
+        with monkeypatch.context() as patches:
+            if fallback:
+                patches.setattr(
+                    'houdini_agent.core.prompt_manager.load_prompt_template',
+                    lambda name: '',
+                )
+            sections = build_system_prompt_sections(
+                with_thinking=False, full_rules=False, language='en',
+            )
+            prompt = ''.join(section.content for section in sections)
+
+        assert 'Verification Scope (MUST follow)' in prompt
+        assert 'health=unknown' in prompt
+        assert 'target and frame' in prompt
+        assert 'missing caches only need annotation' in prompt
+        assert 'do not cook geometry merely to validate these edits' in prompt
+        assert 'Handoff / Organization (MUST follow)' in prompt
+        assert 'unless explicitly authorized by the user or confirmed plan' in prompt
+        assert 'display/render flags, object visibility, current frame, and update mode' in prompt
+        assert 'An output Null does not authorize moving existing flags' in prompt
+        assert 'node category and supported HOM methods' in prompt
+        assert 'Call verify_network(parent_path) before completing any task' not in prompt
+        assert 'Fix issues and repeat until healthy' not in prompt
+
+
 def test_budget_keeps_required_sections_whole_and_omits_optional(monkeypatch):
     sections = [
         PromptSection('persona', 'PERSONA'),

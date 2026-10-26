@@ -54,7 +54,7 @@ class ExternalMCPExecutionAdapterTest(unittest.TestCase):
             registry=self.registry,
             policy_engine=_Policy(decision or ToolPolicyDecision(action="allow")),
             execute=execute or (lambda name, args: {"success": True, "result": args}),
-            audit=audit,
+            audit=audit if audit is not None else (lambda record: None),
             confirm=confirm,
             executor=executor,
         )
@@ -73,6 +73,14 @@ class ExternalMCPExecutionAdapterTest(unittest.TestCase):
         self.assertEqual(calls, [("inspect", {"node_path": "/obj/secret"})])
         self.assertTrue(all(record["correlation_id"] == "call-1" for record in audits))
         self.assertNotIn("/obj/secret", str(audits))
+
+    def test_audit_failure_reports_degraded_read_without_dropping_result(self):
+        adapter = self._adapter(audit=lambda record: False)
+
+        result = adapter.execute(self.context, "inspect", {})
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["audit_status"], "degraded")
 
     def test_untrusted_context_allowlist_and_registry_fail_closed(self):
         calls = []

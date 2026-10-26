@@ -458,24 +458,15 @@ class IntentTest(unittest.TestCase):
         self.assertEqual(groups - keywords - defaults, set(), "工具组没有对应关键词，永远不会被选中")
         self.assertEqual(keywords - groups, set(), "关键词没有对应工具组，命中后不会加入任何工具")
 
-    def test_every_agent_tool_is_reachable_by_intent_selection(self):
+    def test_every_agent_tool_is_reachable_by_discovery(self):
         from unittest import mock
         with mock.patch.dict("sys.modules", {"requests": mock.MagicMock()}):
             from houdini_agent.utils.ai_client import HOUDINI_TOOLS
 
         reg = ToolRegistry()
         reg.register_core_tools(HOUDINI_TOOLS)
-        reachable = set().union(*ToolRegistry._INTENT_TOOL_GROUPS.values())
-        reachable |= ToolRegistry._AGENT_ALWAYS_TOOLS | {"run_skill", "list_skills"}
-        # Plan 模式直接按 mode 取工具，不经过意图选择
-        plan_mode_only = {"create_plan", "update_plan_step", "ask_question"}
-
-        unreachable = reg.get_tool_names_for_mode("agent") - reachable - plan_mode_only
-
-        self.assertEqual(
-            unreachable, set(),
-            "新增工具必须加入 _INTENT_TOOL_GROUPS 或 _AGENT_ALWAYS_TOOLS，否则 Agent 永远拿不到",
-        )
+        for name in reg.get_tool_names_for_mode("agent"):
+            self.assertIn(name, {contract["name"] for contract in reg.search_contracts(query=name, mode="agent")})
 
     def test_classify_intent_chinese(self):
         intents = self.reg.classify_intent("帮我创建一个 box 节点")
@@ -502,14 +493,13 @@ class IntentTest(unittest.TestCase):
         names2 = {s["function"]["name"] for s in self.reg.get_tools_for_intent({"layout"}, "agent")}
         self.assertIn("create_network_box", names2)
 
-    def test_agent_always_tools_present_regardless_of_intent(self):
-        # _AGENT_ALWAYS_TOOLS 保证 agent 模式始终具备最小写操作能力，与意图无关
+    def test_unrelated_writes_are_not_always_exposed(self):
         for name in ("create_node", "connect_nodes", "set_node_parameter"):
             self.reg.register(name, _schema(name), modes={"agent"})
         names = {s["function"]["name"] for s in self.reg.get_tools_for_intent(set(), "agent")}
-        self.assertIn("create_node", names)
-        self.assertIn("connect_nodes", names)
-        self.assertIn("set_node_parameter", names)
+        self.assertNotIn("create_node", names)
+        self.assertNotIn("connect_nodes", names)
+        self.assertNotIn("set_node_parameter", names)
 
     def test_connection_request_selects_preview_and_connection_tools(self):
         for name in (
@@ -626,7 +616,7 @@ class IntentTest(unittest.TestCase):
         self.assertIn("preview_node_operation", names)
         self.assertIn("get_node_connections", names)
 
-    def test_high_risk_tools_are_available_for_policy_confirmation(self):
+    def test_query_does_not_prewarm_high_risk_tools(self):
         for name in ("execute_shell", "execute_python", "save_hip", "get_network_structure"):
             self.reg.register(name, _schema(name), modes={"agent"})
 
@@ -636,9 +626,9 @@ class IntentTest(unittest.TestCase):
         }
 
         self.assertIn("get_network_structure", names)
-        self.assertIn("execute_shell", names)
-        self.assertIn("execute_python", names)
-        self.assertIn("save_hip", names)
+        self.assertNotIn("execute_shell", names)
+        self.assertNotIn("execute_python", names)
+        self.assertNotIn("save_hip", names)
 
     def test_execute_optimization_prefers_dedicated_network_tools(self):
         for name in (

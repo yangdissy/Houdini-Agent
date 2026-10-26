@@ -94,7 +94,7 @@ class DiagnosticsMixin:
                     'event_type': 'policy_decision',
                     'tool': tool_name,
                     'action': action,
-                    'reason': (reason or '').strip(),
+                    'reason_code': 'timeline_' + action,
                     'mode': mode,
                     'plan_phase': getattr(self, '_plan_phase', 'idle'),
                     'confirm_mode': bool(getattr(self, '_confirm_mode', False)),
@@ -114,10 +114,10 @@ class DiagnosticsMixin:
         diag_dir.mkdir(parents=True, exist_ok=True)
         return diag_dir / f"session_{sid}.jsonl"
 
-    def _append_session_diagnostics_records(self, records: list, session_id: Optional[str] = None):
+    def _append_session_diagnostics_records(self, records: list, session_id: Optional[str] = None, strict: bool = False) -> bool:
         """Append-only session diagnostics records (JSONL)."""
         if not records:
-            return
+            return True
         sid = (session_id or self._session_id or "unknown").strip() or "unknown"
         try:
             path = self._get_session_diagnostics_jsonl_path(sid)
@@ -131,8 +131,12 @@ class DiagnosticsMixin:
                         row.setdefault('recorded_at', now_iso)
                         row.setdefault('event_type', 'unknown')
                         f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+            return True
         except Exception as e:
+            if strict:
+                raise OSError("Tool audit write failed") from e
             print(f"[Diagnostics] 写入 session jsonl 失败: {e}")
+            return False
 
     def _show_policy_menu(self):
         """显示策略/诊断菜单。"""

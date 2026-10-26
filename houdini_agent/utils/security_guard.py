@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import re
 import unicodedata
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from ..core.harness_policy_config import PRIVATE_USER_PATH_PATTERN
+from ..core.harness_policy_config import PRIVATE_USER_PATH_PATTERN, POLICY_PATH, get_security_policy, load_security_policy
 
 
 _POLICY_PATH = Path(__file__).resolve().parents[2] / "config" / "security_policy.json"
@@ -18,14 +17,17 @@ _WARNING = "SECURITY WARNING: Suspicious prompt injection was blocked in untrust
 
 @lru_cache(maxsize=1)
 def _policy_patterns() -> dict:
-    policy = json.loads(_POLICY_PATH.read_text(encoding="utf-8"))
+    snapshot = get_security_policy() if _POLICY_PATH == POLICY_PATH else load_security_policy(_POLICY_PATH)
+    if snapshot.error:
+        raise ValueError("Security policy unavailable")
+    policy = snapshot.data
     compiled = {}
     for section in ("injection_patterns", "memory_patterns"):
         patterns = policy[section]
-        if not isinstance(patterns, list) or not patterns:
+        if not isinstance(patterns, tuple) or not patterns:
             raise ValueError("Missing security policy")
         for entry in patterns:
-            if not isinstance(entry, list) or len(entry) != 2 or not all(isinstance(value, str) and value.strip() for value in entry):
+            if not isinstance(entry, tuple) or len(entry) != 2 or not all(isinstance(value, str) and value.strip() for value in entry):
                 raise ValueError("Invalid security policy entry")
         compiled[section] = tuple((rule, re.compile(pattern, re.IGNORECASE)) for rule, pattern in patterns)
     return compiled

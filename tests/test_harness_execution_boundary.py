@@ -63,6 +63,55 @@ class _ThreadStub:
 
 
 class HarnessExecutionBoundaryTest(unittest.TestCase):
+    def test_web_dispatch_uses_same_governed_audit_chain(self):
+        import threading
+        from types import SimpleNamespace
+        from houdini_agent.utils.ai_client import AIClient
+
+        tab = self._make_tab()
+        tab._showToolStatus = _SignalStub()
+        tab.client = object.__new__(AIClient)
+        tab.client._stop_event = threading.Event()
+        tab.client._streaming_tool_executor = None
+        tab.client._batch_tool_executor = None
+        tab.client._tool_executor = tab._execute_tool_with_todo
+        tab.client._web_searcher = SimpleNamespace(search=lambda *args: {"success": True, "results": []})
+        audits = []
+        tab._append_session_diagnostics_records = lambda records, **kwargs: audits.extend(records)
+
+        result = tab.client._get_streaming_tool_executor().execute_round([
+            ("web-1", "web_search", {"query": "Houdini docs"}, {}),
+        ])
+
+        self.assertTrue(result["results_ordered"][0]["success"])
+        self.assertTrue(any(record.get("tool") == "web_search" and record.get("phase") == "result" for record in audits))
+
+    def test_search_handler_explicit_load_uses_active_run_exposure(self):
+        from houdini_agent.core.agent_request_assembly import ToolExposureState
+        from houdini_agent.utils.tool_registry import get_tool_registry
+
+        tab = self._make_tab()
+        tab._agent_mode = True
+        tab._showToolStatus = _SignalStub()
+        registry = get_tool_registry()
+        tab._tool_exposure = ToolExposureState(registry, registry.get_tool_schemas(["search_tool_contracts"]))
+
+        result = AITab._execute_tool_impl(tab, "search_tool_contracts", {
+            "query": "get_usd_prim_info", "load": True,
+        })
+
+        self.assertTrue(result["success"], result)
+        self.assertIn("get_usd_prim_info", result["result"]["loaded_tools"])
+
+    def test_legacy_switch_cannot_bypass_governance(self):
+        tab = self._make_tab()
+        tab._harness_v2_enabled = False
+
+        result = AITab._execute_tool_with_todo(tab, "execute_python", code="pass")
+
+        self.assertFalse(result["success"])
+        self.assertIn("Ask mode", result["error"])
+
     def _make_tab(self):
         tab = object.__new__(AITab)
         cache_dir = tempfile.TemporaryDirectory()
@@ -358,6 +407,84 @@ class HarnessExecutionBoundaryTest(unittest.TestCase):
 
 
 class GovernedToolExecutorTest(unittest.TestCase):
+    def test_audit_failure_blocks_write_before_adapter(self):
+        calls = []
+
+        def broken_audit(record):
+            raise OSError("disk full")
+
+        owner = GovernedToolExecutor(
+            HarnessToolPolicyEngine(),
+            lambda *args: calls.append(args) or {"success": True},
+            audit=broken_audit,
+        )
+
+        result = owner.execute("execute_python", {"code": "pass"}, {"mode": "agent"})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "audit_unavailable")
+        self.assertEqual(calls, [])
+
+    def test_audit_failure_allows_only_explicit_reads_with_warning(self):
+        owner = GovernedToolExecutor(
+            HarnessToolPolicyEngine(), lambda *args: {"success": True, "result": "read"},
+            audit=lambda record: False,
+        )
+
+        result = owner.execute("get_network_structure", {"network_path": "/obj"}, {"mode": "agent"})
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["audit_status"], "degraded")
+        self.assertIn("audit_warning", result)
+
+    def test_result_audit_failure_preserves_write_and_blocks_later_writes(self):
+        state = HarnessRuntimeState()
+        calls = []
+
+        def audit(record):
+            if record.get("phase") == "result":
+                raise OSError("disk full")
+
+        def execute(*args):
+            calls.append(args)
+            return {"success": True, "result": "applied", "operation_id": "op-1"}
+
+        first = GovernedToolExecutor(
+            HarnessToolPolicyEngine(), execute, audit=audit, audit_state=state.audit_state,
+        ).execute("execute_python", {"code": "pass"}, {"mode": "agent"})
+        second = GovernedToolExecutor(
+            HarnessToolPolicyEngine(), execute, audit=lambda record: None, audit_state=state.audit_state,
+        ).execute("execute_python", {"code": "pass"}, {"mode": "agent"})
+
+        self.assertTrue(first["success"])
+        self.assertEqual(first["operation_id"], "op-1")
+        self.assertEqual(first["audit_status"], "degraded")
+        self.assertFalse(first["replay_safe"])
+        self.assertEqual(second["error_code"], "audit_unavailable")
+        self.assertEqual(len(calls), 1)
+
+    def test_confirmation_cancel_has_terminal_and_decision_metadata(self):
+        audits = []
+        decision = ToolPolicyDecision(
+            action="ask", reason="private prompt text", matched_rules=["confirm_write"],
+            risk_score=0.7, required_control="confirm",
+        )
+        owner = GovernedToolExecutor(
+            type("AskPolicy", (), {"decide": lambda self, *args: decision})(),
+            lambda *args: self.fail("cancelled tool executed"),
+            confirm=lambda *args: False, audit=audits.append,
+        )
+
+        result = owner.execute("execute_python", {"code": "pass"}, {"mode": "agent", "run_id": "run-1"})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(audits[-1]["error_code"], "confirmation_cancelled")
+        self.assertEqual(audits[0]["matched_rules"], ["confirm_write"])
+        self.assertEqual(audits[0]["risk_score"], 0.7)
+        self.assertEqual({record["run_id"] for record in audits}, {"run-1"})
+        self.assertEqual(len({record["call_id"] for record in audits}), 1)
+        self.assertNotIn("private prompt text", str(audits))
+
     def test_repeated_exception_family_blocks_changed_python_code(self):
         calls = []
         audits = []
@@ -391,6 +518,7 @@ class GovernedToolExecutorTest(unittest.TestCase):
         ])
         owner = GovernedToolExecutor(
             HarnessToolPolicyEngine(), lambda *args: next(responses),
+            audit=lambda record: None,
         )
 
         results = [
@@ -422,6 +550,7 @@ class GovernedToolExecutorTest(unittest.TestCase):
                         "decide": lambda self, *args: ToolPolicyDecision(action="allow")
                     })(),
                     lambda *args: calls.append(args) or next(responses),
+                    audit=lambda record: None,
                 )
                 for _ in range(2):
                     owner.execute("execute_python", {"code": "pass"}, {"mode": "agent"})
@@ -447,6 +576,7 @@ class GovernedToolExecutorTest(unittest.TestCase):
                 "error": "SyntaxError: eval failed\nDuring handling:\nNameError: missing",
             },
             execution_failures=state.execution_failures,
+            audit=lambda record: None,
         )
 
         for _ in range(3):
@@ -567,6 +697,7 @@ class GovernedToolExecutorTest(unittest.TestCase):
             lambda name, args, confirmed: calls.append(args) or {"success": False, "error": "again"},
             retry_counts=retry_counts,
             retry_limit=1,
+            audit=lambda record: None,
         )
 
         first = owner.execute("save_hip", {"file_path": "unsafe"}, {"mode": "agent"})

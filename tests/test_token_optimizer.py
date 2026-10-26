@@ -2,6 +2,7 @@
 """token_optimizer 单元测试（不依赖 Houdini hou，也不依赖 tiktoken）。"""
 
 import unittest
+import json
 from unittest import mock
 
 from houdini_agent.utils import token_optimizer
@@ -253,6 +254,19 @@ class TokenOptimizerMessageTest(unittest.TestCase):
 
     def test_compress_tool_result_empty(self):
         self.assertEqual(self.opt.compress_tool_result({}), "")
+
+    def test_compress_tool_result_preserves_archive_and_page_protocol(self):
+        reference = "res_" + "a" * 32
+        for payload in (
+            {"success": False, "stored": True, "result_ref": reference, "size": 20000},
+            {
+                "success": True, "result_ref": reference, "content": "cached geometry",
+                "pointer": "/result", "offset": 0, "next_offset": None, "total_chars": 15,
+            },
+        ):
+            with self.subTest(payload=payload):
+                visible = json.loads(self.opt.compress_tool_result(payload))
+                self.assertEqual(visible, payload)
 
     def test_compress_tool_result_long_truncates(self):
         long_text = "line one\n" + "x" * 500 + "\nline last"

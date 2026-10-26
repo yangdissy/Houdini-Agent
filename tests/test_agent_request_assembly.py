@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 
 import unittest
+import json
+from unittest import mock
 
 from houdini_agent.core.agent_request_assembly import (
     build_context,
@@ -21,6 +23,66 @@ def _image(text, url):
 
 
 class AgentRequestAssemblyTest(unittest.TestCase):
+    def test_natural_language_discovery_ranks_names_and_intent(self):
+        from houdini_agent.core.agent_request_assembly import ToolExposureState
+        from houdini_agent.utils.tool_registry import ToolRegistry
+
+        registry = ToolRegistry()
+        schemas = [{"type": "function", "function": {"name": name, "description": description, "parameters": {}}}
+                   for name, description in (
+                       ("search_tool_contracts", "search tools"),
+                       ("get_usd_prim_info", "Inspect USD prim details"),
+                       ("get_usd_layer_stack", "Inspect USD layers"),
+                   )]
+        registry.register_core_tools(schemas)
+        exposure = ToolExposureState(registry, schemas[:1])
+
+        result = exposure.load("USD prim details", limit=1)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["result"]["matches"][0]["name"], "get_usd_prim_info")
+        chinese = exposure.load("查看 USD 场景", limit=2)
+        self.assertTrue(chinese["success"])
+
+    def test_tool_discovery_budget_failure_does_not_partially_load_tools(self):
+        from houdini_agent.core.agent_request_assembly import ToolExposureState
+        from houdini_agent.utils.tool_registry import ToolRegistry
+
+        registry = ToolRegistry()
+        small = {"type": "function", "function": {"name": "search_tool_contracts", "description": "search", "parameters": {}}}
+        large = {"type": "function", "function": {"name": "get_usd_prim_info", "description": "large " * 3000, "parameters": {}}}
+        registry.register_core_tools([small, large])
+        exposure = ToolExposureState(registry, [small], max_schema_tokens=200)
+        before = exposure.snapshot()
+
+        result = exposure.load("get_usd_prim_info")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "tool_schema_budget")
+        self.assertEqual(exposure.snapshot(), before)
+
+    def test_tool_discovery_loads_only_current_run_and_current_permissions(self):
+        from houdini_agent.core.agent_request_assembly import ToolExposureState
+        from houdini_agent.utils.tool_registry import ToolRegistry
+
+        registry = ToolRegistry()
+        schemas = [{"type": "function", "function": {
+            "name": name, "description": name, "parameters": {},
+        }} for name in ("get_network_structure", "get_usd_prim_info", "execute_python", "web_search")]
+        registry.register_core_tools(schemas)
+        first = ToolExposureState(registry, schemas[:1], mode="ask", use_web=False)
+        other = ToolExposureState(registry, schemas[:1], mode="ask", use_web=False)
+
+        result = first.load("get_usd_prim_info")
+
+        self.assertTrue(result["success"])
+        self.assertIn("get_usd_prim_info", {tool["function"]["name"] for tool in first.snapshot()})
+        self.assertNotIn("get_usd_prim_info", {tool["function"]["name"] for tool in other.snapshot()})
+        self.assertFalse(first.load("execute_python")["success"])
+        self.assertFalse(first.load("web_search")["success"])
+        registry.set_enabled("get_usd_prim_info", False)
+        self.assertNotIn("get_usd_prim_info", {tool["function"]["name"] for tool in first.snapshot()})
+
     def test_first_user_message_does_not_count_as_prior_completed_turn(self):
         self.assertFalse(has_prior_completed_turn([
             {'role': 'system', 'content': 'scene snapshot'},
@@ -88,6 +150,70 @@ class AgentRequestAssemblyTest(unittest.TestCase):
         self.assertTrue(tool_results[0].endswith('...[summary]'))
         self.assertEqual(tool_results[1:], [str(index) * 250 for index in range(1, 4)])
         self.assertEqual(history[2]['content'], '0' * 250)
+
+    def test_old_tool_protocol_and_unknown_validation_survive_request_assembly(self):
+        with mock.patch.dict('sys.modules', {'requests': mock.Mock()}):
+            from houdini_agent.utils.ai_client import AIClient
+
+        client = object.__new__(AIClient)
+        reference = 'res_' + 'a' * 32
+        payloads = [
+            ('get_scene_snapshot', {
+                'success': False, 'stored': True, 'result_ref': reference,
+                'size': 20000, 'result': 'Large tool result archived. ' * 20,
+            }),
+            ('read_tool_result', {
+                'success': True, 'result_ref': reference, 'pointer': '/result/nodes',
+                'offset': 0, 'next_offset': 600, 'total_chars': 1200,
+                'content': 'cached geometry /obj/geo1/OUT ' * 30,
+            }),
+            ('temporary_auto_validate_geometry', {
+                'success': False, 'error': 'restore failed /obj/geo1/OUT ' * 30,
+                'health': 'unknown', 'freshness': {'status': 'stale'},
+                'validation_blocked': True, 'restore_succeeded': False,
+            }),
+        ]
+        history = []
+        for index, (tool_name, payload) in enumerate(payloads):
+            history.extend([
+                {'role': 'user', 'content': 'request %d' % index},
+                {'role': 'assistant', 'content': None, 'tool_calls': [{
+                    'id': 'protocol_%d' % index,
+                    'function': {'name': tool_name, 'arguments': '{}'},
+                }]},
+                {'role': 'tool', 'tool_call_id': 'protocol_%d' % index,
+                 'content': AIClient._compress_tool_result(client, tool_name, payload)},
+            ])
+
+        prepared = prepare_history_for_request(
+            history, supports_vision=False,
+            fix_alternation=lambda messages: messages,
+            tool_result_text=lambda name, content: '%s=%s' % (name, content),
+            image_placeholder='image removed',
+            summarize_tool_content=AIClient._summarize_tool_content,
+            protect_recent_rounds=0,
+        )
+        outgoing = normalize_provider_messages(prepared, is_reasoning_model=False)
+        results = [message for message in outgoing if message['role'] == 'tool']
+        archived = json.loads(results[0]['content'])
+        self.assertEqual(archived['result_ref'], reference)
+        self.assertFalse(archived['success'])
+        page = json.loads(results[1]['content'])
+        self.assertEqual(page['result_ref'], reference)
+        self.assertEqual(page['pointer'], '/result/nodes')
+        self.assertEqual(page['offset'], 0)
+        self.assertEqual(page['next_offset'], 600)
+        self.assertTrue(page['content_omitted'])
+        self.assertNotIn('content', page)
+        self.assertLess(len(results[1]['content']), len(history[5]['content']))
+        repeated_page = json.loads(AIClient._summarize_tool_content(results[1]['content']))
+        self.assertEqual(repeated_page, page)
+        self.assertIn('health=unknown', results[2]['content'])
+        self.assertIn('freshness=stale', results[2]['content'])
+        self.assertIn('validation_blocked=true', results[2]['content'])
+        self.assertIn('restore_succeeded=false', results[2]['content'])
+        self.assertEqual([message['tool_call_id'] for message in results],
+                         ['protocol_0', 'protocol_1', 'protocol_2'])
 
     def test_reasoning_assistant_normalization_preserves_tool_call_none(self):
         result = normalize_provider_messages([{

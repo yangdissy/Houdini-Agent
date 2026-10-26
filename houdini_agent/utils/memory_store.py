@@ -668,9 +668,12 @@ class MemoryStore:
         text = record.rule.strip()
         if not policy["min_rule_chars"] <= len(text) <= policy["max_rule_chars"]:
             return "length"
-        if any(re.search(pattern, text) for pattern in policy["blocked_patterns"]):
+        if find_memory_threat(text) or any(re.search(pattern, text) for pattern in policy["blocked_patterns"]):
             return "sensitive_or_control"
-        if text.casefold().strip(" .!。！") in {item.casefold() for item in policy["generic_rules"]}:
+        if (
+            text.casefold().strip(" .!。！") in {item.casefold() for item in policy["generic_rules"]}
+            or any(re.fullmatch(pattern, text) for pattern in policy["generic_patterns"])
+        ):
             return "generic"
         if not math.isfinite(record.confidence) or not 0 <= record.confidence <= 1:
             return "confidence"
@@ -678,12 +681,22 @@ class MemoryStore:
             return "missing_evidence"
         return ""
 
-    def settle_semantic_usage(self, record_id: str, cited: bool, reward: float) -> None:
+    def settle_semantic_usage(
+        self,
+        record_id: str,
+        cited: bool,
+        reward: float,
+        task_success: Optional[bool] = None,
+    ) -> None:
         with self._db_lock:
             record = self.get_semantic(record_id)
             if record is None:
                 return
-            if cited and reward > 0:
+            if (
+                cited
+                and task_success is True
+                and reward >= self.quality_policy["promotion_reward_threshold"]
+            ):
                 record.activation_count += 1
                 record.cited_count += 1
                 if record.status == "trial" and record.cited_count >= self.quality_policy["promotion_citations"]:
@@ -693,6 +706,9 @@ class MemoryStore:
                     record.status = "active"
                 cap = self.quality_policy["trial_confidence_cap"] if record.status == "trial" else 1.0
                 record.confidence = min(cap, record.confidence + self.quality_policy["confidence_increment"])
+            elif cited and (reward <= 0 or task_success is False):
+                floor = 0.45 if record.abstraction_level <= 1 else 0.10 if record.abstraction_level == 2 else 0.05
+                record.confidence = max(min(floor, record.confidence), record.confidence * self.quality_policy["negative_citation_decay"])
             elif not cited:
                 floor = 0.45 if record.abstraction_level <= 1 else 0.10 if record.abstraction_level == 2 else 0.05
                 record.confidence = max(min(floor, record.confidence), record.confidence * self.quality_policy["unused_decay"])

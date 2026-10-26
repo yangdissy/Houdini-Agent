@@ -29,3 +29,17 @@ def test_small_result_is_unchanged(tmp_path):
     result = {"success": True, "result": "small"}
 
     assert store.archive_if_large("inspect", result) is result
+
+
+def test_archival_preserves_audit_and_replay_controls(tmp_path):
+    store = ToolResultStore(tmp_path, "session-a", threshold=20)
+    result = store.archive_if_large("execute_python", {
+        "success": True, "result": "x" * 100, "audit_status": "degraded",
+        "audit_warning": "audit unavailable", "replay_safe": False,
+        "operation_id": "op-1", "scene_consistency": "unknown",
+    })
+
+    assert result["audit_status"] == "degraded"
+    assert result["replay_safe"] is False
+    assert result["operation_id"] == "op-1"
+    assert result["scene_consistency"] == "unknown"

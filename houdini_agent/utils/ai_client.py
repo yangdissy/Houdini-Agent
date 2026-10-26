@@ -2057,11 +2057,12 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "search_tool_contracts",
-            "description": "按名称、描述、标签或模式搜索当前 Registry 中的真实工具契约。不会执行任何工具。",
+            "description": "搜索真实工具契约。load=true 将匹配工具加载到本次运行的下一轮请求；不能在同一响应调用新加载工具。不会执行目标工具。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "名称、描述或标签关键词"},
+                    "load": {"type": "boolean", "description": "加载匹配工具供下一轮调用，默认false仅查询合同"},
                     "mode": {"type": "string", "description": "可选模式过滤"},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "必须全部满足的标签"},
                     "limit": {"type": "integer", "description": "最多返回数量，默认20，范围1-100"}
@@ -2106,6 +2107,7 @@ try:
                 modes={"plan_executing"} if _plan_name == "update_plan_step" else {"plan_planning"},
                 runtime="houdini",
             )
+    _reg.validate_policy_references()
 except Exception as _e:
     print(f"[AIClient] ToolRegistry 注册失败 (非致命): {_e}")
 
@@ -2229,8 +2231,8 @@ class AIClient:
         if self._streaming_tool_executor is None:
             self._streaming_tool_executor = StreamingToolExecutor(
                 tool_executor=self._call_tool_executor,
-                web_search_executor=self._execute_web_search,
-                fetch_webpage_executor=self._execute_fetch_webpage,
+                web_search_executor=lambda arguments: self._call_tool_executor('web_search', arguments),
+                fetch_webpage_executor=lambda arguments: self._call_tool_executor('fetch_webpage', arguments),
                 batch_tool_executor=self._batch_tool_executor,
                 runtime_profile_provider=_runtime_profile_provider,
             )
@@ -2470,6 +2472,36 @@ class AIClient:
         """
         if not content or len(content) <= max_len:
             return content
+
+        if content.lstrip().startswith('{'):
+            try:
+                payload = json.loads(content)
+            except (ValueError, TypeError):
+                payload = None
+            if isinstance(payload, dict) and payload.get('result_ref') and (
+                payload.get('stored') is True or 'content' in payload
+                or payload.get('content_omitted') is True
+            ):
+                summary = {
+                    key: payload[key] for key in (
+                        'success', 'stored', 'result_ref', 'size', 'sha256',
+                        'pointer', 'offset', 'next_offset', 'total_chars',
+                    ) if key in payload
+                }
+                if 'content' in payload or payload.get('content_omitted') is True:
+                    summary['content_omitted'] = True
+                    summary['result'] = (
+                        'Use read_tool_result with result_ref, pointer and offset '
+                        'to recover this page.'
+                    )
+                return json.dumps(summary, ensure_ascii=False)
+
+        if content.startswith('[validation '):
+            header, separator, body = content.partition(']\n')
+            if separator:
+                return header + ']\n' + cls._summarize_tool_content(
+                    body, max_len=max(1, max_len - len(header) - 2)
+                )
 
         parts = []
 
@@ -2734,6 +2766,13 @@ class AIClient:
         - 失败 → 保留完整错误
         """
         result = sanitize_tool_result(result)
+        if result.get('error_code') == 'tool_not_exposed' or result.get('audit_status') == 'degraded':
+            return json.dumps(result, ensure_ascii=False, default=str)
+        if (result.get('stored') is True and result.get('result_ref')) or (
+            tool_name == 'read_tool_result' and result.get('success') and 'content' in result
+        ):
+            return json.dumps(result, ensure_ascii=False, default=str)
+
         def validation_signals(payload):
             signals = []
             freshness = payload.get('freshness')
@@ -4372,7 +4411,8 @@ class AIClient:
                           on_iteration_start: Optional[Callable[[int], None]] = None,
                           on_incomplete: Optional[Callable[[], Optional[str]]] = None,
                           on_plan_incomplete: Optional[Callable[[], Optional[str]]] = None,
-                          context_limit: int = 128000) -> Dict[str, Any]:
+                          context_limit: int = 128000,
+                          tool_exposure=None) -> Dict[str, Any]:
         """流式 Agent Loop
         
         Args:
@@ -4463,6 +4503,9 @@ class AIClient:
                 }
             
             iteration += 1
+            if tool_exposure is not None:
+                effective_tools = tool_exposure.snapshot()
+            exposed_names = {tool.get('function', {}).get('name', '') for tool in effective_tools}
             _call_start = time.time()  # 记录本次 API 调用起始时间（对齐 Cursor 延迟统计）
             
             # 收集本轮的内容和工具调用
@@ -4536,7 +4579,7 @@ class AIClient:
             # 流式请求
             # ★ 思考优化：只在第1轮（规划）和错误重试时开启 thinking，
             #   工具调用续接轮（iteration>1 且无错误）关闭，大幅减少 thinking token 消耗
-            _this_iter_thinking = enable_thinking and (iteration == 1 or should_retry)
+            _this_iter_thinking = enable_thinking and (iteration == 1 or server_error_retries > 0)
             for chunk in self.chat_stream(
                 messages=working_messages,
                 model=model,
@@ -4717,7 +4760,19 @@ class AIClient:
                             wait_seconds = 5 * server_error_retries
                             if on_content:
                                 on_content(f"\n[服务端暂时不可用，{wait_seconds}秒后重试 ({server_error_retries}/{max_server_retries})...]\n")
-                            time.sleep(wait_seconds)
+                            if self._stop_event.wait(wait_seconds):
+                                return {
+                                    'ok': False,
+                                    'error': '用户停止了请求',
+                                    'content': full_content + round_content,
+                                    'final_content': round_content,
+                                    'new_messages': working_messages[initial_msg_count:],
+                                    'tool_calls_history': tool_calls_history,
+                                    'call_records': call_records,
+                                    'iterations': iteration,
+                                    'stopped': True,
+                                    'usage': total_usage,
+                                }
                             
                             # 只在第2次及以后重试时才裁剪（第1次纯等待重试，给服务器恢复机会）
                             if server_error_retries >= 2:
@@ -4936,6 +4991,8 @@ class AIClient:
             if total_tool_calls + len(parsed_calls) > max_tool_calls:
                 print(f"[AI Client] ⚠️ 达到工具调用次数上限 ({max_tool_calls})，本轮 {len(parsed_calls)} 个调用未执行")
                 for tool_id, _tn, _ta, _tc in parsed_calls:
+                    if tool_exposure is not None:
+                        tool_exposure.record_skip(_tn, 'tool_limit', tool_id)
                     working_messages.append({
                         'role': 'tool',
                         'tool_call_id': tool_id,
@@ -4956,14 +5013,36 @@ class AIClient:
                     'stop_reason': 'max_tool_calls',
                 }
 
+            rejected_calls = {
+                index: tool_exposure.reject(call[1], call[0])
+                for index, call in enumerate(parsed_calls)
+                if tool_exposure is not None and call[1] not in exposed_names
+            }
+            executable_calls = [call for index, call in enumerate(parsed_calls) if index not in rejected_calls]
+
             # Harness V2: use extracted streaming tool executor and skip legacy dispatch block.
             if _stream_tool_executor is not None:
-                _exec_out = _stream_tool_executor.execute_round(parsed_calls)
+                _exec_out = _stream_tool_executor.execute_round(executable_calls)
                 results_ordered = _exec_out.get('results_ordered', [])
-                dedup_flags = _exec_out.get('dedup_flags', [False] * len(parsed_calls))
+                dedup_flags = _exec_out.get('dedup_flags', [False] * len(executable_calls))
+                if rejected_calls:
+                    executed = iter(zip(results_ordered, dedup_flags))
+                    paired = [
+                        (rejected_calls[index], False) if index in rejected_calls
+                        else next(executed, ({'success': False, 'error': 'Tool result missing'}, False))
+                        for index in range(len(parsed_calls))
+                    ]
+                    results_ordered = [item[0] for item in paired]
+                    dedup_flags = [item[1] for item in paired]
+                if tool_exposure is not None:
+                    for index, hit in enumerate(dedup_flags):
+                        if hit:
+                            tool_exposure.record_skip(parsed_calls[index][1], 'cache_hit', parsed_calls[index][0])
+                        elif index < len(results_ordered):
+                            tool_exposure.record_link(parsed_calls[index][1], results_ordered[index], parsed_calls[index][0])
                 _early_skip_count = int(_exec_out.get('early_skip_count', 0) or 0)
                 _dedup_hit_count = int(_exec_out.get('dedup_hit_count', 0) or 0)
-                _failed_count = int(_exec_out.get('failed_count', 0) or 0)
+                _failed_count = int(_exec_out.get('failed_count', 0) or 0) + len(rejected_calls)
                 _async_count = int(_exec_out.get('async_count', 0) or 0)
                 _houdini_count = int(_exec_out.get('houdini_count', 0) or 0)
 
@@ -5159,7 +5238,8 @@ class AIClient:
 
         # 如果循环结束但内容为空，且有工具调用历史，强制要求生成总结
         summary_content = ""
-        if not full_content.strip() and tool_calls_history:
+        _summary_stopped = self._stop_event.is_set()
+        if not _summary_stopped and not full_content.strip() and tool_calls_history:
             print("[AI Client] ⚠️ Stream模式：工具调用完成但无回复内容，强制要求生成总结")
             # 最后一次请求，强制要求总结
             working_messages.append({
@@ -5175,8 +5255,12 @@ class AIClient:
                 temperature=temperature,
                 max_tokens=max_tokens or 500,  # 限制总结长度
                 tools=None,  # 总结阶段不需要工具
-                tool_choice=None
+                tool_choice=None,
+                enable_thinking=enable_thinking,
             ):
+                if self._stop_event.is_set() or chunk.get('type') == 'stopped':
+                    _summary_stopped = True
+                    break
                 if chunk.get('type') == 'content':
                     content = chunk.get('content', '')
                     summary_content += content
@@ -5187,6 +5271,20 @@ class AIClient:
             
             full_content = summary_content if summary_content else full_content
         
+        if _summary_stopped or self._stop_event.is_set():
+            return {
+                'ok': False,
+                'error': '用户停止了请求',
+                'content': full_content,
+                'final_content': summary_content,
+                'new_messages': working_messages[initial_msg_count:],
+                'tool_calls_history': tool_calls_history,
+                'call_records': call_records,
+                'iterations': iteration,
+                'stopped': True,
+                'usage': total_usage,
+            }
+
         print(f"[AI Client] Reached max iterations ({iteration})")
         _notice = _run_limit_notice('max_iterations', max_iterations)
         if on_content:
@@ -5296,7 +5394,7 @@ class AIClient:
         """获取 JSON 模式的系统提示（执行器模式）"""
         # 构建工具列表说明
         tool_descriptions = []
-        for tool in (tools_list or HOUDINI_TOOLS):
+        for tool in (tools_list if tools_list is not None else HOUDINI_TOOLS):
             func = tool['function']
             params = func.get('parameters', {}).get('properties', {})
             required = func.get('parameters', {}).get('required', [])
@@ -5438,7 +5536,8 @@ class AIClient:
                               on_tool_args_delta: Optional[Callable[[str, str, str], None]] = None,
                               on_iteration_start: Optional[Callable[[int], None]] = None,
                               on_plan_incomplete: Optional[Callable[[], Optional[str]]] = None,
-                              context_limit: int = 128000) -> Dict[str, Any]:
+                              context_limit: int = 128000,
+                              tool_exposure=None) -> Dict[str, Any]:
         """JSON 模式 Agent Loop（用于不支持 Function Calling 的模型）"""
         
         if not self._tool_executor:
@@ -5454,24 +5553,14 @@ class AIClient:
         # 此处不再重复合并，避免工具重复。
         effective_tools = tools_override if tools_override is not None else HOUDINI_TOOLS
         
+        if tool_exposure is not None:
+            effective_tools = tool_exposure.snapshot()
+
         # 添加 JSON 模式系统提示
         json_system_prompt = self._get_json_mode_system_prompt(effective_tools)
-        working_messages = []
-        
-        # 处理消息，在第一个 system 消息后追加 JSON 模式说明
-        system_found = False
-        for msg in messages:
-            if msg.get('role') == 'system' and not system_found:
-                working_messages.append({
-                    'role': 'system',
-                    'content': msg.get('content', '') + '\n\n' + json_system_prompt
-                })
-                system_found = True
-            else:
-                working_messages.append(msg)
-        
-        if not system_found:
-            working_messages.insert(0, {'role': 'system', 'content': json_system_prompt})
+        working_messages = [dict(message) for message in messages]
+        working_messages.insert(1 if working_messages and working_messages[0].get('role') == 'system' else 0,
+                                {'role': 'system', 'content': json_system_prompt})
         
         # ── 预处理：非视觉模型剥离所有 image_url 内容 ──
         if not supports_vision:
@@ -5515,6 +5604,17 @@ class AIClient:
                 }
             
             iteration += 1
+            if tool_exposure is not None:
+                effective_tools = tool_exposure.snapshot()
+                updated_prompt = self._get_json_mode_system_prompt(effective_tools)
+                for message in working_messages:
+                    if message.get('role') == 'system' and message.get('content') == json_system_prompt:
+                        message['content'] = updated_prompt
+                        break
+                else:
+                    working_messages.insert(0, {'role': 'system', 'content': updated_prompt})
+                json_system_prompt = updated_prompt
+            exposed_names = {tool.get('function', {}).get('name', '') for tool in effective_tools}
             _call_start = time.time()  # 记录本次 API 调用起始时间（对齐 Cursor 延迟统计）
             round_content = ""
             
@@ -5531,7 +5631,14 @@ class AIClient:
             # ★ 通知 UI 新一轮 API 请求即将开始（用于显示 "Generating..." 状态）
             if on_iteration_start:
                 on_iteration_start(iteration)
-            
+
+            if tool_exposure is not None:
+                try:
+                    self._ensure_context_within_budget(working_messages, None, context_limit)
+                except RuntimeError as exc:
+                    return {'ok': False, 'error': str(exc), 'content': full_content,
+                            'tool_calls_history': tool_calls_history, 'iterations': iteration, 'usage': total_usage}
+
             # 流式请求（不传 tools 参数）
             for chunk in self.chat_stream(
                 messages=working_messages,
@@ -5757,6 +5864,9 @@ class AIClient:
             working_messages.append(json_assistant_msg)
 
             if total_tool_calls + len(tool_calls) > max_tool_calls:
+                if tool_exposure is not None:
+                    for call in tool_calls:
+                        tool_exposure.record_skip(call['name'], 'tool_limit')
                 print(f"[AI Client] ⚠️ JSON模式：达到工具调用次数上限 ({max_tool_calls})，本轮 {len(tool_calls)} 个调用未执行")
                 _notice = _run_limit_notice('max_tool_calls', max_tool_calls)
                 if on_content:
@@ -5777,11 +5887,12 @@ class AIClient:
             _json_execution_profile = self._build_tool_execution_profile()
             _async_tools_json = set(_json_execution_profile.get('async_tools') or [])
             _batch_readonly_json = set(_json_execution_profile.get('batch_readonly_tools') or [])
-            async_tc = [(i, tc) for i, tc in enumerate(tool_calls) if tc['name'] in _async_tools_json]
-            houdini_tc = [(i, tc) for i, tc in enumerate(tool_calls) if tc['name'] not in _async_tools_json]
-
-            # 结果槽位
             exec_results = [None] * len(tool_calls)
+            for index, call in enumerate(tool_calls):
+                if tool_exposure is not None and call['name'] not in exposed_names:
+                    exec_results[index] = tool_exposure.reject(call['name'])
+            async_tc = [(i, tc) for i, tc in enumerate(tool_calls) if exec_results[i] is None and tc['name'] in _async_tools_json]
+            houdini_tc = [(i, tc) for i, tc in enumerate(tool_calls) if exec_results[i] is None and tc['name'] not in _async_tools_json]
 
             # 并行 async 工具（web + shell）
             if len(async_tc) > 1:
@@ -5790,9 +5901,9 @@ class AIClient:
                     idx, tc = idx_tc
                     tname, targs = tc['name'], tc['arguments']
                     if tname == 'web_search':
-                        return idx, self._execute_web_search(targs)
+                        return idx, self._call_tool_executor('web_search', targs)
                     elif tname == 'fetch_webpage':
-                        return idx, self._execute_fetch_webpage(targs)
+                        return idx, self._call_tool_executor('fetch_webpage', targs)
                     else:  # execute_shell
                         return idx, self._tool_executor(tname, **targs)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(async_tc))) as pool:
@@ -5802,9 +5913,9 @@ class AIClient:
                 idx, tc = async_tc[0]
                 tname, targs = tc['name'], tc['arguments']
                 if tname == 'web_search':
-                    exec_results[idx] = self._execute_web_search(targs)
+                    exec_results[idx] = self._call_tool_executor('web_search', targs)
                 elif tname == 'fetch_webpage':
-                    exec_results[idx] = self._execute_fetch_webpage(targs)
+                    exec_results[idx] = self._call_tool_executor('fetch_webpage', targs)
                 else:  # execute_shell
                     exec_results[idx] = self._tool_executor(tname, **targs)
 
@@ -6001,8 +6112,8 @@ class AIClient:
             # ★ 检查是否有视口截图需要注入
             _viewport_imgs = []
             if supports_vision:
-                for tc in tool_calls:
-                    _r = exec_results.get(tool_calls.index(tc))
+                for index, tc in enumerate(tool_calls):
+                    _r = exec_results[index]
                     if isinstance(_r, dict) and _r.get('_viewport_image'):
                         _viewport_imgs.append((
                             _r['_viewport_image'],

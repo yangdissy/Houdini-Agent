@@ -437,7 +437,7 @@ class AITab(
             execute=self._execute_tool_in_main_thread,
             confirm=self._request_tool_confirmation,
             audit=lambda record: self._append_session_diagnostics_records(
-                [record], session_id=record.get("session_id")
+                [record], session_id=record.get("session_id"), strict=True
             ),
             session_id=self._session_id,
             username=self._username,

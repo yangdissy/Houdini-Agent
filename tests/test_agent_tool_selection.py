@@ -22,6 +22,15 @@ def _tool_names(tools):
 
 
 class AgentToolSelectionTest(unittest.TestCase):
+    def test_simple_request_meets_initial_schema_and_token_budget(self):
+        from houdini_agent.utils.token_optimizer import TokenOptimizer
+
+        tab = object.__new__(AITab)
+        tools = AITab._select_agent_tools_for_message(tab, "hello", use_web=True)
+
+        self.assertLessEqual(len(tools), 16)
+        self.assertLessEqual(TokenOptimizer().calculate_message_tokens([], tools=tools), 6034)
+
     def test_agent_mode_create_request_uses_intent_minimal_tools(self):
         tab = object.__new__(AITab)
 
@@ -36,10 +45,10 @@ class AgentToolSelectionTest(unittest.TestCase):
         self.assertIn("create_node", names)
         self.assertIn("get_network_structure", names)
         self.assertIn("add_todo", names)
-        self.assertIn("execute_shell", names)
-        self.assertIn("save_hip", names)
+        self.assertNotIn("execute_shell", names)
+        self.assertNotIn("save_hip", names)
         self.assertIn("capture_viewport", names)
-        self.assertIn("visual_review", names)
+        self.assertIn("search_tool_contracts", names)
         self.assertNotIn("web_search", names)
         self.assertNotIn("fetch_webpage", names)
 
@@ -56,7 +65,7 @@ class AgentToolSelectionTest(unittest.TestCase):
         self.assertLess(len(tools), len(HOUDINI_TOOLS))
         self.assertIn("execute_python", names)
         self.assertIn("get_network_structure", names)
-        self.assertIn("save_hip", names)
+        self.assertNotIn("save_hip", names)
 
     def test_agent_mode_spare_parameter_request_exposes_dedicated_tool(self):
         tab = object.__new__(AITab)
@@ -73,7 +82,7 @@ class AgentToolSelectionTest(unittest.TestCase):
         self.assertIn("execute_python", names)
         self.assertIn("upsert_spare_parameter", tab._last_selected_tool_names)
 
-    def test_agent_mode_keeps_spare_parameter_tool_without_keyword_match(self):
+    def test_missing_parameter_intent_retains_discovery_not_unrelated_writes(self):
         tab = object.__new__(AITab)
 
         tools = AITab._select_agent_tools_for_message(
@@ -83,8 +92,8 @@ class AgentToolSelectionTest(unittest.TestCase):
         )
         names = _tool_names(tools)
 
-        self.assertIn("upsert_spare_parameter", names)
-        self.assertIn("get_parameter_schema", names)
+        self.assertNotIn("upsert_spare_parameter", names)
+        self.assertIn("search_tool_contracts", names)
 
     def test_short_followup_keeps_tools_from_previous_turn(self):
         tab = object.__new__(AITab)
@@ -101,7 +110,7 @@ class AgentToolSelectionTest(unittest.TestCase):
         self.assertIn("execute_python", names)
         self.assertIn("create_network_box", names)
 
-    def test_tools_stay_available_for_rest_of_session(self):
+    def test_tools_do_not_accumulate_across_user_runs(self):
         tab = object.__new__(AITab)
         tab._session_id = "s1"
         tab._conversation_history = []
@@ -115,7 +124,8 @@ class AgentToolSelectionTest(unittest.TestCase):
         later = _tool_names(AITab._select_agent_tools_for_message(
             tab, "好", use_web=False, remember=True,
         ))
-        self.assertLessEqual(first, later)
+        self.assertNotIn("create_network_box", later)
+        self.assertLessEqual(len(later), 16)
 
         other = object.__new__(AITab)
         other._session_id = "s2"
@@ -124,7 +134,7 @@ class AgentToolSelectionTest(unittest.TestCase):
             other, "好", use_web=False, remember=True,
         )))
 
-    def test_tool_used_in_history_stays_available(self):
+    def test_old_tool_call_does_not_force_schema_into_new_run(self):
         tab = object.__new__(AITab)
         tab._session_id = "s1"
         tab._conversation_history = [
@@ -135,7 +145,8 @@ class AgentToolSelectionTest(unittest.TestCase):
 
         names = _tool_names(AITab._select_agent_tools_for_message(tab, "好", use_web=False))
 
-        self.assertIn("create_network_box", names)
+        self.assertNotIn("create_network_box", names)
+        self.assertIn("search_tool_contracts", names)
 
     def test_explicit_remember_request_exposes_write_tool(self):
         tab = object.__new__(AITab)

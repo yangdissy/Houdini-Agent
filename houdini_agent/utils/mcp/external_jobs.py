@@ -66,6 +66,7 @@ class ExternalProcessJobAdapter:
         self._jobs_root = Path(jobs_root).resolve()
         self._jobs_root.mkdir(parents=True, exist_ok=True)
         self._audit = audit
+        self._audit_degraded = False
         self._specs: Dict[str, ExternalJobSpec] = {}
         self._active: Dict[str, _ActiveJob] = {}
         self._lock = threading.Lock()
@@ -93,6 +94,8 @@ class ExternalProcessJobAdapter:
         if spec is None:
             self._record("job_policy_denied", session_id, "", kind, "unknown_kind")
             raise KeyError("external job kind is not registered")
+        if self._audit_degraded or not self._record("job_policy", session_id, "", kind, "allow"):
+            raise OSError("External job audit unavailable; process start denied")
         safe_payload = _json_payload(payload)
         operation = self._registry.create(session_id, kind)
         operation_id = operation["operation_id"]
@@ -139,10 +142,14 @@ class ExternalProcessJobAdapter:
             name="external-job-" + operation_id[:8],
             daemon=True,
         ).start()
-        return self._registry.get(session_id, operation_id)
+        return self.get(session_id, operation_id)
 
     def get(self, session_id: str, operation_id: str) -> Optional[Dict[str, Any]]:
-        return self._registry.get(session_id, operation_id)
+        operation = self._registry.get(session_id, operation_id)
+        if operation is not None and self._audit_degraded:
+            operation = dict(operation, audit_status="degraded", replay_safe=False,
+                             audit_warning="Job audit is incomplete; new process starts are blocked.")
+        return operation
 
     def cancel(self, session_id: str, operation_id: str) -> Dict[str, Any]:
         current = self._registry.get(session_id, operation_id)
@@ -355,9 +362,10 @@ class ExternalProcessJobAdapter:
         decision: str,
         exit_code: Optional[int] = None,
         artifacts: Optional[list] = None,
-    ) -> None:
+    ) -> bool:
         if self._audit is None:
-            return
+            self._audit_degraded = True
+            return False
         record = {
             "event_type": event_type,
             "session_id": session_id,
@@ -373,9 +381,12 @@ class ExternalProcessJobAdapter:
                 for item in artifacts
             ]
         try:
-            self._audit(record)
+            if self._audit(record) is not False:
+                return True
         except Exception:
             pass
+        self._audit_degraded = True
+        return False
 
     @staticmethod
     def _terminate(process: subprocess.Popen) -> None:

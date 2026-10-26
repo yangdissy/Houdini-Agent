@@ -260,8 +260,13 @@ class ToolExecutionMixin:
     def _execute_tool_with_policy(self, tool_name: str, kwargs: dict) -> dict:
         """Execute one tool through the shared governed execution owner."""
         mode = self._registry_execution_mode()
+        state = self._harness_state
+        session_id = (state.session_id if state else None) or self._agent_session_id or self._session_id
         context = {
             'mode': mode,
+            'session_id': session_id,
+            'run_id': state.run_id if state else '',
+            'iteration': state.iteration if state else 0,
             'username': str(getattr(self, '_username', '') or ''),
             'plan_phase': self._plan_phase,
             'confirm_mode': bool(getattr(self, '_confirm_mode', False)),
@@ -280,7 +285,7 @@ class ToolExecutionMixin:
             return result
 
         def audit(record):
-            self._append_session_diagnostics_records([record])
+            return self._append_session_diagnostics_records([record], session_id=session_id, strict=True)
 
         def trace(event, **fields):
             if self._harness_state:
@@ -299,6 +304,7 @@ class ToolExecutionMixin:
             execution_failures=(
                 self._harness_state.execution_failures if self._harness_state else None
             ),
+            audit_state=state.audit_state if state else self.__dict__.setdefault('_tool_audit_state', {}),
         )
         result = owner.execute(tool_name, kwargs, context)
         if isinstance(result, dict) and tool_name != "read_tool_result":
@@ -330,10 +336,7 @@ class ToolExecutionMixin:
         """
         kwargs.pop('_harness_policy_checked', None)
         kwargs.pop('_harness_skip_confirm', None)
-        if self._harness_v2_enabled:
-            return self._execute_tool_with_policy(tool_name, kwargs)
-
-        return self._execute_tool_impl(tool_name, kwargs)
+        return self._execute_tool_with_policy(tool_name, kwargs)
 
     def _skill_risk_level(self, skill_name: str) -> str:
         """返回 skill 的 risk_level（'low'/'normal'/'high'），未知/查询失败按最保守 'normal' 处理。
@@ -358,6 +361,7 @@ class ToolExecutionMixin:
     def _execute_tool_impl(self, tool_name: str, kwargs: dict, skip_builtin_confirm: bool = False) -> dict:
         """Execute a tool after the public harness/policy boundary has run."""
         kwargs = dict(kwargs or {})
+        mode = self._registry_execution_mode()
 
         authorization = self._authorize_registry_dispatch(tool_name)
         if not authorization.get("allowed"):
@@ -434,6 +438,11 @@ class ToolExecutionMixin:
         self._showToolStatus.emit(tool_name)
         
         try:
+            if tool_name == "web_search":
+                return self.client._execute_web_search(kwargs)
+            if tool_name == "fetch_webpage":
+                return self.client._execute_fetch_webpage(kwargs)
+
             # ★ Plan 模式专用工具处理
             if tool_name == "create_plan":
                 return self._handle_create_plan(kwargs)
@@ -510,6 +519,16 @@ class ToolExecutionMixin:
                 tags = kwargs.get("tags") or []
                 if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
                     return {"success": False, "error": "tags must be an array of strings"}
+                if type(kwargs.get("load", False)) is not bool:
+                    return {"success": False, "error": "load must be a boolean"}
+                if kwargs.get("load"):
+                    exposure = getattr(self, '_tool_exposure', None)
+                    if exposure is None or exposure.mode != mode:
+                        return {"success": False, "error": "No active tool exposure for this execution mode"}
+                    return exposure.load(
+                        query=str(kwargs.get("query") or ""), tags=tags,
+                        mode=str(kwargs.get("mode") or ""), limit=limit,
+                    )
                 from ..utils.tool_registry import get_tool_registry
                 contracts = get_tool_registry().search_contracts(
                     query=str(kwargs.get("query") or ""),

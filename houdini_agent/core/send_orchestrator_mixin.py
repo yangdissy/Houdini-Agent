@@ -11,7 +11,6 @@ from houdini_agent.ui.i18n import tr
 from houdini_agent.core.harness_engine import HarnessRuntimeState
 from houdini_agent.utils.ai_client import (
     AIClient,
-    HOUDINI_TOOLS,
     DEFAULT_AGENT_MAX_ITERATIONS,
     DEFAULT_AGENT_MAX_TOOL_CALLS,
 )
@@ -24,13 +23,12 @@ from houdini_agent.utils.token_optimizer import (
 from houdini_agent.core.agent_request_assembly import (
     build_context,
     finalize_context_request,
+    ToolExposureState,
     has_prior_completed_turn,
     prepare_history_for_request,
 )
 from houdini_agent.utils.plan_manager import (
-    PLAN_TOOL_CREATE,
     PLAN_TOOL_UPDATE_STEP,
-    PLAN_TOOL_ASK_QUESTION,
 )
 
 
@@ -185,16 +183,9 @@ class SendOrchestratorMixin:
         return ''
 
     def _select_agent_tools_for_message(
-        self, user_message: str, use_web: bool = True, remember: bool = False
+        self, user_message: str, use_web: bool = True, remember: bool = False, mode: str = 'agent'
     ) -> List[dict]:
-        """Select a minimal Agent-mode tool set using ToolRegistry intent groups.
-
-        会话内工具集只增不减：已暴露或已调用过的工具后续轮次继续保留，
-        避免工具中途消失，也避免工具列表变化让 prompt 缓存前缀失效。
-        remember=True 才会把本次结果记入会话（仅真实运行时使用，token 估算不记录）。
-        """
-        session_key = getattr(self, '_agent_session_id', None) or getattr(self, '_session_id', None) or ''
-        sticky_by_session = self.__dict__.setdefault('_sticky_tool_names', {})
+        """Prewarm relevant tools; discovery supplies missing capabilities per run."""
         try:
             from ..utils.tool_registry import get_tool_registry
             reg = get_tool_registry()
@@ -215,22 +206,11 @@ class SendOrchestratorMixin:
             if len(users) > 1:
                 context_parts.append(users[-2][:2000])
 
-            keep = set(sticky_by_session.get(session_key, ()))
-            for message in history:
-                for call in message.get('tool_calls') or []:
-                    name = (call.get('function') or {}).get('name') if isinstance(call, dict) else None
-                    if name:
-                        keep.add(name)
             selected = reg.select_tools_for_request(
-                "\n".join(context_parts), mode='agent', extra_names=keep
+                "\n".join(context_parts), mode=mode
             )
-            if remember:
-                sticky_by_session[session_key] = {
-                    t.get('function', {}).get('name', '') for t in selected
-                } - {''}
         except Exception as e:
-            print(f"[Tool Selection] intent selection failed, falling back to core tools: {e}")
-            selected = list(HOUDINI_TOOLS)
+            raise RuntimeError("Tool selection unavailable; refusing unfiltered exposure") from e
 
         if not use_web:
             selected = [
@@ -295,15 +275,18 @@ class SendOrchestratorMixin:
         execution_context = agent_params.get('execution_context') or {}
         confirmed_plan_execution = execution_context.get('type') == 'confirmed_plan'
         confirm_mode = agent_params.get('confirm_mode', True)
-        if self._harness_v2_enabled:
-            self._harness_state = HarnessRuntimeState(session_id=self._session_id)
+        self._harness_state = HarnessRuntimeState(session_id=self._agent_session_id or self._session_id)
+        if self._append_session_diagnostics_records([{
+            'event_type': 'run_start', 'run_id': self._harness_state.run_id,
+        }], session_id=self._harness_state.session_id) is False:
+            self._harness_state.audit_state['degraded'] = True
         
         # ★ 保存 agent_params 供反思钩子使用
         self._last_agent_params = agent_params
         
         # ★ 存储 Think 开关状态，供 ThinkingStreamParser 事件分发 / _on_thinking_chunk 使用
         self._think_enabled = use_think
-        
+        run_outcome = 'failed'
         try:
             # ========================================
             # 🔥 Cache 优化：保持消息前缀稳定
@@ -488,24 +471,23 @@ class SendOrchestratorMixin:
                         sleep_thread.start()
             
             # 工具必须先选定，messages 与实际 tools 才能共同参与预算。
-            if plan_mode:
-                from ..utils.tool_registry import get_tool_registry
-                plan_filtered = get_tool_registry().get_tools_for_mode("plan_planning")
-                tools = UltraOptimizer.optimize_tool_definitions(plan_filtered)
-            elif confirmed_plan_execution:
-                exec_tools = _confirmed_plan_tools(HOUDINI_TOOLS)
-                tools = UltraOptimizer.optimize_tool_definitions(exec_tools)
-            elif not use_agent:
-                from ..utils.tool_registry import get_tool_registry
-                tools = UltraOptimizer.optimize_tool_definitions(
-                    get_tool_registry().get_tools_for_mode("ask")
-                )
-            else:
-                tools = self._select_agent_tools_for_message(
-                    user_last_msg, use_web=use_web, remember=True
-                )
-            if not use_web:
-                tools = [t for t in tools if t['function']['name'] not in ('web_search', 'fetch_webpage')]
+            from ..utils.tool_registry import get_tool_registry
+            execution_mode = 'plan_executing' if confirmed_plan_execution else (
+                'plan_planning' if plan_mode else ('agent' if use_agent else 'ask')
+            )
+            tools = self._select_agent_tools_for_message(user_last_msg, use_web=use_web, mode=execution_mode)
+
+            def record_exposure(record):
+                payload = dict(record, run_id=self._harness_state.run_id)
+                if self._append_session_diagnostics_records([payload], session_id=self._harness_state.session_id) is False:
+                    self._harness_state.audit_state['degraded'] = True
+
+            self._tool_exposure = ToolExposureState(
+                get_tool_registry(), tools, mode=execution_mode, use_web=use_web,
+                supports_vision=supports_vision, max_schema_tokens=max(1, min(16000, context_limit // 3)),
+                record_event=record_exposure,
+            )
+            tools = self._tool_exposure.snapshot()
 
             if self._auto_optimize:
                 current_tokens = self.token_optimizer.calculate_message_tokens(messages, tools=tools)
@@ -565,21 +547,10 @@ class SendOrchestratorMixin:
             # 调试：显示正在请求
             self._addStatus.emit(f"Requesting {provider}/{model}...")
             
-            # Registry is the sole authority for non-core tool exposure.
-            registry_tools = []
-            try:
-                from ..utils.tool_registry import get_tool_registry
-                _reg = get_tool_registry()
-                _mode = "plan_executing" if confirmed_plan_execution else (
-                    "plan_planning" if plan_mode else ("agent" if use_agent else "ask")
-                )
-                registry_tools = _reg.get_non_core_tools_for_mode(_mode)
-            except Exception:
-                pass
             request = finalize_context_request(
                 context_assembly,
                 selected_tools=tools,
-                registry_tools=registry_tools,
+                registry_tools=[],
                 supports_vision=supports_vision,
                 is_reasoning_model=AIClient.is_reasoning_model(model),
                 context_limit=context_limit,
@@ -631,6 +602,7 @@ class SendOrchestratorMixin:
                     enable_thinking=use_think,
                     supports_vision=supports_vision,
                     tools_override=tools,
+                    tool_exposure=self._tool_exposure,
                     context_limit=context_limit,
                     on_content=lambda c: self._on_content_with_limit(c),
                     on_thinking=lambda t: self._on_thinking_chunk(t),
@@ -664,6 +636,7 @@ class SendOrchestratorMixin:
                     enable_thinking=use_think,
                     supports_vision=supports_vision,
                     tools_override=tools,
+                    tool_exposure=self._tool_exposure,
                     context_limit=context_limit,
                     on_content=lambda c: self._on_content_with_limit(c),
                     on_thinking=lambda t: self._on_thinking_chunk(t),
@@ -692,6 +665,7 @@ class SendOrchestratorMixin:
                     enable_thinking=use_think,
                     supports_vision=supports_vision,
                     tools_override=tools,  # ★ 只传入只读工具
+                    tool_exposure=self._tool_exposure,
                     context_limit=context_limit,
                     on_content=lambda c: self._on_content_with_limit(c),
                     on_thinking=lambda t: self._on_thinking_chunk(t),
@@ -746,6 +720,7 @@ class SendOrchestratorMixin:
                 return
             
             if result.get('ok'):
+                run_outcome = 'completed'
                 self._agentDone.emit(result)
             else:
                 error_msg = result.get('error', 'Unknown error')
@@ -761,3 +736,9 @@ class SendOrchestratorMixin:
                 error_detail = f"{type(e).__name__}: {str(e)}"
                 print(f"[AI Tab Error] {traceback.format_exc()}")  # 控制台输出
                 self._agentError.emit(error_detail)
+        finally:
+            self._append_session_diagnostics_records([{
+                'event_type': 'run_end', 'run_id': self._harness_state.run_id,
+                'outcome': 'stopped' if self.client.is_stop_requested() else run_outcome,
+                'audit_status': 'degraded' if self._harness_state.audit_state.get('degraded') else 'healthy',
+            }], session_id=self._harness_state.session_id)

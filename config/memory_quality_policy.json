@@ -1,7 +1,9 @@
 {
   "trial_confidence_cap": 0.5,
   "promotion_citations": 3,
+  "promotion_reward_threshold": 0.6,
   "unused_decay": 0.97,
+  "negative_citation_decay": 0.9,
   "confidence_increment": 0.1,
   "min_rule_chars": 8,
   "max_rule_chars": 2000,
@@ -9,5 +11,11 @@
     "(?i)(api[_ -]?key|access[_ -]?token|secret|password|passwd|私钥|密码)\\s*[:=]",
     "[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f]"
   ],
-  "generic_rules": ["always be helpful", "do your best", "be careful", "注意安全", "认真思考", "遵循最佳实践"]
+  "generic_rules": ["always be helpful", "do your best", "be careful", "注意安全", "认真思考", "遵循最佳实践"],
+  "generic_patterns": [
+    "(?i)^(?:please\\s+|always\\s+|always\\s+please\\s+)?(?:be helpful|do your best|be careful)[.! ]*$",
+    "^(?:请|务必|一定要|始终要|务必始终)*认真(?:地)?思考[。！! ]*$",
+    "^(?:请|务必|一定要|始终要|务必始终)*遵循(?:所有)?最佳实践[。！! ]*$",
+    "^(?:请|务必|一定要|始终要|务必始终)*注意安全[。！! ]*$"
+  ]
 }

@@ -31,6 +31,10 @@ Executable bundles use `scripts/main.py:run`. Shared implementation belongs in e
 
 ## Consequences
 
+- Provider schema exposure is scoped to one Agent run, not to the entire chat session. Intent selection prewarms a small set; `search_tool_contracts(load=true)` loads additional enabled, mode-compatible contracts for the next model request. Pure contract queries keep their existing behavior.
+- `ToolExposureState` owns stable schema order, dependency expansion, Web/vision filtering, and the schema token budget. Native function calling and JSON fallback use the same state. The JSON tool instruction is replaced on expansion, not accumulated.
+- Each response is checked against the schemas actually sent with that request. Newly loaded tools cannot be called in that same response; rejected native calls still receive paired tool results. Exposure does not grant execution permission.
+- `config/security_policy.json` owns tool risk, mode allowlists, confirmation conditions, and input safety data. Registry runtime, Undo, Cook, path kinds, and handler semantics remain technical facts. Policy snapshots are immutable, content-hashed, and validated; invalid policy denies execution rather than falling back to Python defaults. Changes require a fresh process or module reload, not an in-flight policy update.
 - Prompt text no longer acts as a second tool schema.
 - Parameter changes propagate automatically to error usage hints.
 - Skill discovery supports progressive disclosure without import-time side effects.

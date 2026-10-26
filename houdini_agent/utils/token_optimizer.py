@@ -663,7 +663,13 @@ class TokenOptimizer:
         """
         if not result:
             return ""
-        
+
+        if (result.get('stored') is True and result.get('result_ref')) or (
+            result.get('success') and result.get('result_ref') and 'content' in result
+        ):
+            import json
+            return json.dumps(result, ensure_ascii=False, default=str)
+
         success = result.get('success', False)
         if not success:
             error = result.get('error', 'Unknown error')
