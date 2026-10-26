@@ -12,6 +12,7 @@
 
 import json
 import math
+import re
 import shutil
 import sqlite3
 import threading
@@ -24,6 +25,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from .embedding import get_embedder, LocalEmbedder
+from .memory_quality import append_quality_audit, load_quality_policy, summarize_quality
+from .security_guard import find_memory_threat
 from .memory_sqlite import (
     embedding_metadata,
     metadata_diagnostic,
@@ -104,6 +107,8 @@ class SemanticRecord:
     embedding: Optional[np.ndarray] = None
     category: str = "general"  # preference / command / debug / pitfall / workflow / knowledge / user_profile / general
     abstraction_level: int = 2  # 0-5，默认 2（经验规则），见 ABSTRACTION_LEVELS
+    status: str = "active"
+    cited_count: int = 0
 
     def __post_init__(self):
         if not self.id:
@@ -145,12 +150,13 @@ class MemoryStore:
     """三层记忆 SQLite 存储 + Embedding 向量检索"""
 
     EMBEDDING_BACKUP_RETENTION = 3
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, db_path: Optional[Path] = None, embedder: Optional[LocalEmbedder] = None):
         self.db_path = db_path or _DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.embedder = embedder or get_embedder()
+        self.quality_policy = load_quality_policy()
         self._conn: Optional[sqlite3.Connection] = None
         self._force_delete = False  # 网络盘 fallback: 跳过 WAL，直接用 DELETE 模式
         self.embedding_diagnostic: Optional[str] = None
@@ -381,6 +387,7 @@ class MemoryStore:
 
         migrations = {
             1: cls._migrate_v1_add_abstraction_level,
+            2: cls._migrate_v2_memory_quality,
         }
         for version in range(current_version + 1, cls.SCHEMA_VERSION + 1):
             migration = migrations[version]
@@ -407,6 +414,24 @@ class MemoryStore:
             "CREATE INDEX IF NOT EXISTS idx_semantic_abstraction "
             "ON semantic_memory(abstraction_level)"
         )
+
+    @staticmethod
+    def _migrate_v2_memory_quality(conn: sqlite3.Connection) -> None:
+        conn.execute("ALTER TABLE semantic_memory ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+        conn.execute("ALTER TABLE semantic_memory ADD COLUMN cited_count INTEGER NOT NULL DEFAULT 0")
+
+    def get_quality_stats(self) -> dict:
+        return summarize_quality(self.db_path.parent)
+
+    def record_recall(self, pending: dict, cited: Optional[set], session_id: str, reward: float) -> None:
+        append_quality_audit(self.db_path.parent, "recall", {
+            "session_id": session_id, "reward": reward,
+            "status": "known" if cited is not None else "unknown",
+            "memories": [
+                {**item, "alias": alias, "cited": alias in cited if cited is not None else None}
+                for alias, item in pending.items()
+            ],
+        })
 
     def close(self):
         with self._db_lock:
@@ -551,16 +576,20 @@ class MemoryStore:
         # fallback embedding (n-gram hash) 相似度值域显著偏低。
         return threshold * 0.2
 
-    def add_semantic(self, record: SemanticRecord) -> str:
+    def add_semantic(self, record: SemanticRecord, source: str = "manual") -> str:
         """写入一条抽象知识"""
         if record.embedding is None:
             record.embedding = self.embedder.encode(record.rule)
 
+        if source == "manual":
+            append_quality_audit(self.db_path.parent, "write", {
+                "memory_id": record.id, "source": source, "decision": "accept", "reason": "user_owned",
+            })
         self._execute(
             """INSERT OR REPLACE INTO semantic_memory
                (id, created_at, updated_at, rule, source_episodes,
-                confidence, activation_count, embedding, category, abstraction_level)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                confidence, activation_count, embedding, category, abstraction_level, status, cited_count)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 record.id,
                 record.created_at,
@@ -572,6 +601,8 @@ class MemoryStore:
                 self.embedder.to_bytes(record.embedding),
                 record.category,
                 record.abstraction_level,
+                record.status,
+                record.cited_count,
             ),
         )
         self._commit()
@@ -582,9 +613,21 @@ class MemoryStore:
         record: SemanticRecord,
         duplicate_threshold: float = 0.80,
         confidence_increment: float = 0.1,
+        source: str = "manual",
     ) -> Tuple[SemanticRecord, bool]:
         """写入新规则，或合并重复规则的来源与强化信号。"""
         with self._db_lock:
+            if source != "manual":
+                reason = self._automatic_rule_rejection(record)
+                append_quality_audit(self.db_path.parent, "write", {
+                    "memory_id": record.id, "source": source,
+                    "decision": "reject" if reason else "trial", "reason": reason or "requires_observation",
+                })
+                if reason:
+                    return record, False
+                record.status = "trial"
+                record.abstraction_level = max(1, record.abstraction_level)
+                record.confidence = min(record.confidence, self.quality_policy["trial_confidence_cap"])
             existing = self.find_duplicate_semantic(
                 record.rule,
                 threshold=duplicate_threshold,
@@ -592,19 +635,19 @@ class MemoryStore:
                 abstraction_level=record.abstraction_level,
             )
             if existing is None:
-                self.add_semantic(record)
+                self.add_semantic(record, source=source)
                 return record, True
 
             source_episodes = list(dict.fromkeys(
                 existing.source_episodes + record.source_episodes
             ))
-            confidence = min(1.0, existing.confidence + confidence_increment)
+            confidence = existing.confidence
             now = time.time()
             self._get_conn().execute(
                 """
                 UPDATE semantic_memory
                 SET source_episodes=?, confidence=?,
-                    activation_count=activation_count + 1, updated_at=?
+                    updated_at=?
                 WHERE id=?
                 """,
                 (
@@ -617,9 +660,49 @@ class MemoryStore:
             self._get_conn().commit()
             existing.source_episodes = source_episodes
             existing.confidence = confidence
-            existing.activation_count += 1
             existing.updated_at = now
             return existing, False
+
+    def _automatic_rule_rejection(self, record: SemanticRecord) -> str:
+        policy = self.quality_policy
+        text = record.rule.strip()
+        if not policy["min_rule_chars"] <= len(text) <= policy["max_rule_chars"]:
+            return "length"
+        if any(re.search(pattern, text) for pattern in policy["blocked_patterns"]):
+            return "sensitive_or_control"
+        if text.casefold().strip(" .!。！") in {item.casefold() for item in policy["generic_rules"]}:
+            return "generic"
+        if not math.isfinite(record.confidence) or not 0 <= record.confidence <= 1:
+            return "confidence"
+        if not record.source_episodes or any(self.get_episodic(record_id) is None for record_id in record.source_episodes):
+            return "missing_evidence"
+        return ""
+
+    def settle_semantic_usage(self, record_id: str, cited: bool, reward: float) -> None:
+        with self._db_lock:
+            record = self.get_semantic(record_id)
+            if record is None:
+                return
+            if cited and reward > 0:
+                record.activation_count += 1
+                record.cited_count += 1
+                if record.status == "trial" and record.cited_count >= self.quality_policy["promotion_citations"]:
+                    append_quality_audit(self.db_path.parent, "write", {
+                        "memory_id": record.id, "source": "recall", "decision": "promote", "reason": "positive_citations",
+                    })
+                    record.status = "active"
+                cap = self.quality_policy["trial_confidence_cap"] if record.status == "trial" else 1.0
+                record.confidence = min(cap, record.confidence + self.quality_policy["confidence_increment"])
+            elif not cited:
+                floor = 0.45 if record.abstraction_level <= 1 else 0.10 if record.abstraction_level == 2 else 0.05
+                record.confidence = max(min(floor, record.confidence), record.confidence * self.quality_policy["unused_decay"])
+            else:
+                return
+            self._execute(
+                "UPDATE semantic_memory SET confidence=?, activation_count=?, cited_count=?, status=?, updated_at=? WHERE id=?",
+                (record.confidence, record.activation_count, record.cited_count, record.status, time.time(), record.id),
+            )
+            self._commit()
 
     def get_semantic(self, record_id: str) -> Optional[SemanticRecord]:
         """根据 ID 获取抽象知识"""
@@ -742,13 +825,14 @@ class MemoryStore:
     # 分层记忆检索（6 层抽象层级）
     # ==========================================================
 
-    def get_core_memories(self, max_count: int = 5) -> List[SemanticRecord]:
+    def get_core_memories(self, max_count: int = 5, username: str = "") -> List[SemanticRecord]:
         """获取 level=0 核心记忆，按 confidence 降序，最多 max_count 条"""
         rows = self._fetchall(
             "SELECT * FROM semantic_memory WHERE abstraction_level = 0 ORDER BY confidence DESC LIMIT ?",
             (max_count,)
         )
-        return [self._row_to_semantic(r) for r in rows]
+        records = [self._row_to_semantic(row) for row in rows]
+        return [record for record in records if not find_memory_threat(record.rule, username)]
 
     def search_by_level(
         self, query: str, level: int, top_k: int = 3,
@@ -1016,7 +1100,7 @@ class MemoryStore:
                 else:
                     min_floor = 0.05
 
-                new_conf = max(min_floor, min(1.0, new_conf))
+                new_conf = min(confidence, max(min_floor, min(1.0, new_conf)))
                 if abs(new_conf - confidence) > 0.001:
                     conn.execute(
                         "UPDATE semantic_memory SET confidence=?, updated_at=? WHERE id=?",
@@ -1228,6 +1312,8 @@ class MemoryStore:
             embedding=self.embedder.from_bytes(row[7]) if row[7] else None,
             category=row[8],
             abstraction_level=row[9] if len(row) > 9 and row[9] is not None else 2,
+            status=row[10],
+            cited_count=row[11],
         )
 
     def _row_to_procedural(self, row) -> ProceduralRecord:

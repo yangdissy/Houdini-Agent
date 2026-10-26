@@ -11,6 +11,7 @@ from houdini_agent.qt_compat import QtCore
 from houdini_agent.ui.i18n import tr
 from .thinking_stream_parser import ThinkingStreamParser
 from ..utils.dev_feature_toggles import DEV_FEATURE_TOGGLES, is_toggle_enabled
+from ..utils.memory_activation import strip_memory_usage
 
 
 class RuntimeStateMixin:
@@ -20,7 +21,7 @@ class RuntimeStateMixin:
             return False
         if result.get('tool_calls_history'):
             return True
-        final_content = result.get('final_content', '')
+        final_content = result.get('final_content', '') or result.get('content', '')
         return isinstance(final_content, str) and bool(final_content.strip())
 
     _TAB_RUNNING_PREFIX = "\u25cf "
@@ -327,6 +328,8 @@ class RuntimeStateMixin:
             for message in new_messages:
                 clean = message.copy()
                 clean.pop('reasoning_content', None)
+                if clean.get('role') == 'assistant' and isinstance(clean.get('content'), str):
+                    clean['content'] = strip_memory_usage(clean['content']).strip()
                 if message is new_messages[-1] and message.get('role') == 'assistant' and not message.get('tool_calls'):
                     continue
                 history.append(clean)
@@ -349,6 +352,7 @@ class RuntimeStateMixin:
             thinking_parts = re.findall(r'<think>([\s\S]*?)</think>', final_content)
             thinking_text = '\n'.join(thinking_parts).strip() if thinking_parts else ''
             clean_content = re.sub(r'<think>[\s\S]*?</think>', '', final_content).strip()
+            clean_content = strip_memory_usage(clean_content).strip()
             clean_content = self._strip_fake_tool_results(clean_content)
 
         need_final = bool(clean_content) or bool(new_messages) or not history or history[-1].get('role') != 'assistant'
@@ -500,11 +504,18 @@ class RuntimeStateMixin:
                 )
 
         if self._memory_initialized and self._should_reflect_on_result(result):
-            reflect_params = getattr(self, '_last_agent_params', {})
+            reflect_params = dict(getattr(self, '_last_agent_params', {}))
+            reflect_result = dict(result)
+            reflect_result['final_content'] = final_content
+            reflect_result['_memory_recall'] = getattr(self, '_pending_memory_reinforcement', None) or {}
+            reflect_result['_memory_session_id'] = self._agent_session_id or self._session_id
+            self._pending_memory_reinforcement = None
             def do_reflect():
-                self._reflect_after_task(result, reflect_params)
+                self._reflect_after_task(reflect_result, reflect_params)
             reflect_thread = threading.Thread(target=do_reflect, daemon=True)
             reflect_thread.start()
+        elif getattr(self, '_pending_memory_reinforcement', None):
+            self._record_unknown_memory_recall()
 
         agent_sid = self._agent_session_id
         if self._auto_save_cache and len(history) > 0 and agent_sid:
@@ -520,6 +531,8 @@ class RuntimeStateMixin:
         self._maybe_generate_title(agent_sid, history)
 
     def _on_agent_error(self, error: str):
+        if getattr(self, '_pending_memory_reinforcement', None):
+            self._record_unknown_memory_recall()
         self._main_thread_busy = False
         self._restore_update_mode()
         try:
@@ -543,6 +556,8 @@ class RuntimeStateMixin:
         self._set_running(False)
 
     def _on_agent_stopped(self):
+        if getattr(self, '_pending_memory_reinforcement', None):
+            self._record_unknown_memory_recall()
         self._main_thread_busy = False
         self._restore_update_mode()
         try:

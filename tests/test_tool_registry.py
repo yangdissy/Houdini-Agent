@@ -450,6 +450,33 @@ class IntentTest(unittest.TestCase):
     def setUp(self):
         self.reg = ToolRegistry()
 
+    def test_intent_groups_and_keywords_stay_in_sync(self):
+        groups = set(ToolRegistry._INTENT_TOOL_GROUPS)
+        keywords = set(ToolRegistry._INTENT_KEYWORDS)
+        defaults = set(ToolRegistry._DEFAULT_INTENT_GROUPS)
+
+        self.assertEqual(groups - keywords - defaults, set(), "工具组没有对应关键词，永远不会被选中")
+        self.assertEqual(keywords - groups, set(), "关键词没有对应工具组，命中后不会加入任何工具")
+
+    def test_every_agent_tool_is_reachable_by_intent_selection(self):
+        from unittest import mock
+        with mock.patch.dict("sys.modules", {"requests": mock.MagicMock()}):
+            from houdini_agent.utils.ai_client import HOUDINI_TOOLS
+
+        reg = ToolRegistry()
+        reg.register_core_tools(HOUDINI_TOOLS)
+        reachable = set().union(*ToolRegistry._INTENT_TOOL_GROUPS.values())
+        reachable |= ToolRegistry._AGENT_ALWAYS_TOOLS | {"run_skill", "list_skills"}
+        # Plan 模式直接按 mode 取工具，不经过意图选择
+        plan_mode_only = {"create_plan", "update_plan_step", "ask_question"}
+
+        unreachable = reg.get_tool_names_for_mode("agent") - reachable - plan_mode_only
+
+        self.assertEqual(
+            unreachable, set(),
+            "新增工具必须加入 _INTENT_TOOL_GROUPS 或 _AGENT_ALWAYS_TOOLS，否则 Agent 永远拿不到",
+        )
+
     def test_classify_intent_chinese(self):
         intents = self.reg.classify_intent("帮我创建一个 box 节点")
         self.assertIn("create", intents)
@@ -610,7 +637,7 @@ class IntentTest(unittest.TestCase):
 
         self.assertIn("get_network_structure", names)
         self.assertIn("execute_shell", names)
-        self.assertNotIn("execute_python", names)
+        self.assertIn("execute_python", names)
         self.assertIn("save_hip", names)
 
     def test_execute_optimization_prefers_dedicated_network_tools(self):
@@ -636,7 +663,6 @@ class IntentTest(unittest.TestCase):
         self.assertIn("set_node_flags", names)
         self.assertIn("layout_nodes", names)
         self.assertIn("verify_network", names)
-        self.assertNotIn("execute_python", names)
 
     def test_explicit_python_request_selects_execute_python(self):
         for name in ("execute_python", "get_network_structure"):
@@ -662,6 +688,49 @@ class IntentTest(unittest.TestCase):
         self.assertIn("get_node_connections", names)
         self.assertIn("preview_node_operation", names)
         self.assertNotIn("connect_nodes", names)
+
+    def test_keywords_match_whole_words_not_substrings(self):
+        self.assertNotIn("modify", self.reg.classify_intent("reset the address"))
+        self.assertNotIn("create", self.reg.classify_intent("address"))
+        self.assertNotIn("create", self.reg.classify_intent("请建议一下"))
+        self.assertNotIn("code", self.reg.classify_intent("encode this"))
+        self.assertIn("create", self.reg.classify_intent("creates a box"))
+        self.assertIn("create", self.reg.classify_intent("新建一个节点"))
+
+    def test_uppercase_node_prefix_keywords_match(self):
+        self.assertIn("null", self.reg.classify_intent("把结果接到 /obj/geo1/OUT_geo"))
+
+    def test_domain_and_support_tools_are_reachable(self):
+        names = (
+            "get_usd_prim_info", "get_usd_layer_stack", "get_top_network_status",
+            "list_top_work_items", "get_top_errors", "build_pdg_expression",
+            "inspect_python", "preview_layout_nodes", "cook_sample_frames",
+            "inspect_frame_range_risk", "read_tool_result", "get_operation_status",
+            "list_operation_receipts", "inspect_tool_contract", "search_tool_contracts",
+        )
+        for name in names:
+            self.reg.register(name, _schema(name), modes={"agent"})
+
+        def selected(message):
+            return {s["function"]["name"] for s in self.reg.select_tools_for_request(message, "agent")}
+
+        self.assertLessEqual({"read_tool_result", "get_operation_status", "list_operation_receipts"}, selected("好"))
+        self.assertIn("get_usd_prim_info", selected("检查 usd stage 里的 prim"))
+        self.assertIn("get_top_errors", selected("pdg 的 work item 报错"))
+        self.assertIn("inspect_python", selected("用 python 分析一下"))
+        self.assertIn("preview_layout_nodes", selected("整理节点布局"))
+        self.assertIn("cook_sample_frames", selected("cook 几帧看看"))
+        self.assertIn("inspect_tool_contract", selected("查看 tool contract"))
+
+    def test_extra_names_are_kept_regardless_of_intent(self):
+        self.reg.register("get_usd_prim_info", _schema("get_usd_prim_info"), modes={"agent"})
+
+        names = {
+            s["function"]["name"]
+            for s in self.reg.select_tools_for_request("好", "agent", extra_names={"get_usd_prim_info"})
+        }
+
+        self.assertIn("get_usd_prim_info", names)
 
 
 class ModeAllowanceTest(unittest.TestCase):

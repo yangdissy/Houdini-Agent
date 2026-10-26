@@ -282,6 +282,13 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         self._nav_group.buttonClicked.connect(self._on_nav_clicked)
         bl.addWidget(nav)
 
+        self._quality_lbl = QtWidgets.QLabel()
+        self._quality_lbl.setObjectName("memoryMgrStats")
+        self._quality_lbl.setWordWrap(True)
+        self._quality_lbl.setContentsMargins(20, 4, 20, 8)
+        self._quality_lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        bl.addWidget(self._quality_lbl)
+
         # ── Stack ──
         self._stack = QtWidgets.QStackedWidget()
         self._stack.setObjectName("memoryMgrStack")
@@ -870,6 +877,21 @@ class MemoryManagerDialog(QtWidgets.QDialog):
                 st.get("procedural_count", 0),
             )
         )
+        try:
+            quality = self._store.get_quality_stats()
+            overall = quality["groups"].get("all", {})
+            def percentage(value):
+                return tr("memory_mgr.no_data") if value is None else f"{value:.1%}"
+            self._quality_lbl.setText(tr(
+                "memory_mgr.quality_stats",
+                percentage(overall.get("declared_use_rate")), percentage(overall.get("uncited_rate")),
+                percentage(quality["unknown_rate"]), overall.get("known", 0),
+                quality["writes"].get("trial", 0), quality["writes"].get("reject", 0), quality["writes"].get("promote", 0),
+            ))
+            self._quality_lbl.setToolTip(tr("memory_mgr.quality_detail") + "\n" + json.dumps(quality, ensure_ascii=False, indent=2))
+        except (OSError, ValueError) as exc:
+            self._quality_lbl.setText(tr("memory_mgr.quality_error"))
+            self._quality_lbl.setToolTip(str(exc))
 
     def _reload_episodic_list(self):
         self._list_epi.blockSignals(True)
@@ -981,6 +1003,8 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         q = self._filter_sem.text().strip().lower()
         for rec in self._store.get_all_semantic(category=None):
             line = f"[L{rec.abstraction_level}][{rec.category}] {(rec.rule or '')[:80]}"
+            if rec.status == "trial":
+                line = tr("memory_mgr.trial_prefix") + " " + line
             if q and q not in line.lower() and q not in (rec.id or "").lower():
                 continue
             it = QtWidgets.QListWidgetItem(line if len(line) <= 200 else line[:197] + "…")
@@ -1078,6 +1102,7 @@ class MemoryManagerDialog(QtWidgets.QDialog):
                 source_episodes=eps,
                 confidence=self._sem_conf.value(),
                 activation_count=old.activation_count,
+                cited_count=old.cited_count,
                 category=cat,
                 abstraction_level=self._sem_level.value(),
                 embedding=None,

@@ -39,7 +39,7 @@ from .team_memory_document import (
 from .team_memory_settings import is_team_export_enabled
 
 def _semantic_export_entry(record) -> Optional[dict]:
-    if not semantic_eligibility(record)[0]:
+    if record.status != "active" or not semantic_eligibility(record)[0]:
         return None
     return {
         "rule": record.rule,

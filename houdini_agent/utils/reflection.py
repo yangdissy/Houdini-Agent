@@ -634,12 +634,13 @@ class ReflectionModule:
                 record,
                 duplicate_threshold=0.80,
                 confidence_increment=0.1,
+                source="reflection",
             )
             if created:
                 result["new_rules"].append(rule_text)
                 print(f"[Reflection] 新规则: {rule_text[:50]}...")
-            else:
-                print(f"[Reflection] 强化已有规则: {saved.rule[:50]}... (conf={saved.confidence:.2f})")
+            elif self.store.get_semantic(saved.id) is not None:
+                print(f"[Reflection] 合并已有规则来源: {saved.rule[:50]}...")
 
         # 2. 处理策略更新
         for update in strategy_updates:
@@ -742,6 +743,7 @@ class ReflectionModule:
                     record,
                     duplicate_threshold=0.80,
                     confidence_increment=0.1,
+                    source="light_sleep",
                 )
                 if created:
                     result["new_rules"].append(rule_text)
@@ -752,7 +754,7 @@ class ReflectionModule:
                     record = SemanticRecord(
                         rule=fact[:120],
                         source_episodes=[result["episodic_id"]] if result["episodic_id"] else [],
-                        confidence=0.8,
+                        confidence=0.5,
                         category="preference",
                         abstraction_level=1,
                     )
@@ -760,6 +762,7 @@ class ReflectionModule:
                         record,
                         duplicate_threshold=0.80,
                         confidence_increment=0.1,
+                        source="light_sleep",
                     )
                     if created:
                         result["new_rules"].append(fact[:120])
@@ -853,6 +856,7 @@ class ReflectionModule:
                     record,
                     duplicate_threshold=0.80,
                     confidence_increment=0.15,
+                    source="deep_sleep",
                 )
                 if created:
                     result["new_rules"].append(rule_text)
@@ -881,7 +885,7 @@ class ReflectionModule:
                     record = SemanticRecord(
                         rule=fact[:120],
                         source_episodes=[result["episodic_id"]] if result["episodic_id"] else [],
-                        confidence=0.85,
+                        confidence=0.5,
                         category="preference",
                         abstraction_level=1,
                     )
@@ -889,6 +893,7 @@ class ReflectionModule:
                         record,
                         duplicate_threshold=0.80,
                         confidence_increment=0.15,
+                        source="deep_sleep",
                     )
                     if created:
                         result["new_rules"].append(fact[:120])

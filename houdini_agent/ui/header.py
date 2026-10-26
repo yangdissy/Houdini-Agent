@@ -101,16 +101,8 @@ class HeaderMixin:
             'kimi_coding': ['k3', 'k3-256k', 'kimi-for-coding', 'kimi-for-coding-highspeed'],
             'of3d': ['gpt-5.6', 'chatgpt-4o-latest'],
             'siliconflow': [
-                'deepseek-ai/DeepSeek-V4-Pro',
-                'deepseek-ai/DeepSeek-V4-Flash',
-                'deepseek-ai/DeepSeek-V3',
-                'deepseek-ai/DeepSeek-R1',
-                'Pro/deepseek-ai/DeepSeek-V3',
-                'Pro/deepseek-ai/DeepSeek-R1',
-                'Qwen/Qwen3-235B-A22B',
-                'Qwen/Qwen3-30B-A3B',
-                'Qwen/Qwen3-8B',
-                'THUDM/GLM-Z1-32B-0414',
+                'deepseek-ai/DeepSeek-V4.1-Flash',
+                'zai-org/GLM-5.3',
             ],
             'custom': [],  # 由用户通过配置对话框动态填充
         }
@@ -168,16 +160,8 @@ class HeaderMixin:
             'chatgpt-4o-latest': 128000,
             'gpt-5.6': 425000,
             # SiliconFlow
-            'deepseek-ai/DeepSeek-V4-Pro': 1048576,
-            'deepseek-ai/DeepSeek-V4-Flash': 1048576,
-            'deepseek-ai/DeepSeek-V3': 65536,
-            'deepseek-ai/DeepSeek-R1': 16384,
-            'Pro/deepseek-ai/DeepSeek-V3': 65536,
-            'Pro/deepseek-ai/DeepSeek-R1': 16384,
-            'Qwen/Qwen3-235B-A22B': 131072,
-            'Qwen/Qwen3-30B-A3B': 32768,
-            'Qwen/Qwen3-8B': 32768,
-            'THUDM/GLM-Z1-32B-0414': 32768,
+            'deepseek-ai/DeepSeek-V4.1-Flash': 1048576,
+            'zai-org/GLM-5.3': 200000,
         }
         # 模型特性配置
         self._model_features = {
@@ -236,16 +220,8 @@ class HeaderMixin:
             'chatgpt-4o-latest':                  {'supports_prompt_caching': False, 'supports_vision': True},
             'gpt-5.6':                            {'supports_prompt_caching': False, 'supports_vision': True},
             # SiliconFlow
-            'deepseek-ai/DeepSeek-V4-Pro':        {'supports_prompt_caching': False, 'supports_vision': False},
-            'deepseek-ai/DeepSeek-V4-Flash':      {'supports_prompt_caching': False, 'supports_vision': False},
-            'deepseek-ai/DeepSeek-V3':            {'supports_prompt_caching': False, 'supports_vision': False},
-            'deepseek-ai/DeepSeek-R1':            {'supports_prompt_caching': False, 'supports_vision': False},
-            'Pro/deepseek-ai/DeepSeek-V3':        {'supports_prompt_caching': False, 'supports_vision': False},
-            'Pro/deepseek-ai/DeepSeek-R1':        {'supports_prompt_caching': False, 'supports_vision': False},
-            'Qwen/Qwen3-235B-A22B':               {'supports_prompt_caching': False, 'supports_vision': False},
-            'Qwen/Qwen3-30B-A3B':                 {'supports_prompt_caching': False, 'supports_vision': False},
-            'Qwen/Qwen3-8B':                      {'supports_prompt_caching': False, 'supports_vision': False},
-            'THUDM/GLM-Z1-32B-0414':              {'supports_prompt_caching': False, 'supports_vision': False},
+            'deepseek-ai/DeepSeek-V4.1-Flash':  {'supports_prompt_caching': False, 'supports_vision': True},
+            'zai-org/GLM-5.3':                  {'supports_prompt_caching': False, 'supports_vision': False},
         }
         self._refresh_models('deepseek')
         self.model_combo.setMinimumWidth(100)

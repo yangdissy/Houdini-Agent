@@ -10,12 +10,10 @@ from pathlib import Path
 from typing import Optional
 
 from .memory_store import MemoryStore, SemanticRecord, get_memory_store
+from .security_guard import find_memory_threat
 
 
 _MAX_CONTENT_LENGTH = 2000
-_SENSITIVE_PATTERN = re.compile(
-    r"(?i)(api[_ -]?key|access[_ -]?token|secret|password|passwd|私钥|密码)\s*[:=]"
-)
 _CONTROL_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _SAVE_INTENT_PATTERN = re.compile(
     r"(记住|记得住|记下来|保存为长期记忆|以后都按|以后按照|remember this|save this)"
@@ -42,12 +40,13 @@ class ExplicitMemoryResult:
 class ExplicitMemoryService:
     """Validate, deduplicate, persist, and verify explicit memories."""
 
-    def __init__(self, store: MemoryStore):
+    def __init__(self, store: MemoryStore, username: str = ""):
         self._store = store
+        self._username = username
 
     def remember(self, content: str) -> ExplicitMemoryResult:
         text = (content or "").strip()
-        rejection = self._validate(text)
+        rejection = self._validate(text, self._username)
         if rejection:
             return ExplicitMemoryResult("rejected", message=rejection)
 
@@ -92,15 +91,15 @@ class ExplicitMemoryService:
         return bool(_SAVE_INTENT_PATTERN.search(text))
 
     @staticmethod
-    def _validate(text: str) -> str:
+    def _validate(text: str, username: str = "") -> str:
         if not text:
             return "记忆内容不能为空。"
         if len(text) > _MAX_CONTENT_LENGTH:
             return f"记忆内容不能超过 {_MAX_CONTENT_LENGTH} 个字符。"
         if _CONTROL_PATTERN.search(text):
             return "记忆内容包含不允许的控制字符。"
-        if _SENSITIVE_PATTERN.search(text):
-            return "为保护安全，不保存密码、密钥或访问令牌。"
+        if find_memory_threat(text, username):
+            return "为保护安全，不保存含敏感信息或疑似指令注入的记忆。"
         return ""
 
     @staticmethod
@@ -121,7 +120,7 @@ def remember_explicit_memory(
     audit_dir: Optional[Path] = None,
 ) -> ExplicitMemoryResult:
     """Persist an explicit memory in the current user's authoritative store."""
-    result = ExplicitMemoryService(get_memory_store(username)).remember(content)
+    result = ExplicitMemoryService(get_memory_store(username), username=username).remember(content)
     _append_explicit_memory_audit(
         username=username,
         session_id=session_id,

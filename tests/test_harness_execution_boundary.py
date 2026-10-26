@@ -18,6 +18,7 @@ _install_qt_stubs()
 
 from houdini_agent.core.harness_engine import (
     GovernedToolExecutor,
+    HarnessRuntimeState,
     HarnessToolPolicyEngine,
     ToolPolicyDecision,
 )
@@ -84,6 +85,46 @@ class HarnessExecutionBoundaryTest(unittest.TestCase):
         tab._execute_tool_impl = lambda *args, **kwargs: {"success": True, "result": "should not run"}
         tab._pre_agent_update_mode = None
         return tab
+
+    def test_recreated_executor_shares_failures_only_within_user_turn(self):
+        tab = self._make_tab()
+        tab._agent_mode = True
+        tab._harness_state = HarnessRuntimeState()
+        calls = []
+        tab._execute_tool_impl = lambda *args, **kwargs: calls.append(args) or {
+            "success": False, "error": "NameError: missing",
+        }
+
+        for _ in range(3):
+            result = AITab._execute_tool_with_todo(tab, "execute_python", code="pass")
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result["error_code"], "repeated_execution_failure")
+
+        tab._execute_tool_impl = lambda *args, **kwargs: calls.append(args) or {
+            "success": True, "result": "parameters inspected",
+        }
+        evidence = AITab._execute_tool_with_todo(
+            tab, "get_parameter_schema", node_path="/obj/geo1",
+        )
+        recovered = AITab._execute_tool_with_todo(tab, "execute_python", code="pass")
+
+        self.assertTrue(evidence["success"])
+        self.assertTrue(recovered["success"])
+        self.assertEqual(len(calls), 4)
+
+        tab._execute_tool_impl = lambda *args, **kwargs: calls.append(args) or {
+            "success": False, "error": "NameError: missing",
+        }
+        for _ in range(3):
+            result = AITab._execute_tool_with_todo(tab, "execute_python", code="pass")
+        self.assertEqual(len(calls), 6)
+
+        tab._harness_state = HarnessRuntimeState()
+        result = AITab._execute_tool_with_todo(tab, "execute_python", code="pass")
+
+        self.assertEqual(len(calls), 7)
+        self.assertNotIn("error_code", result)
 
     @staticmethod
     def _empty_geometry_result(node_path="/obj/geo1/OUT"):
@@ -317,6 +358,124 @@ class HarnessExecutionBoundaryTest(unittest.TestCase):
 
 
 class GovernedToolExecutorTest(unittest.TestCase):
+    def test_repeated_exception_family_blocks_changed_python_code(self):
+        calls = []
+        audits = []
+        owner = GovernedToolExecutor(
+            HarnessToolPolicyEngine(),
+            lambda name, args, confirmed: calls.append(args) or {
+                "success": False,
+                "error": "NameError: name 'value_%d' is not defined" % len(calls),
+            },
+            audit=audits.append,
+        )
+
+        results = [
+            owner.execute("execute_python", {"code": "print(%d)" % index}, {"mode": "agent"})
+            for index in range(3)
+        ]
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(results[-1]["error_code"], "repeated_execution_failure")
+        self.assertEqual(results[1]["recommended_next_action"], "collect_evidence")
+        self.assertTrue(any(record["event_type"] == "execution_failure_guard" for record in audits))
+        self.assertNotIn("value_", str(audits))
+
+    def test_different_errors_and_success_do_not_accumulate(self):
+        responses = iter([
+            {"success": False, "error": "NameError: missing"},
+            {"success": False, "error": "AttributeError: missing"},
+            {"success": True, "result": "fixed"},
+            {"success": False, "error": "AttributeError: missing"},
+            {"success": True, "result": "fixed again"},
+        ])
+        owner = GovernedToolExecutor(
+            HarnessToolPolicyEngine(), lambda *args: next(responses),
+        )
+
+        results = [
+            owner.execute("execute_python", {"code": "pass"}, {"mode": "agent"})
+            for _ in range(5)
+        ]
+
+        self.assertTrue(results[-1]["success"])
+
+    def test_only_successful_current_evidence_releases_paused_tool(self):
+        for evidence in (
+            {"success": False, "error": "inspection failed"},
+            {"success": True, "scene_consistency": "unknown"},
+            {"success": True, "thread_still_running": True},
+            {"success": True, "verification": {"status": "applied_unknown"}},
+            {"success": True, "result": "node inspected"},
+        ):
+            with self.subTest(evidence=evidence):
+                calls = []
+                responses = iter([
+                    {"success": False, "error": "NameError: first"},
+                    {"success": False, "error": "NameError: second"},
+                    {"success": True, "result": "archived result"},
+                    evidence,
+                    {"success": True, "result": "fixed"},
+                ])
+                owner = GovernedToolExecutor(
+                    type("FixedPolicy", (), {
+                        "decide": lambda self, *args: ToolPolicyDecision(action="allow")
+                    })(),
+                    lambda *args: calls.append(args) or next(responses),
+                )
+                for _ in range(2):
+                    owner.execute("execute_python", {"code": "pass"}, {"mode": "agent"})
+
+                owner.execute("read_tool_result", {}, {"mode": "agent"})
+                blocked = owner.execute("execute_python", {"code": "pass"}, {"mode": "agent"})
+                self.assertEqual(blocked["error_code"], "repeated_execution_failure")
+
+                owner.execute("inspect_node", {}, {"mode": "agent"})
+                result = owner.execute("execute_python", {"code": "pass"}, {"mode": "agent"})
+
+                recovered = evidence.get("result") == "node inspected"
+                self.assertEqual(result["success"], recovered)
+                self.assertEqual(len(calls), 5 if recovered else 4)
+
+    def test_traceback_classification_uses_final_exception(self):
+        state = HarnessRuntimeState()
+        calls = []
+        owner = GovernedToolExecutor(
+            HarnessToolPolicyEngine(),
+            lambda *args: calls.append(args) or {
+                "success": False,
+                "error": "SyntaxError: eval failed\nDuring handling:\nNameError: missing",
+            },
+            execution_failures=state.execution_failures,
+        )
+
+        for _ in range(3):
+            result = owner.execute("execute_python", {"code": "pass"}, {"mode": "agent"})
+
+        self.assertEqual(state.execution_failures["execute_python"], ("NameError", 2))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result["error_code"], "repeated_execution_failure")
+
+    def test_plain_tool_errors_are_limited_without_logging_error_text(self):
+        calls = []
+        audits = []
+        owner = GovernedToolExecutor(
+            type("FixedPolicy", (), {
+                "decide": lambda self, *args: ToolPolicyDecision(action="allow")
+            })(),
+            lambda *args: calls.append(args) or {
+                "success": False, "error": "Cannot update /obj/private_node",
+            },
+            audit=audits.append,
+        )
+
+        for index in range(3):
+            result = owner.execute("set_node_parameter", {"value": index}, {"mode": "agent"})
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result["error_code"], "repeated_execution_failure")
+        self.assertNotIn("private_node", str(audits))
+
     def test_execute_python_audits_code_hash_without_source(self):
         audits = []
         code = "print('audit-source-secret')"

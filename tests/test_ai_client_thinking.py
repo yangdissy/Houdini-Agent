@@ -82,6 +82,98 @@ class AIClientThinkingHintTest(unittest.TestCase):
         resume.assert_not_called()
         self.assertEqual(client.chat_stream.call_count, 1)
 
+    @staticmethod
+    def _tool_call_chunk(call_id, name="inspect_node"):
+        return {"type": "tool_call", "tool_call": {
+            "id": call_id, "type": "function",
+            "function": {"name": name, "arguments": "{}"},
+        }}
+
+    def test_tool_call_limit_stops_before_executing_and_pairs_every_call(self):
+        client = self._loop_client([
+            [self._tool_call_chunk("a"), self._tool_call_chunk("b"), {"type": "done", "usage": {}}],
+        ])
+        streamed = []
+
+        result = client.agent_loop_stream(
+            messages=[{"role": "user", "content": "go"}],
+            model="test-model",
+            provider="test-provider",
+            tools_override=[],
+            on_content=streamed.append,
+            max_tool_calls=1,
+        )
+
+        client._get_streaming_tool_executor.return_value.execute_round.assert_not_called()
+        self.assertEqual(result["stop_reason"], "max_tool_calls")
+        tool_msgs = [m for m in result["new_messages"] if m.get("role") == "tool"]
+        self.assertEqual({m["tool_call_id"] for m in tool_msgs}, {"a", "b"})
+        self.assertTrue(all("未执行" in m["content"] for m in tool_msgs))
+        self.assertTrue(any("继续" in s for s in streamed))
+
+    def test_max_iterations_reports_visible_stop_reason(self):
+        tool_round = [self._tool_call_chunk("a"), {"type": "done", "usage": {}}]
+        summary = [{"type": "content", "content": "summary"}, {"type": "done", "usage": {}}]
+        client = self._loop_client([tool_round, tool_round, summary])
+        streamed = []
+
+        result = client.agent_loop_stream(
+            messages=[{"role": "user", "content": "go"}],
+            model="test-model",
+            provider="test-provider",
+            tools_override=[],
+            on_content=streamed.append,
+            max_iterations=2,
+        )
+
+        self.assertEqual(result["stop_reason"], "max_iterations")
+        self.assertIn("继续", result["final_content"])
+        self.assertTrue(any("继续" in s for s in streamed))
+
+    def test_near_iteration_limit_injects_wrap_up_hint_once(self):
+        tool_round = [self._tool_call_chunk("a"), {"type": "done", "usage": {}}]
+        summary = [{"type": "content", "content": "summary"}, {"type": "done", "usage": {}}]
+        client = self._loop_client([tool_round, tool_round, tool_round, summary])
+
+        result = client.agent_loop_stream(
+            messages=[{"role": "user", "content": "go"}],
+            model="test-model",
+            provider="test-provider",
+            tools_override=[],
+            enable_thinking=False,
+            max_iterations=3,
+        )
+
+        tool_msgs = [m for m in result["new_messages"] if m.get("role") == "tool"]
+        hinted = [m for m in tool_msgs if "上限" in m["content"]]
+        self.assertEqual(len(hinted), 1)
+
+    def test_loop_abort_keeps_real_results_of_already_executed_calls(self):
+        client = self._loop_client([
+            [self._tool_call_chunk("a"), self._tool_call_chunk("b"), {"type": "done", "usage": {}}],
+        ])
+        client._get_streaming_tool_executor.return_value.execute_round.return_value = {
+            "results_ordered": [
+                {"success": True, "result": "RESULT_A"},
+                {"success": True, "result": "RESULT_B"},
+            ],
+            "dedup_flags": [False, False],
+            "early_skip_count": 0,
+        }
+        client._tool_loop_abort_reason = mock.Mock(return_value="loop detected")
+
+        result = client.agent_loop_stream(
+            messages=[{"role": "user", "content": "go"}],
+            model="test-model",
+            provider="test-provider",
+            tools_override=[],
+        )
+
+        tool_msgs = {m["tool_call_id"]: m["content"] for m in result["new_messages"] if m.get("role") == "tool"}
+        self.assertIn("RESULT_A", tool_msgs.get("a", ""))
+        self.assertIn("RESULT_B", tool_msgs.get("b", ""))
+        self.assertEqual(len(result["tool_calls_history"]), 2)
+
     def test_lexical_embedder_does_not_probe_semantic_model(self):
         with mock.patch.object(LocalEmbedder, "_try_load_model") as try_load:
             embedder = LocalEmbedder(load_semantic_model=False)

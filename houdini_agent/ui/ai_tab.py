@@ -163,7 +163,8 @@ class AITab(
     _updateStreamingPlan = QtCore.Signal(str)        # 更新流式 Plan 预览卡片内容 (accumulated_json)
     _renderPlanViewer = QtCore.Signal(dict)          # Plan 模式：在主线程渲染 PlanViewer 卡片
     _updatePlanStep = QtCore.Signal(str, str, str)   # Plan 模式：更新步骤状态 (step_id, status, result_summary)
-    _askQuestionRequest = QtCore.Signal()             # Plan 模式：ask_question 请求（参数通过属性传递）
+    _askQuestionRequest = QtCore.Signal(dict)
+    _finishAskQuestionRequest = QtCore.Signal(str, str)
     _episodicRecorded = QtCore.Signal(str)            # 任务反思完成：写入 episodic 记忆 (episodic_id)
     _memoryMigrationRequired = QtCore.Signal()
     _memoryMigrationFinished = QtCore.Signal(bool, str)
@@ -272,6 +273,8 @@ class AITab(
         
         # 会话级节点路径映射：name → set[path]，用于节点引用去歧义
         self._session_node_map: dict[str, set[str]] = {}
+        # 会话内 agent 创建成功的节点路径集合，供 Harness 判断 foreign 修改
+        self._session_agent_created_paths: set[str] = set()
         
         # Token 使用统计（累积值，每轮对话叠加）—— 对齐 Cursor
         self._token_stats = self._empty_token_stats()
@@ -337,6 +340,7 @@ class AITab(
         self._renderPlanViewer.connect(self._on_render_plan_viewer, QtCore.Qt.QueuedConnection)
         self._updatePlanStep.connect(self._on_update_plan_step, QtCore.Qt.QueuedConnection)
         self._askQuestionRequest.connect(self._on_render_ask_question, QtCore.Qt.QueuedConnection)
+        self._finishAskQuestionRequest.connect(self._on_finish_ask_question, QtCore.Qt.QueuedConnection)
         self._episodicRecorded.connect(self._on_episodic_recorded, QtCore.Qt.QueuedConnection)
         self._memoryMigrationRequired.connect(self._on_memory_migration_required, QtCore.Qt.QueuedConnection)
         self._memoryMigrationFinished.connect(self._on_memory_migration_finished, QtCore.Qt.QueuedConnection)

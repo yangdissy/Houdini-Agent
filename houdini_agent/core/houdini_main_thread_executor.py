@@ -120,6 +120,7 @@ class HoudiniMainThreadExecutor:
                     thread_still_running=False,
                     scene_consistency="known",
                     error_code="" if success else "tool_failed",
+                    error_detail="" if success else self._extract_error_detail(result),
                 )
                 if self._active_operation_id == operation_id:
                     self._active_operation_id = None
@@ -295,6 +296,7 @@ class HoudiniMainThreadExecutor:
             thread_still_running=False,
             scene_consistency="known",
             error_code="" if success else "tool_failed",
+            error_detail="" if success else self._extract_error_detail(result),
         )
         return {"operation_id": operation_id, "result": result}
 
@@ -356,6 +358,7 @@ class HoudiniMainThreadExecutor:
                 "scene_consistency": "known",
                 "success": None,
                 "error_code": "",
+                "error_detail": "",
                 "result_available": False,
                 "session_id": session_id,
                 "arguments_sha256": self._arguments_sha256(arguments),
@@ -398,6 +401,29 @@ class HoudiniMainThreadExecutor:
         except Exception:
             payload = repr(arguments or {})
         return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+
+    @staticmethod
+    def _extract_error_detail(result, max_len: int = 500) -> str:
+        """从工具返回的 result dict 中提取详细错误信息，写入 receipt.error_detail。
+
+        底层工具函数约定失败时把可读错误信息放在 result["error"]，
+        这里只负责透传并截断，不解析、不翻译。result 不是 dict 或没有
+        error 字段时返回空串，保证 receipt 字段始终存在。
+        """
+        if not isinstance(result, dict):
+            return ""
+        error = result.get("error", "")
+        if error is None:
+            return ""
+        if not isinstance(error, str):
+            try:
+                error = str(error)
+            except Exception:
+                return ""
+        error = error.strip()
+        if len(error) > max_len:
+            error = error[: max_len - 3] + "..."
+        return error
 
     @staticmethod
     def _tool_contract_version(tool_name: str) -> str:

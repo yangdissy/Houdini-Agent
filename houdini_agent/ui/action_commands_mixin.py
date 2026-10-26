@@ -111,6 +111,7 @@ class ActionCommandsMixin:
         self._pending_ops.clear()
         self._batch_bar.setVisible(False)
         self._session_node_map.clear()
+        self._session_agent_created_paths.clear()
         
         while self.chat_layout.count() > 1:
             item = self.chat_layout.takeAt(0)

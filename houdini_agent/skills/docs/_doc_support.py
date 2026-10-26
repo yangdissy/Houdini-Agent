@@ -30,7 +30,7 @@ def search_help(query, top_k=8, archive_names=None, path_prefix=None):
         archive_path = help_dir / archive_name
         if not archive_path.exists():
             continue
-        for path, raw in help_source.iter_pages(
+        for path, raw in help_source.iter_pages_cached(
             archive_path,
             max_scan=MAX_SCAN_PER_ZIP,
             max_bytes=MAX_PAGE_BYTES,

@@ -138,6 +138,51 @@ class DiagnosticsPayloadTest(unittest.TestCase):
         self.assertNotIn("secret-result", rendered)
         self.assertNotIn("C:/secret", rendered)
 
+    def test_summary_tool_usage_policy_actions_and_python_ratio(self):
+        tab = object.__new__(AITab)
+        tab._session_id = "usage-session"
+        tab._username = "tester"
+        tab._agent_mode = True
+        tab._plan_mode = False
+        tab._plan_phase = "idle"
+        tab._confirm_mode = False
+        tab._conversation_history = []
+        tab._harness_trace_records = []
+        tab._call_records = []
+        tab._token_stats = {}
+        tab._harness_state = type("HarnessState", (), {"trace": [], "policy_retry_counts": {}})()
+        tab._current_provider = lambda: "test"
+        tab.model_combo = type("ModelCombo", (), {"currentText": lambda self: "model"})()
+        tab._policy_timeline_records = [
+            {"tool": "delete_node", "action": "allow", "reason": ""},
+            {"tool": "execute_python", "action": "allow", "reason": ""},
+            {"tool": "cook_node", "action": "ask", "reason": "confirm"},
+        ]
+
+        with TemporaryDirectory() as tmp:
+            tab._cache_dir = Path(tmp)
+            audit_path = AITab._get_session_diagnostics_jsonl_path(tab, tab._session_id)
+            audit_path.write_text(
+                '{"event_type":"operation_receipt","operation_id":"a","state":"completed",'
+                '"success":true,"tool_name":"create_nodes_batch","recorded_at":"2026-10-14T10:00:00"}\n'
+                '{"event_type":"operation_receipt","operation_id":"b","state":"completed",'
+                '"success":true,"tool_name":"execute_python","recorded_at":"2026-10-14T10:01:00"}\n'
+                '{"event_type":"operation_receipt","operation_id":"c","state":"completed",'
+                '"success":true,"tool_name":"execute_python","recorded_at":"2026-10-14T10:02:00"}\n'
+                '{"event_type":"operation_receipt","operation_id":"d","state":"completed",'
+                '"success":true,"tool_name":"get_network_structure","recorded_at":"2026-10-14T10:03:00"}\n',
+                encoding="utf-8",
+            )
+
+            payload = AITab._build_diagnostics_payload(tab)
+
+        summary = payload["summary"]
+        self.assertEqual(summary["tool_usage_counts"]["execute_python"], 2)
+        self.assertEqual(summary["tool_usage_counts"]["create_nodes_batch"], 1)
+        self.assertEqual(summary["policy_action_counts"], {"allow": 2, "ask": 1})
+        # 修改类调用 3 次（execute_python x2 + create_nodes_batch x1），python 占 2/3
+        self.assertEqual(summary["execute_python_ratio"], round(2 / 3, 4))
+
 
 if __name__ == "__main__":
     unittest.main()

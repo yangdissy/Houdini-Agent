@@ -9,10 +9,16 @@ from typing import List
 from houdini_agent.qt_compat import QtWidgets
 from houdini_agent.ui.i18n import tr
 from houdini_agent.core.harness_engine import HarnessRuntimeState
-from houdini_agent.utils.ai_client import AIClient, HOUDINI_TOOLS
+from houdini_agent.utils.ai_client import (
+    AIClient,
+    HOUDINI_TOOLS,
+    DEFAULT_AGENT_MAX_ITERATIONS,
+    DEFAULT_AGENT_MAX_TOOL_CALLS,
+)
 from houdini_agent.utils.ultra_optimizer import UltraOptimizer
 from houdini_agent.utils.token_optimizer import (
     DynamicContextSection,
+    message_content_text,
     prune_context_assembly_to_token_target,
 )
 from houdini_agent.core.agent_request_assembly import (
@@ -178,12 +184,50 @@ class SendOrchestratorMixin:
             return str(content or '')
         return ''
 
-    def _select_agent_tools_for_message(self, user_message: str, use_web: bool = True) -> List[dict]:
-        """Select a minimal Agent-mode tool set using ToolRegistry intent groups."""
+    def _select_agent_tools_for_message(
+        self, user_message: str, use_web: bool = True, remember: bool = False
+    ) -> List[dict]:
+        """Select a minimal Agent-mode tool set using ToolRegistry intent groups.
+
+        会话内工具集只增不减：已暴露或已调用过的工具后续轮次继续保留，
+        避免工具中途消失，也避免工具列表变化让 prompt 缓存前缀失效。
+        remember=True 才会把本次结果记入会话（仅真实运行时使用，token 估算不记录）。
+        """
+        session_key = getattr(self, '_agent_session_id', None) or getattr(self, '_session_id', None) or ''
+        sticky_by_session = self.__dict__.setdefault('_sticky_tool_names', {})
         try:
             from ..utils.tool_registry import get_tool_registry
             reg = get_tool_registry()
-            selected = reg.select_tools_for_request(user_message or "", mode='agent')
+            # 「好，开始执行」这类短消息没有意图关键词，会丢掉上一轮已确定要用的工具（如 execute_python），
+            # 所以把上一条用户消息和上一条助手回复一并纳入意图判定。
+            context_parts = [user_message or ""]
+            history = getattr(self, '_conversation_history', None) or []
+
+            def _texts(role):
+                return [
+                    m['content'] for m in history
+                    if m.get('role') == role and isinstance(m.get('content'), str) and m['content']
+                ]
+
+            users, assistants = _texts('user'), _texts('assistant')
+            if assistants:
+                context_parts.append(assistants[-1][:2000])
+            if len(users) > 1:
+                context_parts.append(users[-2][:2000])
+
+            keep = set(sticky_by_session.get(session_key, ()))
+            for message in history:
+                for call in message.get('tool_calls') or []:
+                    name = (call.get('function') or {}).get('name') if isinstance(call, dict) else None
+                    if name:
+                        keep.add(name)
+            selected = reg.select_tools_for_request(
+                "\n".join(context_parts), mode='agent', extra_names=keep
+            )
+            if remember:
+                sticky_by_session[session_key] = {
+                    t.get('function', {}).get('name', '') for t in selected
+                } - {''}
         except Exception as e:
             print(f"[Tool Selection] intent selection failed, falling back to core tools: {e}")
             selected = list(HOUDINI_TOOLS)
@@ -200,6 +244,31 @@ class SendOrchestratorMixin:
             if tool.get('function', {}).get('name')
         ]
         return UltraOptimizer.optimize_tool_definitions(selected)
+
+    def _agent_run_limits(self) -> dict:
+        """单次运行上限，可在用户 ai 配置中用 agent_max_iterations / agent_max_tool_calls 覆盖。"""
+        limits = {
+            'max_iterations': DEFAULT_AGENT_MAX_ITERATIONS,
+            'max_tool_calls': DEFAULT_AGENT_MAX_TOOL_CALLS,
+        }
+        try:
+            from shared.common_utils import load_user_config
+            cfg, _ = load_user_config(getattr(self, '_username', ''), 'ai', dcc_type='houdini')
+        except Exception as e:
+            print(f"[Agent Limits] 读取配置失败，使用默认上限: {e}")
+            return limits
+        for key in limits:
+            raw = (cfg or {}).get(f'agent_{key}')
+            if raw is None:
+                continue
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                print(f"[Agent Limits] agent_{key}={raw!r} 不是整数，忽略")
+                continue
+            if value > 0:
+                limits[key] = value
+        return limits
 
     def _run_agent(self, agent_params: dict):
         """后台运行 Agent
@@ -280,7 +349,7 @@ class SendOrchestratorMixin:
             # ★ L0 核心记忆加载：用户手动 /remember 写入，优先级高于自动记忆（上限 8 条，按 confidence TopK）
             if self._memory_initialized and self._memory_store:
                 try:
-                    core_mems = self._memory_store.get_core_memories(max_count=8)
+                    core_mems = self._memory_store.get_core_memories(max_count=8, username=self._username)
                     if core_mems:
                         core_lines = [f"- {m.rule}" for m in core_mems]
                         sys_prompt = sys_prompt + (
@@ -341,6 +410,7 @@ class SendOrchestratorMixin:
             
             # 4. ★ 长期记忆激活（"我想起来了"机制）
             # 在 RAG 文档之后、上下文提醒之前注入
+            memory_context = ''
             if user_last_msg:
                 memory_context = self._activate_long_term_memory(
                     user_last_msg, scene_context=scene_context
@@ -431,7 +501,9 @@ class SendOrchestratorMixin:
                     get_tool_registry().get_tools_for_mode("ask")
                 )
             else:
-                tools = self._select_agent_tools_for_message(user_last_msg, use_web=use_web)
+                tools = self._select_agent_tools_for_message(
+                    user_last_msg, use_web=use_web, remember=True
+                )
             if not use_web:
                 tools = [t for t in tools if t['function']['name'] not in ('web_search', 'fetch_webpage')]
 
@@ -521,6 +593,14 @@ class SendOrchestratorMixin:
                 )
             messages = request.messages
             tools = request.tools
+            pending_memories = getattr(self, '_pending_memory_reinforcement', None)
+            if pending_memories:
+                memory_retained = memory_context and any(
+                    memory_context in message_content_text(message.get('content'))
+                    for message in messages if message.get('role') in ('system', 'user')
+                )
+                if not memory_retained:
+                    self._pending_memory_reinforcement = None
             
             # ★ Plan 模式的静默工具集合（不在 UI 中显示的工具）
             _silent = self._SILENT_TOOLS | self._PLAN_SILENT_TOOLS if (plan_mode or confirmed_plan_execution) else self._SILENT_TOOLS
@@ -534,7 +614,7 @@ class SendOrchestratorMixin:
             
             if plan_mode or confirmed_plan_execution:
                 # ★ Plan 模式：使用 agent loop（规划或执行阶段均走此分支）
-                _max_iter = 999 if confirmed_plan_execution else 20
+                _limits = self._agent_run_limits() if confirmed_plan_execution else {'max_iterations': 20}
                 
                 # ★ Plan 续接回调：逻辑和状态统一由 PlanMixin._check_plan_resume 管理
                 _plan_resume_callback = None
@@ -546,7 +626,7 @@ class SendOrchestratorMixin:
                     messages=messages,
                     model=model,
                     provider=provider,
-                    max_iterations=_max_iter,
+                    **_limits,
                     max_tokens=None,
                     enable_thinking=use_think,
                     supports_vision=supports_vision,
@@ -579,7 +659,7 @@ class SendOrchestratorMixin:
                     messages=messages,
                     model=model,
                     provider=provider,
-                    max_iterations=999,  # 不限制迭代次数
+                    **self._agent_run_limits(),
                     max_tokens=None,  # 不限制输出长度
                     enable_thinking=use_think,
                     supports_vision=supports_vision,

@@ -5,12 +5,46 @@ from houdini_agent.core.memory_mixin import MemoryMixin
 from houdini_agent.utils.memory_activation import (
     MemoryActivationCandidate,
     MemoryActivationSelector,
+    parse_memory_usage,
+    strip_memory_usage,
 )
 from houdini_agent.utils.memory_store import EpisodicRecord, ProceduralRecord, SemanticRecord
 from houdini_agent.utils.team_memory_store import TeamSemanticRecord
 
 
 class MemoryActivationSelectorTest(unittest.TestCase):
+    def test_usage_declaration_requires_known_unique_aliases_at_end(self):
+        self.assertEqual(parse_memory_usage("Done\n[mem-used: M1,M3]", ["M1", "M3"]), {"M1", "M3"})
+        self.assertEqual(parse_memory_usage("Done\n[mem-used: none]", ["M1"]), set())
+        for text in ("Done", "[mem-used: M2]", "[mem-used: M1,M1]",
+                     "[mem-used: M1]\nMore", "[mem-used: M1]\n[mem-used: none]",
+                     "<think>[mem-used: M1]</think>", "[mem-used: ]"):
+            with self.subTest(text=text):
+                self.assertIsNone(parse_memory_usage(text, ["M1"]))
+
+    def test_strip_usage_preserves_answer(self):
+        self.assertEqual(strip_memory_usage("Done\n[mem-used: M1]"), "Done\n")
+        self.assertEqual(strip_memory_usage("ordinary [M1] reference"), "ordinary [M1] reference")
+        declaration = "[mem-used: M1]"
+        for end in range(1, len(declaration) + 1):
+            self.assertEqual(strip_memory_usage("Done\n" + declaration[:end], streaming=True), "Done\n")
+
+    def test_ui_uses_same_cleaning_for_history_and_copy(self):
+        from tests.test_import_smoke import _install_qt_stubs, _install_thirdparty_stubs
+        _install_thirdparty_stubs()
+        _install_qt_stubs()
+        from houdini_agent.ui.cursor_chat_widgets import AIResponse
+        self.assertEqual(AIResponse._clean_content("Done\n[mem-used: M1]"), "Done")
+
+    def test_request_retention_uses_available_content_extractor(self):
+        from tests.test_import_smoke import _install_qt_stubs, _install_thirdparty_stubs
+        _install_thirdparty_stubs()
+        _install_qt_stubs()
+        from houdini_agent.core.send_orchestrator_mixin import message_content_text
+        block = "[Long-Term Memory]\n[M1] Validate before cooking"
+        self.assertIn(block, message_content_text([{"type": "text", "text": block}]))
+        self.assertNotIn(block, message_content_text("[M1] old history reference"))
+
     def test_prefers_high_confidence_priority_adjusted_score(self):
         selector = MemoryActivationSelector(max_chars=500)
 
@@ -64,6 +98,8 @@ class FakeMemoryStore:
         self.semantic_activations = []
         self.episodic_updates = []
         self.procedural_updates = []
+        self.quality_policy = {"unused_decay": 0.97}
+        self.recall_events = []
 
     def search_by_level(self, query, level, top_k=3, threshold=0.0):
         if level == 1:
@@ -100,6 +136,16 @@ class FakeMemoryStore:
 
     def increment_semantic_activation(self, record_id):
         self.semantic_activations.append(record_id)
+
+    def record_recall(self, pending, cited, session_id, reward):
+        self.recall_events.append((pending, cited, session_id, reward))
+
+    def settle_semantic_usage(self, record_id, cited, reward):
+        if cited and reward > 0:
+            self.semantic_activations.append(record_id)
+
+    def get_episodic(self, record_id):
+        return EpisodicRecord(id=record_id, importance=1.0)
 
     def update_episodic_importance(self, record_id, new_importance):
         self.episodic_updates.append((record_id, new_importance))
@@ -140,24 +186,18 @@ class MemoryMixinActivationTest(unittest.TestCase):
         self.assertEqual(result.count("Always validate Houdini node path"), 1)
         self.assertEqual(mixin._memory_store.semantic_activations, [])
         self.assertEqual(mixin._memory_store.episodic_updates, [])
-        self.assertEqual(
-            mixin._pending_memory_reinforcement,
-            {
-                "semantic_ids": ["s1"],
-                "episodic": [("e1", 1.0)],
-                "procedural_ids": ["p1"],
-            },
-        )
+        self.assertEqual({item['record_id'] for item in mixin._pending_memory_reinforcement.values()}, {'s1', 'e1', 'p1'})
+        self.assertIn('[M1]', result)
 
     def test_positive_task_result_reinforces_pending_memories(self):
         mixin = MemoryMixin()
         mixin._memory_store = FakeMemoryStore()
         mixin._pending_memory_reinforcement = {
-            "semantic_ids": ["s1"],
-            "episodic": [("e1", 1.0)],
+            "M1": {"kind": "semantic", "record_id": "s1"},
+            "M2": {"kind": "episodic", "record_id": "e1"},
         }
 
-        mixin._reinforce_pending_memories(0.5, task_success=True)
+        mixin._reinforce_pending_memories(0.5, task_success=True, final_content="Done\n[mem-used: M1,M2]")
 
         self.assertEqual(mixin._memory_store.semantic_activations, ["s1"])
         self.assertEqual(mixin._memory_store.episodic_updates, [("e1", 1.05)])
@@ -167,12 +207,10 @@ class MemoryMixinActivationTest(unittest.TestCase):
         mixin = MemoryMixin()
         mixin._memory_store = FakeMemoryStore()
         mixin._pending_memory_reinforcement = {
-            "semantic_ids": ["s1"],
-            "episodic": [("e1", 1.0)],
-            "procedural_ids": ["p1"],
+            "M1": {"kind": "procedural", "record_id": "p1"},
         }
 
-        mixin._reinforce_pending_memories(0.0, task_success=False)
+        mixin._reinforce_pending_memories(0.0, task_success=False, final_content="Done\n[mem-used: M1]")
 
         self.assertEqual(mixin._memory_store.semantic_activations, [])
         self.assertEqual(mixin._memory_store.episodic_updates, [])
@@ -183,8 +221,8 @@ class MemoryMixinActivationTest(unittest.TestCase):
         mixin = MemoryMixin()
         mixin._memory_store = FakeMemoryStore()
         mixin._pending_memory_reinforcement = {
-            "semantic_ids": ["s1"],
-            "episodic": [("e1", 1.0)],
+            "M1": {"kind": "semantic", "record_id": "s1"},
+            "M2": {"kind": "episodic", "record_id": "e1"},
         }
 
         mixin._reinforce_pending_memories(0.0)

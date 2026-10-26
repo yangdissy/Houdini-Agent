@@ -24,3 +24,16 @@
 保持只读：不加载、烹饪、保存或修改 HIP。只有 `all` 才附带 ChooseTask、Daily、SubmitTool、Publish 等人工确认项，避免局部检查被无关存疑结果淹没。
 
 `scene_settings` 会在未提供项目 FPS 时先检查当前值是否为清单允许的 24fps；合法时仍因缺少项目标准而标为存疑，其他值直接失败。艺术表现、最终 velocity、渲染器、色彩空间、合成和交付质量需要观察最终结果或读取已烹饪几何，因此仅在 `all` 中列为人工确认，不做猜测性自动判定。
+
+## 故障排查 Handoff
+
+本 Skill 只负责确定性检查，不在内部调用其他 Skill，也不根据自然语言建议自动修改场景。
+
+当结果包含 `fail` 或需要继续调查的 `uncertain` 时：
+
+1. 保留对应 finding 的 `module`、`item`、`problem`、`evidence` 和原始 `checks` 范围。
+2. 调用 `get_workflow_guide`，传入 `topic="troubleshooting"`，并在 `description` 中描述失败项及证据。
+3. 按 Guide 建议使用 `debug_scene_workflow` 做局部检查；所有场景修改仍通过现有受治理工具执行。
+4. 修复后只重新运行原失败项对应的 `checks`，不要无条件重跑 `all`。
+
+若同一症状连续两次修复仍未通过，停止继续猜测性修改，补充 Houdini 官方帮助或运行时证据后再形成新假设。QC 的工具调用成功不等于场景、视觉结果或模拟结果已通过；最终结论仍以原检查项复验结果为准。

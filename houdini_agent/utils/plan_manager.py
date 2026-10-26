@@ -19,6 +19,74 @@ from typing import Optional, Dict, Any, List
 from .plan_runtime import PlanQualityGate, PlanRuntime
 
 
+def validate_plan_questions(questions: Any) -> None:
+    if not isinstance(questions, list) or not 1 <= len(questions) <= 2:
+        raise ValueError("Provide 1 or 2 questions.")
+    question_ids = set()
+    for question in questions:
+        if not isinstance(question, dict):
+            raise ValueError("Each question must be an object.")
+        question_id = question.get("id")
+        if not isinstance(question_id, str) or not question_id.strip() or question_id in question_ids:
+            raise ValueError("Question ids must be non-empty and unique.")
+        question_ids.add(question_id)
+        if not isinstance(question.get("prompt"), str) or not question["prompt"].strip():
+            raise ValueError("Question prompt is required.")
+        for flag in ("allow_multiple", "allow_free_text"):
+            if flag in question and not isinstance(question[flag], bool):
+                raise ValueError(f"{flag} must be a boolean.")
+        options = question.get("options", [])
+        if not isinstance(options, list) or (not options and not question.get("allow_free_text")):
+            raise ValueError("Provide options or enable free text.")
+        option_ids = set()
+        for option in options:
+            if not isinstance(option, dict):
+                raise ValueError("Each option must be an object.")
+            option_id = option.get("id")
+            if (not isinstance(option_id, str) or not option_id.strip()
+                    or option_id.startswith("__free_text__:") or option_id in option_ids):
+                raise ValueError("Option ids must be non-empty, unique and not reserved.")
+            if not isinstance(option.get("label"), str) or not option["label"].strip():
+                raise ValueError("Option label is required.")
+            option_ids.add(option_id)
+
+
+def normalize_plan_answers(questions: list, answers: Any) -> dict:
+    if not isinstance(answers, dict) or set(answers) != {question["id"] for question in questions}:
+        raise ValueError("Answer every question using its question id.")
+    normalized = {}
+    for question in questions:
+        selections = answers[question["id"]]
+        if not isinstance(selections, list) or not all(isinstance(value, str) for value in selections):
+            raise ValueError("Answers must be lists of option ids or free text.")
+        option_ids = {option["id"] for option in question.get("options", [])}
+        selected = []
+        free_text = ""
+        for value in selections:
+            if value.startswith("__free_text__:"):
+                text = value[len("__free_text__:"):].strip()
+                if not question.get("allow_free_text") or not text or free_text:
+                    raise ValueError("Invalid free text answer.")
+                free_text = text
+            elif value not in option_ids or value in selected:
+                raise ValueError("Unknown or duplicate option id.")
+            else:
+                selected.append(value)
+        if not selected and not free_text:
+            raise ValueError("Answer every question before submitting.")
+        if not question.get("allow_multiple") and len(selected) > 1:
+            raise ValueError("Only one option may be selected.")
+        normalized[question["id"]] = {"selected_option_ids": selected, "free_text": free_text}
+    return normalized
+
+
+class PlanQualityError(ValueError):
+    def __init__(self, diagnostics: list) -> None:
+        self.diagnostics = [diagnostic.to_dict() for diagnostic in diagnostics]
+        messages = "; ".join(item["message"] for item in self.diagnostics if item["severity"] == "error")
+        super().__init__(f"Plan failed quality gate: {messages}")
+
+
 class PlanManager:
     """Plan 文件管理器
 
@@ -134,8 +202,7 @@ class PlanManager:
             "diagnostics": [d.to_dict() for d in diagnostics],
         }
         if PlanQualityGate.has_errors(diagnostics):
-            messages = "; ".join(d.message for d in diagnostics if d.severity == "error")
-            raise ValueError(f"Plan failed quality gate: {messages}")
+            raise PlanQualityError(diagnostics)
 
         # 归档旧 plan。必须在新 plan 通过 quality gate 后执行，避免坏计划删除 active plan。
         old_path = self._plan_path(session_id)
@@ -175,6 +242,7 @@ class PlanManager:
         step_id: str,
         status: str,
         result_summary: Optional[str] = None,
+        evidence: Optional[List[dict]] = None,
     ) -> Optional[dict]:
         """更新单个步骤的状态
 
@@ -194,12 +262,20 @@ class PlanManager:
         can_transition, reason = self._runtime.can_transition(plan, step_id, status)
         if not can_transition:
             raise ValueError(reason)
+        if status in {"blocked", "error"} and (not isinstance(result_summary, str) or not result_summary.strip()):
+            raise ValueError("Blocked or error steps require a reason in result_summary.")
 
         for step in plan["steps"]:
             if step["id"] == step_id:
                 step["status"] = status
                 if result_summary is not None:
                     step["result_summary"] = result_summary
+                if evidence is not None:
+                    step["evidence"] = evidence
+                step["verification"] = {
+                    "reference_check": "verified" if step.get("evidence") else "not_provided",
+                    "acceptance": "unverified",
+                }
                 break
 
         plan["status"] = self._runtime.plan_status(plan)
@@ -219,8 +295,7 @@ class PlanManager:
                 "diagnostics": [d.to_dict() for d in diagnostics],
             }
             if PlanQualityGate.has_errors(diagnostics):
-                messages = "; ".join(d.message for d in diagnostics if d.severity == "error")
-                raise ValueError(f"Plan failed quality gate: {messages}")
+                raise PlanQualityError(diagnostics)
             plan["status"] = "confirmed"
             self._save(session_id, plan)
         return plan
@@ -267,6 +342,13 @@ class PlanManager:
 
         lines = [f"[Active Plan: {plan.get('title', 'Untitled')}]"]
         lines.append(f"Progress: {done_count}/{total} done")
+        unverified = [step["id"] for step in steps if step.get("status") == "done"
+                      and step.get("verification", {}).get("acceptance", "unverified") == "unverified"]
+        if unverified:
+            lines.append("Acceptance unverified: " + ", ".join(unverified))
+        for step in steps:
+            if step.get("status") in {"error", "blocked"}:
+                lines.append(f"{step['id']} {step['status']}: {step.get('result_summary', '')}")
 
         # 当前正在执行的步骤
         for s in steps:
@@ -362,15 +444,17 @@ PLAN_TOOL_CREATE = {
             "The user must confirm before execution begins.\n"
             "CRITICAL REQUIREMENTS:\n"
             "1. Group steps by SUBSYSTEM, not by individual node. One step = one complete logical "
-            "subsystem (e.g. 'scatter system: Grid+Scatter+CopyToPoints+Box'), executed via ONE "
-            "create_nodes_batch call. Per-node steps are FORBIDDEN unless the network truly has only one node.\n"
-            "2. Every step MUST have depends_on set (even linear: step-2 depends_on step-1).\n"
-            "3. Plans with 3+ steps MUST use phases for logical grouping.\n"
-            "4. Each step needs detailed description with specific node paths, param names, values.\n"
+            "subsystem (e.g. 'scatter system: Grid+Scatter+CopyToPoints+Box'). Prefer batch tools "
+            "when applicable. Analysis, layout and verification steps do not require node creation.\n"
+            "2. Declare actual depends_on; independent root steps may use []. Missing dependencies "
+            "on non-first steps produce a quality warning, not an invented linear dependency.\n"
+            "3. Plans with 3+ steps should use phases for logical grouping; omissions produce quality warnings.\n"
+            "4. Describe concrete targets, relevant paths and applicable parameters or checks.\n"
             "5. steps.tools must list the exact Houdini tool names. Prefer batch tools "
             "(create_nodes_batch, batch_set_parameters, layout_nodes) over per-node tools.\n"
-            "6. depends_on drives the DAG layout — without it the flow diagram will be broken.\n"
-            "Anti-pattern check: if step_count >= node_count, you split too finely — merge into subsystems."
+            "6. depends_on drives the execution DAG. Unknown dependencies and cycles are rejected.\n"
+            "For node-building tasks, avoid per-node steps; merge related work into subsystems. "
+            "For non-building tasks architecture is optional. For large networks include only the affected portion."
         ),
         "parameters": {
             "type": "object",
@@ -394,7 +478,7 @@ PLAN_TOOL_CREATE = {
                 },
                 "phases": {
                     "type": "array",
-                    "description": "REQUIRED for plans with 3+ steps. Group steps into logical phases. Each phase represents a logical stage (e.g., 'Phase 1: Base Setup'). All step IDs must be covered.",
+                    "description": "Recommended for 3+ steps. Group steps into logical phases and cover all step ids. Missing phases or coverage produce quality warnings.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -442,7 +526,7 @@ PLAN_TOOL_CREATE = {
                             "depends_on": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "description": "REQUIRED: IDs of steps this depends on. Must be set for every step except the first. Linear: [\"step-1\"] for step-2. Parallel branches share common ancestor.",
+                                "description": "Ids of actual prerequisite steps. Use [] for independent roots. Unknown ids and cycles are rejected; non-first empty dependencies produce a quality warning.",
                             },
                             "expected_result": {
                                 "type": "string",
@@ -472,14 +556,14 @@ PLAN_TOOL_CREATE = {
                 "architecture": {
                     "type": "object",
                     "description": (
-                        "REQUIRED: Describes the target Houdini node network architecture "
-                        "that will be built/modified by this plan. This is the design blueprint, "
-                        "NOT the execution steps. It shows what the final node graph looks like."
+                        "Optional for analysis, layout, and other non-building tasks. For node-building tasks, "
+                        "describe the affected target network, not every existing node in a large scene. "
+                        "This is a design blueprint, not the execution steps. Without it the UI shows the step DAG."
                     ),
                     "properties": {
                         "nodes": {
                             "type": "array",
-                            "description": "All Houdini nodes in the target network",
+                            "description": "Nodes in the affected portion of the target network",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -561,7 +645,7 @@ PLAN_TOOL_CREATE = {
                     "required": ["nodes", "connections"],
                 },
             },
-            "required": ["title", "overview", "steps", "architecture"],
+            "required": ["title", "overview", "steps"],
         },
     },
 }
@@ -572,8 +656,10 @@ PLAN_TOOL_UPDATE_STEP = {
         "name": "update_plan_step",
         "description": (
             "Update the status of a plan step. Call this BEFORE starting a step "
-            "(status='running') and AFTER completing it (status='done' or 'error'). "
-            "This keeps the plan UI in sync with progress."
+            "(status='running') and AFTER completing it (status='done', 'error' or 'blocked'). "
+            "Use blocked for missing prerequisites and supply a reason for blocked/error. "
+            "Terminal steps cannot be restarted. Evidence references are checked for provenance, "
+            "not acceptance: success of a tool call does not prove expected_result."
         ),
         "parameters": {
             "type": "object",
@@ -584,12 +670,26 @@ PLAN_TOOL_UPDATE_STEP = {
                 },
                 "status": {
                     "type": "string",
-                    "enum": ["running", "done", "error"],
+                    "enum": ["running", "done", "error", "blocked"],
                     "description": "New status for the step",
                 },
                 "result_summary": {
                     "type": "string",
-                    "description": "Brief summary of what was done (for 'done') or what went wrong (for 'error')",
+                    "description": "Brief result summary; a non-empty reason is required for error or blocked.",
+                },
+                "evidence_refs": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "description": "Optional current-session references. References are checked, not proof of acceptance. No references leaves acceptance unverified.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["operation_receipt", "result"]},
+                            "ref": {"type": "string", "description": "request_ref or result_ref returned by a tool"},
+                        },
+                        "required": ["kind", "ref"],
+                        "additionalProperties": False,
+                    },
                 },
             },
             "required": ["step_id", "status"],
@@ -603,11 +703,10 @@ PLAN_TOOL_ASK_QUESTION = {
     "function": {
         "name": "ask_question",
         "description": (
-            "Ask the user clarifying questions or request authorization. "
-            "In planning, use this when information is insufficient, ambiguous, or when multiple "
-            "significantly different implementation approaches exist. In plan execution, use it "
-            "when continuing safely requires user action or authorization (for example switching "
-            "Houdini Update Mode, manual cook, selecting viewport objects, installing assets). "
+            "Ask the user clarifying questions during planning. "
+            "Use this when information is insufficient, ambiguous, or when multiple "
+            "significantly different implementation approaches exist. "
+            "Not available during plan execution: the plan confirmation already authorizes the work. "
             "Ask at most 1-2 key questions per call. Do not over-ask."
         ),
         "parameters": {
@@ -615,6 +714,8 @@ PLAN_TOOL_ASK_QUESTION = {
             "properties": {
                 "questions": {
                     "type": "array",
+                    "minItems": 1,
+                    "maxItems": 2,
                     "description": "List of questions to ask (max 2)",
                     "items": {
                         "type": "object",

@@ -20,6 +20,7 @@ from houdini_agent.utils.help_source import (
     find_help_dir,
     get_page,
     iter_pages,
+    iter_pages_cached,
     parse_wiki,
 )
 from houdini_agent.utils.doc_rag import HoudiniDocIndex
@@ -143,6 +144,19 @@ class IterPagesTest(unittest.TestCase):
     def test_missing_zip_raises(self):
         with self.assertRaises(Exception):
             list(iter_pages(self._tmp / "nope.zip"))
+
+    def test_cached_pages_reuse_until_zip_changes(self):
+        zp = self._tmp / "nodes.zip"
+        _make_zip(zp, {"nodes/a.txt": "= A ="})
+        first = iter_pages_cached(zp)
+        self.assertIs(iter_pages_cached(zp), first)
+        _make_zip(zp, {"nodes/a.txt": "= A =", "nodes/b.txt": "= B ="})
+        self.assertEqual(len(iter_pages_cached(zp)), 2)
+
+    def test_only_docs_skills_run_off_main_thread(self):
+        self.assertTrue(skills.is_hou_free_skill("search_houdini_help"))
+        self.assertFalse(skills.is_hou_free_skill("analyze_groups"))
+        self.assertFalse(skills.is_hou_free_skill("missing_skill"))
 
     def test_page_lookup_uses_same_filter_decode_and_limit(self):
         _make_zip(self._tmp / "nodes.zip", {

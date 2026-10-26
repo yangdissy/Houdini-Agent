@@ -92,6 +92,35 @@ class ExternalMCPMutationVerificationTest(unittest.TestCase):
         self.assertEqual(result["verification"]["status"], "verified")
         self.assertEqual(result["verification"]["created_paths"], ["/stage/node0", "/stage/node1"])
 
+    def test_create_nodes_batch_plan_hash_guard(self):
+        client = object.__new__(HoudiniMCP)
+        client.create_network = lambda plan: (True, "ok")
+
+        plan_args = {
+            "parent_path": "/stage",
+            "nodes": [{"id": "a", "type": "null"}],
+            "connections": [],
+        }
+        dry = HoudiniMCP._tool_create_nodes_batch(client, dict(plan_args, dry_run=True))
+        self.assertTrue(dry["success"])
+        self.assertIn("plan_hash", dry)
+
+        # 哈希一致 → 放行
+        matched = HoudiniMCP._tool_create_nodes_batch(
+            client, dict(plan_args, expected_plan=dry["plan_hash"])
+        )
+        self.assertTrue(matched["success"])
+
+        # 哈希失配 → 零写入拒绝
+        calls = []
+        client.create_network = lambda plan: calls.append(plan) or (True, "ok")
+        mismatched = HoudiniMCP._tool_create_nodes_batch(
+            client, dict(plan_args, expected_plan="deadbeefdeadbeef")
+        )
+        self.assertFalse(mismatched["success"])
+        self.assertIn("plan mismatch", mismatched["error"])
+        self.assertEqual(calls, [])
+
     def test_create_node_returns_actual_path_and_type_verification(self):
         client = object.__new__(HoudiniMCP)
         parent = _Node("/obj/project", "geo")

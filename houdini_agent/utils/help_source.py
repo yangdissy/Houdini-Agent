@@ -224,6 +224,29 @@ def iter_pages(
                 continue
 
 
+_PAGE_CACHE: Dict[str, Tuple[Tuple, Tuple[Tuple[str, str], ...]]] = {}
+
+
+def iter_pages_cached(
+    zip_path: Path,
+    max_scan: Optional[int] = None,
+    max_bytes: Optional[int] = None,
+) -> Tuple[Tuple[str, str], ...]:
+    """``iter_pages`` 的进程内缓存版：同一 ZIP 重复全文检索不再重复解压/解码。
+
+    ZIP 的 mtime/size 或扫描参数变化时自动重建。
+    """
+    stat = Path(zip_path).stat()
+    signature = (stat.st_mtime_ns, stat.st_size, max_scan, max_bytes)
+    key = str(zip_path)
+    cached = _PAGE_CACHE.get(key)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    pages = tuple(iter_pages(Path(zip_path), max_scan=max_scan, max_bytes=max_bytes))
+    _PAGE_CACHE[key] = (signature, pages)
+    return pages
+
+
 def get_page(
     help_dir: Path,
     entry_name: str,

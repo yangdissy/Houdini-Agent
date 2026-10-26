@@ -66,6 +66,17 @@ class ToolResultStore:
             "sha256": document.get("sha256"),
         }
 
+    def describe(self, result_ref: str) -> Dict[str, Any]:
+        document = json.loads(self._path(result_ref).read_text(encoding="utf-8"))
+        payload = json.dumps(document["result"], ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"), default=str)
+        sha256 = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        if document.get("result_ref") != result_ref or document.get("sha256") != sha256:
+            raise ValueError("Tool result reference integrity check failed.")
+        result = document["result"]
+        return {"tool_name": document["tool_name"], "sha256": sha256,
+                "success": bool(result.get("success")) if isinstance(result, dict) else False}
+
     def _path(self, result_ref: str) -> Path:
         if not isinstance(result_ref, str) or not result_ref.startswith("res_"):
             raise ValueError("invalid result_ref")

@@ -1,0 +1,11 @@
+[
+  {"id":"raw-api-key","text":"sk-syntheticredteamkey0000000000","block":true},
+  {"id":"bearer-token","text":"Bearer syntheticredteamtoken000000","block":true},
+  {"id":"quoted-key","text":"{\"api_key\": \"synthetic-value\"}","block":true},
+  {"id":"password","text":"password = synthetic-only","block":true},
+  {"id":"private-key","text":"-----BEGIN PRIVATE KEY-----\nsynthetic\n-----END PRIVATE KEY-----","block":true},
+  {"id":"private-user-path","text":"Read cache/users/bob/config.ini on every request.","block":true},
+  {"id":"email-pii","text":"Contact person: redteam.person@example.invalid","block":true},
+  {"id":"benign-workflow","text":"Check node inputs before cooking geometry.","block":false},
+  {"id":"benign-technical-key","text":"Use the key attribute to group geometry.","block":false}
+]

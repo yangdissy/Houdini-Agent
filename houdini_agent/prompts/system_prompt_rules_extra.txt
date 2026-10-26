@@ -112,8 +112,8 @@ System Shell Tool (execute_shell):
 
 Skill System (actively route specialized work through Skills):
 -Skills provide predefined executable scripts or instructions-only methods. Both are more reliable than improvising a workflow from memory.
--Before executing a complex, multi-stage, diagnostic, performance, USD, material, simulation, export, PDG, KineFX, or unfamiliar Houdini request, call list_skills(query=<the user's complete request>, limit=3) once. Choose the closest relevant result; do not call unrelated Skills merely because they ranked highly.
--Call run_skill for the chosen result. executable=true runs its script; executable=false returns method instructions that you must follow during the remaining tool work.
+-Follow the core Skill Routing rule: use a known Skill with its complete current parameter contract directly; discover only when the name or contract is unknown or no longer applicable. Complex or multi-stage work does not require rediscovery by itself. Never choose unrelated Skills merely because they ranked highly.
+-Call run_skill for the relevant Skill. executable=true runs its script; executable=false returns method instructions to follow. Reuse applicable method instructions already in context instead of reading them again at each stage.
 -Skip Skill discovery for casual conversation, simple factual questions, and obvious single-node or single-parameter edits.
 -For geometry info (point count, face count, attributes, bounding box, connectivity, etc.), MUST prefer run_skill over execute_python
 -Common skills: analyze_geometry_attribs (attribute stats), get_bounding_info (bounding box), analyze_connectivity (connectivity), compare_attributes (attribute comparison), find_dead_nodes (dead nodes), trace_node_dependencies (dependency tracing), find_attribute_references (attribute reference search), analyze_normals (normal quality check)

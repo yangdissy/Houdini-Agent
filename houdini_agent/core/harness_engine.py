@@ -6,6 +6,7 @@ This module is intentionally lightweight and can be enabled gradually.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -16,7 +17,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .harness_policy_config import (
     CONTROLLED_WRITE_SKILLS,
+    EXECUTION_ERROR_FAMILY_PATTERN,
+    EXECUTION_FAILURE_LIMIT,
+    EXECUTION_FAILURE_RECOVERY_HINT,
+    EXECUTION_RECOVERY_TOOLS,
     HIGH_RISK_TOOLS,
+    PRIVATE_USER_PATH_PATTERN,
+    PYTHON_BLOCKED_CALLS,
+    PYTHON_BLOCKED_MODULES,
     PYTHON_DANGEROUS_PATTERNS,
     SECRET_REDACTION_PATTERNS,
     SENSITIVE_ARG_KEYS,
@@ -180,6 +188,7 @@ class HarnessRuntimeState:
     iteration: int = 0
     retries: int = 0
     policy_retry_counts: Dict[str, int] = field(default_factory=dict)
+    execution_failures: Dict[str, Tuple[str, int]] = field(default_factory=dict)
     trace: List[Dict[str, Any]] = field(default_factory=list)
 
     def add_trace(self, event: str, **payload: Any):
@@ -262,7 +271,7 @@ class ToolArgumentValidator:
             issues.append(ToolValidationIssue(severity="error", code="invalid_path", message=path_reason))
 
         if tool_name == "execute_python":
-            reason = self._match_patterns(
+            reason = self._check_python_code(str(safe_args.get("code") or "")) or self._match_patterns(
                 str(safe_args.get("code") or ""),
                 PYTHON_DANGEROUS_PATTERNS,
                 "Tool input guardrail blocked dangerous Python",
@@ -285,6 +294,54 @@ class ToolArgumentValidator:
                 )
 
         return ToolValidationResult(args=safe_args, issues=issues)
+
+    @staticmethod
+    def _check_python_code(code: str) -> str:
+        try:
+            tree = ast.parse(code)
+        except (SyntaxError, ValueError):
+            return "Tool input guardrail blocked dangerous Python: invalid syntax"
+
+        aliases: Dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for item in node.names:
+                    aliases[item.asname or item.name.split('.')[0]] = item.name if item.asname else item.name.split('.')[0]
+                    if any(item.name == module or item.name.startswith(module + '.') for module in PYTHON_BLOCKED_MODULES):
+                        return "Tool input guardrail blocked dangerous Python module: " + item.name
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                for item in node.names:
+                    aliases[item.asname or item.name] = module + '.' + item.name
+                if any(module == blocked or module.startswith(blocked + '.') for blocked in PYTHON_BLOCKED_MODULES):
+                    return "Tool input guardrail blocked dangerous Python module: " + module
+
+        def resolve(node: ast.AST) -> str:
+            if isinstance(node, ast.Name):
+                return aliases.get(node.id, node.id)
+            if isinstance(node, ast.Attribute):
+                return resolve(node.value) + '.' + node.attr
+            if isinstance(node, ast.Call):
+                return resolve(node.func)
+            return ""
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = resolve(node.func)
+            if name in PYTHON_BLOCKED_CALLS:
+                return "Tool input guardrail blocked dangerous Python call: " + name
+            if name in {"open", "builtins.open", "io.open", "pathlib.Path.open"}:
+                mode_index = 0 if name == "pathlib.Path.open" else 1
+                mode = next((item.value for item in node.keywords if item.arg == "mode"), None)
+                if mode is None and len(node.args) > mode_index:
+                    mode = node.args[mode_index]
+                if mode is not None and (
+                    not isinstance(mode, ast.Constant) or not isinstance(mode.value, str)
+                    or any(flag in mode.value for flag in "wax+")
+                ):
+                    return "Tool input guardrail blocked dangerous Python: file write"
+        return ""
 
     def _check_sensitive_args(self, args: Dict[str, Any]) -> str:
         for key, value in self._walk_args(args):
@@ -386,6 +443,19 @@ class HarnessToolPolicyEngine:
     def decide(self, tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> ToolPolicyDecision:
         validation = self.validator.validate(tool_name, args)
         safe_args = validation.args
+
+        username = str(context.get("username") or "").strip().casefold()
+        for key, value in ToolArgumentValidator._walk_args(safe_args):
+            if not isinstance(value, str):
+                continue
+            normalized = re.sub(r'/+', '/', value.replace('\\', '/'))
+            for match in re.finditer(PRIVATE_USER_PATH_PATTERN, normalized):
+                owner = (match.group(1) or "").casefold()
+                if not username or owner != username or "/../" in normalized:
+                    return self._decision(
+                        "deny", "Tool input guardrail blocked private user path",
+                        required_control="deny",
+                    )
 
         if not validation.ok:
             return self._decision(
@@ -492,6 +562,10 @@ class HarnessToolPolicyEngine:
                 required_control="confirm",
             )
 
+        # Ownership 检查必须先于通用确认返回：修改非本 session agent 创建节点时，
+        # Step Confirm 升级为 ask 并携带 foreign 信号；Direct Execute 仅在后续 allow 加风险分。
+        foreign_factor = self._foreign_node_factor(tool_name, safe_args, context, meta)
+
         # confirm_mode=True means Step Confirm is enabled: high-risk tools must
         # ask the user before execution. confirm_mode=False is Direct Execute
         # (HIGH-RISK), where the user has opted out of confirmation prompts.
@@ -508,10 +582,13 @@ class HarnessToolPolicyEngine:
                     )],
                     required_control="confirm",
                 )
+            factors = [RiskFactor("high_risk_confirmation", "warning", f"Dangerous tool requires confirmation: {tool_name}", 0.7)]
+            if foreign_factor is not None:
+                factors.append(foreign_factor)
             return self._decision(
                 "ask",
-                f"Tool requires confirmation: {tool_name}",
-                risk_factors=[RiskFactor("high_risk_confirmation", "warning", f"Dangerous tool requires confirmation: {tool_name}", 0.7)],
+                foreign_factor.message if foreign_factor is not None else f"Tool requires confirmation: {tool_name}",
+                risk_factors=factors,
                 required_control="confirm",
             )
 
@@ -563,14 +640,75 @@ class HarnessToolPolicyEngine:
             )
 
         if safe_args != args:
+            factors = [RiskFactor("args_normalized", "info", "Arguments normalized", 0.0)]
+            if foreign_factor is not None:
+                factors.append(foreign_factor)
             return self._decision(
                 action="allow",
                 reason="Arguments normalized",
                 patched_args=safe_args,
-                risk_factors=[RiskFactor("args_normalized", "info", "Arguments normalized", 0.0)],
+                risk_factors=factors,
+            )
+
+        if foreign_factor is not None:
+            return self._decision(
+                "allow",
+                reason=foreign_factor.message,
+                risk_factors=[foreign_factor],
             )
 
         return self._decision("allow")
+
+    @staticmethod
+    def _foreign_node_factor(
+        tool_name: str,
+        safe_args: Dict[str, Any],
+        context: Dict[str, Any],
+        meta=None,
+    ) -> Optional[RiskFactor]:
+        """Build a risk factor when a mutation targets nodes not created by the agent.
+
+        Policy layer does not query hou; it only compares declared node path
+        arguments against the session's agent-created set from context.
+        """
+        from .harness_policy_config import SCENE_MUTATION_TOOLS
+
+        # DESTRUCTIVE_TOOLS（delete_node 等）不在 SCENE_MUTATION_TOOLS 里，单独放行
+        if tool_name not in SCENE_MUTATION_TOOLS and tool_name != "delete_node":
+            return None
+        if tool_name.startswith("create_") or tool_name in {"layout_nodes", "execute_python"}:
+            return None
+
+        created = context.get("agent_created_paths")
+        if not isinstance(created, (set, frozenset)) or not created:
+            return None
+
+        if meta is None:
+            return None
+
+        targets: set = set()
+        for key, kind in (meta.path_kinds or {}).items():
+            if kind != "node":
+                continue
+            value = safe_args.get(key)
+            if isinstance(value, str) and value.startswith("/"):
+                targets.add(value)
+            elif isinstance(value, list):
+                targets.update(v for v in value if isinstance(v, str) and v.startswith("/"))
+        if not targets:
+            return None
+
+        foreign = sorted(t for t in targets if t not in created)
+        if not foreign:
+            return None
+        shown = ", ".join(foreign[:3])
+        extra = f" (+{len(foreign) - 3} more)" if len(foreign) > 3 else ""
+        return RiskFactor(
+            "foreign_node_mutation",
+            "warning",
+            f"{tool_name} targets node(s) not created by the agent this session: {shown}{extra}",
+            0.4,
+        )
 
     @staticmethod
     def _validation_risk_factors(validation: ToolValidationResult) -> List[RiskFactor]:
@@ -614,6 +752,7 @@ class GovernedToolExecutor:
         trace=None,
         retry_counts=None,
         retry_limit=2,
+        execution_failures: Optional[Dict[str, Tuple[str, int]]] = None,
     ):
         self._policy_engine = policy_engine
         self._execute = execute
@@ -622,6 +761,7 @@ class GovernedToolExecutor:
         self._trace = trace
         self._retry_counts = retry_counts if retry_counts is not None else {}
         self._retry_limit = retry_limit
+        self._execution_failures = execution_failures if execution_failures is not None else {}
 
     def execute(self, tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         safe_args = dict(args or {})
@@ -638,6 +778,21 @@ class GovernedToolExecutor:
 
         if action == "deny":
             return {"success": False, "error": reason or f"Tool blocked by policy: {tool_name}"}
+
+        previous_failure = self._execution_failures.get(tool_name)
+        if previous_failure and previous_failure[1] >= EXECUTION_FAILURE_LIMIT:
+            self._record_decision(tool_name, "deny", "repeated_execution_failure")
+            self._record_audit({
+                "event_type": "execution_failure_guard", "tool": tool_name,
+                "action": "blocked", "failure_kind": previous_failure[0],
+                "failure_count": previous_failure[1],
+            })
+            return {
+                "success": False,
+                "error": EXECUTION_FAILURE_RECOVERY_HINT,
+                "error_code": "repeated_execution_failure",
+                "recommended_next_action": "collect_evidence",
+            }
 
         if action == "ask":
             if self._confirm is None:
@@ -712,6 +867,41 @@ class GovernedToolExecutor:
         error_code = "tool_execution_failed" if not result.get("success") else ""
         if result.get("success") and verification_status == "applied_unknown":
             error_code = "verification_inconclusive"
+        if result.get("success"):
+            self._execution_failures.pop(tool_name, None)
+            if (
+                tool_name in EXECUTION_RECOVERY_TOOLS
+                and self._execution_failures
+                and not result.get("thread_still_running")
+                and result.get("scene_consistency") != "unknown"
+                and verification_status != "applied_unknown"
+            ):
+                self._execution_failures.clear()
+                self._record_audit({
+                    "event_type": "execution_failure_guard", "tool": tool_name,
+                    "action": "evidence_collected",
+                })
+        else:
+            error_text = str(result.get("error") or "")
+            exception_kinds = re.findall(EXECUTION_ERROR_FAMILY_PATTERN, error_text)
+            failure_kind = exception_kinds[-1] if exception_kinds else (
+                "message:" + hashlib.sha256(error_text.splitlines()[0].encode("utf-8")).hexdigest()[:16]
+            )
+            previous_failure = self._execution_failures.get(tool_name)
+            failure_count = (
+                previous_failure[1] + 1
+                if previous_failure and previous_failure[0] == failure_kind else 1
+            )
+            self._execution_failures[tool_name] = (failure_kind, failure_count)
+            if failure_count >= EXECUTION_FAILURE_LIMIT:
+                result["recovery_hint"] = EXECUTION_FAILURE_RECOVERY_HINT
+                result["recommended_next_action"] = "collect_evidence"
+                result["error"] += "\n\n" + EXECUTION_FAILURE_RECOVERY_HINT
+                self._record_audit({
+                    "event_type": "execution_failure_guard", "tool": tool_name,
+                    "action": "limit_reached", "failure_kind": failure_kind,
+                    "failure_count": failure_count,
+                })
         self._record_audit({
             "event_type": "tool_call", "phase": "result", "tool": tool_name,
             "action": action, "mode": context.get("mode", "agent"),

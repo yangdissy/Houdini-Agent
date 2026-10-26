@@ -32,6 +32,7 @@ from types import ModuleType
 import importlib
 import importlib.util
 import sys
+import threading
 import traceback
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, List
@@ -378,6 +379,7 @@ def _load_all():
         print(f"[Skills] 用户 Skill 目录: {user_dir}")
 
     _loaded = True
+    _prewarm_search_embedder()
     if _registry:
         print(f"[Skills] 已加载 {len(_registry)} 个 skill: {', '.join(_registry.keys())}")
 
@@ -387,11 +389,31 @@ def _load_all():
     # 保留 run_skill 元工具两步走（list_skills → run_skill）更可控。
 
 
-def _is_skill_enabled(skill_name: str) -> bool:
+def _get_search_embedder():
+    global _search_embedder
+    if _search_embedder is None:
+        from ..utils.embedding import LocalEmbedder
+        _search_embedder = LocalEmbedder(load_semantic_model=False)
+    return _search_embedder
+
+
+def _prewarm_search_embedder() -> None:
+    # 首次 import embedding（numpy 等）约 0.7s，提前在后台完成，避免首个 list_skills(query) 等待
+    def _warm():
+        try:
+            _get_search_embedder()
+        except Exception:
+            pass
+    threading.Thread(target=_warm, name="skill-embedder-warmup", daemon=True).start()
+
+
+def _is_skill_enabled(skill_name: str, disabled: Optional[set] = None) -> bool:
     """读取 ToolRegistry 中持久化的单 Skill 禁用状态。"""
     try:
-        from ..utils.tool_registry import get_tool_registry
-        return f"skill_{skill_name}" not in get_tool_registry().get_disabled_tools()
+        if disabled is None:
+            from ..utils.tool_registry import get_tool_registry
+            disabled = get_tool_registry().get_disabled_tools()
+        return f"skill_{skill_name}" not in disabled
     except Exception:
         return True
 
@@ -406,9 +428,14 @@ def list_skills(category: Optional[str] = None, query: Optional[str] = None,
         limit: query 非空时的最大返回数。
     """
     _load_all()
+    try:
+        from ..utils.tool_registry import get_tool_registry
+        disabled = get_tool_registry().get_disabled_tools()
+    except Exception:
+        disabled = set()
     result = []
     for name, mod in _registry.items():
-        if not _is_skill_enabled(name):
+        if not _is_skill_enabled(name, disabled):
             continue
         info = dict(getattr(mod, "SKILL_INFO", {}))
         info.setdefault("name", name)
@@ -434,11 +461,7 @@ def list_skills(category: Optional[str] = None, query: Optional[str] = None,
 
     ranked = []
     try:
-        global _search_embedder
-        if _search_embedder is None:
-            from ..utils.embedding import LocalEmbedder
-            _search_embedder = LocalEmbedder(load_semantic_model=False)
-        embedder = _search_embedder
+        embedder = _get_search_embedder()
         query_vector = embedder.encode(query)
         scores = embedder.batch_cosine_similarity(
             query_vector, embedder.encode_batch(texts)
@@ -461,6 +484,15 @@ def list_skills(category: Optional[str] = None, query: Optional[str] = None,
     return [info for _, info in ranked[:max(1, int(limit))]]
 
 
+def is_hou_free_skill(skill_name: str) -> bool:
+    """docs 类 Skill 只读本地文档、不调用 hou，可在后台线程运行。"""
+    _load_all()
+    mod = _registry.get(skill_name)
+    if mod is None:
+        return False
+    return getattr(mod, "SKILL_INFO", {}).get("category") == "docs"
+
+
 def run_skill(skill_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """执行指定 skill
 
@@ -474,12 +506,15 @@ def run_skill(skill_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
     _load_all()
 
     if not _is_skill_enabled(skill_name):
-        return {"error": f"Skill 已禁用: {skill_name}"}
+        return {"error_kind": "skill_disabled", "error": f"Skill 已禁用: {skill_name}"}
 
     mod = _registry.get(skill_name)
     if mod is None:
         available = ", ".join(_registry.keys()) or "(无)"
-        return {"error": f"Skill 不存在: {skill_name}\n可用 skill: {available}"}
+        return {
+            "error_kind": "skill_not_found",
+            "error": f"Skill 不存在: {skill_name}\n可用 skill: {available}",
+        }
 
     if isinstance(mod, SkillDescriptor):
         if not mod.entrypoint:
@@ -491,18 +526,20 @@ def run_skill(skill_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
         try:
             loaded_module = _load_descriptor_entrypoint(mod)
         except Exception as exc:
-            return {"error": f"Skill 加载失败: {exc}"}
+            return {"error_kind": "skill_load_failed", "error": f"Skill 加载失败: {exc}"}
         _, _, function_name = mod.entrypoint.partition(":")
         run_fn = getattr(loaded_module, function_name, None)
     else:
         run_fn = getattr(mod, "run", None)
     if not callable(run_fn):
-        return {"error": f"Skill '{skill_name}' 没有 run() 函数"}
+        return {"error_kind": "skill_no_run", "error": f"Skill '{skill_name}' 没有 run() 函数"}
 
     validated_params, validation_error = validate_params(
         getattr(mod, "SKILL_INFO", {}), params
     )
     if validation_error:
+        if "error_kind" not in validation_error:
+            validation_error["error_kind"] = "params_invalid"
         return validation_error
 
     try:
@@ -511,7 +548,10 @@ def run_skill(skill_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
             result = {"result": str(result)}
         return result
     except Exception as e:
-        return {"error": f"Skill 执行失败: {e}\n{traceback.format_exc()[:500]}"}
+        return {
+            "error_kind": "runtime_error",
+            "error": f"Skill 执行失败: {e}\n{traceback.format_exc()[:500]}",
+        }
 
 
 def get_skill_instructions(skill_name: str) -> Dict[str, Any]:

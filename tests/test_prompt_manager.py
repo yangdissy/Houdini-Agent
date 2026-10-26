@@ -80,11 +80,14 @@ def test_core_prompt_requires_result_verification_at_task_completion():
 
     assert 'Task Completion Verification (MUST follow)' in prompt
     assert 'final Plan step' in prompt
-    assert 'about to claim the task is complete' in prompt
-    assert 'run_skill(skill_name="verify_agent_result"' in prompt
+    assert 'reuse a successful verify_network result' in prompt
+    assert 'call verify_network once' in prompt
+    assert 'call visual_review exactly once' in prompt
+    assert 'Do not call run_skill("verify_agent_result")' in prompt
+    assert 'run_skill(skill_name="verify_agent_result"' not in prompt
     assert 'temporary_auto_validate_geometry' in prompt
-    assert 'restores the exact original mode' in prompt
-    assert 'current mode is Auto and freshness is established, do not call it' in prompt
+    assert 'restoration of the exact original mode' in prompt
+    assert 'Manual mode or stale/unknown freshness' in prompt
     assert 'not a node-creation hook' in prompt
 
 

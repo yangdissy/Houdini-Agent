@@ -21,6 +21,11 @@ class ModelFeaturesTest(unittest.TestCase):
     def test_of3d_gpt_56_supports_image_input(self):
         self.assertTrue(_model_features()['gpt-5.6']['supports_vision'])
 
+    def test_siliconflow_deepseek_v41_flash_supports_image_input(self):
+        self.assertTrue(
+            _model_features()['deepseek-ai/DeepSeek-V4.1-Flash']['supports_vision']
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

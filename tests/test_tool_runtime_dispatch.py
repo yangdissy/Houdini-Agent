@@ -1,5 +1,6 @@
 """Runtime selection tests for registry-backed tool dispatch."""
 
+import json
 import sys
 from types import SimpleNamespace
 from unittest import mock
@@ -74,8 +75,74 @@ def test_list_skills_marks_instructions_only_usage():
         result = client._tool_list_skills({"query": "复杂 Houdini 任务"})
 
     assert result["success"] is True
-    assert '"executable": false' in result["result"]
+    payload = json.loads(result["result"].split("\n\n", 1)[1])
+    assert payload["workflow"][0]["executable"] is False
     assert "读取必须遵循的方法说明" in result["result"]
+
+
+def test_list_skills_preserves_parameter_contract_in_compact_output():
+    client = HoudiniMCP()
+    parameters = {
+        "node_path": {"type": "string", "description": "Target node.", "required": True},
+        "limit": {
+            "type": "integer", "description": "Result limit.",
+            "default": 0, "minimum": 0, "maximum": 10,
+        },
+        "mode": {
+            "type": "string", "description": "Analysis mode.",
+            "default": "fast", "enum": ["fast", "full"],
+        },
+        "enabled": {"type": "boolean", "description": "Include details.", "default": False},
+        "selector": {"type": ["integer", "string"], "description": "Index or name."},
+        "attributes": {
+            "type": "array", "description": "Attribute names.",
+            "default": [], "items": {"type": "string"},
+        },
+    }
+    listed = [{
+        "name": "contract_test",
+        "category": "geometry",
+        "description": "Analyze selected attributes.",
+        "risk_level": "low",
+        "parameters": parameters,
+        "executable": True,
+    }]
+    expected = {
+        "geometry": [{
+            "name": "contract_test",
+            "description": "Analyze selected attributes.",
+            "risk_level": "low",
+            "executable": True,
+            "parameters": [
+                {**definition, "name": name, "required": bool(definition.get("required", False))}
+                for name, definition in parameters.items()
+            ],
+        }],
+    }
+
+    with mock.patch("houdini_agent.utils.mcp.client._list_skills", return_value=listed) as discover:
+        result = client._tool_list_skills({"category": "geometry", "query": "attributes", "limit": 1})
+
+    discover.assert_called_once_with(category="geometry", query="attributes", limit=1)
+    assert result["success"] is True
+    payload_text = result["result"].split("\n\n", 1)[1]
+    assert json.loads(payload_text) == expected
+    assert payload_text == json.dumps(expected, ensure_ascii=False, separators=(",", ":"))
+
+
+def test_list_skills_empty_results_keep_discovery_feedback():
+    client = HoudiniMCP()
+    cases = [
+        ({}, "当前没有可用的 Skill。"),
+        ({"category": "geometry"}, "分类 'geometry' 下没有可用的 Skill。"),
+        ({"query": "unmatched request"}, "没有找到与 'unmatched request' 相关的 Skill。"),
+    ]
+
+    for args, expected in cases:
+        with mock.patch("houdini_agent.utils.mcp.client._list_skills", return_value=[]):
+            result = client._tool_list_skills(args)
+
+        assert result == {"success": True, "result": expected}
 
 
 def test_mcp_set_user_binds_skill_registry_user():

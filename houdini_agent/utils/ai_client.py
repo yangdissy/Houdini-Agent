@@ -16,6 +16,7 @@ from urllib.parse import quote_plus
 
 from shared.common_utils import load_config, save_config, load_user_config, save_user_config
 from ..core.harness_engine import is_harness_v2_enabled, sanitize_tool_result
+from .security_guard import screen_external_result
 from ..core.streaming_tool_executor import StreamingToolExecutor
 from ..utils.token_optimizer import (
     TokenOptimizer,
@@ -513,6 +514,25 @@ _LOOP_SAME_TOOL_SOFT_HINT = 15  # 同工具连续调用 ≥15 次 → 软提示�
 _LOOP_SAME_TOOL_HARD_ABORT = 25  # 同工具连续调用 ≥25 次 → 硬熔断（已禁用，保留常量供恢复）
 _SKILL_DISCOVERY_HARD_ABORT = 8  # list_skills 仅用于发现；连续换参数搜索不会产生新的能力
 
+# 单次 Agent 运行的保底上限（防失控）；到达后暂停，用户发送「继续」即开启新一次运行
+DEFAULT_AGENT_MAX_ITERATIONS = 300
+DEFAULT_AGENT_MAX_TOOL_CALLS = 600
+_LIMIT_WRAP_UP_ITERATIONS = 2
+_LIMIT_WRAP_UP_TOOL_CALLS = 10
+_LIMIT_WRAP_UP_HINT = (
+    "\n\n[系统提示] 本次运行即将达到迭代/工具调用上限。请尽快完成当前小步骤，"
+    "然后简要总结已完成的内容和剩余步骤，便于用户发送「继续」后接着执行。"
+)
+_TOOL_LIMIT_SKIPPED_RESULT = "[未执行] 已达到本次运行的工具调用次数上限，此调用未执行。"
+
+
+def _run_limit_notice(stop_reason: str, limit: int) -> str:
+    label = "迭代轮数" if stop_reason == "max_iterations" else "工具调用次数"
+    return (
+        f"\n\n[已达到本次运行的{label}上限（{limit}），已暂停。"
+        "已完成的操作和对话进度都已保留，发送「继续」即可接着执行。]"
+    )
+
 
 # ============================================================
 # Houdini 工具定义
@@ -583,7 +603,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_parameter_schema",
-            "description": "结构化获取节点参数 schema：参数名、标签、类型、tuple 尺寸、当前值、默认值、min/max、菜单 token/label。设置参数前优先用此工具精确确认可用参数和值域；支持 pattern 过滤和 offset/limit 分页。",
+            "description": "结构化获取节点参数 schema：参数名、标签、类型、tuple 尺寸、当前值、默认值、min/max、菜单 token/label，以及节点 editability 和每个参数的 writable 状态。inside_locked_hda 为 true 时先使用 nearest_editable_ancestor 确认公开编辑入口，不要用 execute_python 探测内部节点。设置参数前优先用此工具精确确认可用参数和值域；支持 pattern 过滤和 offset/limit 分页。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -708,7 +728,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "inspect_node",
-            "description": "结构化读取单个节点的当前状态：类型、标签、备注、flags、位置、输入/输出连接、错误/警告、非默认参数摘要。用于快速理解一个节点，不需要拉取完整参数列表时优先使用。",
+            "description": "结构化读取单个节点的当前状态：类型、标签、备注、flags、位置、输入/输出连接、错误/警告、非默认参数摘要，以及 editability（含 inside_locked_hda、writable、nearest_editable_ancestor）。用于快速理解节点及其锁定 HDA 编辑边界，不需要拉取完整参数列表时优先使用。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -726,8 +746,22 @@ HOUDINI_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "check_errors",
+            "description": "结构化检查目标节点或网络的 cook 错误。返回 freshness、error_count、root_cause_count、去重后的 root_causes，以及每条错误的 classification。VEX/DOP/VOP 错误会尽量提供 reported_node、owner_node、repair_parameter、line 和 columns；优先修改 owner_node 的公开 repair_parameter，不要用 execute_python 遍历锁定内部节点。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "要检查的节点或网络完整路径"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_node_parameter",
-            "description": "设置节点参数值。修改已有节点（包括向已选中的 wrangle 节点写入 VEX 代码）必须使用此工具：先用 get_parameter_schema 或 get_node_parameters 确认参数名和值域，再用本工具设置。菜单参数可传 token 或 label；参数名错误时会返回 did-you-mean 建议。不要为了写入代码而额外创建新节点。",
+            "description": "设置节点参数值。修改已有节点（包括向已选中的 wrangle 节点写入 VEX 代码）必须使用此工具：先用 get_parameter_schema 或 get_node_parameters 确认参数名和值域，再用本工具设置。菜单参数可传 token 或 label；参数名错误时会返回 did-you-mean 建议。不可写时会 fail-fast 返回稳定 error_code：node_inside_locked_hda、parameter_locked 或 parameter_disabled；使用 data.nearest_editable_ancestor 寻找公开编辑入口。不要为了写入代码而额外创建新节点。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -841,6 +875,10 @@ HOUDINI_TOOLS = [
                     "dry_run": {
                         "type": "boolean",
                         "description": "只跑预校验（节点类型存在性、id 重复、name 冲突、connections 端点）不创建任何节点。校验失败会返回完整错误清单与 did-you-mean 建议。用陌生节点类型时强烈建议先 dry_run=True。默认 false。"
+                    },
+                    "expected_plan": {
+                        "type": "string",
+                        "description": "可选：dry_run 成功后返回的 plan_hash。真实创建时传入可防计划过期——内容与本批不一致会直接拒绝、零写入。"
                     }
                 },
                 "required": ["nodes"]
@@ -1561,7 +1599,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "verify_network",
-            "description": "【建完/改完网络必用】一次性核查一个网络下所有子节点的状态：errors / warnings / display+render+bypass flags / display 节点的几何 evidence（points/prims/vertices）。比逐个调 check_errors 高效得多。\n\n何时用：用 create_nodes_batch 建完一个网络后；改完连接或参数后；用户问 '建好了吗'。tool 返回 success 不等于网络真的工作，请用此工具确认 evidence（健康 + 几何点数非零）再回报用户。\n\n★ Manual 模式：本工具已在 Manual 更新模式下自动对 display 节点强制重 cook 再读几何，若返回的几何点数仍为 0，说明这是真实空几何（缓存假象已排除），应转向排查上游连线/过滤参数，不要反复重试同一验证。",
+            "description": "【建完/改完网络必用】一次性核查一个网络下所有子节点的状态：errors / warnings / display+render+bypass flags / display 节点的几何 evidence（points/prims/vertices）。比逐个调 check_errors 高效得多。\n\n何时用：用 create_nodes_batch 建完一个网络后；改完连接或参数后；用户问 '建好了吗'。tool 返回 success 不等于网络真的工作，请用此工具确认 evidence（健康 + 几何点数非零）再回报用户。\n\n★ Manual 模式：本工具在 Manual 下会对 display 节点强制 cook，但若 display 几何仍为 0，则 display 几何与 child 错误/警告统计均为 stale 缓存（中间节点可能从未 cook，errors() 为空不代表无错误）——此时报告的健康结论会标注为「未知」，请勿采信「0 错误」，也不要对其他节点重复调用本工具或 get_geometry_summary（同一份 stale 缓存）；按 recommended_next_action 对目标节点调用 temporary_auto_validate_geometry 临时 Auto 验证（自动恢复 Manual）。display 几何非零时错误统计可信，健康结论正常。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1630,17 +1668,17 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "run_skill",
-            "description": "执行预定义的 Skill（专用分析脚本）。Skill 比手写 execute_python 更可靠、更结构化。常见场景：几何属性统计(analyze_geometry_attribs)、边界盒信息(get_bounding_info)、法线质量检测(analyze_normals)、cook 性能分析(analyze_cook_performance)、死节点查找(find_dead_nodes)、节点依赖追溯(trace_node_dependencies)、网络契约验证(validate_network_contract)等。遇到分析类需求时优先用 run_skill 而非 execute_python。用 list_skills 查看完整列表和参数。Plan 规划阶段可用只读 skill（如 get_node_card 查真实参数、analyze_*/inspect_* 分析现有网络）来设计更合理的计划；会改场景/建图的 skill（setup_*）仅执行阶段可用。",
+            "description": "执行专用 Skill 脚本，或读取 instructions-only Skill 的方法说明。分析类需求优先于手写 execute_python。当前上下文已有精确技能名和完整参数契约时直接调用，不必先 list_skills；名称或契约未知时再搜索，不能猜参数。已有且仍适用的方法说明无需重复读取；场景变化后必须重跑相关分析。Plan 规划阶段仅可用明确只读的 Skill；会改场景或写文件的 Skill 留到执行阶段，权限和确认检查不变。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "skill_name": {
                         "type": "string",
-                        "description": "Skill 名称（用 list_skills 获取，或直接用描述中提到的常见 skill 名）"
+                        "description": "精确 Skill 名称。名称和完整参数契约已在当前上下文中时可直接调用，否则先用 list_skills 查找。"
                     },
                     "params": {
                         "type": "object",
-                        "description": "传给 Skill 的参数（键值对，具体参数见 list_skills 输出）"
+                        "description": "传给 Skill 的参数对象，遵循当前上下文或 list_skills 提供的完整契约，包括必填项、默认值、枚举和取值范围。"
                     }
                 },
                 "required": ["skill_name", "params"]
@@ -1651,7 +1689,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_skills",
-            "description": "列出或按自然语言语义搜索可用 Skill，按分类分组输出（结构化 JSON）。分类含 geometry(几何分析)/graph(网络节点)/scene(场景上下文)/usd(LOPs)/materials(材质)/performance(性能缓存)/docs(文档)/workflow(一键搭建)。在需要复杂分析时先搜索现成 Skill，比手写 execute_python 更高效可靠。",
+            "description": "按自然语言搜索或分类列出可用 Skill，返回名称、说明、风险、可执行标记和参数契约。仅当当前上下文缺少相关技能名或完整参数契约时发现；已知则直接 run_skill，不因任务复杂或进入下一阶段而重复搜索。复杂或不熟悉的任务用完整请求作为 query，通常 limit=3；只选真正相关的结果。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2065,10 +2103,7 @@ try:
                 _plan_name,
                 _plan_tool,
                 source="core",
-                modes={"plan_planning"} if _plan_name == "create_plan" else (
-                    {"plan_planning", "plan_executing"} if _plan_name == "ask_question"
-                    else {"plan_executing"}
-                ),
+                modes={"plan_executing"} if _plan_name == "update_plan_step" else {"plan_planning"},
                 runtime="houdini",
             )
 except Exception as _e:
@@ -2306,12 +2341,13 @@ class AIClient:
             return (
                 "\n\n[提示：工具已成功。如还需继续执行，请最多用 1-3 行简短 <think> 说明状态和下一步；"
                 "只有在连接、删除、代码执行、失败恢复或多步网络规划时才使用完整深度思考。"
-                "如任务已完成，请直接总结。]"
+                "如任务已完成，请直接在 <think> 之外给出最终答复——不要再把答案写进 <think>。]"
             )
 
         return (
-            "\n\n[提示：工具已成功。如任务已完成，请直接总结；"
-            "只有需要继续操作时才使用简短 <think>。]"
+            "\n\n[提示：工具已成功。如任务已完成，请直接在 <think> 之外给出最终答复；"
+            "只有需要继续操作时才使用简短 <think>。"
+            "注意：最终答案绝不能放在 <think> 内，否则用户看不到。]"
         )
 
     @staticmethod
@@ -4321,7 +4357,8 @@ class AIClient:
                           messages: List[Dict[str, Any]],
                           model: str = 'gpt-5.2',
                           provider: str = 'openai',
-                          max_iterations: int = 999,
+                          max_iterations: int = DEFAULT_AGENT_MAX_ITERATIONS,
+                          max_tool_calls: int = DEFAULT_AGENT_MAX_TOOL_CALLS,
                           temperature: float = 0.17,
                           max_tokens: Optional[int] = None,
                           enable_thinking: bool = True,
@@ -4354,7 +4391,8 @@ class AIClient:
         
         Returns:
             {"ok": bool, "content": str, "final_content": str,
-             "new_messages": list, "tool_calls_history": list, "iterations": int}
+             "new_messages": list, "tool_calls_history": list, "iterations": int,
+             "stop_reason": "max_iterations" | "max_tool_calls"（仅触达上限时）}
         """
         if not self._tool_executor:
             return {'ok': False, 'error': '未设置工具执行器', 'content': '', 'tool_calls_history': [], 'iterations': 0}
@@ -4392,8 +4430,8 @@ class AIClient:
         }
         
         # 防止死循环：检测重复工具调用
-        max_tool_calls = 999  # 不限制总调用次数（仅保留连续重复检测）
         total_tool_calls = 0
+        _wrap_up_hinted = False
         consecutive_same_calls = 0  # 连续相同调用计数（工具名+参数完全相同）
         last_call_signature = None
         recent_call_signatures = []  # 最近调用签名滑动窗口（交替循环检测）
@@ -4799,9 +4837,8 @@ class AIClient:
                     full_content += round_content
                     
                     # 1. 将 AI 的纯文本回复作为 assistant 消息存入 working_messages
+                    # ★ 不回灌 reasoning_content：避免模型在下一轮把"答复"也误放进 thinking
                     _assistant_msg = {'role': 'assistant', 'content': round_content or ''}
-                    if round_thinking:
-                        _assistant_msg['reasoning_content'] = round_thinking
                     working_messages.append(_assistant_msg)
                     
                     # 2. 注入 "Plan 未完成" 的提醒消息作为 user 消息
@@ -4895,6 +4932,30 @@ class AIClient:
                     arguments = {}
                 parsed_calls.append((tool_id, tool_name, arguments, tool_call))
 
+            # 先于执行检查：超出上限的整轮不执行，并为每个 tool_call 配对"未执行"结果
+            if total_tool_calls + len(parsed_calls) > max_tool_calls:
+                print(f"[AI Client] ⚠️ 达到工具调用次数上限 ({max_tool_calls})，本轮 {len(parsed_calls)} 个调用未执行")
+                for tool_id, _tn, _ta, _tc in parsed_calls:
+                    working_messages.append({
+                        'role': 'tool',
+                        'tool_call_id': tool_id,
+                        'content': _TOOL_LIMIT_SKIPPED_RESULT,
+                    })
+                _notice = _run_limit_notice('max_tool_calls', max_tool_calls)
+                if on_content:
+                    on_content(_notice)
+                return {
+                    'ok': True,
+                    'content': full_content + round_content + _notice,
+                    'final_content': round_content + _notice,
+                    'new_messages': working_messages[initial_msg_count:],
+                    'tool_calls_history': tool_calls_history,
+                    'call_records': call_records,
+                    'iterations': iteration,
+                    'usage': total_usage,
+                    'stop_reason': 'max_tool_calls',
+                }
+
             # Harness V2: use extracted streaming tool executor and skip legacy dispatch block.
             if _stream_tool_executor is not None:
                 _exec_out = _stream_tool_executor.execute_round(parsed_calls)
@@ -4932,11 +4993,6 @@ class AIClient:
                     # 防止死循环：检测重复工具调用
                     total_tool_calls += 1
                     call_signature = f"{tool_name}:{json.dumps(arguments, sort_keys=True)}"
-
-                    if total_tool_calls > max_tool_calls:
-                        print(f"[AI Client] ⚠️ 达到最大工具调用次数限制 ({max_tool_calls})")
-                        should_break_tool_limit = True
-                        break
 
                     if call_signature == last_call_signature:
                         consecutive_same_calls += 1
@@ -5046,10 +5102,24 @@ class AIClient:
                         print(f"[AI Client] 📸 视口截图已注入消息 ({len(_img_b64)//1024}KB base64)")
 
                 if should_break_tool_limit:
-                    if _loop_abort_reason is not None:
-                        _abort_msg = _loop_abort_reason
-                    else:
-                        _abort_msg = f"已达到工具调用次数限制({max_tool_calls})，自动停止。"
+                    # 本轮工具已全部执行（含触发熔断的那个），必须如实回填结果，否则清洗会补"被中断"占位误导模型重做
+                    for _j in range(i, len(parsed_calls)):
+                        _tid, _tname, _targs, _ = parsed_calls[_j]
+                        _res = results_ordered[_j] if _j < len(results_ordered) else {
+                            'success': False,
+                            'error': '工具执行器返回索引越界'
+                        }
+                        if on_tool_call:
+                            on_tool_call(_tname, _targs)
+                        tool_calls_history.append({'tool_name': _tname, 'arguments': _targs, 'result': _res})
+                        if on_tool_result:
+                            on_tool_result(_tname, _targs, _res)
+                        working_messages.append({
+                            'role': 'tool',
+                            'tool_call_id': _tid,
+                            'content': self._compress_tool_result(_tname, _res),
+                        })
+                    _abort_msg = _loop_abort_reason
                     return {
                         'ok': True,
                         'content': full_content + f"\n\n{_abort_msg}",
@@ -5077,11 +5147,18 @@ class AIClient:
                     )
                     if _followup_hint:
                         working_messages[-1]['content'] += _followup_hint
+                    if not _wrap_up_hinted and (
+                        max_iterations - iteration <= _LIMIT_WRAP_UP_ITERATIONS
+                        or max_tool_calls - total_tool_calls <= _LIMIT_WRAP_UP_TOOL_CALLS
+                    ):
+                        _wrap_up_hinted = True
+                        working_messages[-1]['content'] += _LIMIT_WRAP_UP_HINT
 
                 full_content += round_content
                 continue
 
         # 如果循环结束但内容为空，且有工具调用历史，强制要求生成总结
+        summary_content = ""
         if not full_content.strip() and tool_calls_history:
             print("[AI Client] ⚠️ Stream模式：工具调用完成但无回复内容，强制要求生成总结")
             # 最后一次请求，强制要求总结
@@ -5091,7 +5168,6 @@ class AIClient:
             })
             
             # 再次请求生成总结
-            summary_content = ""
             for chunk in self.chat_stream(
                 messages=working_messages,
                 model=model,
@@ -5112,6 +5188,9 @@ class AIClient:
             full_content = summary_content if summary_content else full_content
         
         print(f"[AI Client] Reached max iterations ({iteration})")
+        _notice = _run_limit_notice('max_iterations', max_iterations)
+        if on_content:
+            on_content(_notice)
         # 计算 cache 命中率
         prompt_total = total_usage['cache_hit_tokens'] + total_usage['cache_miss_tokens']
         if prompt_total > 0:
@@ -5120,13 +5199,14 @@ class AIClient:
             total_usage['cache_hit_rate'] = 0
         return {
             'ok': True,
-            'content': full_content if full_content.strip() else "(工具调用完成，但未生成回复)",
-            'final_content': '',  # max iterations 时无明确的最终回复
+            'content': full_content + _notice,
+            'final_content': summary_content + _notice,
             'new_messages': working_messages[initial_msg_count:],
             'tool_calls_history': tool_calls_history,
             'call_records': call_records,
             'iterations': iteration,
-            'usage': total_usage
+            'usage': total_usage,
+            'stop_reason': 'max_iterations',
         }
 
     def _execute_web_search(self, arguments: dict) -> dict:
@@ -5137,7 +5217,8 @@ class AIClient:
         if not query:
             return {"success": False, "error": "缺少搜索关键词"}
         
-        result = self._web_searcher.search(query, max_results)
+        result = screen_external_result(self._web_searcher.search(query, max_results))
+        warning = result.get('security_warning', '')
         
         if result.get('success'):
             items = result.get('results', [])
@@ -5156,9 +5237,13 @@ class AIClient:
             
             lines.append("提示: 如需查看详细内容，请用 fetch_webpage(url=...) 获取网页正文。引用信息时务必在段落末标注 [来源: 标题](URL)。请勿用相同关键词重复搜索。")
             
-            return {"success": True, "result": "\n".join(lines)}
+            response = {"success": True, "result": "\n".join(lines)}
+            if warning:
+                response['security_warning'] = warning
+                response['result'] += '\n' + warning
+            return response
         else:
-            return {"success": False, "error": result.get('error', '搜索失败')}
+            return {"success": False, "error": result.get('error', '搜索失败'), **({'security_warning': warning} if warning else {})}
 
     def _execute_fetch_webpage(self, arguments: dict) -> dict:
         """获取网页内容（分页返回，支持翻页）"""
@@ -5174,13 +5259,18 @@ class AIClient:
         except (TypeError, ValueError):
             start_line = 1
         
-        result = self._web_searcher.fetch_page_content(url, max_lines=80, start_line=start_line)
+        result = screen_external_result(self._web_searcher.fetch_page_content(url, max_lines=80, start_line=start_line))
+        warning = result.get('security_warning', '')
         
         if result.get('success'):
             content = result.get('content', '')
-            return {"success": True, "result": f"网页正文（{url}）：\n\n{content}"}
+            response = {"success": True, "result": f"网页正文（{url}）：\n\n{content}"}
+            if warning:
+                response['security_warning'] = warning
+                response['result'] += '\n' + warning
+            return response
         else:
-            return {"success": False, "error": result.get('error', '获取失败')}
+            return {"success": False, "error": result.get('error', '获取失败'), **({'security_warning': warning} if warning else {})}
 
     # 保持兼容性
     def agent_loop(self, *args, **kwargs):
@@ -5334,7 +5424,8 @@ class AIClient:
                               messages: List[Dict[str, Any]],
                               model: str = 'qwen2.5:14b',
                               provider: str = 'ollama',
-                              max_iterations: int = 999,
+                              max_iterations: int = DEFAULT_AGENT_MAX_ITERATIONS,
+                              max_tool_calls: int = DEFAULT_AGENT_MAX_TOOL_CALLS,
                               temperature: float = 0.17,
                               max_tokens: Optional[int] = None,
                               enable_thinking: bool = True,
@@ -5405,7 +5496,6 @@ class AIClient:
         }
         
         # 防止死循环：检测重复工具调用
-        max_tool_calls = 999  # 不限制总调用次数（仅保留连续重复检测）
         total_tool_calls = 0
         consecutive_same_calls = 0
         last_call_signature = None
@@ -5665,6 +5755,21 @@ class AIClient:
             if self.is_reasoning_model(model) and provider in ('deepseek', 'glm', 'siliconflow'):
                 json_assistant_msg['reasoning_content'] = ''
             working_messages.append(json_assistant_msg)
+
+            if total_tool_calls + len(tool_calls) > max_tool_calls:
+                print(f"[AI Client] ⚠️ JSON模式：达到工具调用次数上限 ({max_tool_calls})，本轮 {len(tool_calls)} 个调用未执行")
+                _notice = _run_limit_notice('max_tool_calls', max_tool_calls)
+                if on_content:
+                    on_content(_notice)
+                return {
+                    'ok': True,
+                    'content': full_content + _notice,
+                    'tool_calls_history': tool_calls_history,
+                    'call_records': call_records,
+                    'iterations': iteration,
+                    'usage': total_usage,
+                    'stop_reason': 'max_tool_calls',
+                }
             
             # 执行工具调用（web 工具并行，Houdini 工具串行）
             tool_results = []
@@ -5754,11 +5859,6 @@ class AIClient:
                 total_tool_calls += 1
                 call_signature = f"{tool_name}:{json.dumps(arguments, sort_keys=True)}"
 
-                if total_tool_calls > max_tool_calls:
-                    print(f"[AI Client] ⚠️ JSON模式：达到最大工具调用次数限制 ({max_tool_calls})")
-                    should_break_limit = True
-                    break
-
                 if call_signature == last_call_signature:
                     consecutive_same_calls += 1
                 else:
@@ -5846,10 +5946,16 @@ class AIClient:
                     tool_results.append(f"{tool_name}:错误:{compressed}{suffix}")
 
             if should_break_limit:
-                if _loop_abort_reason is not None:
-                    _abort_msg = _loop_abort_reason
-                else:
-                    _abort_msg = f"已达到工具调用次数限制({max_tool_calls})，自动停止。"
+                # 本轮工具已全部执行，如实记录剩余结果
+                for _j in range(i, len(tool_calls)):
+                    _tname, _targs = tool_calls[_j]['name'], tool_calls[_j]['arguments']
+                    _res = exec_results[_j]
+                    if on_tool_call:
+                        on_tool_call(_tname, _targs)
+                    tool_calls_history.append({'tool_name': _tname, 'arguments': _targs, 'result': _res})
+                    if on_tool_result:
+                        on_tool_result(_tname, _targs, _res)
+                _abort_msg = _loop_abort_reason
                 return {
                     'ok': True,
                     'content': full_content + f"\n\n{_abort_msg}",
@@ -5962,6 +6068,10 @@ class AIClient:
             
             full_content = summary_content if summary_content else full_content
         
+        print(f"[AI Client] JSON模式：Reached max iterations ({iteration})")
+        _notice = _run_limit_notice('max_iterations', max_iterations)
+        if on_content:
+            on_content(_notice)
         # 计算 cache 命中率
         prompt_total = total_usage['cache_hit_tokens'] + total_usage['cache_miss_tokens']
         if prompt_total > 0:
@@ -5971,11 +6081,12 @@ class AIClient:
         
         _result = {
             'ok': True,
-            'content': full_content if full_content.strip() else "(工具调用完成，但未生成回复)",
+            'content': full_content + _notice,
             'tool_calls_history': tool_calls_history,
             'call_records': call_records,
             'iterations': iteration,
-            'usage': total_usage
+            'usage': total_usage,
+            'stop_reason': 'max_iterations',
         }
         
         # ★ Hook: on_after_response — 通知插件 Agent Loop 结束

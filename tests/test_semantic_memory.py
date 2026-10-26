@@ -29,7 +29,7 @@ class SemanticMemoryTest(unittest.TestCase):
         self.store.close()
         self.temp_dir.cleanup()
 
-    def test_upsert_duplicate_merges_episode_sources_and_reinforces_rule(self):
+    def test_upsert_duplicate_merges_sources_without_claiming_usage(self):
         first, created = self.store.upsert_semantic(
             SemanticRecord(
                 rule="Validate the node path before cooking",
@@ -55,8 +55,8 @@ class SemanticMemoryTest(unittest.TestCase):
         self.assertEqual(second.id, first.id)
         self.assertEqual(self.store.count_semantic(), 1)
         self.assertEqual(saved.source_episodes, ["episode-1", "episode-2"])
-        self.assertAlmostEqual(saved.confidence, 0.7)
-        self.assertEqual(saved.activation_count, 1)
+        self.assertAlmostEqual(saved.confidence, 0.6)
+        self.assertEqual(saved.activation_count, 0)
 
     def test_light_sleep_links_rules_to_summary_episodes(self):
         reflection = ReflectionModule(store=self.store)
@@ -78,7 +78,7 @@ class SemanticMemoryTest(unittest.TestCase):
         saved = self.store.get_all_semantic()[0]
         self.assertEqual(self.store.count_semantic(), 1)
         self.assertEqual(saved.source_episodes, [first["episodic_id"], second["episodic_id"]])
-        self.assertEqual(saved.activation_count, 1)
+        self.assertEqual(saved.activation_count, 0)
 
     def test_deep_sleep_links_rules_and_key_facts_to_summary_episode(self):
         reflection = ReflectionModule(store=self.store)
@@ -113,6 +113,8 @@ class SemanticMemoryTest(unittest.TestCase):
         reflection = ReflectionModule(store=self.store)
         first_episode = EpisodicRecord(id="episode-1")
         second_episode = EpisodicRecord(id="episode-2")
+        self.store.add_episodic(first_episode)
+        self.store.add_episodic(second_episode)
         response = json.dumps({
             "semantic_rules": [{
                 "rule": "Validate the node path before cooking",
@@ -130,7 +132,7 @@ class SemanticMemoryTest(unittest.TestCase):
         saved = self.store.get_all_semantic()[0]
         self.assertEqual(self.store.count_semantic(), 1)
         self.assertEqual(saved.source_episodes, ["episode-1", "episode-2"])
-        self.assertEqual(saved.activation_count, 1)
+        self.assertEqual(saved.activation_count, 0)
 
     def test_rule_reflect_does_not_write_before_episode_is_inserted(self):
         reflection = ReflectionModule(store=self.store)

@@ -31,11 +31,13 @@ PlanMixin — Plan 模式工具处理相关方法
 
 import queue
 import threading
+import time
+import uuid
 
 from houdini_agent.qt_compat import QtCore, QtWidgets
 
 from ..ui.i18n import tr
-from ..utils.plan_manager import get_plan_manager
+from ..utils.plan_manager import PlanQualityError, get_plan_manager, normalize_plan_answers, validate_plan_questions
 from ..utils.plan_runtime import PlanRuntime
 from ..ui.cursor_plan_widgets import AskQuestionCard, PlanViewer, StreamingPlanCard
 
@@ -92,24 +94,46 @@ class PlanMixin:
             self._showGenerating.emit()
             return {
                 "success": True,
+                "plan_id": plan_data["plan_id"],
+                "quality": plan_data["quality"],
+                "status": "awaiting_confirmation",
                 "result": f"Plan '{plan_data.get('title', '')}' created with {len(plan_data.get('steps', []))} steps. Waiting for user confirmation."
             }
+        except PlanQualityError as exc:
+            return {"success": False, "error_kind": "plan_quality", "error": str(exc),
+                    "diagnostics": exc.diagnostics}
         except Exception as e:
             return {"success": False, "error": f"Failed to create plan: {e}"}
 
     def _handle_update_plan_step(self, kwargs: dict) -> dict:
         """处理 update_plan_step 工具调用（后台线程）"""
         try:
+            session_id = getattr(self, '_agent_session_id', None) or self._session_id
             step_id = kwargs.get('step_id', '')
-            status = kwargs.get('status', 'done')
+            status = kwargs.get('status')
+            if not isinstance(step_id, str) or not step_id.strip() or status not in {"running", "done", "error", "blocked"}:
+                raise ValueError("A step_id and explicit valid status are required.")
             result_summary = kwargs.get('result_summary', '')
+            if not isinstance(result_summary, str):
+                raise ValueError("result_summary must be a string.")
+            evidence = self._resolve_plan_evidence(session_id, kwargs["evidence_refs"]) if "evidence_refs" in kwargs else None
             plan = self._get_plan_manager().update_step(
-                self._session_id, step_id, status, result_summary
+                session_id, step_id, status, result_summary, evidence=evidence
             )
             if not plan:
-                return {"success": False, "error": f"No active plan found for session {self._session_id}"}
+                return {"success": False, "error": f"No active plan found for session {session_id}"}
+            step = next(item for item in plan["steps"] if item["id"] == step_id)
+            state = {
+                "step_id": step_id, "status": status, "plan_status": plan["status"],
+                "verification": step["verification"], "evidence": step.get("evidence", []),
+                "ready_step_ids": [item["id"] for item in PlanRuntime().next_ready_steps(plan)],
+                "blocked_step_ids": [item["id"] for item in PlanRuntime().blocked_steps(plan)],
+            }
             # 通过信号在主线程更新 PlanViewer 步骤状态
-            self._updatePlanStep.emit(step_id, status, result_summary or '')
+            display_summary = result_summary
+            if status == "done":
+                display_summary = (display_summary + "\n" + tr('ai.plan_acceptance_unverified')).strip()
+            self._updatePlanStep.emit(step_id, status, display_summary)
             # 检查是否全部完成
             all_steps = plan.get('steps', [])
             done_count = sum(1 for s in all_steps if s.get('status') == 'done')
@@ -119,6 +143,7 @@ class PlanMixin:
             self._restore_plan_projection()
             if plan.get('status') == 'completed':
                 return {
+                    **state,
                     "success": True,
                     "result": f"Step {step_id} updated to '{status}'. Plan complete! ({done_count}/{total} done, {error_count} errors)"
                 }
@@ -131,88 +156,158 @@ class PlanMixin:
                 next_step_info = f" Next: {ns['id']} \"{ns.get('title', ns.get('description', ns['id']))}\""
 
             return {
+                **state,
                 "success": True,
                 "result": f"Step {step_id} updated to '{status}'. Progress: {done_count}/{total} done.{next_step_info}"
             }
         except Exception as e:
             return {"success": False, "error": f"Failed to update plan step: {e}"}
 
+    def _resolve_plan_evidence(self, session_id: str, references: list) -> list:
+        if not isinstance(references, list) or len(references) > 20:
+            raise ValueError("evidence_refs must be a list of at most 20 references.")
+        evidence = []
+        for reference in references:
+            if not isinstance(reference, dict) or set(reference) != {"kind", "ref"}:
+                raise ValueError("Evidence references require only kind and ref.")
+            kind, ref = reference["kind"], reference["ref"]
+            if not isinstance(ref, str) or not ref.strip():
+                raise ValueError("Evidence ref must be a non-empty string.")
+            if kind == "operation_receipt":
+                executor = getattr(self, '_houdini_main_thread_executor', None)
+                receipt = executor.get_operation_status(ref) if executor is not None else None
+                if receipt is None:
+                    receipt = next((item for item in self._read_operation_receipts(session_id)
+                                    if item.get("request_ref") == ref or item.get("operation_id") == ref), None)
+                if (not isinstance(receipt, dict) or receipt.get("session_id") != session_id
+                        or ref not in {receipt.get("request_ref"), receipt.get("operation_id")}):
+                    raise ValueError("Operation receipt is unavailable in this session.")
+                metadata = {key: receipt.get(key) for key in (
+                    "tool_name", "state", "success", "thread_still_running", "scene_consistency",
+                )}
+            elif kind == "result":
+                from .tool_result_store import ToolResultStore
+                metadata = ToolResultStore(self._cache_dir, session_id).describe(ref)
+            else:
+                raise ValueError("Unknown evidence reference kind.")
+            evidence.append({"kind": kind, "ref": ref, **metadata})
+        return evidence
+
     def _handle_ask_question(self, kwargs: dict) -> dict:
-        """处理 ask_question 工具调用（后台线程）
-
-        复用 _request_tool_confirmation 的阻塞模式：
-        1. 设置 pending 属性 → 发射信号 → 主线程渲染 AskQuestionCard
-        2. 后台线程在 queue 上阻塞等待用户回答
-        3. 用户提交后 queue.put(answers) → 后台线程继续
-        """
         questions = kwargs.get('questions', [])
-        if not questions:
-            return {"success": False, "error": "No questions provided"}
-
-        self._ask_question_result_queue = queue.Queue()
-        self._pending_ask_questions = questions
-        self._askQuestionRequest.emit()
-
         try:
-            result = self._ask_question_result_queue.get(timeout=300.0)  # 5 分钟超时
-            if result is None:
-                return {"success": True, "result": "User skipped the questions."}
-            # 格式化答案为可读文本
-            answer_lines = []
-            for q_id, selections in result.items():
-                readable = []
-                for sel in selections:
-                    if sel.startswith("__free_text__:"):
-                        readable.append(sel.replace("__free_text__:", ""))
-                    else:
-                        readable.append(sel)
-                answer_lines.append(f"{q_id}: {', '.join(readable)}")
-            return {
-                "success": True,
-                "result": f"User answered:\n" + "\n".join(answer_lines)
+            validate_plan_questions(questions)
+        except ValueError as exc:
+            return {"success": False, "error_kind": "invalid_questions", "error": str(exc)}
+
+        request_id = uuid.uuid4().hex
+        request = {
+            "id": request_id,
+            "session_id": getattr(self, '_agent_session_id', None) or self._session_id,
+            "questions": questions,
+            "queue": queue.Queue(),
+            "active": threading.Event(),
+        }
+        request["active"].set()
+        self._plan_question_request = request
+        self._ask_question_result_queue = request["queue"]
+        status = "cancelled"
+        try:
+            if self.client.is_stop_requested():
+                outcome = {"status": "cancelled"}
+            else:
+                self._askQuestionRequest.emit(request)
+                deadline = time.monotonic() + 300.0
+                while True:
+                    if self.client.is_stop_requested() or self._session_id != request["session_id"]:
+                        outcome = {"status": "cancelled"}
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        outcome = {"status": "timed_out"}
+                        break
+                    try:
+                        outcome = request["queue"].get(timeout=min(0.1, remaining))
+                        break
+                    except queue.Empty:
+                        continue
+            status = outcome.get("status", "ui_error") if isinstance(outcome, dict) else "ui_error"
+            answers = {}
+            if status == "answered":
+                try:
+                    answers = normalize_plan_answers(questions, outcome.get("answers"))
+                except ValueError as exc:
+                    status = "invalid_answers"
+                    return {"success": False, "status": status, "answers": {},
+                            "question_request_id": request_id, "error_kind": status, "error": str(exc)}
+            if status not in {"answered", "skipped", "timed_out", "cancelled", "ui_error"}:
+                status = "ui_error"
+            result = {
+                "success": status == "answered", "status": status,
+                "question_request_id": request_id, "answers": answers,
+                "result": "User answered: " + str(answers) if answers else
+                          f"Question request {status}; no consent was given. Do not automatically repeat the questions.",
             }
-        except queue.Empty:
-            return {"success": True, "result": "User did not answer within the time limit."}
+            if status != "answered":
+                result.update(error_kind=status, error=result["result"])
+            return result
+        finally:
+            request["active"].clear()
+            self._finishAskQuestionRequest.emit(request_id, status)
 
-    @QtCore.Slot()
-    def _on_render_ask_question(self):
+    @QtCore.Slot(dict)
+    def _on_render_ask_question(self, request: dict):
         """主线程：在聊天流中插入 AskQuestionCard"""
-        q = getattr(self, '_ask_question_result_queue', None)
-        questions = getattr(self, '_pending_ask_questions', [])
-
-        if not q:
-            print("[AskQuestion] ⚠ _ask_question_result_queue 不存在")
+        if not request or not request["active"].is_set():
+            return
+        result_queue = request["queue"]
+        if request["session_id"] != self._session_id:
+            result_queue.put({"status": "cancelled"})
             return
 
         try:
-            card = AskQuestionCard(questions, parent=self.chat_container)
-        except Exception as e:
-            print(f"[AskQuestion] ✖ AskQuestionCard 创建失败: {e}")
-            q.put(None)
+            card = AskQuestionCard(request["questions"], parent=self.chat_container)
+        except Exception:
+            result_queue.put({"status": "ui_error"})
             return
 
         def _on_answered(answers: dict):
-            q.put(answers)
+            if request["active"].is_set():
+                result_queue.put({"status": "answered", "answers": answers})
 
         def _on_cancelled():
-            q.put(None)
+            if request["active"].is_set():
+                result_queue.put({"status": "skipped"})
 
         card.answered.connect(_on_answered)
         card.cancelled.connect(_on_cancelled)
+        card.destroyed.connect(lambda *_args: result_queue.put({"status": "cancelled"})
+                       if request["active"].is_set() else None)
+        self.__dict__.setdefault('_plan_question_cards', {})[request["id"]] = card
 
         # 插入到对话流
         try:
             self.chat_layout.insertWidget(self.chat_layout.count() - 1, card)
-        except Exception as e:
-            print(f"[AskQuestion] ⚠ 插入失败: {e}")
-            q.put(None)
+        except Exception:
+            result_queue.put({"status": "ui_error"})
             return
 
         card.setVisible(True)
+        if not request["active"].is_set():
+            self._on_finish_ask_question(request["id"], "cancelled")
         try:
             self._scroll_to_bottom(force=True)
         except Exception:
             pass
+
+    @QtCore.Slot(str, str)
+    def _on_finish_ask_question(self, request_id: str, status: str):
+        card = getattr(self, '_plan_question_cards', {}).pop(request_id, None)
+        if card is not None:
+            try:
+                card.finish(status)
+            except RuntimeError:
+                pass
 
     @QtCore.Slot(dict)
     def _show_plan_generation_progress(self, accumulated: str):

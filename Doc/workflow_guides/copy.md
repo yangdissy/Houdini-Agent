@@ -12,6 +12,7 @@ Use `setup_instance_scatter` when the task needs a SOP or USD point-instancing b
 - Choose copies versus instances from editability, memory, renderer, and variation requirements.
 - Treat template points and their attributes as the instance contract: position, orientation, scale, variant, ID, and visibility.
 - Keep source transforms, template generation, attribute authoring, copying, and output independently inspectable.
+- Treat the complete source and the layout (template points) as separate editing responsibilities, and re-check every consumer after the source changes.
 
 ## Order of work
 

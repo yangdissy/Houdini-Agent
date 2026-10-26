@@ -406,6 +406,66 @@ class HarnessToolPolicyEngineTest(unittest.TestCase):
         self.assertEqual(decision.action, "ask")
         self.assertIn("persistent", decision.reason)
 
+    # ---- Ownership：修改非本 session agent 创建节点的风险信号 ----
+
+    def test_agent_created_node_mutation_has_no_foreign_factor(self):
+        context = {
+            "mode": "agent",
+            "confirm_mode": False,
+            "agent_created_paths": frozenset({"/obj/geo1/box1"}),
+        }
+        decision = self.policy.decide("delete_node", {"node_path": "/obj/geo1/box1"}, context)
+        self.assertEqual(decision.action, "allow")
+        self.assertNotIn("foreign_node_mutation", decision.matched_rules)
+
+    def test_foreign_node_mutation_direct_execute_allows_with_factor(self):
+        context = {
+            "mode": "agent",
+            "confirm_mode": False,
+            "agent_created_paths": frozenset({"/obj/geo1/box1"}),
+        }
+        decision = self.policy.decide("delete_node", {"node_path": "/obj/geo1/user_node"}, context)
+        self.assertEqual(decision.action, "allow")
+        self.assertIn("foreign_node_mutation", decision.matched_rules)
+        self.assertIn("/obj/geo1/user_node", decision.reason)
+        self.assertGreaterEqual(decision.risk_score, 0.4)
+
+    def test_foreign_node_mutation_confirm_mode_asks(self):
+        context = {
+            "mode": "agent",
+            "confirm_mode": True,
+            "agent_created_paths": frozenset({"/obj/geo1/box1"}),
+        }
+        decision = self.policy.decide("delete_node", {"node_path": "/obj/geo1/user_node"}, context)
+        self.assertEqual(decision.action, "ask")
+        self.assertIn("foreign_node_mutation", decision.matched_rules)
+        self.assertEqual(decision.required_control, "confirm")
+        self.assertIn("/obj/geo1/user_node", decision.reason)
+
+    def test_foreign_check_skipped_without_created_paths(self):
+        # 集合为空（如 session 刚开始或未注入）时不做任何判断
+        decision = self.policy.decide(
+            "delete_node",
+            {"node_path": "/obj/geo1/user_node"},
+            {"mode": "agent", "confirm_mode": False},
+        )
+        self.assertEqual(decision.action, "allow")
+        self.assertNotIn("foreign_node_mutation", decision.matched_rules)
+
+    def test_foreign_check_skips_creation_tools(self):
+        context = {
+            "mode": "agent",
+            "confirm_mode": False,
+            "agent_created_paths": frozenset({"/obj/geo1/box1"}),
+        }
+        decision = self.policy.decide(
+            "create_named_null",
+            {"name": "OUT", "parent_path": "/obj/geo1"},
+            context,
+        )
+        self.assertEqual(decision.action, "allow")
+        self.assertNotIn("foreign_node_mutation", decision.matched_rules)
+
     def test_sensitive_argument_key_is_denied(self):
         decision = self.policy.decide(
             "execute_shell",

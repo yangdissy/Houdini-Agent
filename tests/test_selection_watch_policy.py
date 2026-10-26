@@ -87,6 +87,9 @@ class SelectionWatchPolicyTest(unittest.TestCase):
 
     def test_zero_tool_success_is_eligible_for_reflection(self):
         self.assertTrue(RuntimeStateMixin._should_reflect_on_result({
+            "ok": True, "content": "Plain chat response\n[mem-used: M1]", "tool_calls_history": [],
+        }))
+        self.assertTrue(RuntimeStateMixin._should_reflect_on_result({
             "ok": True,
             "final_content": "Completed without tools",
             "tool_calls_history": [],

@@ -38,9 +38,9 @@ def _resolve():
 def _iter_pages(help_dir):
     """Yield (zip_name, entry_name, raw_text) for every .txt help page present."""
     try:
-        from houdini_agent.utils.help_source import HELP_ZIPS, iter_pages
+        from houdini_agent.utils.help_source import HELP_ZIPS, iter_pages_cached as iter_pages
     except Exception:
-        from ...utils.help_source import HELP_ZIPS, iter_pages  # type: ignore
+        from ...utils.help_source import HELP_ZIPS, iter_pages_cached as iter_pages  # type: ignore
     for zip_name in HELP_ZIPS:
         zp = help_dir / zip_name
         if not zp.exists():

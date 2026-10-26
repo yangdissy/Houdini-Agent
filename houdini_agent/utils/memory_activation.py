@@ -9,6 +9,31 @@ from difflib import SequenceMatcher
 from typing import List, Sequence
 
 
+def parse_memory_usage(text: str, aliases: Sequence[str]) -> set[str] | None:
+    clean = re.sub(r"<think>[\s\S]*?</think>", "", text or "")
+    matches = list(re.finditer(r"(?m)^\[mem-used:\s*([^\]\n]*)\]\s*$", clean))
+    if len(matches) != 1 or clean[matches[0].end():].strip():
+        return None
+    declaration = matches[0].group(1).strip()
+    if declaration == "none":
+        return set()
+    tokens = [token.strip() for token in declaration.split(",")]
+    if not tokens or len(set(tokens)) != len(tokens):
+        return None
+    if any(not re.fullmatch(r"M[1-9][0-9]*", token) for token in tokens):
+        return None
+    return set(tokens) if set(tokens).issubset(aliases) else None
+
+
+def strip_memory_usage(text: str, streaming: bool = False) -> str:
+    clean = re.sub(r"(?m)^\[mem-used:[^\]\n]*\][ \t]*(?:\r?\n|$)", "", text or "")
+    if streaming:
+        tail = clean.rsplit("\n", 1)[-1]
+        if tail and ("[mem-used:".startswith(tail) or tail.startswith("[mem-used:")):
+            clean = clean[:-len(tail)]
+    return clean
+
+
 @dataclass
 class MemoryActivationCandidate:
     """One candidate memory line before prompt injection."""

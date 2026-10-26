@@ -172,7 +172,7 @@ class ExternalMCPExecutionAdapter:
 
                     def decide(inner_self, name, safe_args, policy_context):
                         decision = inner_self._base_policy.decide(name, safe_args, policy_context)
-                        if decision.action == "allow":
+                        if decision.action == "allow" and not policy_context.get("confirmed"):
                             return ToolPolicyDecision(
                                 action="ask",
                                 reason="External MCP scene mutation requires Houdini panel confirmation",

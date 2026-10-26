@@ -15,6 +15,7 @@ import fnmatch
 import itertools
 import difflib
 import contextlib
+import threading
 from collections import OrderedDict
 from typing import Any, Optional, Dict, List, Tuple
 from pathlib import Path
@@ -144,8 +145,6 @@ def _display_node_has_volume(display_node) -> bool:
     if hou is None:
         return False
     try:
-        if display_node.needsToCook():
-            return True
         geo = display_node.geometry()
         if geo is None:
             return False
@@ -720,6 +719,66 @@ class HoudiniMCP:
     # ========================================
     # 节点详情读取（优化版：先构建ATS，再读取部分上下文）
     # ========================================
+
+    @staticmethod
+    def _node_editability(node: Any) -> Dict[str, Any]:
+        def read_bool(obj: Any, method_name: str, default: bool) -> bool:
+            try:
+                method = getattr(obj, method_name, None)
+                value = method() if callable(method) else default
+                return value if isinstance(value, bool) else default
+            except Exception:
+                return default
+
+        inside_locked_hda = read_bool(node, "isInsideLockedHDA", False)
+        editable_inside_locked_hda = read_bool(node, "isEditableInsideLockedHDA", False)
+        editable = read_bool(node, "isEditable", not inside_locked_hda)
+        writable = bool(editable or editable_inside_locked_hda)
+        nearest_editable_ancestor = None
+        if not writable:
+            try:
+                ancestor = node.parent()
+            except Exception:
+                ancestor = None
+            while ancestor is not None:
+                ancestor_state = HoudiniMCP._node_editability(ancestor)
+                if ancestor_state["writable"]:
+                    try:
+                        nearest_editable_ancestor = ancestor.path()
+                    except Exception:
+                        pass
+                    break
+                try:
+                    ancestor = ancestor.parent()
+                except Exception:
+                    ancestor = None
+        return {
+            "writable": writable,
+            "editable": editable,
+            "inside_locked_hda": inside_locked_hda,
+            "editable_inside_locked_hda": editable_inside_locked_hda,
+            "nearest_editable_ancestor": nearest_editable_ancestor,
+        }
+
+    @classmethod
+    def _parameter_writability(cls, node: Any, parm: Any) -> Dict[str, Any]:
+        state = cls._node_editability(node)
+        try:
+            locked_value = parm.isLocked()
+            parameter_locked = locked_value if isinstance(locked_value, bool) else False
+        except Exception:
+            parameter_locked = False
+        try:
+            disabled_value = parm.isDisabled()
+            parameter_disabled = disabled_value if isinstance(disabled_value, bool) else False
+        except Exception:
+            parameter_disabled = False
+        state.update({
+            "parameter_locked": parameter_locked,
+            "parameter_disabled": parameter_disabled,
+            "writable": bool(state["writable"] and not parameter_locked and not parameter_disabled),
+        })
+        return state
     
     def get_node_details(self, node_path: str) -> Tuple[bool, Dict[str, Any]]:
         """获取指定节点的详细信息（优化版：先构建ATS，再读取部分上下文）
@@ -902,6 +961,7 @@ class HoudiniMCP:
             "position": data.get("position"),
             "child_count": data.get("child_count", 0),
             "parameter_count": data.get("parameter_count", 0),
+            "editability": self._node_editability(hou.node(node_path)),
         }
 
         if include_errors:
@@ -1028,6 +1088,79 @@ class HoudiniMCP:
     # ========================================
     # 错误和警告检查
     # ========================================
+
+    @classmethod
+    def _attribute_node_error(cls, reporting_node: Any, message: str) -> Dict[str, Any]:
+        location_pattern = re.compile(
+            r"(?P<path>/(?:obj|out|shop|stage|tasks|ch|mat|img)/[^:\s]+)"
+            r":\s*(?P<source>[A-Za-z_][\w.]*)\s*:\s*"
+            r"(?P<diagnostic>.*?)(?:\s+\((?P<line>\d+),(?P<start>\d+):(?P<end>\d+)\))",
+            re.DOTALL,
+        )
+        matches = list(location_pattern.finditer(message))
+        compile_markers = ("snippet", "no matching function", "syntax error", "vex")
+        selected = next((
+            match for match in reversed(matches)
+            if any(marker in " ".join(match.groups(default="")).lower() for marker in compile_markers)
+        ), matches[-1] if matches else None)
+
+        reported_node = reporting_node.path()
+        source = ""
+        diagnostic = message.strip()
+        line = None
+        columns = None
+        if selected is not None:
+            reported_node = selected.group("path")
+            source = selected.group("source")
+            diagnostic = " ".join(selected.group("diagnostic").split())
+            line = int(selected.group("line"))
+            columns = [int(selected.group("start")), int(selected.group("end"))]
+
+        implementation_node = hou.node(reported_node) if hou is not None else None
+        owner = None
+        if implementation_node is not None:
+            try:
+                cwd_parm = implementation_node.parm("vex_cwdpath")
+                cwd_path = str(cwd_parm.eval() or "") if cwd_parm is not None else ""
+                owner = hou.node(cwd_path) if cwd_path else None
+            except Exception:
+                owner = None
+            ancestor = implementation_node
+            while owner is None and ancestor is not None:
+                try:
+                    if "wrangle" in ancestor.type().name().lower():
+                        owner = ancestor
+                        break
+                    ancestor = ancestor.parent()
+                except Exception:
+                    ancestor = None
+
+        owner_path = owner.path() if owner is not None else reported_node
+        repair_parameter = None
+        try:
+            if owner is not None and "wrangle" in owner.type().name().lower() and owner.parm("snippet") is not None:
+                repair_parameter = "snippet"
+        except Exception:
+            pass
+        inside_locked_hda = False
+        if implementation_node is not None:
+            inside_locked_hda = cls._node_editability(implementation_node)["inside_locked_hda"]
+
+        normalized = diagnostic.lower()
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        root_key = (reported_node, source, normalized, line, tuple(columns or ()))
+        return {
+            "reported_node": reported_node,
+            "owner_node": owner_path,
+            "source": source,
+            "diagnostic": diagnostic,
+            "kind": "vex_compile" if source.lower().startswith("snippet") else "node_error",
+            "line": line,
+            "columns": columns,
+            "inside_locked_hda": inside_locked_hda,
+            "repair_parameter": repair_parameter,
+            "_root_key": root_key,
+        }
     
     def check_node_errors(self, node_path: Optional[str] = None) -> Tuple[bool, Dict[str, Any]]:
         """检查节点或网络中的错误和警告
@@ -1077,12 +1210,28 @@ class HoudiniMCP:
                     # 检查错误
                     errors = node.errors() if hasattr(node, 'errors') else []
                     for err in errors:
-                        results["errors"].append({
+                        entry = {
                             "node_path": node.path(),
                             "node_name": node.name(),
                             "node_type": node.type().name() if node.type() else "unknown",
                             "message": str(err)
-                        })
+                        }
+                        try:
+                            entry.update(self._attribute_node_error(node, str(err)))
+                        except Exception:
+                            entry.update({
+                                "reported_node": node.path(),
+                                "owner_node": node.path(),
+                                "source": "",
+                                "diagnostic": str(err),
+                                "kind": "node_error",
+                                "line": None,
+                                "columns": None,
+                                "inside_locked_hda": False,
+                                "repair_parameter": None,
+                                "_root_key": (node.path(), "", str(err), None, ()),
+                            })
+                        results["errors"].append(entry)
                         results["error_count"] += 1
                     
                     # 检查警告
@@ -1098,6 +1247,36 @@ class HoudiniMCP:
                         
                 except Exception:
                     continue
+
+            root_groups: "OrderedDict[Any, Dict[str, Any]]" = OrderedDict()
+            for entry in results["errors"]:
+                root_key = entry.pop("_root_key")
+                group = root_groups.get(root_key)
+                if group is None:
+                    root_cause_id = f"root-{len(root_groups) + 1}"
+                    entry["classification"] = "root_cause"
+                    entry["root_cause_id"] = root_cause_id
+                    group = {
+                        key: entry.get(key)
+                        for key in (
+                            "reported_node", "owner_node", "source", "diagnostic", "kind",
+                            "line", "columns", "inside_locked_hda", "repair_parameter",
+                        )
+                    }
+                    group.update({
+                        "root_cause_id": root_cause_id,
+                        "occurrences": 0,
+                        "reported_by": [],
+                    })
+                    root_groups[root_key] = group
+                else:
+                    entry["classification"] = "propagated_error"
+                    entry["root_cause_id"] = group["root_cause_id"]
+                group["occurrences"] += 1
+                group["reported_by"].append(entry["node_path"])
+
+            results["root_causes"] = list(root_groups.values())
+            results["root_cause_count"] = len(root_groups)
             
             return True, results
             
@@ -1109,7 +1288,11 @@ class HoudiniMCP:
         ok, data = self.check_node_errors(node_path)
         if not ok:
             return False, data.get("error", "未知错误")
-        
+
+        return True, self._format_node_errors_text(data)
+
+    @staticmethod
+    def _format_node_errors_text(data: Dict[str, Any]) -> str:
         lines = [
             f"## 错误检查报告",
             f"检查路径: {data['checked_path']}",
@@ -1118,7 +1301,19 @@ class HoudiniMCP:
             f"警告数: {data['warning_count']}",
         ]
         
-        if data['errors']:
+        if data.get('root_causes'):
+            lines.append("")
+            lines.append("### 根因:")
+            for cause in data['root_causes']:
+                location = f" line {cause['line']}" if cause.get('line') is not None else ""
+                repair = ""
+                if cause.get('repair_parameter'):
+                    repair = f"；修改 {cause['owner_node']} 的 {cause['repair_parameter']} 参数"
+                lines.append(
+                    f"- **{cause['reported_node']}**{location}: {cause['diagnostic']}"
+                    f"（传播 {cause['occurrences']} 次{repair}）"
+                )
+        elif data['errors']:
             lines.append("")
             lines.append("### 错误:")
             for err in data['errors']:
@@ -1133,8 +1328,8 @@ class HoudiniMCP:
         if not data['errors'] and not data['warnings']:
             lines.append("")
             lines.append("**没有发现错误或警告。**")
-        
-        return True, "\n".join(lines)
+
+        return "\n".join(lines)
 
     def verify_network(self, parent_path: str, cook_display: bool = True) -> Tuple[bool, str]:
         """核查一个网络的所有 child 节点：errors / warnings / flags / display 节点几何 evidence。
@@ -1232,14 +1427,25 @@ class HoudiniMCP:
             except Exception:
                 pass
 
+        # ★ Manual + display 空几何时，所有基于 cook 状态的证据（display 几何、
+        #   逐节点 errors()/warnings()）都是 stale 的：中间节点可能从未被 cook，
+        #   errors() 返回空不代表真的无错误。此时健康结论必须降级为 unknown，
+        #   避免把 stale 的「0 错误」当成可信事实误导诊断方向。
+        stale_evidence = bool(
+            manual_mode and geom_summary
+            and geom_summary['points'] == 0 and geom_summary['prims'] == 0)
+
         # 格式化输出
         lines = [
             f"## 网络核查报告: {parent.path()}",
             f"子节点数: {len(child_reports)}",
             f"错误节点: {len(error_nodes)}",
             f"警告节点: {len(warning_nodes)}",
-            f"健康: {'是' if not error_nodes else '否'}",
         ]
+        if stale_evidence:
+            lines.append("健康: 未知（Manual 更新模式下错误/警告统计未刷新，不能作为证据）")
+        else:
+            lines.append(f"健康: {'是' if not error_nodes else '否'}")
         if display is not None:
             lines.append(f"Display 节点: {display.path()}")
         if geom_summary:
@@ -1247,12 +1453,14 @@ class HoudiniMCP:
                 f"Display 几何: points={geom_summary['points']}, "
                 f"prims={geom_summary['prims']}, vertices={geom_summary['vertices']}")
             # ★ 几何为空 + Manual 模式：0 可能是 stale 缓存假象而非真实空几何。
-            #   给 Agent 明确诊断方向，避免把「0」当事实反复死循环。
-            if geom_summary['points'] == 0 and geom_summary['prims'] == 0 and manual_mode:
+            #   与 get_geometry_summary 对齐，直接指向 temporary_auto_validate。
+            if stale_evidence:
                 lines.append(
-                    "⚠️ 几何为 0 且当前处于 **Manual 更新模式**：本次已对 display 节点强制 "
-                    "cook 后仍为 0，若源节点参数正常，请优先怀疑上游连线/过滤参数问题；"
-                    "如需排除缓存干扰，可让用户临时切回 Auto 更新模式再核查。")
+                    "⚠️ 几何为 0 且当前处于 **Manual 更新模式**：display 几何与 child 错误/警告 "
+                    "统计均为 stale 缓存（中间节点可能从未 cook，errors() 为空不代表无错误）。"
+                    "请对目标节点调用 `temporary_auto_validate_geometry(node_path=...)` 临时 Auto 验证"
+                    "（会自动恢复原 Manual 模式），不要在其他节点上重复调用本工具或 get_geometry_summary——"
+                    "它们读到的是同一份 stale 缓存。")
 
         if error_nodes:
             lines.append("")
@@ -1270,7 +1478,7 @@ class HoudiniMCP:
                     for warn in r["warnings"]:
                         lines.append(f"- **{r['name']}** ({r['type']}): {warn}")
 
-        if not error_nodes and not warning_nodes:
+        if not error_nodes and not warning_nodes and not stale_evidence:
             lines.append("")
             lines.append("**所有 child 节点无错误、无警告。**")
 
@@ -2207,8 +2415,15 @@ class HoudiniMCP:
 
         try:
             first_parm = node.parm(parm_tuple.name())
+            if first_parm is None:
+                try:
+                    first_parm = next(iter(parm_tuple), None)
+                except Exception:
+                    first_parm = None
             if first_parm is not None and hasattr(first_parm, "isTimeDependent"):
                 entry["is_time_dependent"] = bool(first_parm.isTimeDependent())
+            if first_parm is not None:
+                entry.update(self._parameter_writability(node, first_parm))
         except Exception:
             pass
 
@@ -2410,6 +2625,7 @@ class HoudiniMCP:
                 "node_path": node.path(),
                 "node_type": node_type.name() if node_type else "unknown",
                 "node_category": node_type.category().name() if node_type else "unknown",
+                "editability": self._node_editability(node),
                 "pattern": pattern,
                 "include_hidden": include_hidden,
                 "total": len(parm_tuples),
@@ -3653,6 +3869,57 @@ class HoudiniMCP:
             return False, f"未找到节点: {node_path}"
         if all(value is None for value in (bypass, template, lock, display, render, select, current)):
             return False, "至少需要指定一个标志（display / render / bypass / template / lock / select / current）"
+
+        # ---- 可写性预检：宁可 fail-fast，不让"set 静默不生效"进入下游 verification ----
+        # 1) locked HDA 内部节点的 flag 通常被 HDA 定义锁死，set 会静默无效
+        try:
+            if hasattr(node, "isInsideLockedHDA") and node.isInsideLockedHDA():
+                # bypass/template/lock 这些"节点自身状态"在 locked HDA 内仍可写；
+                # display/render/select/current 这些"网络状态"不可写
+                network_flags_requested = [
+                    name for name, value in
+                    (("display", display), ("render", render),
+                     ("select", select), ("current", current))
+                    if value is not None
+                ]
+                if network_flags_requested:
+                    return False, (
+                        f"节点 {node_path} 位于锁定的 HDA 内部，"
+                        f"网络状态 flag {network_flags_requested} 不可写（HDA 已锁定）。"
+                        f"如需修改，请先解锁 HDA 或在其父级操作。"
+                    )
+        except Exception:
+            # 预检本身异常不阻塞主流程，退化为原有静默行为
+            pass
+
+        # 2) display/render flag 在 sibling 中互斥：设置 A 会清掉 B。
+        #    提前告诉 agent 当前 holder 是谁，避免事后"为什么没生效"的困惑。
+        sibling_mutex_warnings = []
+        if display is True or render is True:
+            try:
+                parent = node.parent()
+                if parent is not None:
+                    if display is True:
+                        for sib in parent.children():
+                            if (sib.path() != node.path()
+                                    and hasattr(sib, "isDisplayFlagSet")
+                                    and sib.isDisplayFlagSet()):
+                                sibling_mutex_warnings.append(
+                                    f"display 将从 {sib.path()} 转移到 {node_path}（sibling 互斥）"
+                                )
+                                break
+                    if render is True:
+                        for sib in parent.children():
+                            if (sib.path() != node.path()
+                                    and hasattr(sib, "isRenderFlagSet")
+                                    and sib.isRenderFlagSet()):
+                                sibling_mutex_warnings.append(
+                                    f"render 将从 {sib.path()} 转移到 {node_path}（sibling 互斥）"
+                                )
+                                break
+            except Exception:
+                pass
+
         try:
             applied = []
             if display is not None and hasattr(node, 'setDisplayFlag'):
@@ -3677,7 +3944,10 @@ class HoudiniMCP:
                 node.setCurrent(True, clear_all_selected=True)
                 applied.append("current=on")
             if applied:
-                return True, f"已设置 {node_path}: {', '.join(applied)}"
+                msg = f"已设置 {node_path}: {', '.join(applied)}"
+                if sibling_mutex_warnings:
+                    msg += " | 注意: " + "; ".join(sibling_mutex_warnings)
+                return True, msg
             return False, f"节点类型 {node.type().name()} 不支持请求的标志"
         except Exception as exc:
             return False, f"设置标志失败: {exc}"
@@ -4760,7 +5030,7 @@ class HoudiniMCP:
                 'hou': hou,
                 '__builtins__': __builtins__,
             }
-            exec_locals = {}
+            exec_locals = exec_globals
             
             # ★ 安装超时/停止监控，再执行代码
             with self._timeout_guard(timeout):
@@ -5189,7 +5459,11 @@ class HoudiniMCP:
             compact=bool(args.get("compact", False)),
         )
         if ok:
-            return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2)}
+            return {
+                "success": True,
+                "result": json.dumps(data, ensure_ascii=False, indent=2),
+                "data": data,
+            }
         return {"success": False, "error": str(data.get("error", "读取节点状态失败"))}
 
     def _tool_set_node_parameter(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -5203,6 +5477,33 @@ class HoudiniMCP:
             missing.append("param_name(参数名)")
         if missing:
             return {"success": False, "error": f"缺少必要参数: {', '.join(missing)}"}
+        node = hou.node(node_path) if hou is not None else None
+        if node is not None:
+            editability = self._node_editability(node)
+            if not editability["writable"]:
+                return {
+                    "success": False,
+                    "error_code": "node_inside_locked_hda",
+                    "error": f"节点 {node_path} 位于不可编辑的锁定 HDA 内部",
+                    "data": editability,
+                }
+            parm = node.parm(param_name)
+            if parm is None:
+                try:
+                    parm_tuple = node.parmTuple(param_name)
+                    parm = next(iter(parm_tuple), None) if parm_tuple is not None else None
+                except Exception:
+                    parm = None
+            if parm is not None:
+                parameter_state = self._parameter_writability(node, parm)
+                if not parameter_state["writable"]:
+                    error_code = "parameter_locked" if parameter_state["parameter_locked"] else "parameter_disabled"
+                    return {
+                        "success": False,
+                        "error_code": error_code,
+                        "error": f"参数 {node_path}/{param_name} 当前不可写",
+                        "data": parameter_state,
+                    }
         ok, msg, snapshot = self.set_parameter(node_path, param_name, value)
         result = {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
         if ok and snapshot:
@@ -5295,6 +5596,16 @@ class HoudiniMCP:
         print(f"[MCP Client] create_node 失败: {error_msg[:200]}")
         return {"success": False, "result": "", "error": error_msg}
 
+    @staticmethod
+    def _batch_plan_hash(nodes: Any, connections: Any, parent_path: Any) -> str:
+        """对批量创建计划做规范化哈希，用于 dry_run 与应用之间的防过期核对。"""
+        import hashlib
+        payload = json.dumps(
+            {"nodes": nodes, "connections": connections, "parent_path": parent_path},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()[:16]
+
     def _tool_create_nodes_batch(self, args: Dict[str, Any]) -> Dict[str, Any]:
         nodes = args.get("nodes", [])
         if not nodes:
@@ -5317,6 +5628,14 @@ class HoudiniMCP:
             "dry_run": bool(args.get("dry_run", False)),  # 只校验、不创建
         }
         parent_path = plan["parent_path"]
+        plan_hash = self._batch_plan_hash(nodes, connections, parent_path)
+        expected_plan = str(args.get("expected_plan") or "").strip()
+        if expected_plan and not plan["dry_run"] and expected_plan != plan_hash:
+            return {
+                "success": False,
+                "error": "计划已过期或与本批内容不一致 (plan mismatch)；请重新 dry_run 获取 plan_hash",
+                "plan_hash": plan_hash,
+            }
         before_paths = set()
         try:
             parent = hou.node(parent_path) if hou is not None and parent_path else None
@@ -5327,6 +5646,32 @@ class HoudiniMCP:
         with _SuspendHoudiniUIRedraw():
             ok, msg = self.create_network(plan)
         result = {"success": ok, "result": msg if ok else "", "error": "" if ok else msg}
+        if not ok:
+            # 失败时把 msg 按行解析出结构化 failed_items，方便 agent 定位失败 item
+            # 而不用解析一大段文本。msg 格式由 create_network 保证：
+            #   预校验失败（共 N 项）...:\n  - [node_id] 原因\n  - ...
+            #   批量创建部分失败...:\n错误清单:\n  - [node_id] 原因\n  - ...
+            failed_items: List[Dict[str, str]] = []
+            if isinstance(msg, str):
+                for line in msg.splitlines():
+                    line = line.strip()
+                    if not line.startswith("- "):
+                        continue
+                    entry = line[2:].strip()
+                    # 尝试提取 [node_id] 前缀
+                    node_id = ""
+                    reason = entry
+                    if entry.startswith("[") and "]" in entry:
+                        end = entry.index("]")
+                        node_id = entry[1:end]
+                        reason = entry[end + 1:].strip()
+                    failed_items.append({"node_id": node_id, "reason": reason})
+            if failed_items:
+                result["failed_items"] = failed_items
+                result["failed_count"] = len(failed_items)
+        if ok and plan["dry_run"]:
+            # 应用时回传 expected_plan 可防过期：真实执行前会重新核对
+            result["plan_hash"] = plan_hash
         if ok and not plan["dry_run"]:
             verification = {
                 "status": "applied_unknown",
@@ -5566,8 +5911,14 @@ class HoudiniMCP:
             verification = {"status": "applied_unknown", "node_path": node_path, "flags": {}}
             try:
                 node = hou.node(node_path) if hou is not None else None
+                # 覆盖 set_node_flags 支持的全部可读 flag；current 是动作不是状态，不读
                 getters = {
-                    "bypass": "isBypassed", "template": "isTemplateFlagSet", "lock": "isHardLocked",
+                    "bypass": "isBypassed",
+                    "template": "isTemplateFlagSet",
+                    "lock": "isHardLocked",
+                    "display": "isDisplayFlagSet",
+                    "render": "isRenderFlagSet",
+                    "select": "isSelected",
                 }
                 actual = {
                     name: bool(getattr(node, getter)())
@@ -5577,8 +5928,33 @@ class HoudiniMCP:
                 verification["flags"] = actual
                 if actual and all(actual.get(name) == bool(args[name]) for name in actual):
                     verification["status"] = "verified"
-            except Exception:
-                pass
+                else:
+                    # 回读对不上时，把"期望 vs 实际"写进 error 字段，
+                    # receipt 层会自动把它透传到 operation_receipt.error_detail，
+                    # 避免事后只看到 applied_unknown 而无法定位是哪个 flag 没生效。
+                    expected = {
+                        name: bool(args[name])
+                        for name in getters
+                        if args.get(name) is not None
+                    }
+                    mismatched = {
+                        name: {"expected": expected[name], "actual": actual.get(name)}
+                        for name in expected
+                        if name not in actual or actual[name] != expected[name]
+                    }
+                    unreadable = [name for name in expected if name not in actual]
+                    detail_parts = []
+                    if mismatched:
+                        detail_parts.append(f"flag 回读不一致: {mismatched}")
+                    if unreadable:
+                        detail_parts.append(
+                            f"flag 不可读（节点类型可能不支持 getter 或处于锁定状态）: {unreadable}"
+                        )
+                    if not detail_parts:
+                        detail_parts.append("verification 未能确认 flag 状态")
+                    result["error"] = "; ".join(detail_parts)
+            except Exception as exc:
+                result["error"] = f"verification 回读异常: {exc}"
             result["verification"] = verification
         return result
 
@@ -6644,6 +7020,7 @@ class HoudiniMCP:
                 param_list = []
                 for pname, pinfo in params.items():
                     param_list.append({
+                        **pinfo,
                         "name": pname,
                         "type": pinfo.get("type", "string"),
                         "description": pinfo.get("description", ""),
@@ -6658,19 +7035,15 @@ class HoudiniMCP:
                     "parameters": param_list,
                 })
             total = sum(len(v) for v in grouped.values())
-            cats = ", ".join(f"{c}({len(v)})" for c, v in sorted(grouped.items()))
             hint = (
-                f"共 {total} 个 Skill，分 {len(grouped)} 类：{cats}。"
-                f"使用方式：对 executable=true 的 Skill，run_skill 会执行专用脚本；"
-                f"对 executable=false 的 Skill，run_skill 会读取必须遵循的方法说明。"
-                f"调用格式均为 run_skill(skill_name=\"<name>\", params={{...}})。"
-                f"可用 list_skills(category=\"<类名>\") 只看某一类。"
-                f"risk_level != low 的 Skill 会改场景/建图，Plan 规划阶段不可用（仅执行阶段）。"
+                f"共 {total} 个 Skill。run_skill(skill_name=\"<name>\", params={{...}})："
+                "executable=true 执行脚本，false 读取必须遵循的方法说明；已有适用说明不必重读。"
+                "Plan 规划阶段仅可用明确只读且 risk_level=low 的 Skill。"
             )
             payload = {c: grouped[c] for c in sorted(grouped)}
             return {
                 "success": True,
-                "result": hint + "\n\n" + _json.dumps(payload, ensure_ascii=False, indent=2),
+                "result": hint + "\n\n" + _json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             }
         except Exception as e:
             return {"success": False, "error": f"列出 Skill 失败: {e}"}
@@ -6705,23 +7078,40 @@ class HoudiniMCP:
         timeout = max(5, min(timeout, 300))
 
         try:
+            from ...skills import is_hou_free_skill, set_current_user
             if self._username:
-                from ...skills import set_current_user
                 set_current_user(self._username)
-            with self._timeout_guard(timeout):
+            # docs skill 有界且不碰 hou；settrace 逐行监控会让纯 Python 检索慢约 3 倍
+            if is_hou_free_skill(skill_name):
                 result = _run_skill(skill_name, params)
+            else:
+                with self._timeout_guard(timeout):
+                    result = _run_skill(skill_name, params)
             if "error" in result:
-                return {"success": False, "error": result["error"]}
+                failure = {"success": False, "error": result["error"]}
+                # 透传错误分类（skill_not_found / params_invalid / runtime_error 等），
+                # 上层 harness / agent 可据此做针对性重试或换路径
+                if "error_kind" in result:
+                    failure["error_kind"] = result["error_kind"]
+                return failure
 
             # 格式化输出
             import json as _json
             formatted = _json.dumps(result, ensure_ascii=False, indent=2)
             return {"success": True, "result": formatted}
         except HoudiniMCP._ExecInterrupt as e:
-            return {"success": False, "error": f"Skill '{skill_name}' 执行被中断：{e}"}
+            return {
+                "success": False,
+                "error_kind": "interrupted",
+                "error": f"Skill '{skill_name}' 执行被中断：{e}",
+            }
         except Exception as e:
             import traceback
-            return {"success": False, "error": f"Skill 执行异常: {e}\n{traceback.format_exc()[:500]}"}
+            return {
+                "success": False,
+                "error_kind": "runtime_error",
+                "error": f"Skill 执行异常: {e}\n{traceback.format_exc()[:500]}",
+            }
 
     def _tool_check_errors(self, args: Dict[str, Any]) -> Dict[str, Any]:
         node_path = str(args.get("node_path") or "").strip()
@@ -6742,6 +7132,7 @@ class HoudiniMCP:
 
         manual_mode = original_mode is not None and original_mode == getattr(hou.updateMode, "Manual", None)
         if manual_mode:
+            validation_data: Dict[str, Any] = {}
             transaction = ScopedValidationTransaction(
                 hou.updateModeSetting,
                 hou.setUpdateMode,
@@ -6753,19 +7144,19 @@ class HoudiniMCP:
             )
 
             def validate_target():
-                if hasattr(target, "needsToCook") and target.needsToCook():
+                if _display_node_has_volume(target):
                     reason = "Target may contain uncooked Volume/VDB geometry; scoped cook was skipped for safety."
                     return ScopedValidationOperationResult(
                         success=False, validation_blocked=True,
                         block_reason=reason, error=reason,
                     )
                 target.cook(force=True)
-                ok, text = self.check_node_errors_text(node_path)
-                lower_text = text.lower()
-                unhealthy = "error" in lower_text or "错误" in text and "无错误" not in text
+                ok, data = self.check_node_errors(node_path)
+                validation_data.update(data if ok else {})
+                text = self._format_node_errors_text(data) if ok else data.get("error", "检查错误失败")
                 return ScopedValidationOperationResult(
                     success=bool(ok), payload=text,
-                    health="unhealthy" if unhealthy else "healthy",
+                    health="unhealthy" if data.get("error_count", 0) else "healthy",
                     cook_succeeded=True, read_succeeded=bool(ok),
                     error="" if ok else text,
                 )
@@ -6773,20 +7164,31 @@ class HoudiniMCP:
             outcome = transaction.run(node_path, validate_target)
             text = outcome.pop("payload", None)
             outcome["result"] = text if outcome["success"] else "验证状态未知；目标健康状态未确认。"
+            if validation_data:
+                outcome["data"] = validation_data
             outcome["recovery_hint"] = outcome.get("block_reason", "")
             return outcome
 
-        ok, text = self.check_node_errors_text(node_path)
-        lower_text = text.lower()
-        unhealthy = "error" in lower_text or "错误" in text and "无错误" not in text
+        ok, data = self.check_node_errors(node_path)
+        text = self._format_node_errors_text(data) if ok else data.get("error", "检查错误失败")
+        needs_cook = None
+        try:
+            needs_cook = bool(target.needsToCook())
+        except Exception:
+            pass
+        freshness_status = "stale" if needs_cook else ("fresh" if needs_cook is False else "unknown")
+        health = "unhealthy" if data.get("error_count", 0) else (
+            "healthy" if freshness_status == "fresh" else "unknown"
+        )
         return {
             "success": ok,
             "result": text,
-            "health": "unhealthy" if unhealthy else "healthy",
+            "data": data,
+            "health": health,
             "freshness": {
-                "status": "fresh",
+                "status": freshness_status,
                 "target": node_path,
-                "cook_succeeded": True,
+                "cook_succeeded": False,
                 "read_succeeded": bool(ok),
             },
             "restore_attempted": False,
@@ -7160,7 +7562,8 @@ class HoudiniMCP:
             )
         except Exception:
             use_undo = False
-        if hou is not None and use_undo and hasattr(hou, "undos"):
+        if (hou is not None and use_undo and hasattr(hou, "undos")
+                and threading.current_thread() is threading.main_thread()):
             try:
                 with hou.undos.group(f"Agent: {tool_name}"):
                     yield

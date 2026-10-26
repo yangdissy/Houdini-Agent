@@ -29,6 +29,11 @@ class _UpdateMode:
     AutoUpdate = _ModeValue("AutoUpdate")
 
 
+class _PrimType:
+    Volume = object()
+    VDB = object()
+
+
 class _NodeType:
     def name(self):
         return "null"
@@ -49,18 +54,22 @@ class _BoundingBox:
 
 
 class _Geometry:
-    def __init__(self, point_count=0, primitive_count=0, vertex_count=0):
+    def __init__(self, point_count=0, primitive_count=0, vertex_count=0, volume_count=0):
         self._counts = {
             "pointcount": point_count,
             "primitivecount": primitive_count,
             "vertexcount": vertex_count,
         }
+        self._volume_count = volume_count
 
     def intrinsicValue(self, name):
         return self._counts[name]
 
     def boundingBox(self):
         return _BoundingBox()
+
+    def countPrimType(self, primitive_type):
+        return self._volume_count
 
 
 class _Node:
@@ -121,6 +130,7 @@ class _ParentNode:
 
 class _HouStub:
     updateMode = _UpdateMode
+    primType = _PrimType
 
     def __init__(self, mode, nodes=None):
         self._mode = mode
@@ -418,8 +428,35 @@ class GeometryValidationSignalsTest(unittest.TestCase):
         self.assertTrue(result["restore_succeeded"])
         self.assertEqual(result["freshness"]["status"], "fresh")
 
+    def test_check_errors_real_chinese_empty_report_is_healthy(self):
+        target = _Node(_Geometry(point_count=4, primitive_count=1, vertex_count=4))
+        hou_stub = _HouStub(_UpdateMode.AutoUpdate, {"/obj/geo1/OUT": target})
+        mcp_client.hou = hou_stub
+        client = object.__new__(mcp_client.HoudiniMCP)
+
+        result = client._tool_check_errors({"node_path": "/obj/geo1/OUT"})
+
+        self.assertEqual(result["health"], "healthy")
+        self.assertEqual(result["data"]["error_count"], 0)
+        self.assertFalse(result["freshness"]["cook_succeeded"])
+
+    def test_check_errors_manual_dirty_non_volume_target_is_cooked(self):
+        target = _Node(_Geometry(point_count=4, primitive_count=1, vertex_count=4))
+        target.needsToCook = lambda: True
+        hou_stub = _HouStub(_UpdateMode.Manual, {"/obj/geo1/OUT": target})
+        mcp_client.hou = hou_stub
+        client = object.__new__(mcp_client.HoudiniMCP)
+        client.check_node_errors_text = lambda path: (True, "节点无错误")
+
+        result = client._tool_check_errors({"node_path": "/obj/geo1/OUT"})
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["health"], "healthy")
+        self.assertEqual(target.cook_calls, [True])
+        self.assertFalse(result.get("validation_blocked", False))
+
     def test_check_errors_volume_skip_has_unknown_health(self):
-        target = _Node(_Geometry())
+        target = _Node(_Geometry(volume_count=1))
         target.needsToCook = lambda: True
         hou_stub = _HouStub(_UpdateMode.Manual, {"/obj/geo1/VDB": target})
         mcp_client.hou = hou_stub
@@ -432,6 +469,46 @@ class GeometryValidationSignalsTest(unittest.TestCase):
         self.assertEqual(result["freshness"]["status"], "unknown")
         self.assertTrue(result["validation_blocked"])
         self.assertNotIn("无错误", result["result"])
+
+    # ------------------------------------------------------------------
+    # 复现 archive_35118eb1 场景：Manual 模式下，网络内某中间节点（wrangle）
+    # 的 errors() 返回 stale 空列表（未 cook），display 几何也为 stale 0。
+    # 期望：verify_network 报告 "健康: 是 / 错误节点: 0" 时不能把该结论
+    # 当作可信事实——当 Manual + display 几何为空时，错误统计本身也是 stale
+    # 的（中间节点从未被 cook，errors() 为空不代表真的无错误）。
+    # ------------------------------------------------------------------
+    def test_verify_network_manual_empty_display_marks_health_unknown(self):
+        wrangle = _Node(_Geometry())
+        wrangle.errors = lambda: []  # stale: 未 cook，errors() 为空
+
+        display = _Node(_Geometry())  # stale 空几何
+        display.errors = lambda: []
+
+        parent = _ParentNode(display)
+        parent.children = lambda: [wrangle, display]
+
+        mcp_client.hou = _HouStub(_UpdateMode.Manual, {"/obj/grain_pile": parent})
+        client = object.__new__(mcp_client.HoudiniMCP)
+
+        ok, text = client.verify_network("/obj/grain_pile", cook_display=True)
+
+        self.assertTrue(ok)
+        # 当前行为：误报 "健康: 是 / 错误节点: 0"。修复后应不再给出可信的健康结论，
+        # 而是标注 health=unknown / 需临时 Auto 验证。
+        self.assertNotIn("健康: 是", text)
+
+    def test_verify_network_manual_nonempty_display_keeps_health_verdict(self):
+        # 对照组：Manual 但 display 几何非空（fresh），错误统计可信，健康结论保留。
+        display = _Node(_Geometry(point_count=8, primitive_count=2, vertex_count=16))
+        parent = _ParentNode(display)
+
+        mcp_client.hou = _HouStub(_UpdateMode.Manual, {"/obj/geo1": parent})
+        client = object.__new__(mcp_client.HoudiniMCP)
+
+        ok, text = client.verify_network("/obj/geo1", cook_display=True)
+
+        self.assertTrue(ok)
+        self.assertIn("健康: 是", text)
 
 
 if __name__ == "__main__":

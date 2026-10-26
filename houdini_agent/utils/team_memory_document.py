@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .memory_sqlite import EMBEDDING_FORMAT_VERSION
+from .security_guard import find_memory_threat
 
 TEAM_EXPORT_SCHEMA_VERSION = 1
 LEGACY_EXPORT_SCHEMA_VERSION = 0
@@ -76,6 +77,8 @@ def semantic_eligibility(entry) -> Tuple[bool, str]:
         return False, "semantic_confidence"
     if not entry.rule:
         return False, "semantic_rule_empty"
+    if find_memory_threat(entry.rule):
+        return False, "semantic_security"
     return True, "eligible"
 
 
@@ -86,6 +89,8 @@ def procedural_eligibility(entry) -> Tuple[bool, str]:
         return False, "procedural_success_rate"
     if not entry.strategy_name:
         return False, "procedural_name_empty"
+    if find_memory_threat(entry.strategy_name + "\n" + entry.description):
+        return False, "procedural_security"
     return True, "eligible"
 
 

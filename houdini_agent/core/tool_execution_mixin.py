@@ -238,6 +238,7 @@ class ToolExecutionMixin:
         return result
 
     def _after_tool_result(self, tool_name: str, result: dict) -> None:
+        self._track_agent_created_paths(tool_name, result)
         if tool_name != 'set_update_mode' or not isinstance(result, dict) or not result.get('success'):
             return
         if not result.get('persistent_update_mode_change'):
@@ -261,10 +262,14 @@ class ToolExecutionMixin:
         mode = self._registry_execution_mode()
         context = {
             'mode': mode,
+            'username': str(getattr(self, '_username', '') or ''),
             'plan_phase': self._plan_phase,
             'confirm_mode': bool(getattr(self, '_confirm_mode', False)),
             'user_message': str(getattr(self, '_current_user_message', '') or ''),
             'remember_memory_calls': int(getattr(self, '_remember_memory_calls', 0) or 0),
+            'agent_created_paths': frozenset(
+                getattr(self, '_session_agent_created_paths', set()) or set()
+            ),
         }
         retry_counts = self._harness_state.policy_retry_counts if self._harness_state else {}
 
@@ -291,6 +296,9 @@ class ToolExecutionMixin:
             trace=trace,
             retry_counts=retry_counts,
             retry_limit=self._policy_retry_limit,
+            execution_failures=(
+                self._harness_state.execution_failures if self._harness_state else None
+            ),
         )
         result = owner.execute(tool_name, kwargs, context)
         if isinstance(result, dict) and tool_name != "read_tool_result":
@@ -533,6 +541,12 @@ class ToolExecutionMixin:
             # 不依赖 hou 的工具 → 直接在后台线程执行（避免阻塞 UI）
             if meta.runtime == "local":
                 return self._execute_tool_in_bg(tool_name, kwargs)
+
+            # docs 类 skill 不碰 hou：后台执行，避免占用 Houdini 主线程
+            if tool_name == "run_skill":
+                from ..skills import is_hou_free_skill
+                if is_hou_free_skill((kwargs or {}).get("skill_name", "")):
+                    return self._execute_tool_in_bg(tool_name, kwargs)
             
             # 其他工具需要在主线程执行（Houdini hou 模块操作）
             return self._execute_tool_in_main_thread(tool_name, kwargs)
@@ -690,6 +704,39 @@ class ToolExecutionMixin:
     # ------------------------------------------------------------------
 
     _NODE_PATH_RE = re.compile(r'/(?:obj|out|shop|stage|tasks|ch|mat|img)/[\w/]+')
+
+    _AGENT_CREATION_TOOLS = frozenset({
+        'create_node', 'create_nodes_batch', 'create_wrangle_node',
+        'copy_node', 'create_named_null',
+    })
+
+    def _track_agent_created_paths(self, tool_name: str, result: dict, arguments: dict = None):
+        """把本 session agent 创建成功的节点路径记入 _session_agent_created_paths。
+
+        数据来源：创建类工具的 verification.created_paths，或通用 _node_changes.created。
+        rename 时迁移旧路径到 verification.new_path。
+        """
+        created = getattr(self, '_session_agent_created_paths', None)
+        if created is None or not isinstance(result, dict) or not result.get('success'):
+            return
+        if tool_name == 'rename_node':
+            verification = result.get('verification') or {}
+            old_path = verification.get('old_path')
+            new_path = verification.get('new_path')
+            if old_path in created and new_path:
+                created.discard(old_path)
+                created.add(new_path)
+            return
+        if tool_name not in self._AGENT_CREATION_TOOLS:
+            return
+        verification = result.get('verification') or {}
+        for path in verification.get('created_paths') or []:
+            if path:
+                created.add(path)
+        node_changes = result.get('_node_changes') or {}
+        for node in node_changes.get('created', []):
+            if node.get('path'):
+                created.add(node['path'])
 
     def _collect_node_paths_from_tool(self, result: dict, arguments: dict = None):
         """从工具执行的结果和参数中提取 Houdini 节点路径，累积到 _session_node_map。"""

@@ -1,0 +1,25 @@
+{"backend":"fallback","memories":[{"id":"cache","rule":"File Cache: check Load from Disk before debugging viewport differences."},{"id":"vex","rule":"VEX wrangle: verify attribute types and point versus primitive class before editing code."},{"id":"pyro","rule":"Pyro simulation: validate voxel size and sparse domain bounds before caching smoke."},{"id":"flip","rule":"FLIP fluid: check particle separation and collision surface resolution for leaking liquids."},{"id":"cop","rule":"Copernicus image processing: verify layer signature and resolution before connecting image nodes."},{"id":"heightfield","rule":"HeightField terrain erosion: preserve mask layers and check voxel grid resolution."},{"id":"packed","rule":"Copy to Points: packed instances need matching orient quaternion and pscale point attributes."},{"id":"usd","rule":"Solaris USD: distinguish reference composition from sublayer composition before publishing assets."},{"id":"rig","rule":"KineFX skeleton: check joint names and parent hierarchy before retargeting animation."},{"id":"mpm","rule":"MPM solver: verify material stiffness and substeps when simulating unstable sand."},{"id":"opencl","rule":"OpenCL kernel: verify buffer bindings and workgroup size when debugging compilation."},{"id":"render","rule":"Karma rendering: inspect exposure and light intensity before changing material roughness."}]}
+{"query":"File Cache Load from Disk viewport differences","expected":["cache"]}
+{"query":"VEX wrangle attribute types point primitive class","expected":["vex"]}
+{"query":"Pyro smoke voxel size sparse domain bounds","expected":["pyro"]}
+{"query":"FLIP fluid particle separation leaking collision surface","expected":["flip"]}
+{"query":"Copernicus layer signature image nodes resolution","expected":["cop"]}
+{"query":"HeightField terrain erosion mask layers grid resolution","expected":["heightfield"]}
+{"query":"Copy to Points packed orient quaternion pscale","expected":["packed"]}
+{"query":"Solaris USD reference sublayer composition assets","expected":["usd"]}
+{"query":"KineFX skeleton joint names parent hierarchy retargeting","expected":["rig"]}
+{"query":"MPM sand material stiffness substeps unstable solver","expected":["mpm"]}
+{"query":"OpenCL kernel buffer bindings workgroup compilation","expected":["opencl"]}
+{"query":"Karma render exposure light intensity roughness","expected":["render"]}
+{"query":"Before smoke caching, how can I check pyro domain bounds?","expected":["pyro"]}
+{"query":"The liquid particles leak through collisions in my FLIP simulation","expected":["flip"]}
+{"query":"Why are packed instances not rotating with orient on Copy to Points?","expected":["packed"]}
+{"query":"Retarget animation after renaming skeleton joints","expected":["rig"]}
+{"query":"文件缓存 File Cache 显示不同，检查 Load from Disk","expected":["cache"]}
+{"query":"VEX wrangle 属性类型和 point primitive 归属","expected":["vex"]}
+{"query":"请翻译今天的午餐菜单","expected":[]}
+{"query":"Explain Gregorian calendar leap years","expected":[]}
+{"query":"计算银行贷款利率","expected":[]}
+{"query":"Who wrote Pride and Prejudice?","expected":[]}
+{"query":"What is the capital of Argentina?","expected":[]}
+{"query":"推荐一首钢琴曲","expected":[]}

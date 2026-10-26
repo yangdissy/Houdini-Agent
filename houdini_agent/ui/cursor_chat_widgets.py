@@ -6,6 +6,7 @@ import time
 from typing import List, Optional
 
 from houdini_agent.qt_compat import QtWidgets, QtCore, QtGui, safe_single_shot
+from ..utils.memory_activation import strip_memory_usage
 
 from .cursor_theme import CursorTheme
 from .i18n import tr
@@ -249,7 +250,9 @@ class ThinkingSection(CollapsibleSection):
     """
     
     # 最大高度（像素），超过此值则固定高度，内置滚动条自动出现
-    _MAX_HEIGHT_PX = 400
+    _MAX_HEIGHT_PX = 640
+    # 最小高度（像素），至少能完整显示几行思考内容，避免看起来太挤
+    _MIN_VISIBLE_LINES = 4
     
     def __init__(self, parent=None):
         # ★ 默认展开（用户要求不自动折叠）；section 整体初始 setVisible(False)，
@@ -279,9 +282,10 @@ class ThinkingSection(CollapsibleSection):
         self.thinking_label.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.thinking_label.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
         self.thinking_label.setObjectName("thinkLabel")
-        # 初始高度为一行（紧凑），流式输入时会动态增大
+        # 初始高度为几行（不再紧凑到一行），流式输入时会动态增大
         self._line_h = QtGui.QFontMetrics(self._text_font).lineSpacing()
-        self.thinking_label.setFixedHeight(self._line_h + 12)
+        self._min_h = self._line_h * self._MIN_VISIBLE_LINES + 12
+        self.thinking_label.setFixedHeight(self._min_h)
         self.thinking_label.document().documentLayout().documentSizeChanged.connect(
             self._on_document_size_changed
         )
@@ -299,7 +303,7 @@ class ThinkingSection(CollapsibleSection):
             return
         doc.setTextWidth(viewport_width)
         desired = int(doc.size().height()) + 12
-        self.thinking_label.setFixedHeight(min(max(desired, self._line_h + 12), self._MAX_HEIGHT_PX))
+        self.thinking_label.setFixedHeight(min(max(desired, self._min_h), self._MAX_HEIGHT_PX))
 
     def _on_document_size_changed(self, _size):
         safe_single_shot(0, self, '_update_height')
@@ -1185,7 +1189,7 @@ class AIResponse(QtWidgets.QWidget):
             self._try_freeze_completed()
 
         # 更新活跃区域显示（只显示未冻结的文本）
-        self.content_label.setPlainText(self._pending_text)
+        self.content_label.setPlainText(strip_memory_usage(self._pending_text, streaming=True))
         # setPlainText 会重置 block format，需要重新应用行间距
         self._apply_line_spacing(160)
         # 光标移到末尾
@@ -1259,6 +1263,7 @@ class AIResponse(QtWidgets.QWidget):
 
     def _freeze_text(self, text: str):
         """将一段文本冻结为富文本 Widget"""
+        text = strip_memory_usage(text)
         # 使用 SimpleMarkdown 解析
         segments = SimpleMarkdown.parse_segments(text)
 
@@ -1336,7 +1341,7 @@ class AIResponse(QtWidgets.QWidget):
         if not text:
             return ""
         import re
-        cleaned = re.sub(r'\n{3,}', '\n\n', text)
+        cleaned = re.sub(r'\n{3,}', '\n\n', strip_memory_usage(text))
         return cleaned.strip()
     
     def add_collapsible(self, title: str, content: str) -> CollapsibleSection:

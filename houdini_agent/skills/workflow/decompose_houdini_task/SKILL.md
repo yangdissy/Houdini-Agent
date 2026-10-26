@@ -20,6 +20,10 @@ For each module, identify:
 
 Build and inspect one useful dependency unit before expanding work that depends on unresolved shape, data, timing, or interface decisions. Preserve the overall goal while using observed output to choose the next step.
 
+When the overall shape or connection is still unclear, use a simple proxy to settle the interface, then replace it with the formal module. Keep the proxy recognizable and the output interface stable, and do not treat observations of the proxy as covering the formal module.
+
+For repeated structures, treat the complete source and its layout as two editing responsibilities. Derive shared continuous boundaries from the same curve, surface, or interface output instead of duplicating formulas, and re-check every consumer after the source changes.
+
 ## Delegate domain decisions
 
 Use the matching executable workflow Skill for SOP, COP, materials, USD, simulation, export, PDG, or KineFX construction. This Skill does not prescribe node recipes. Use `design_houdini_parameter_ui` when a stable artist-facing control interface is required, and `handoff_houdini_network` after module boundaries and outputs are proven.

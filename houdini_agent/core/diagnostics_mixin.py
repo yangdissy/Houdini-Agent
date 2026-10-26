@@ -212,7 +212,7 @@ class DiagnosticsMixin:
             for key in (
                 'protocol_version', 'request_ref', 'operation_id', 'kind', 'tool_name', 'state', 'created_at',
                 'updated_at', 'batch_size', 'wait_status', 'thread_still_running',
-                'scene_consistency', 'success', 'error_code', 'result_available',
+                'scene_consistency', 'success', 'error_code', 'error_detail', 'result_available',
                 'session_id', 'arguments_sha256', 'contract_version', 'executor_id',
                 'houdini_version', 'scene_id', 'hip_path', 'revision', 'recorded_at',
             )
@@ -339,9 +339,87 @@ class DiagnosticsMixin:
         except Exception:
             registered_tool_names = []
 
+        # ---- 会话级 summary 聚合：打开 diagnostics 就能一眼看到失败分布 ----
+        # 基于 operation_records（终态 receipt），聚合 success/failure/inconclusive。
+        tool_calls_total = 0
+        tool_calls_succeeded = 0
+        tool_calls_failed = 0
+        failure_by_tool: dict = {}
+        error_code_counts: dict = {}
+        top_error_details: list = []
+        tool_usage_counts: dict = {}
+        for receipt in operation_records.values():
+            # 只统计终态 receipt（completed / failed / abandoned），跳过中间态
+            state = receipt.get('state')
+            if state not in ('completed', 'failed', 'abandoned'):
+                continue
+            if receipt.get('success') is None:
+                continue
+            tool_calls_total += 1
+            tool_name = str(receipt.get('tool_name') or 'unknown')
+            tool_usage_counts[tool_name] = tool_usage_counts.get(tool_name, 0) + 1
+            if receipt.get('success'):
+                tool_calls_succeeded += 1
+            else:
+                tool_calls_failed += 1
+                failure_by_tool[tool_name] = failure_by_tool.get(tool_name, 0) + 1
+                error_code = str(receipt.get('error_code') or 'unknown')
+                error_code_counts[error_code] = error_code_counts.get(error_code, 0) + 1
+                detail = receipt.get('error_detail')
+                if detail:
+                    top_error_details.append({
+                        'tool_name': tool_name,
+                        'error_code': error_code,
+                        'error_detail': str(detail)[:200],
+                        'recorded_at': receipt.get('recorded_at'),
+                    })
+        # 按时间倒序保留最近 10 条详细错误
+        top_error_details.sort(key=lambda item: str(item.get('recorded_at') or ''), reverse=True)
+        top_error_details = top_error_details[:10]
+        # failure_by_tool 按失败次数倒序
+        failure_by_tool_sorted = dict(
+            sorted(failure_by_tool.items(), key=lambda kv: kv[1], reverse=True)
+        )
+        tool_usage_sorted = dict(
+            sorted(tool_usage_counts.items(), key=lambda kv: kv[1], reverse=True)
+        )
+
+        # 策略动作直方 + execute_python 裸改占比（分母为修改类工具调用数）
+        policy_action_counts: dict = {}
+        for rec in (getattr(self, '_policy_timeline_records', []) or []):
+            action = str(rec.get('action') or 'unknown')
+            policy_action_counts[action] = policy_action_counts.get(action, 0) + 1
+        try:
+            from .harness_policy_config import SCENE_MUTATION_TOOLS
+            mutation_calls = sum(
+                count for name, count in tool_usage_counts.items()
+                if name in SCENE_MUTATION_TOOLS
+            )
+        except Exception:
+            mutation_calls = 0
+        python_calls = int(tool_usage_counts.get('execute_python', 0))
+        execute_python_ratio = (
+            round(python_calls / mutation_calls, 4) if mutation_calls > 0 else 0.0
+        )
+
         return {
             'schema_version': 1,
             'exported_at': datetime.now().isoformat(),
+            'summary': {
+                'tool_calls_total': tool_calls_total,
+                'tool_calls_succeeded': tool_calls_succeeded,
+                'tool_calls_failed': tool_calls_failed,
+                'failure_rate': (
+                    round(tool_calls_failed / tool_calls_total, 4)
+                    if tool_calls_total > 0 else 0.0
+                ),
+                'failure_by_tool': failure_by_tool_sorted,
+                'error_code_counts': error_code_counts,
+                'top_error_details': top_error_details,
+                'tool_usage_counts': tool_usage_sorted,
+                'policy_action_counts': policy_action_counts,
+                'execute_python_ratio': execute_python_ratio,
+            },
             'session': {
                 'id': session_id,
                 'username': getattr(self, '_username', 'default'),

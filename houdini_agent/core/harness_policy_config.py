@@ -48,11 +48,32 @@ SCENE_MUTATION_TOOLS = frozenset({
 
 HIGH_RISK_TOOLS = frozenset(DESTRUCTIVE_TOOLS | CODE_EXEC_TOOLS)
 
+EXECUTION_FAILURE_LIMIT = 2
+EXECUTION_ERROR_FAMILY_PATTERN = r"(?m)^\s*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*(?:Error|Exception)|OperationFailed|ObjectWasDeleted|InvalidNodeType):"
+EXECUTION_RECOVERY_TOOLS = frozenset({
+    "inspect_node",
+    "get_parameter_schema",
+    "get_network_structure",
+    "inspect_python",
+    "get_houdini_node_doc",
+    "search_local_doc",
+    "search_tool_contracts",
+    "inspect_tool_contract",
+})
+EXECUTION_FAILURE_RECOVERY_HINT = (
+    "Repeated execution failures: this tool is paused for this user turn. "
+    "Do not keep rewriting code or repeating the call. Inspect the relevant node/parameters "
+    "or read the relevant documentation/tool contract with a read-only tool before retrying. "
+    "If no new evidence is available, report the blocker to the user."
+)
+
 # Skills that implement their own narrower write authorization contract.
 # install_houdini_skill separates source installation from explicit activation.
 CONTROLLED_WRITE_SKILLS = frozenset({
     "install_houdini_skill",
 })
+
+PRIVATE_USER_PATH_PATTERN = r'(?i)(?:^|[^\w])cache/+users(?:/+([^/\s\'"<>;,)]+))?'
 
 SENSITIVE_ARG_KEYS = frozenset({
     'api_key',
@@ -73,7 +94,7 @@ SENSITIVE_ARG_KEYS = frozenset({
 
 SENSITIVE_VALUE_PATTERNS = (
     (r'\bsk-[A-Za-z0-9_\-]{16,}\b', 'openai_style_api_key'),
-    (r'\b(?:api[_-]?key|password|passwd|pwd|secret|token)\s*[:=]', 'sensitive_assignment'),
+    (r'\b(?:api[_-]?key|password|passwd|pwd|secret|token)["\']?\s*[:=]', 'sensitive_assignment'),
     (r'-----BEGIN [A-Z ]*PRIVATE KEY-----', 'private_key_block'),
     (r'\bBearer\s+[A-Za-z0-9._\-]{16,}\b', 'bearer_token'),
 )
@@ -81,9 +102,20 @@ SENSITIVE_VALUE_PATTERNS = (
 SECRET_REDACTION_PATTERNS = (
     (r'\bsk-[A-Za-z0-9_\-]{8,}\b', '[REDACTED_API_KEY]'),
     (r'\bBearer\s+[A-Za-z0-9._\-]{8,}\b', 'Bearer [REDACTED_TOKEN]'),
-    (r'(?i)\b(api[_-]?key|password|passwd|pwd|secret|token)\s*[:=]\s*([^\s,;]+)', r'\1=[REDACTED]'),
+    (r'(?i)\b(api[_-]?key|password|passwd|pwd|secret|token)["\']?\s*[:=]\s*(?:"[^"\n]*"|\'[^\'\n]*\'|[^\s,;]+)', r'\1=[REDACTED]'),
     (r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----', '[REDACTED_PRIVATE_KEY]'),
 )
+
+PYTHON_BLOCKED_MODULES = frozenset({
+    'subprocess', 'importlib', 'requests', 'urllib', 'socket', 'http.client',
+})
+
+PYTHON_BLOCKED_CALLS = frozenset({
+    'os.remove', 'os.unlink', 'os.rmdir', 'os.removedirs', 'os.system',
+    'shutil.rmtree', 'pathlib.Path.unlink', 'pathlib.Path.rmdir',
+    'pathlib.Path.write_text', 'pathlib.Path.write_bytes',
+    '__import__', 'exec', 'eval', 'compile',
+})
 
 PYTHON_DANGEROUS_PATTERNS = (
     (r'\bos\.remove\b', 'python_os_remove'),
@@ -92,7 +124,6 @@ PYTHON_DANGEROUS_PATTERNS = (
     (r'\bos\.system\b', 'python_os_system'),
     (r'\bsubprocess\b', 'python_subprocess'),
     (r'\b__import__\b', 'python_dynamic_import'),
-    (r'\bopen\s*\([^)]*["\']w["\']', 'python_open_write'),
     (r'\bhou\.exit\b', 'python_hou_exit'),
     (r'\bhou\.hipFile\.clear\b', 'python_hip_clear'),
 )
@@ -100,10 +131,8 @@ PYTHON_DANGEROUS_PATTERNS = (
 SHELL_DANGEROUS_PATTERNS = (
     (r'\brm\s+.*-r', 'shell_rm_recursive'),
     (r'\brm\s+.*-f', 'shell_rm_force'),
-    (r'\brmdir\s+/s', 'shell_rmdir_recursive'),
-    (r'\bdel\s+/s', 'shell_del_recursive'),
-    (r'\bdel\s+/q', 'shell_del_quiet'),
-    (r'\brd\s+/s', 'shell_rd_recursive'),
+    (r'\b(?:rmdir|rd)\s+[^\r\n;&|]*/s\b', 'shell_rmdir_recursive'),
+    (r'\bdel\s+[^\r\n;&|]*/[sq]\b', 'shell_del_recursive'),
     (r'\bformat\s+[a-zA-Z]:', 'shell_format_disk'),
     (r'\breg\s+(delete|add)', 'shell_registry_edit'),
     (r'\bshutdown\b', 'shell_shutdown'),
@@ -112,7 +141,7 @@ SHELL_DANGEROUS_PATTERNS = (
     (r'\bsudo\b', 'shell_sudo'),
     (r'\bnetsh\b', 'shell_netsh'),
     (r'\btaskkill\s+/f', 'shell_taskkill_force'),
-    (r'Remove-Item\s+.*-Recurse', 'shell_powershell_recursive_delete'),
+    (r'\b(?:Remove-Item|ri|rm|del|erase|rd|rmdir)\s+[^\r\n;&|]*-Recurse\b', 'shell_powershell_recursive_delete'),
     (r'Invoke-Expression', 'shell_invoke_expression'),
     (r'\biex\b', 'shell_iex'),
     (r'\bdiskpart\b', 'shell_diskpart'),

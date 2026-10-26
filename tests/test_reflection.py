@@ -90,7 +90,8 @@ class ReflectionTest(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0].category, "general")
         self.assertEqual(records[0].abstraction_level, 3)
-        self.assertEqual(records[0].confidence, 1.0)
+        self.assertEqual(records[0].confidence, 0.5)
+        self.assertEqual(records[0].status, "trial")
 
     def test_message_budget_keeps_recent_context_in_order(self):
         messages = [

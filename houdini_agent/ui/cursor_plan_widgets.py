@@ -6,6 +6,16 @@ import math
 from houdini_agent.qt_compat import QtWidgets, QtCore, QtGui
 
 from .cursor_theme import CursorTheme
+from .i18n import tr
+from ..utils.plan_manager import normalize_plan_answers
+from ..utils.plan_runtime import PlanRuntime
+
+
+def _plan_step_title(step: dict) -> str:
+    title = step.get("title", step.get("description", ""))
+    if step.get("status") == "done" and step.get("verification", {}).get("acceptance", "unverified") == "unverified":
+        title += " [" + tr('ai.plan_acceptance_unverified') + "]"
+    return title
 
 
 # ============================================================
@@ -489,7 +499,7 @@ class StreamingPlanCard(QtWidgets.QWidget):
     planRejected = QtCore.Signal()
 
     _STATUS_ICONS = {
-        "pending": "○", "running": "◎", "done": "●", "error": "✗",
+        "pending": "○", "running": "◎", "done": "●", "error": "✗", "blocked": "!",
     }
 
     def __init__(self, parent=None):
@@ -718,8 +728,9 @@ class StreamingPlanCard(QtWidgets.QWidget):
             sid_lbl.setFixedWidth(50)
             step_row.addWidget(sid_lbl)
 
-            title_text = s.get("title", s.get("description", ""))
+            title_text = _plan_step_title(s)
             title_lbl = QtWidgets.QLabel(title_text)
+            title_lbl.setToolTip(s.get("result_summary") or "")
             title_lbl.setObjectName("planStepTitle")
             title_lbl.setWordWrap(True)
             step_row.addWidget(title_lbl, 1)
@@ -891,6 +902,9 @@ class StreamingPlanCard(QtWidgets.QWidget):
                 s["status"] = status
                 if result_summary:
                     s["result_summary"] = result_summary
+                if step_id in self._step_labels:
+                    self._step_labels[step_id][1].setText(_plan_step_title(s))
+                    self._step_labels[step_id][1].setToolTip(s.get("result_summary") or "")
                 break
         if step_id in self._step_labels:
             icon_w, _ = self._step_labels[step_id]
@@ -900,13 +914,8 @@ class StreamingPlanCard(QtWidgets.QWidget):
             icon_w.style().polish(icon_w)
         if self._progress_bar:
             self._update_progress()
-        all_done = all(
-            s.get("status") in ("done", "error")
-            for s in self._plan.get("steps", [])
-        )
-        if all_done:
-            self._plan["status"] = "completed"
-            self._refresh_ui()
+        self._plan["status"] = PlanRuntime().plan_status(self._plan)
+        self._refresh_ui()
 
     def get_plan_data(self) -> dict:
         return self._plan
@@ -955,6 +964,7 @@ class StreamingPlanCard(QtWidgets.QWidget):
             "confirmed": ("CONFIRMED", "#a78bfa"),
             "executing": ("EXECUTING", "#3b82f6"),
             "completed": ("COMPLETED", "#10b981"),
+            "blocked":   ("BLOCKED",   "#b91c1c"),
             "rejected":  ("REJECTED",  "#ef4444"),
         }
         text, color = badge_map.get(status, ("DRAFT", "#64748b"))
@@ -1000,6 +1010,7 @@ class PlanViewer(QtWidgets.QWidget):
         "running":  "◎",
         "done":     "●",
         "error":    "✗",
+        "blocked":  "!",
     }
 
     def __init__(self, plan_data: dict, parent=None):
@@ -1116,8 +1127,9 @@ class PlanViewer(QtWidgets.QWidget):
             step_row.addWidget(sid_lbl)
 
             # 使用 title 作为步骤列表显示文本，description 放在详情中
-            title_text = s.get("title", s.get("description", ""))
+            title_text = _plan_step_title(s)
             title_lbl = QtWidgets.QLabel(title_text)
+            title_lbl.setToolTip(s.get("result_summary") or "")
             title_lbl.setObjectName("planStepTitle")
             title_lbl.setWordWrap(True)
             step_row.addWidget(title_lbl, 1)
@@ -1309,6 +1321,9 @@ class PlanViewer(QtWidgets.QWidget):
                 s["status"] = status
                 if result_summary:
                     s["result_summary"] = result_summary
+                if step_id in self._step_labels:
+                    self._step_labels[step_id][1].setText(_plan_step_title(s))
+                    self._step_labels[step_id][1].setToolTip(s.get("result_summary") or "")
                 break
 
         # 更新步骤列表 UI
@@ -1327,13 +1342,8 @@ class PlanViewer(QtWidgets.QWidget):
         self._update_progress()
 
         # 检查是否全部完成
-        all_done = all(
-            s.get("status") in ("done", "error")
-            for s in self._plan.get("steps", [])
-        )
-        if all_done:
-            self._plan["status"] = "completed"
-            self._refresh_ui()
+        self._plan["status"] = PlanRuntime().plan_status(self._plan)
+        self._refresh_ui()
 
     def get_plan_data(self) -> dict:
         return self._plan
@@ -1364,9 +1374,6 @@ class PlanViewer(QtWidgets.QWidget):
         nodes = []
         connections = []
 
-        # 收集所有 depends_on 关系
-        has_any_deps = any(s.get("depends_on") for s in steps)
-
         for s in steps:
             sid = s.get("id", "")
             title = s.get("title", s.get("description", sid))
@@ -1383,14 +1390,6 @@ class PlanViewer(QtWidgets.QWidget):
             # 依赖关系 → 连线
             for dep_id in (s.get("depends_on") or []):
                 connections.append({"from": dep_id, "to": sid})
-
-        # 没有依赖关系时，自动生成线性链
-        if not has_any_deps and len(steps) > 1:
-            for i in range(len(steps) - 1):
-                connections.append({
-                    "from": steps[i]["id"],
-                    "to": steps[i + 1]["id"],
-                })
 
         # 尝试从 phases 构建分组（如果有的话不会到这里，但兼容）
         return {
@@ -1425,6 +1424,7 @@ class PlanViewer(QtWidgets.QWidget):
             "confirmed": ("CONFIRMED", "#a78bfa"),
             "executing": ("EXECUTING", "#3b82f6"),
             "completed": ("COMPLETED", "#10b981"),
+            "blocked":   ("BLOCKED",   "#b91c1c"),
             "rejected":  ("REJECTED",  "#ef4444"),
         }
         text, color = badge_map.get(status, ("DRAFT", "#64748b"))
@@ -1577,6 +1577,10 @@ class AskQuestionCard(QtWidgets.QFrame):
 
         main_lay.addLayout(btn_row)
 
+        self._validation_error = QtWidgets.QLabel("")
+        self._validation_error.setWordWrap(True)
+        main_lay.addWidget(self._validation_error)
+
     def _collect_answers(self) -> dict:
         """收集用户的回答"""
         answers = {}
@@ -1595,18 +1599,30 @@ class AskQuestionCard(QtWidgets.QFrame):
     def _do_submit(self):
         if self._answered:
             return
-        self._answered = True
         answers = self._collect_answers()
-        self._btn_submit.setEnabled(False)
-        self._btn_cancel.setEnabled(False)
-        self._btn_submit.setText("✓ Submitted")
+        try:
+            normalize_plan_answers(self._questions, answers)
+        except ValueError:
+            self._validation_error.setText(tr('ai.plan_question_incomplete'))
+            return
+        self.finish("answered")
         self.answered.emit(answers)
 
     def _do_cancel(self):
         if self._answered:
             return
+        self.finish("skipped")
+        self.cancelled.emit()
+
+    def finish(self, status: str) -> None:
+        if self._answered:
+            return
         self._answered = True
         self._btn_submit.setEnabled(False)
         self._btn_cancel.setEnabled(False)
-        self._btn_cancel.setText("Skipped")
-        self.cancelled.emit()
+        for widgets in self._widgets.values():
+            for button in widgets["buttons"]:
+                button.setEnabled(False)
+            if widgets["free_text"] is not None:
+                widgets["free_text"].setEnabled(False)
+        self._btn_submit.setText(tr('ai.plan_question_' + status))

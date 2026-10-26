@@ -4,6 +4,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from houdini_agent import skills
 
 
@@ -226,13 +228,19 @@ def test_workflow_guide_runtime_assets_are_tracked_for_distribution():
         "Doc/vex.zip",
         "Doc/hom.zip",
     }
-    tracked = set(subprocess.run(
-        ["git", "ls-files", "--", "Doc"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.splitlines())
+    try:
+        listing = subprocess.run(
+            ["git", "ls-files", "--", "Doc"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        pytest.skip("git executable not available")
+    if listing.returncode != 0:
+        # Release tarballs / CI exports have no .git; asset presence is covered by audit_runtime_assets.
+        pytest.skip(f"not a git work tree: {listing.stderr.strip()}")
+    tracked = set(listing.stdout.splitlines())
 
     assert expected <= tracked
 

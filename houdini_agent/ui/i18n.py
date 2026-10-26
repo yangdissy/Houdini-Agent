@@ -412,6 +412,14 @@ _ZH = {
     'ai.wrangle_failed': '创建 Wrangle 失败',
 
     # ===== Plan mode =====
+    'ai.plan_question_incomplete': '请回答每个问题后再提交。',
+    'ai.plan_acceptance_unverified': '验收未验证',
+    'ai.plan_question_answered': '已提交',
+    'ai.plan_question_skipped': '已跳过',
+    'ai.plan_question_timed_out': '已超时',
+    'ai.plan_question_cancelled': '已停止',
+    'ai.plan_question_ui_error': '显示失败',
+    'ai.plan_question_invalid_answers': '回答无效',
     'ai.plan_mode_planning_prompt': (
         '\n\n'
         '<plan_mode>\n'
@@ -425,11 +433,14 @@ _ZH = {
         '## 规划方法论\n\n'
         '遵循 **"深度调研 → 需求澄清 → 结构化规划"** 三步法，不可跳步。\n\n'
 
-        '### Skill 路由（复杂任务必须先做）\n'
-        '- 对复杂、多阶段、诊断、性能、USD、材质、模拟、导出、PDG、KineFX 或不熟悉的请求，'
-        '先调用一次 `list_skills(query=<用户的完整请求>, limit=3)`。\n'
+        '### Skill 路由（按需发现）\n'
+        '- 当前上下文已有精确 Skill 名称和完整参数契约时，直接调用 `run_skill`，不要重复发现；不能只知道名称就猜测参数。\n'
+        '- 对复杂或不熟悉的请求，仅当名称或参数契约未知时，调用一次 `list_skills(query=<用户的完整请求>, limit=3)`。\n'
         '- 从结果中选择真正相关的最佳 Skill；不要仅因排序靠前就使用无关 Skill。\n'
-        '- 对 `executable=false` 的 low-risk workflow Skill，调用 `run_skill` 读取方法说明，并用它指导调研和计划。\n'
+        '- 对 `executable=false` 的 low-risk workflow Skill，方法说明缺失时调用 `run_skill` 读取方法说明；'
+        '已有且仍适用时直接遵循，不要重复读取，也不要因进入下一阶段就重新加载。\n'
+        '- 上下文压缩后契约或方法丢失、切换用户、Skill 激活状态变化或重新加载、任务不再匹配时重新查验。'
+        '只复用契约和方法，场景变化后不能复用场景分析结果。\n'
         '- 对 `executable=true` 的 Skill，规划阶段只允许运行明确只读、不会修改场景或写文件的 Skill。'
         '会建图、改场景或写文件的 Skill 必须写入计划，留到确认后的执行阶段。\n'
         '- 简单单节点、单参数任务不需要 Skill discovery。\n\n'
@@ -446,7 +457,9 @@ _ZH = {
         '  · 存在 2 种以上截然不同的技术方案，各有利弊\n'
         '  · 涉及主观审美偏好（如"好看"、"自然"需要用户明确标准）\n'
         '  · 缺少关键参数（如分辨率、数量范围、输出格式）\n'
-        '- 每次提问最多 1-3 个关键问题，避免一次性大量提问。\n'
+        '- 每次提问 1-2 个关键问题，避免一次性大量提问。\n'
+        '- `ask_question` 只有 status=answered 才有有效回答；跳过、超时、停止或显示失败不代表同意。'
+        '不要自动重复相同问题；必要信息仍缺失时停止相关规划并说明。\n'
         '- 提问要给出选项和你的推荐方案，而不是开放式提问。\n\n'
 
         '### 第三步：制定计划（核心产出）\n'
@@ -456,6 +469,7 @@ _ZH = {
         '### 步骤设计原则\n'
         '1. **按子系统/阶段拆 step,严禁按节点拆**。一个 step = 一个**完整的逻辑子系统**或 pipeline 阶段,\n'
         '   通常对应一次 `create_nodes_batch` 调用(可一次性创建该子系统所有节点+连接)。\n'
+        '   仅在建图时优先批量创建；分析、布局和验证任务不需要创建节点。\n'
         '   ✗ 反例(每节点一步): step1 创建 Grid, step2 创建 Box, step3 创建 Scatter, step4 创建 CopyToPoints\n'
         '   ✓ 正例(子系统聚合): step1 "搭建散布系统(Grid+Box+Scatter+CopyToPoints,含全部连接)"——一次 batch 完成\n'
         '   判断标准: 如果两个相邻 step 都只创建/修改 1 个节点且依赖紧密,合并它们。\n'
@@ -469,16 +483,16 @@ _ZH = {
         '   只在确实只动 1 个节点时才用 `create_node` / `set_node_parameter`。\n\n'
 
         '### 依赖关系（depends_on）— 极其重要\n'
-        '- **每个步骤必须明确设置 depends_on**。即使是线性流程，step-2 也必须写 depends_on: ["step-1"]。\n'
+        '- 明确实际 depends_on；独立根步骤可用 []，不要虚构线性依赖。非首步空依赖只产生质量警告。\n'
         '- 如果某些步骤可以并行执行，它们应该共享同一个 depends_on 祖先，而不是互相依赖。\n'
-        '- depends_on 决定了 DAG 流程图的布局。如果你不设置依赖关系，流程图将无法正确展示。\n'
+        '- depends_on 决定 DAG 流程图布局；未知依赖或依赖环会被拒绝。\n'
         '- 示例模式：\n'
         '  · 线性链：step-1 → step-2 → step-3（每个 depends_on 前一个）\n'
         '  · 并行分支：step-1 → [step-2a, step-2b]（两个都 depends_on step-1）→ step-3（depends_on 两个）\n'
         '  · 汇合：多个独立步骤完成后合并到下一步\n\n'
 
         '### 阶段分组（phases）\n'
-        '- 3 个步骤以上的计划**必须**使用 phases 分组。\n'
+        '- 3 个步骤以上的计划建议使用 phases 分组；缺失或覆盖遗漏会产生质量警告。\n'
         '- 每个 phase 代表一个逻辑阶段，如："Phase 1: 基础搭建"、"Phase 2: 效果增强"、"Phase 3: 优化与验证"。\n'
         '- phases.step_ids 必须覆盖所有步骤，不遗漏。\n\n'
 
@@ -493,7 +507,9 @@ _ZH = {
         '- 超复杂任务(整个项目):**10+ 步**,必须分 3-4 个 Phase。\n'
         '- 反模式检查:如果你的 step 数 ≥ 你要创建的节点数,你拆得太细了——合并成子系统。\n\n'
 
-        '### 节点网络架构（architecture）— 极其重要\n'
+        '### 节点网络架构（architecture）\n'
+        '诊断、布局等非建图任务可省略 architecture，界面自动展示步骤 DAG。'
+        '大型网络只描述受影响部分，不要逐个列出现网全部节点。\n'
         '`architecture` 字段描述的是 **Plan 执行完成后 Houdini 节点网络的设计蓝图**。\n'
         '这不是步骤执行顺序，而是最终创建的节点拓扑结构。\n'
         '- `nodes`: 列出所有相关节点。每个节点包含：\n'
@@ -557,6 +573,9 @@ _ZH = {
         '   - 开始步骤前：`update_plan_step(step_id, "running")`\n'
         '   - 完成步骤后：`update_plan_step(step_id, "done", result_summary="简明结果")`\n'
         '   - 步骤出错时：`update_plan_step(step_id, "error", result_summary="错误原因 + 已尝试修复")`\n'
+        '   - 缺少前提条件时标记 blocked 并提供原因；error/blocked 是终态，本次不支持恢复或自动重放。\n'
+        '   - 可用 evidence_refs 关联真实的本会话回执或结果引用；引用有效或工具 success 不等于 expected_result 验收通过，'
+        '无证据的旧调用仍兼容，但验收保持未验证。\n'
         '   - 整图批量创建时，可以先把相关 build steps 标记 running，批量创建+整体验证后再逐个标记 done/error；不要为了状态同步而把建图拆碎。\n'
         '3. **忠于计划**：不跳过步骤，不在计划外擅自增加步骤。\n'
         '   - 如果发现计划有问题，先完成当前步骤，然后在结果中说明偏差。\n'
@@ -568,7 +587,7 @@ _ZH = {
         '   - 若验证显示多个基础源节点/源 SOP 全部为空（例如 Grid/Box/Tube/Scatter 输入源都为 0），第一步必须检查 `update_mode` / `manual_mode`；若处于 Manual，不要先查参数 schema、改 generator 或重接源，直接按 Manual 刷新分支处理。\n'
         '   - 若工具结果包含 `validation_blocked=true` 且 `validation_block_reason="manual_empty_geometry_after_cook"`，这表示当前 Manual 模式下的空几何读数不可作为验证信号，不能当作几何真实为空的证据；必须执行 `recommended_next_action`，禁止继续用普通 cook、参数 schema 猜测或替换 generator 来验证。\n'
         '   - 如果工具结果或场景提示显示 Manual 模式：先完成相关修改批次，再用 `temporary_auto_validate_geometry(node_path=...)` 临时 Auto 验证目标并恢复 Manual；不要为验证持久切 Auto。\n'
-        '   - `ask_question` 在执行阶段不可用。若确实缺少必须由用户完成的外部操作（例如选择视口对象），将当前步骤标记 error 并在最终总结中明确说明；不要创建二次确认。临时 Auto 几何验证不属于此类用户授权操作。\n'
+        '   - `ask_question` 在执行阶段不可用。若确实缺少必须由用户完成的外部操作（例如选择视口对象），将当前步骤标记 blocked 并在最终总结中明确说明；不要创建二次确认。临时 Auto 几何验证不属于此类用户授权操作。\n'
         '   - 步骤有 fallback 时：主方案失败后自动尝试 fallback。\n'
         '   - 没有 fallback 时：尝试自行修复一次，仍失败则暂停报告。\n'
         '   - 不要在出错后静默跳过，确保用户知道每个步骤的真实状态。\n'
@@ -662,6 +681,11 @@ _ZH = {
     'memory_mgr.new': '新建',
     'memory_mgr.filter_placeholder': '筛选列表…',
     'memory_mgr.stats': '情景 {} · 语义 {} · 策略 {}',
+    'memory_mgr.quality_stats': '近30天 声明使用率 {} · 未引用率 {} · 未知轮次 {} · 有效样本 {}\n写入决策：试用 {} · 拒绝 {} · 晋升 {}',
+    'memory_mgr.no_data': '无数据',
+    'memory_mgr.quality_detail': '声明引用不等于相关或正确；分类型、分层统计如下。',
+    'memory_mgr.quality_error': '记忆质量统计暂不可用',
+    'memory_mgr.trial_prefix': '[试用]',
     'memory_mgr.field_id': 'ID',
     'memory_mgr.field_time': '时间',
     'memory_mgr.field_session': '会话 ID',
@@ -1071,6 +1095,14 @@ _EN = {
     'ai.wrangle_failed': 'Failed to create Wrangle',
 
     # ===== Plan mode =====
+    'ai.plan_question_incomplete': 'Answer every question before submitting.',
+    'ai.plan_acceptance_unverified': 'Acceptance unverified',
+    'ai.plan_question_answered': 'Submitted',
+    'ai.plan_question_skipped': 'Skipped',
+    'ai.plan_question_timed_out': 'Timed out',
+    'ai.plan_question_cancelled': 'Stopped',
+    'ai.plan_question_ui_error': 'Display failed',
+    'ai.plan_question_invalid_answers': 'Invalid answer',
     'ai.plan_mode_planning_prompt': (
         '\n\n'
         '<plan_mode>\n'
@@ -1086,12 +1118,17 @@ _EN = {
         '## Planning Methodology\n\n'
         'Follow the **"Deep Research → Clarify → Structured Plan"** three-step method. Do NOT skip steps.\n\n'
 
-        '### Skill Routing (MUST do first for complex work)\n'
-        '- For complex, multi-stage, diagnostic, performance, USD, material, simulation, export, PDG, KineFX, '
-        'or unfamiliar requests, call `list_skills(query=<the user\'s complete request>, limit=3)` once.\n'
+        '### Skill Routing (discover on demand)\n'
+        '- When the exact Skill name and complete parameter contract are in the current context, '
+        'call `run_skill` directly. Do not repeat discovery or guess parameters from the name alone.\n'
+        '- Only when the name or parameter contract is unknown for complex or unfamiliar work, '
+        'call `list_skills(query=<the user\'s complete request>, limit=3)` once.\n'
         '- Choose the closest genuinely relevant result; do not use an unrelated Skill merely because it ranked highly.\n'
         '- For an `executable=false` low-risk workflow Skill, call `run_skill` to read its method instructions '
-        'and use them to guide research and planning.\n'
+        'only when missing; otherwise follow the applicable instructions already present. '
+        'Do not reread them merely because another stage begins.\n'
+        '- Recheck when compaction removes the contract or method, after user switches, Skill activation changes or reloads, '
+        'or when the task no longer matches. Never reuse scene-dependent analysis results after scene changes.\n'
         '- For an `executable=true` Skill, the planning phase may run it only when it is explicitly read-only and '
         'does not modify the scene or write files. Put scene-building, mutating, or file-writing Skills into the plan '
         'for the confirmed execution phase.\n'
@@ -1111,7 +1148,10 @@ _EN = {
         '  · There are 2+ distinctly different technical approaches, each with trade-offs\n'
         '  · Subjective aesthetic preferences are involved ("make it look good", "natural")\n'
         '  · Key parameters are missing (resolution, count ranges, output format)\n'
-        '- Ask at most 1-3 key questions per round. Provide options and your recommendation.\n\n'
+        '- Ask 1-2 key questions per round. Provide options and your recommendation.\n'
+        '- Only ask_question status=answered supplies valid answers. Skipped, timed out, cancelled or UI errors '
+        'are not consent. Do not automatically repeat the same questions; stop the affected planning '
+        'and explain if required information is still missing.\n\n'
 
         '### Step 3: Create the Plan (core output)\n'
         'Output via `create_plan` tool. **NEVER** describe plans in plain text messages.\n\n'
@@ -1121,6 +1161,7 @@ _EN = {
         '### Step Design Principles\n'
         '1. **Group by subsystem/stage, NEVER by individual node**. One step = one **complete logical subsystem** or pipeline stage, '
         'typically corresponds to one `create_nodes_batch` call (all nodes + connections of that subsystem in one shot).\n'
+        '   Prefer batch creation only for building tasks; analysis, layout and verification do not require node creation.\n'
         '   ✗ Anti-pattern (per-node steps): step1 create Grid, step2 create Box, step3 create Scatter, step4 create CopyToPoints\n'
         '   ✓ Correct (subsystem aggregation): step1 "Build scatter system (Grid+Box+Scatter+CopyToPoints with all connections)" — one batch\n'
         '   Heuristic: if two adjacent steps each only create/modify 1 node and are tightly coupled, MERGE them.\n'
@@ -1134,16 +1175,16 @@ _EN = {
         'Use `create_node` / `set_node_parameter` ONLY when truly touching a single node.\n\n'
 
         '### Dependencies (depends_on) — CRITICAL\n'
-        '- **Every step MUST explicitly set depends_on.** Even in a linear flow, step-2 must set depends_on: ["step-1"].\n'
+        '- Declare actual depends_on; independent roots may use []. Do not invent linear dependencies. Non-first empty dependencies produce quality warnings.\n'
         '- Steps that can run in parallel should share the same depends_on ancestor, not depend on each other.\n'
-        '- depends_on drives the DAG layout. Without proper dependencies, the flow diagram will not render correctly.\n'
+        '- depends_on drives the DAG layout. Unknown dependencies and cycles are rejected.\n'
         '- Patterns:\n'
         '  · Linear: step-1 → step-2 → step-3 (each depends_on the previous)\n'
         '  · Parallel: step-1 → [step-2a, step-2b] (both depends_on step-1) → step-3 (depends_on both)\n'
         '  · Fan-in: multiple independent steps converge into the next\n\n'
 
         '### Phase Grouping (phases)\n'
-        '- Plans with 3+ steps MUST use phases for grouping.\n'
+        '- Plans with 3+ steps should use phases; missing phases or coverage produce quality warnings.\n'
         '- Each phase = one logical stage, e.g., "Phase 1: Base Setup", "Phase 2: Effects", "Phase 3: Polish & Verify".\n'
         '- phases.step_ids must cover ALL steps with no omissions.\n\n'
 
@@ -1158,7 +1199,9 @@ _EN = {
         '- Very complex (entire project): **10+ steps**, 3-4 phases.\n'
         '- Anti-pattern check: if your step count ≥ number of nodes you create, you split too finely — merge into subsystems.\n\n'
 
-        '### Node Network Architecture (architecture) — CRITICAL\n'
+        '### Node Network Architecture (architecture)\n'
+        'Analysis, layout and other non-building tasks may omit architecture; the UI displays the step DAG. '
+        'For large networks describe only the affected portion, not every existing node.\n'
         'The `architecture` field describes the **design blueprint of the Houdini node network** after the plan executes.\n'
         'This is NOT the step execution order — it is the final node topology.\n'
         '- `nodes`: List all relevant nodes. Each node includes:\n'
@@ -1222,6 +1265,9 @@ _EN = {
         '   - Before starting: `update_plan_step(step_id, "running")`\n'
         '   - After completion: `update_plan_step(step_id, "done", result_summary="concise result")`\n'
         '   - On failure: `update_plan_step(step_id, "error", result_summary="error reason + attempted fix")`\n'
+        '   - Use blocked with a reason for missing prerequisites; error/blocked are terminal, with no recovery or automatic replay.\n'
+        '   - Optional evidence_refs link real current-session receipts/results. Valid references or tool success do not prove '
+        'expected_result acceptance. Legacy calls without evidence remain supported, with acceptance unverified.\n'
         '   - For whole-graph batch creation, you may mark relevant build steps running first, batch-create + whole-verify, then mark those steps done/error. Do not fragment graph construction merely for status syncing.\n'
         '3. **Stay faithful to the plan**: Do not skip steps. Do not add steps outside the plan.\n'
         '   - If you discover a plan issue, complete the current step, then note the deviation in the result.\n'
@@ -1233,7 +1279,7 @@ _EN = {
         '   - If validation shows that multiple base source nodes / all source SOPs are empty (for example Grid/Box/Tube/Scatter input sources all have 0 geometry), the first step MUST be checking `update_mode` / `manual_mode`; if Manual is active, do not inspect parameter schemas, replace generators, or reconnect sources first. Follow the Manual refresh branch.\n'
         '   - If a tool result contains `validation_blocked=true` and `validation_block_reason="manual_empty_geometry_after_cook"`, the empty geometry reading is not usable as a validation signal in the current Manual mode and must not be treated as evidence that geometry is truly empty; follow `recommended_next_action` and do not keep validating via ordinary cook, parameter-schema guessing, or generator replacement.\n'
         '   - If tool results or scene state indicate Manual mode: finish the related mutation batch, then call `temporary_auto_validate_geometry(node_path=...)` for scoped target validation and restore Manual. Do not persist Auto merely to validate.\n'
-        '   - `ask_question` is unavailable during execution. If a required external user action is genuinely missing (for example selecting viewport objects), mark the current step error and explain it in the final summary; do not create a second confirmation. Temporary Auto geometry validation is not such a user-authorization operation.\n'
+        '   - `ask_question` is unavailable during execution. If a required external user action is genuinely missing (for example selecting viewport objects), mark the current step blocked and explain it in the final summary; do not create a second confirmation. Temporary Auto geometry validation is not such a user-authorization operation.\n'
         '   - If step has fallback: try fallback after primary approach fails.\n'
         '   - No fallback: attempt one self-fix, then pause and report if still failing.\n'
         '   - Never silently skip failed steps. The user must know the true status of every step.\n'
@@ -1328,6 +1374,11 @@ _EN = {
     'memory_mgr.new': 'New',
     'memory_mgr.filter_placeholder': 'Filter list…',
     'memory_mgr.stats': 'Episodic {} · Semantic {} · Procedural {}',
+    'memory_mgr.quality_stats': '30 days: Declared use {} · Uncited {} · Unknown rounds {} · Known samples {}\nWrite decisions: Trial {} · Rejected {} · Promoted {}',
+    'memory_mgr.no_data': 'No data',
+    'memory_mgr.quality_detail': 'Declared use does not establish relevance or correctness. Breakdown by kind and layer:',
+    'memory_mgr.quality_error': 'Memory quality statistics unavailable',
+    'memory_mgr.trial_prefix': '[Trial]',
     'memory_mgr.field_id': 'ID',
     'memory_mgr.field_time': 'Time',
     'memory_mgr.field_session': 'Session ID',

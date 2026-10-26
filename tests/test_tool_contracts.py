@@ -37,6 +37,28 @@ class CoreToolContractTest(unittest.TestCase):
                 description = meta.schema.get("function", {}).get("description", "")
                 self.assertTrue(description.strip())
 
+    def test_node_diagnostic_contracts_expose_structured_repair_guidance(self):
+        expected_terms = {
+            "check_errors": (
+                "freshness", "root_causes", "classification", "owner_node",
+                "repair_parameter", "line", "columns",
+            ),
+            "inspect_node": ("editability", "inside_locked_hda", "nearest_editable_ancestor"),
+            "get_parameter_schema": ("editability", "writable", "nearest_editable_ancestor"),
+            "set_node_parameter": (
+                "node_inside_locked_hda", "parameter_locked", "parameter_disabled",
+                "nearest_editable_ancestor",
+            ),
+        }
+
+        for tool_name, terms in expected_terms.items():
+            with self.subTest(tool=tool_name):
+                meta = self.registry.get_meta(tool_name)
+                self.assertIsNotNone(meta)
+                description = meta.schema["function"]["description"]
+                for term in terms:
+                    self.assertIn(term, description)
+
     def test_execute_python_confirmation_follows_harness_policy(self):
         description = self.registry.get_meta("execute_python").schema["function"]["description"]
 
@@ -291,7 +313,7 @@ class CoreToolContractTest(unittest.TestCase):
         }
         non_mcp_internal_dispatch = {
             "set_display_flag", "get_node_inputs", "list_network_boxes",
-            "get_node_positions", "get_node_card", "check_errors",
+            "get_node_positions", "get_node_card",
             "find_nodes_by_param", "list_children", "get_node_parameters",
         }
 

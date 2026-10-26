@@ -11,10 +11,11 @@ ToolRegistry — 统一工具注册中心
 
 import json
 import hashlib
+import re
 import threading
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 from dataclasses import dataclass, field
 
 from ..core.harness_policy_config import HIGH_RISK_TOOLS, SCENE_MUTATION_TOOLS
@@ -363,6 +364,7 @@ class ToolRegistry:
         self._tools: Dict[str, ToolMeta] = {}       # name -> ToolMeta
         self._disabled_tools: Set[str] = set()       # 持久化禁用列表
         self._initialized = False
+        self._intent_patterns = self._compile_intent_patterns()
 
     # ---------- 注册 / 注销 ----------
 
@@ -843,6 +845,8 @@ class ToolRegistry:
         'base': {
             'get_network_structure', 'read_selection', 'verify_network',
             'search_memory',
+            # 大结果折叠后只能靠 read_tool_result 读回；回执工具用于超时后的状态确认
+            'read_tool_result', 'get_operation_status', 'list_operation_receipts',
         },
         'query': {
             'get_network_structure', 'get_parameter_schema', 'inspect_node', 'get_node_connections',
@@ -884,6 +888,7 @@ class ToolRegistry:
         },
         'cook': {
             'inspect_node', 'cook_node', 'check_errors', 'verify_network', 'validate_node_network',
+            'cook_sample_frames', 'inspect_frame_range_risk',
         },
         'null': {
             'create_named_null', 'get_node_connections', 'suggest_connection',
@@ -906,7 +911,7 @@ class ToolRegistry:
             'preview_node_operation', 'get_node_connections', 'get_network_structure',
         },
         'code': {
-            'execute_python', 'execute_shell',
+            'execute_python', 'execute_shell', 'inspect_python',
         },
         'search': {
             'web_search', 'fetch_webpage', 'search_local_doc',
@@ -921,7 +926,17 @@ class ToolRegistry:
         },
         'layout': {
             'layout_nodes', 'create_network_box', 'add_nodes_to_box',
-            'set_network_box_comment',
+            'set_network_box_comment', 'preview_layout_nodes',
+        },
+        'usd': {
+            'get_usd_prim_info', 'get_usd_layer_stack',
+        },
+        'pdg': {
+            'get_top_network_status', 'list_top_work_items', 'get_top_errors',
+            'build_pdg_expression',
+        },
+        'tools': {
+            'inspect_tool_contract', 'search_tool_contracts',
         },
         'task': {
             'add_todo', 'update_todo',
@@ -932,18 +947,14 @@ class ToolRegistry:
         'file': {
             'save_hip', 'undo_redo',
         },
-        'plan': {
-            'create_plan', 'update_plan_step', 'ask_question',
-        },
-        'skill': set(),  # 动态填充
     }
 
-    # 意图关键词（中英文）
+    # 意图关键词（中英文）。英文按整词（可带 s/es/ed/ing）匹配，中文按子串匹配，大小写不敏感。
     _INTENT_KEYWORDS: Dict[str, List[str]] = {
         'query': ['what', 'show', 'list', 'check', 'look', 'display', 'view', 'see',
                   '查看', '检查', '分析', '看看', '显示', '状态', '有什么', '哪些'],
         'create': ['create', 'build', 'make', 'add', 'generate', 'construct',
-                   '创建', '搭建', '添加', '生成', '建', '做', '造'],
+                   '创建', '搭建', '添加', '生成', '新建', '建立', '建一', '建个', '制作', '新增'],
         'connection': ['connect', 'disconnect', 'wire', 'input', 'output', 'link',
                        '连接', '接线', '断开', '输入', '输出', '端口', '插到'],
         'parameter': ['parameter', 'parm', 'param', 'value', 'menu', 'tuple',
@@ -961,7 +972,7 @@ class ToolRegistry:
         'null': ['null', 'out null', 'output null', 'named null', 'OUT_', 'IN_', 'CTRL_', 'CACHE_',
                  '空节点', '输出空节点', '命名null'],
         'modify': ['change', 'set', 'modify', 'update', 'adjust', 'tweak',
-                   '修改', '设置', '调整', '改', '变'],
+                   '修改', '设置', '调整', '更改', '改成', '改为', '变成', '变更'],
         'delete': ['delete', 'remove', 'destroy', 'rename',
                    '删除', '删掉', '移除', '销毁', '清除', '重命名', '改名'],
         'operation': ['apply', 'implement', 'optimize', 'fix', 'repair', 'cleanup', 'clean up',
@@ -974,7 +985,11 @@ class ToolRegistry:
                    '记忆', '回忆', '偏好', '历史'],
         'memory_write': ['记住', '记下来', '保存为长期记忆', 'remember this', 'save this'],
         'layout': ['layout', 'organize', 'arrange', 'position', 'move',
-                   '排列', '布局', '整理', '位置'],
+                   '排列', '布局', '整理', '位置', '分组'],
+        'usd': ['usd', 'lop', 'solaris', 'stage', 'prim', 'layer stack',
+                'usd 场景', '图层'],
+        'pdg': ['pdg', 'tops', 'topnet', 'work item', 'workitem', '工作项'],
+        'tools': ['tool contract', '工具合同', '工具契约', '工具定义'],
         'perf': ['performance', 'profile', 'benchmark', 'speed', 'slow',
                  '性能', '速度', '慢', '优化'],
         'file': ['save', 'undo', 'redo', '保存', '撤销', '重做'],
@@ -988,8 +1003,8 @@ class ToolRegistry:
         'set_node_parameter', 'batch_set_parameters', 'upsert_spare_parameter', 'set_node_flags',
         'connect_nodes', 'disconnect_nodes', 'delete_node', 'rename_node',
         'layout_nodes', 'copy_node', 'create_named_null',
-        'set_update_mode',
-    }) | (HIGH_RISK_TOOLS - {'execute_python'})
+        'set_update_mode', 'visual_review',
+    }) | HIGH_RISK_TOOLS
 
     _TOOL_DEPENDENCIES: Dict[str, Set[str]] = {
         'connect_nodes': {'get_node_connections', 'suggest_connection', 'preview_node_operation'},
@@ -1004,12 +1019,29 @@ class ToolRegistry:
         'create_wrangle_node': {'get_network_structure', 'get_houdini_node_doc'},
         'create_named_null': {'get_node_connections', 'suggest_connection', 'preview_node_operation', 'validate_node_network'},
         'layout_nodes': {'get_network_structure'},
-        'create_network_box': set(),
-        'set_network_box_comment': set(),
         'cook_node': {'inspect_node', 'verify_network'},
         'copy_node': {'inspect_node', 'get_network_structure'},
         'save_hip': {'get_scene_snapshot'},
     }
+
+    @classmethod
+    def _compile_intent_patterns(cls) -> Dict[str, Any]:
+        patterns: Dict[str, Any] = {}
+        for intent, keywords in cls._INTENT_KEYWORDS.items():
+            ascii_parts: List[str] = []
+            cjk_parts: List[str] = []
+            for keyword in keywords:
+                kw = keyword.lower()
+                if not kw.isascii():
+                    cjk_parts.append(re.escape(kw))
+                elif kw.endswith('_'):
+                    # OUT_、CTRL_ 这类前缀后面紧跟节点名，只要求前边界
+                    ascii_parts.append(r'\b' + re.escape(kw))
+                else:
+                    ascii_parts.append(r'\b' + re.escape(kw) + r'(?:s|es|ed|d|ing)?\b')
+            parts = ascii_parts + cjk_parts
+            patterns[intent] = re.compile('|'.join(parts)) if parts else None
+        return patterns
 
     def classify_intent(self, user_message: str) -> Set[str]:
         """根据用户消息关键词推断意图类别
@@ -1020,13 +1052,10 @@ class ToolRegistry:
         if not user_message:
             return set()
         msg_lower = user_message.lower()
-        matched = set()
-        for intent, keywords in self._INTENT_KEYWORDS.items():
-            for kw in keywords:
-                if kw in msg_lower:
-                    matched.add(intent)
-                    break  # 一个关键词命中即可
-        return matched
+        return {
+            intent for intent, pattern in self._intent_patterns.items()
+            if pattern is not None and pattern.search(msg_lower)
+        }
 
     def _expand_tool_dependencies(self, tool_names: Set[str]) -> Set[str]:
         """Add helper tools that make selected write tools safer to call."""
@@ -1040,14 +1069,19 @@ class ToolRegistry:
                     pending.append(dep)
         return expanded
 
-    def select_tools_for_request(self, user_message: str, mode: str = 'agent') -> List[dict]:
+    def select_tools_for_request(self, user_message: str, mode: str = 'agent',
+                                 extra_names: Optional[Iterable[str]] = None) -> List[dict]:
         """Classify a user request and return the smallest useful tool schema set."""
-        return self.get_tools_for_intent(self.classify_intent(user_message or ""), mode=mode)
+        return self.get_tools_for_intent(
+            self.classify_intent(user_message or ""), mode=mode, extra_names=extra_names
+        )
 
-    def get_tools_for_intent(self, intents: Set[str], mode: str = 'agent') -> List[dict]:
+    def get_tools_for_intent(self, intents: Set[str], mode: str = 'agent',
+                             extra_names: Optional[Iterable[str]] = None) -> List[dict]:
         """根据意图集获取相关工具 schema
 
         始终包含 'base' 和 'task' 组，额外包含匹配意图的工具组。
+        extra_names 为调用方要求保留的工具（如本会话已暴露/已调用过的）。
         只返回该 mode 下允许且启用的工具。
         """
         # 始终包含基础工具组
@@ -1064,6 +1098,7 @@ class ToolRegistry:
         # Skill 元工具始终可用：skill 通过 run_skill/list_skills 暴露（非独立工具），
         # 不属于任何意图组，必须显式纳入，否则会被意图过滤剔除。
         target_names |= {'run_skill', 'list_skills'}
+        target_names |= set(extra_names or ())
 
         # 过滤：必须在指定 mode 中且启用
         with self._lock:

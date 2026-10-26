@@ -38,6 +38,8 @@ class AgentToolSelectionTest(unittest.TestCase):
         self.assertIn("add_todo", names)
         self.assertIn("execute_shell", names)
         self.assertIn("save_hip", names)
+        self.assertIn("capture_viewport", names)
+        self.assertIn("visual_review", names)
         self.assertNotIn("web_search", names)
         self.assertNotIn("fetch_webpage", names)
 
@@ -83,6 +85,57 @@ class AgentToolSelectionTest(unittest.TestCase):
 
         self.assertIn("upsert_spare_parameter", names)
         self.assertIn("get_parameter_schema", names)
+
+    def test_short_followup_keeps_tools_from_previous_turn(self):
+        tab = object.__new__(AITab)
+        tab._conversation_history = [
+            {"role": "user", "content": "把 1902 个节点整理分组"},
+            {"role": "assistant", "content": "我用 execute_python 批量完成，并用 NetworkBox 分组。"},
+            {"role": "user", "content": "好，开始执行"},
+        ]
+
+        names = _tool_names(AITab._select_agent_tools_for_message(
+            tab, "好，开始执行", use_web=False,
+        ))
+
+        self.assertIn("execute_python", names)
+        self.assertIn("create_network_box", names)
+
+    def test_tools_stay_available_for_rest_of_session(self):
+        tab = object.__new__(AITab)
+        tab._session_id = "s1"
+        tab._conversation_history = []
+
+        first = _tool_names(AITab._select_agent_tools_for_message(
+            tab, "整理节点布局并分组", use_web=False, remember=True,
+        ))
+        self.assertIn("create_network_box", first)
+
+        tab._session_id = "s1"
+        later = _tool_names(AITab._select_agent_tools_for_message(
+            tab, "好", use_web=False, remember=True,
+        ))
+        self.assertLessEqual(first, later)
+
+        other = object.__new__(AITab)
+        other._session_id = "s2"
+        other._conversation_history = []
+        self.assertNotIn("create_network_box", _tool_names(AITab._select_agent_tools_for_message(
+            other, "好", use_web=False, remember=True,
+        )))
+
+    def test_tool_used_in_history_stays_available(self):
+        tab = object.__new__(AITab)
+        tab._session_id = "s1"
+        tab._conversation_history = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "1", "type": "function", "function": {"name": "create_network_box", "arguments": "{}"}},
+            ]},
+        ]
+
+        names = _tool_names(AITab._select_agent_tools_for_message(tab, "好", use_web=False))
+
+        self.assertIn("create_network_box", names)
 
     def test_explicit_remember_request_exposes_write_tool(self):
         tab = object.__new__(AITab)

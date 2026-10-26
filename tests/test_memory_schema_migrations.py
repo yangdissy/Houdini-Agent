@@ -67,6 +67,8 @@ class MemorySchemaMigrationTest(unittest.TestCase):
                 saved = store.get_semantic("semantic-1")
                 self.assertEqual(saved.rule, "legacy rule")
                 self.assertEqual(saved.abstraction_level, 2)
+                self.assertEqual(saved.status, "active")
+                self.assertEqual(saved.cited_count, 0)
             finally:
                 store.close()
 
