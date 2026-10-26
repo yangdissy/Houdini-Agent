@@ -566,6 +566,30 @@ class GovernedToolExecutorTest(unittest.TestCase):
                 self.assertEqual(result["success"], recovered)
                 self.assertEqual(len(calls), 5 if recovered else 4)
 
+    def test_recovery_tool_can_collect_new_evidence_after_repeated_failures(self):
+        calls = []
+        responses = iter([
+            {"success": False, "error": "OperationFailed: first inspection failed"},
+            {"success": False, "error": "OperationFailed: second inspection failed"},
+            {"success": True, "result": "different inspection succeeded"},
+        ])
+        owner = GovernedToolExecutor(
+            type("FixedPolicy", (), {
+                "decide": lambda self, *args: ToolPolicyDecision(action="allow")
+            })(),
+            lambda *args: calls.append(args) or next(responses),
+            audit=lambda record: None,
+        )
+
+        for code in ("inspect_first()", "inspect_second()"):
+            owner.execute("inspect_python", {"code": code}, {"mode": "agent"})
+        result = owner.execute(
+            "inspect_python", {"code": "inspect_different_target()"}, {"mode": "agent"}
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(len(calls), 3)
+
     def test_traceback_classification_uses_final_exception(self):
         state = HarnessRuntimeState()
         calls = []

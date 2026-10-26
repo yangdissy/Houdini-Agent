@@ -763,7 +763,11 @@ class GovernedToolExecutor:
             return {"success": False, "error": reason or f"Tool blocked by policy: {tool_name}"}
 
         previous_failure = self._execution_failures.get(tool_name)
-        if previous_failure and previous_failure[1] >= EXECUTION_FAILURE_LIMIT:
+        if (
+            tool_name not in EXECUTION_RECOVERY_TOOLS
+            and previous_failure
+            and previous_failure[1] >= EXECUTION_FAILURE_LIMIT
+        ):
             self._record_decision(tool_name, "deny", "repeated_execution_failure")
             self._record_audit({
                 "event_type": "execution_failure_guard", "tool": tool_name,

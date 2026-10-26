@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """Read-only QC checks for the current Houdini HIP scene."""
 
+import heapq
 import os
 import re
-
-
 
 
 _PATH_HINTS = (
@@ -48,7 +47,7 @@ _KEY_TYPE_HINTS = ("filecache", "alembic", "geometry", "mantra", "export", "rop_
 _DEFAULT_INTEGRATION_NAMES = {"filecache1", "mantra1", "rop_alembic1", "rop_geometry1"}
 _CHECKS = (
     "scene_settings", "node_naming", "cache_paths", "file_naming",
-    "external_references", "workflow_rules",
+    "external_references", "workflow_rules", "network_analysis",
 )
 
 
@@ -141,8 +140,170 @@ def _normalize_checks(checks):
     return selected
 
 
+def _group_network_nodes(nodes, max_group_size=8):
+    """Partition every same-parent component into bounded structural analysis groups.
+
+    Existing NetworkBoxes are retained only as node evidence. They never define
+    report groups because their contents may mix unrelated responsibilities.
+    """
+    nodes_by_path = {node["path"]: node for node in nodes}
+    remaining = set(nodes_by_path)
+    components = []
+    while remaining:
+        start = min(remaining)
+        parent_path = nodes_by_path[start].get("parent_path", "")
+        component = set()
+        pending = [start]
+        while pending:
+            path = pending.pop()
+            if path not in remaining or nodes_by_path[path].get("parent_path", "") != parent_path:
+                continue
+            remaining.remove(path)
+            component.add(path)
+            neighbors = nodes_by_path[path].get("inputs", []) + nodes_by_path[path].get("outputs", [])
+            pending.extend(neighbor for neighbor in neighbors if neighbor in remaining)
+        components.append((parent_path, component))
+
+    groups = []
+    for parent_path, component in sorted(components):
+        if len(component) <= max_group_size:
+            chunks = [sorted(component)]
+        else:
+            # Kahn layering keeps processing stages together without recursion.
+            downstream = {path: [] for path in component}
+            indegree = {path: 0 for path in component}
+            for path in component:
+                for input_path in set(nodes_by_path[path].get("inputs", [])) & component:
+                    downstream[input_path].append(path)
+                    indegree[path] += 1
+            ready = [(0, path) for path, degree in indegree.items() if degree == 0]
+            heapq.heapify(ready)
+            ranks = {}
+            ordered = []
+            while ready:
+                depth, path = heapq.heappop(ready)
+                ranks[path] = depth
+                ordered.append(path)
+                for output_path in downstream[path]:
+                    indegree[output_path] -= 1
+                    if indegree[output_path] == 0:
+                        heapq.heappush(ready, (depth + 1, output_path))
+            ordered.extend(sorted(component - set(ordered)))
+            chunks = [ordered[index:index + max_group_size] for index in range(0, len(ordered), max_group_size)]
+        for chunk in chunks:
+            groups.append({
+                "id": "group:{}:{}".format(parent_path, len(groups) + 1),
+                "source": "structural_analysis_group",
+                "parent_path": parent_path,
+                "node_paths": chunk,
+                "requires_semantic_review": True,
+                "existing_network_boxes": sorted({
+                    box.get("name", "")
+                    for path in chunk
+                    for box in nodes_by_path[path].get("network_boxes", [])
+                    if box.get("name", "")
+                }),
+            })
+    return groups
+
+
+def _network_analysis_contract(nodes, groups, containers):
+    """Return an executable four-stage protocol with one task per bounded group."""
+    nodes_by_path = {node["path"]: node for node in nodes}
+    group_tasks = []
+    for group in groups:
+        member_paths = set(group["node_paths"])
+        internal_edges = []
+        external_inputs = set()
+        external_outputs = set()
+        for path in sorted(member_paths):
+            for input_path in nodes_by_path[path].get("inputs", []):
+                if input_path in member_paths:
+                    internal_edges.append({"from": input_path, "to": path})
+                else:
+                    external_inputs.add(input_path)
+            for output_path in nodes_by_path[path].get("outputs", []):
+                if output_path not in member_paths:
+                    external_outputs.add(output_path)
+        group_tasks.append({
+            "group_id": group["id"],
+            "parent_path": group["parent_path"],
+            "node_paths": group["node_paths"],
+            "nodes": [nodes_by_path[path] for path in group["node_paths"]],
+            "internal_edges": internal_edges,
+            "external_inputs": sorted(external_inputs),
+            "external_outputs": sorted(external_outputs),
+            "required_analysis": [
+                "识别本组每个节点在当前连接和参数下的实际用途，不能只翻译节点类型",
+                "重新评估整组组合后完成的事情、输入输出和下游消费者",
+                "解释本组为何采用这种节点组合，证据不足标 uncertain",
+            ],
+            "required_output": {
+                "group_id": group["id"],
+                "node_paths": group["node_paths"],
+                "node_roles": {},
+                "group_purpose": "",
+                "inputs": [],
+                "outputs": [],
+                "composition_reasons": [],
+                "evidence": [],
+                "confidence": "",
+                "uncertainties": [],
+            },
+        })
+    container_tasks = [
+        {
+            "container_path": container["path"],
+            "container_type": container["type"],
+            "depth": container["depth"],
+            "required_output": {
+                "container_path": container["path"],
+                "specific_purpose": "",
+                "internal_group_ids": [
+                    task["group_id"] for task in group_tasks
+                    if task["parent_path"] == container["path"]
+                ],
+                "inputs": [],
+                "outputs": [],
+                "evidence": [],
+                "uncertainties": [],
+            },
+        }
+        for container in containers
+    ]
+    return {
+        "status": "analysis_required",
+        "read_only": True,
+        "scene_mutations_allowed": False,
+        "protocol": [
+            "1. 识别全部节点：按 path/type/inputs/outputs/key_parameters/comment 给出每个节点的实际用途；未知类型先查 get_node_card 或文档",
+            "2. 强制分组：每个 group_task 单独分析；组边界只作起点，不按现有 NetworkBox 分组，不在 HIP 中创建或修改注释/Box/布局",
+            "3. 逐组重新评估：依据组内拓扑和参数回答 group_purpose，不把各节点说明简单拼接",
+            "4. 逐组解释组合原因：写 composition_reasons；无法从场景证明的作者意图标 uncertain",
+            "5. 每个容器写专属用途摘要，再汇总组间依赖；不得用全局概述替代逐组结果",
+        ],
+        "completion_criteria": {
+            "every_node_has_role": True,
+            "every_group_has_purpose_and_composition_reasons": True,
+            "every_container_has_specific_summary": True,
+            "all_report_groups_bounded_and_reviewed": True,
+            "no_scene_mutations": True,
+        },
+        "group_tasks": group_tasks,
+        "container_tasks": container_tasks,
+        "coverage_audit": {
+            "node_paths": sorted(nodes_by_path),
+            "node_count": len(nodes_by_path),
+            "group_count": len(groups),
+            "container_paths": [item["path"] for item in containers],
+            "require_exact_node_union": True,
+            "require_all_containers_expanded_including_subnet_and_dop": True,
+        },
+    }
+
+
 def _collect_scene(hou, max_nodes, checks):
-    needs_nodes = any(check in checks for check in ("node_naming", "cache_paths", "workflow_rules"))
+    needs_nodes = any(check in checks for check in ("node_naming", "cache_paths", "workflow_rules", "network_analysis"))
     root = hou.node("/") if needs_nodes else None
     all_nodes = list(_safe_call(lambda: root.allSubChildren(), ()) or ()) if root else []
     truncated = needs_nodes and len(all_nodes) > max_nodes
@@ -153,13 +314,57 @@ def _collect_scene(hou, max_nodes, checks):
         name = _safe_call(lambda n=node: n.name(), "") or ""
         path = _safe_call(lambda n=node: n.path(), "") or ""
         input_paths = []
-        if "workflow_rules" in checks:
+        output_paths = []
+        parent_path = ""
+        network_boxes = []
+        if "workflow_rules" in checks or "network_analysis" in checks:
             input_paths = [
                 _safe_call(lambda item=input_node: item.path(), "") or ""
                 for input_node in (_safe_call(lambda n=node: n.inputs(), ()) or ())
                 if input_node is not None
             ]
-        nodes.append({"path": path, "name": name, "type": type_name, "inputs": input_paths})
+        if "network_analysis" in checks:
+            output_paths = [
+                _safe_call(lambda item=output_node: item.path(), "") or ""
+                for output_node in (_safe_call(lambda n=node: n.outputs(), ()) or ())
+                if output_node is not None
+            ]
+            parent = _safe_call(lambda n=node: n.parent(), None)
+            parent_path = _safe_call(lambda: parent.path(), "") or "" if parent is not None else ""
+            for box in (_safe_call(lambda: parent.networkBoxes(), ()) or ()) if parent is not None else ():
+                items = _safe_call(lambda item=box: item.items(), ()) or ()
+                if node in items:
+                    network_boxes.append({
+                        "name": _safe_call(lambda item=box: item.name(), "") or "",
+                        "comment": _safe_call(lambda item=box: item.comment(), "") or "",
+                    })
+        depth = len([part for part in path.split("/") if part])
+        child_count = len(_safe_call(lambda n=node: n.children(), ()) or ()) if "network_analysis" in checks else 0
+        is_network_container = child_count > 0 or bool(_safe_call(lambda n=node: n.isNetwork(), False))
+        key_parameters = {}
+        if "network_analysis" in checks:
+            for parm in (_safe_call(lambda n=node: n.parms(), ()) or ()):
+                if _safe_call(lambda item=parm: item.isAtDefault(), True):
+                    continue
+                parm_name = _safe_call(lambda item=parm: item.name(), "") or ""
+                value = _raw_value(parm)
+                if parm_name and value is not None and len(key_parameters) < 32:
+                    key_parameters[parm_name] = value[:500]
+        nodes.append({
+            "path": path,
+            "name": name,
+            "type": type_name,
+            "parent_path": parent_path,
+            "depth": depth,
+            "is_network_container": is_network_container,
+            "child_count": child_count,
+            "inputs": input_paths,
+            "outputs": output_paths,
+            "key_parameters": key_parameters,
+            "comment": _safe_call(lambda n=node: n.comment(), "") or "" if "network_analysis" in checks else "",
+            "bypassed": bool(_safe_call(lambda n=node: n.isBypassed(), False)) if "network_analysis" in checks else False,
+            "network_boxes": network_boxes,
+        })
         lowered = f"{type_name} {name}".lower()
         if "workflow_rules" not in checks and not any(hint in lowered for hint in _KEY_TYPE_HINTS):
             continue
@@ -189,6 +394,16 @@ def _collect_scene(hou, max_nodes, checks):
         "fps": _safe_call(lambda: float(hou.fps()), None),
         "frame_range": _safe_call(lambda: list(hou.playbar.frameRange()), None),
         "nodes": nodes,
+        "node_groups": _group_network_nodes(nodes) if "network_analysis" in checks else [],
+        "network_containers": [
+            {
+                "path": node["path"],
+                "type": node["type"],
+                "depth": node["depth"],
+                "child_count": node["child_count"],
+            }
+            for node in nodes if node.get("is_network_container")
+        ] if "network_analysis" in checks else [],
         "key_nodes": key_nodes,
         "references": references,
         "scan_truncated": truncated,
@@ -364,6 +579,19 @@ def _evaluate(scene, project_fps=None, checks=None, include_manual=True):
             {"connections": abc_to_cache},
         ))
 
+    if "network_analysis" in checks:
+        groups = scene.get("node_groups", [])
+        findings.append(_finding(
+            "N", "N1 节点识别与逐组分析", "uncertain" if groups else "pass",
+            "已识别 {} 个节点并形成 {} 个分析组；仍需逐组进行语义评估。".format(len(scene.get("nodes", [])), len(groups)) if groups else "场景中没有可分析的节点。",
+            "按 network_analysis.group_tasks 和 container_tasks 逐组、逐容器完成报告。" if groups else "无需处理。",
+            {
+                "group_count": len(groups),
+                "container_count": len(scene.get("network_containers", [])),
+            },
+            "high",
+        ))
+
     manual_items = (
         ("A", "A1 ChooseTask 上下文", "重新执行 ChooseTask 并确认 tankconfig。"),
         ("A", "A2 项目目录结构", "人工核对 abc/audio/comp/desk/flip/geo/hda/render/scripts/sim/tex/video。"),
@@ -385,7 +613,7 @@ def _evaluate(scene, project_fps=None, checks=None, include_manual=True):
     if include_manual:
         for module, item, fix in manual_items:
             findings.append(_finding(module, item, "uncertain", "该项无法仅凭当前只读场景数据可靠判定。", fix, {"source": "manual_confirmation_required"}, "low"))
-    if scene.get("scan_truncated") and any(check in checks for check in ("node_naming", "cache_paths", "workflow_rules")):
+    if scene.get("scan_truncated") and any(check in checks for check in ("node_naming", "cache_paths", "workflow_rules", "network_analysis")):
         findings.append(_finding("F", "扫描完整性", "uncertain", "节点数超过 max_nodes，扫描结果已截断。", "提高 max_nodes 后重新运行。", {"scan_truncated": True}, "high"))
     return findings
 
@@ -413,12 +641,20 @@ def run(checks=None, project_fps=None, max_nodes=10000):
         "uncertain": sum(item["status"] == "uncertain" for item in findings),
         "pass": sum(item["status"] == "pass" for item in findings),
     }
+    network_analysis = None
+    if "network_analysis" in selected_checks:
+        network_analysis = _network_analysis_contract(
+            scene["nodes"], scene["node_groups"], scene["network_containers"]
+        )
+        network_analysis["scan_truncated"] = scene["scan_truncated"]
     return {
         "hip_path": scene["hip_path"],
+        "status": "analysis_required" if network_analysis is not None else "complete",
         "read_only": True,
         "checks": selected_checks,
         "summary": summary,
         "priority_fixes": [item for item in findings if item["status"] == "fail"],
         "findings": findings,
-        "scope": "仅检查流程和工程规范，不评价艺术效果，也不修改 HIP。",
+        "network_analysis": network_analysis,
+        "scope": "只读：输出逐组分析报告；不写节点注释，不创建或修改 NetworkBox，不修改 HIP。",
     }

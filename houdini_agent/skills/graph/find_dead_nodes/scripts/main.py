@@ -7,6 +7,16 @@
 
 
 
+def _flag(node, method_name):
+    method = getattr(node, method_name, None)
+    if not callable(method):
+        return False
+    try:
+        return bool(method())
+    except Exception:
+        return False
+
+
 def run(network_path):
     """入口函数
 
@@ -34,17 +44,17 @@ def run(network_path):
     render_node = None
 
     for node in children:
-        if node.isDisplayFlagSet():
+        if _flag(node, "isDisplayFlagSet"):
             display_node = node.path()
-        if hasattr(node, 'isRenderFlagSet') and node.isRenderFlagSet():
+        if _flag(node, "isRenderFlagSet"):
             render_node = node.path()
 
     for node in children:
         outputs = node.outputs()
         is_dead = (
             len(outputs) == 0
-            and not node.isDisplayFlagSet()
-            and (not hasattr(node, 'isRenderFlagSet') or not node.isRenderFlagSet())
+            and not _flag(node, "isDisplayFlagSet")
+            and not _flag(node, "isRenderFlagSet")
         )
 
         if is_dead:
