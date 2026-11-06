@@ -1105,6 +1105,7 @@ class MemoryManagerDialog(QtWidgets.QDialog):
                 cited_count=old.cited_count,
                 category=cat,
                 abstraction_level=self._sem_level.value(),
+                status=old.status,
                 embedding=None,
             )
             self._store.add_semantic(rec)

@@ -29,6 +29,33 @@ class SemanticMemoryTest(unittest.TestCase):
         self.store.close()
         self.temp_dir.cleanup()
 
+    def test_model_facing_searches_exclude_trial_rules(self):
+        active = SemanticRecord(
+            rule="Check active node paths before cooking",
+            confidence=0.9,
+            abstraction_level=0,
+            status="active",
+        )
+        trial = SemanticRecord(
+            rule="Check trial node paths before cooking",
+            confidence=0.9,
+            abstraction_level=0,
+            status="trial",
+        )
+        self.store.add_semantic(active)
+        self.store.add_semantic(trial)
+
+        searches = (
+            self.store.get_core_memories(max_count=10),
+            [record for record, _score in self.store.search_semantic("node paths", top_k=10)],
+            [record for record, _score in self.store.search_by_level("node paths", level=0, top_k=10)],
+            [record for record, _score in self.store.search_all_levels("node paths", top_k=10)],
+        )
+
+        for records in searches:
+            with self.subTest(records=records):
+                self.assertEqual([record.id for record in records], [active.id])
+
     def test_upsert_duplicate_merges_sources_without_claiming_usage(self):
         first, created = self.store.upsert_semantic(
             SemanticRecord(

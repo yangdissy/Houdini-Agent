@@ -732,7 +732,7 @@ class MemoryStore:
         ranked = self._rank_by_embedding(
             table="semantic_memory",
             query=query,
-            where_sql="confidence >= ?",
+            where_sql="status = 'active' AND confidence >= ?",
             where_params=(min_confidence,),
             top_k=top_k,
             weight_col="confidence",
@@ -844,7 +844,8 @@ class MemoryStore:
     def get_core_memories(self, max_count: int = 5, username: str = "") -> List[SemanticRecord]:
         """获取 level=0 核心记忆，按 confidence 降序，最多 max_count 条"""
         rows = self._fetchall(
-            "SELECT * FROM semantic_memory WHERE abstraction_level = 0 ORDER BY confidence DESC LIMIT ?",
+            "SELECT * FROM semantic_memory WHERE abstraction_level = 0 AND status = 'active' "
+            "ORDER BY confidence DESC LIMIT ?",
             (max_count,)
         )
         records = [self._row_to_semantic(row) for row in rows]
@@ -871,7 +872,7 @@ class MemoryStore:
         ranked = self._rank_by_embedding(
             table="semantic_memory",
             query=query,
-            where_sql="abstraction_level = ? AND confidence >= ?",
+            where_sql="abstraction_level = ? AND status = 'active' AND confidence >= ?",
             where_params=(level, min_confidence),
             top_k=top_k,
             weight_col="confidence",
@@ -909,9 +910,10 @@ class MemoryStore:
             [(record, similarity_score), ...] 按综合分降序
         """
         if category:
-            where_sql, where_params = "category = ? AND confidence >= ?", (category, min_confidence)
+            where_sql = "category = ? AND status = 'active' AND confidence >= ?"
+            where_params = (category, min_confidence)
         else:
-            where_sql, where_params = "confidence >= ?", (min_confidence,)
+            where_sql, where_params = "status = 'active' AND confidence >= ?", (min_confidence,)
         ranked = self._rank_by_embedding(
             table="semantic_memory",
             query=query,
