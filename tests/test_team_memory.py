@@ -20,6 +20,7 @@ from houdini_agent.utils.team_memory_document import (
 from houdini_agent.utils.team_memory_settings import (
     is_team_export_enabled,
     set_team_export_enabled,
+    withdraw_team_memory,
 )
 from houdini_agent.utils.team_memory_store import TeamMemoryStore, rebuild_team_memory
 
@@ -103,6 +104,10 @@ class BuildTeamExportPayloadTest(unittest.TestCase):
                 strategy_name="untested_strategy", description="没验证过",
                 priority=0.6, success_rate=0.9, usage_count=1,
             ))
+            store.add_procedural(ProceduralRecord(
+                strategy_name="trial_strategy", description="试验中的策略",
+                priority=0.8, success_rate=0.9, usage_count=5, status="trial",
+            ))
 
             payload = build_team_export_payload(store)
             store.close()
@@ -160,6 +165,24 @@ class ExportTeamMemoryToggleTest(unittest.TestCase):
                     set_team_export_enabled(username, expected)
                     self.assertEqual(is_team_export_enabled(username), expected)
 
+    def test_withdraw_disables_export_deletes_contribution_and_rebuilds(self):
+        with TemporaryDirectory() as repo_root:
+            with mock.patch("shared.user_paths.get_repo_root", return_value=repo_root):
+                username = "withdraw_tester"
+                memory_dir = Path(repo_root) / "cache" / "users" / username / "memory"
+                memory_dir.mkdir(parents=True)
+                export_path = memory_dir / "team_export.json"
+                export_path.write_text("{}", encoding="utf-8")
+
+                with mock.patch(
+                    "houdini_agent.utils.team_memory_store.rebuild_team_memory"
+                ) as rebuild:
+                    withdraw_team_memory(username)
+
+                self.assertFalse(is_team_export_enabled(username))
+                self.assertFalse(export_path.exists())
+                rebuild.assert_called_once_with()
+
     def test_save_falls_back_to_direct_write_when_atomic_replace_keeps_failing(self):
         """模拟网络盘 rename-replace 反复失败：应退化为直写而不是静默丢弃设置。"""
         with TemporaryDirectory() as repo_root:
@@ -170,6 +193,18 @@ class ExportTeamMemoryToggleTest(unittest.TestCase):
                 from pathlib import Path as _Path
                 with mock.patch.object(_Path, "replace", side_effect=OSError("simulated SMB lock")):
                     set_team_export_enabled(username, False)
+
+                self.assertFalse(is_team_export_enabled(username))
+
+    def test_corrupt_settings_fail_closed(self):
+        with TemporaryDirectory() as repo_root:
+            with mock.patch("shared.user_paths.get_repo_root", return_value=repo_root):
+                username = "corrupt_settings_tester"
+                memory_dir = Path(repo_root) / "cache" / "users" / username / "memory"
+                memory_dir.mkdir(parents=True)
+                (memory_dir / "team_export_settings.json").write_text(
+                    "{not-json", encoding="utf-8"
+                )
 
                 self.assertFalse(is_team_export_enabled(username))
 

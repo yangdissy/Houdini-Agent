@@ -35,19 +35,19 @@ def _settings_path(username: str) -> Path:
 
 
 def load_team_export_settings(username: str) -> Dict:
-    """读取用户的团队记忆共享设置，缺省/损坏时回退默认值。"""
+    """读取共享设置；文件缺省使用默认值，存在但无效时关闭共享。"""
     path = _settings_path(username)
     if not path.exists():
         return dict(_DEFAULT_SETTINGS)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
-            return dict(_DEFAULT_SETTINGS)
+            return {"enabled": False, "notice_shown": False}
         merged = dict(_DEFAULT_SETTINGS)
         merged.update(data)
         return merged
     except Exception:
-        return dict(_DEFAULT_SETTINGS)
+        return {"enabled": False, "notice_shown": False}
 
 
 def _save_team_export_settings(username: str, settings: Dict) -> None:
@@ -89,6 +89,18 @@ def set_team_export_enabled(username: str, enabled: bool) -> None:
     settings = load_team_export_settings(username)
     settings["enabled"] = bool(enabled)
     _save_team_export_settings(username, settings)
+
+
+def withdraw_team_memory(username: str) -> None:
+    """停止后续导出，删除当前贡献，并全量重建团队记忆库。"""
+    uname = normalize_username(username)
+    set_team_export_enabled(uname, False)
+    export_path = UserPaths(uname).memory_dir() / "team_export.json"
+    if export_path.exists():
+        export_path.unlink()
+
+    from .team_memory_store import rebuild_team_memory
+    rebuild_team_memory()
 
 
 def has_shown_team_export_notice(username: str) -> bool:

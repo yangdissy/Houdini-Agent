@@ -109,6 +109,10 @@ class SemanticRecord:
     abstraction_level: int = 2  # 0-5，默认 2（经验规则），见 ABSTRACTION_LEVELS
     status: str = "active"
     cited_count: int = 0
+    origin: str = "manual"
+    scope: Dict[str, str] = field(default_factory=dict)
+    validated_at: float = 0.0
+    supersedes_id: str = ""
 
     def __post_init__(self):
         if not self.id:
@@ -134,6 +138,13 @@ class ProceduralRecord:
     last_used: float = 0.0
     embedding: Optional[np.ndarray] = None
     conditions: List[str] = field(default_factory=list)   # 适用条件
+    status: str = "active"
+    origin: str = "manual"
+    source_episodes: List[str] = field(default_factory=list)
+    cited_count: int = 0
+    scope: Dict[str, str] = field(default_factory=dict)
+    validated_at: float = 0.0
+    supersedes_id: str = ""
 
     def __post_init__(self):
         if not self.id:
@@ -150,7 +161,7 @@ class MemoryStore:
     """三层记忆 SQLite 存储 + Embedding 向量检索"""
 
     EMBEDDING_BACKUP_RETENTION = 3
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, db_path: Optional[Path] = None, embedder: Optional[LocalEmbedder] = None):
         self.db_path = db_path or _DB_PATH
@@ -388,6 +399,7 @@ class MemoryStore:
         migrations = {
             1: cls._migrate_v1_add_abstraction_level,
             2: cls._migrate_v2_memory_quality,
+            3: cls._migrate_v3_memory_provenance,
         }
         for version in range(current_version + 1, cls.SCHEMA_VERSION + 1):
             migration = migrations[version]
@@ -419,6 +431,20 @@ class MemoryStore:
     def _migrate_v2_memory_quality(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE semantic_memory ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
         conn.execute("ALTER TABLE semantic_memory ADD COLUMN cited_count INTEGER NOT NULL DEFAULT 0")
+
+    @staticmethod
+    def _migrate_v3_memory_provenance(conn: sqlite3.Connection) -> None:
+        conn.execute("ALTER TABLE semantic_memory ADD COLUMN origin TEXT NOT NULL DEFAULT 'legacy'")
+        conn.execute("ALTER TABLE semantic_memory ADD COLUMN scope_json TEXT NOT NULL DEFAULT '{}'")
+        conn.execute("ALTER TABLE semantic_memory ADD COLUMN validated_at REAL NOT NULL DEFAULT 0.0")
+        conn.execute("ALTER TABLE semantic_memory ADD COLUMN supersedes_id TEXT NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE procedural_memory ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+        conn.execute("ALTER TABLE procedural_memory ADD COLUMN origin TEXT NOT NULL DEFAULT 'legacy'")
+        conn.execute("ALTER TABLE procedural_memory ADD COLUMN source_episodes TEXT NOT NULL DEFAULT '[]'")
+        conn.execute("ALTER TABLE procedural_memory ADD COLUMN cited_count INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE procedural_memory ADD COLUMN scope_json TEXT NOT NULL DEFAULT '{}'")
+        conn.execute("ALTER TABLE procedural_memory ADD COLUMN validated_at REAL NOT NULL DEFAULT 0.0")
+        conn.execute("ALTER TABLE procedural_memory ADD COLUMN supersedes_id TEXT NOT NULL DEFAULT ''")
 
     def get_quality_stats(self) -> dict:
         return summarize_quality(self.db_path.parent)
@@ -588,8 +614,9 @@ class MemoryStore:
         self._execute(
             """INSERT OR REPLACE INTO semantic_memory
                (id, created_at, updated_at, rule, source_episodes,
-                confidence, activation_count, embedding, category, abstraction_level, status, cited_count)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                confidence, activation_count, embedding, category, abstraction_level, status, cited_count,
+                origin, scope_json, validated_at, supersedes_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 record.id,
                 record.created_at,
@@ -603,6 +630,10 @@ class MemoryStore:
                 record.abstraction_level,
                 record.status,
                 record.cited_count,
+                record.origin,
+                json.dumps(record.scope, ensure_ascii=False),
+                record.validated_at,
+                record.supersedes_id,
             ),
         )
         self._commit()
@@ -626,6 +657,7 @@ class MemoryStore:
                 if reason:
                     return record, False
                 record.status = "trial"
+                record.origin = source
                 record.abstraction_level = max(1, record.abstraction_level)
                 record.confidence = min(record.confidence, self.quality_policy["trial_confidence_cap"])
             existing = self.find_duplicate_semantic(
@@ -951,8 +983,9 @@ class MemoryStore:
         self._execute(
             """INSERT OR REPLACE INTO procedural_memory
                (id, strategy_name, description, priority, success_rate,
-                usage_count, last_used, embedding, conditions)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                usage_count, last_used, embedding, conditions, status, origin,
+                source_episodes, cited_count, scope_json, validated_at, supersedes_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 record.id,
                 record.strategy_name,
@@ -963,6 +996,13 @@ class MemoryStore:
                 record.last_used,
                 self.embedder.to_bytes(record.embedding),
                 json.dumps(record.conditions, ensure_ascii=False),
+                record.status,
+                record.origin,
+                json.dumps(record.source_episodes, ensure_ascii=False),
+                record.cited_count,
+                json.dumps(record.scope, ensure_ascii=False),
+                record.validated_at,
+                record.supersedes_id,
             ),
         )
         self._commit()
@@ -979,7 +1019,7 @@ class MemoryStore:
         ranked = self._rank_by_embedding(
             table="procedural_memory",
             query=query,
-            where_sql="1=1",
+            where_sql="status = 'active'",
             where_params=(),
             top_k=top_k,
             weight_col="priority",
@@ -1332,6 +1372,10 @@ class MemoryStore:
             abstraction_level=row[9] if len(row) > 9 and row[9] is not None else 2,
             status=row[10],
             cited_count=row[11],
+            origin=row[12],
+            scope=json.loads(row[13]) if row[13] else {},
+            validated_at=row[14],
+            supersedes_id=row[15],
         )
 
     def _row_to_procedural(self, row) -> ProceduralRecord:
@@ -1345,6 +1389,13 @@ class MemoryStore:
             last_used=row[6],
             embedding=self.embedder.from_bytes(row[7]) if row[7] else None,
             conditions=json.loads(row[8]) if row[8] else [],
+            status=row[9],
+            origin=row[10],
+            source_episodes=json.loads(row[11]) if row[11] else [],
+            cited_count=row[12],
+            scope=json.loads(row[13]) if row[13] else {},
+            validated_at=row[14],
+            supersedes_id=row[15],
         )
 
     # ==========================================================

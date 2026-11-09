@@ -784,6 +784,7 @@ class ReflectionModule:
         ai_client: Any,
         model: str,
         provider: str,
+        memory_scope: Optional[Dict[str, str]] = None,
     ) -> Dict:
         """深度睡眠：上下文压缩前，总结全部上下文写入长期记忆
 
@@ -796,11 +797,13 @@ class ReflectionModule:
             ai_client: AI 客户端实例
             model: 当前使用的模型
             provider: 当前使用的提供商
+            memory_scope: 调用方确认的记忆适用范围；不提供表示全局适用
 
         Returns:
             {"success": bool, "episodic_id": str, "new_rules": [...], "new_strategies": [...]}
         """
         result = {"success": False, "episodic_id": None, "new_rules": [], "new_strategies": []}
+        scope = dict(memory_scope or {})
 
         if not all_messages:
             return result
@@ -851,6 +854,7 @@ class ReflectionModule:
                     confidence=rule_data["confidence"],
                     category=rule_data["category"],
                     abstraction_level=rule_data["abstraction_level"],
+                    scope=scope,
                 )
                 _, created = self.store.upsert_semantic(
                     record,
@@ -875,6 +879,10 @@ class ReflectionModule:
                         description=desc,
                         priority=0.6,
                         conditions=strat_data.get("conditions", []),
+                        status="trial",
+                        origin="deep_sleep",
+                        source_episodes=[result["episodic_id"]] if result["episodic_id"] else [],
+                        scope=scope,
                     )
                     self.store.add_procedural(record)
                     result["new_strategies"].append(name)
@@ -888,6 +896,7 @@ class ReflectionModule:
                         confidence=0.5,
                         category="preference",
                         abstraction_level=1,
+                        scope=scope,
                     )
                     _, created = self.store.upsert_semantic(
                         record,

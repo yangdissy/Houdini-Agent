@@ -1130,6 +1130,8 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         q = self._filter_proc.text().strip().lower()
         for rec in self._store.get_all_procedural():
             line = f"{rec.strategy_name or '—'} | prio={rec.priority:.2f}"
+            if rec.status == "trial":
+                line = tr("memory_mgr.trial_prefix") + " " + line
             if q and q not in line.lower() and q not in (rec.id or "").lower():
                 continue
             it = QtWidgets.QListWidgetItem(line[:200])
@@ -1224,6 +1226,13 @@ class MemoryManagerDialog(QtWidgets.QDialog):
                 usage_count=old.usage_count,
                 last_used=old.last_used,
                 conditions=conds,
+                status=old.status,
+                origin=old.origin,
+                source_episodes=old.source_episodes,
+                cited_count=old.cited_count,
+                scope=old.scope,
+                validated_at=old.validated_at,
+                supersedes_id=old.supersedes_id,
                 embedding=None,
             )
             self._store.add_procedural(rec)

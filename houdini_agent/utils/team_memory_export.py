@@ -51,7 +51,7 @@ def _semantic_export_entry(record) -> Optional[dict]:
 
 
 def _procedural_export_entry(record) -> Optional[dict]:
-    if not procedural_eligibility(record)[0]:
+    if record.status != "active" or not procedural_eligibility(record)[0]:
         return None
     return {
         "strategy_name": record.strategy_name,

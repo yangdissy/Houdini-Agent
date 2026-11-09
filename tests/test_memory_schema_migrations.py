@@ -48,14 +48,24 @@ class MemorySchemaMigrationTest(unittest.TestCase):
             conn = sqlite3.connect(str(path))
             try:
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
-                columns = {
+                semantic_columns = {
                     row[1] for row in conn.execute("PRAGMA table_info(semantic_memory)")
+                }
+                procedural_columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(procedural_memory)")
                 }
             finally:
                 conn.close()
 
             self.assertEqual(version, MemoryStore.SCHEMA_VERSION)
-            self.assertIn("abstraction_level", columns)
+            self.assertTrue({
+                "abstraction_level", "status", "cited_count", "origin", "scope_json",
+                "validated_at", "supersedes_id",
+            }.issubset(semantic_columns))
+            self.assertTrue({
+                "status", "origin", "source_episodes", "cited_count", "scope_json",
+                "validated_at", "supersedes_id",
+            }.issubset(procedural_columns))
 
     def test_legacy_database_is_upgraded_without_losing_data(self):
         with TemporaryDirectory() as temp_dir:
@@ -69,6 +79,8 @@ class MemorySchemaMigrationTest(unittest.TestCase):
                 self.assertEqual(saved.abstraction_level, 2)
                 self.assertEqual(saved.status, "active")
                 self.assertEqual(saved.cited_count, 0)
+                self.assertEqual(saved.origin, "legacy")
+                self.assertEqual(saved.scope, {})
             finally:
                 store.close()
 

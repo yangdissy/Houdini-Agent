@@ -416,9 +416,18 @@ class HeaderMixin:
         没有正在进行的 Agent 回复时会被静默丢弃（菜单动作常常在无活跃会话时触发）。
         """
         try:
-            set_team_export_enabled(username, enabled)
+            if enabled:
+                set_team_export_enabled(username, True)
+            else:
+                from ..utils.team_memory_settings import withdraw_team_memory
+                withdraw_team_memory(username)
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Team Memory Sharing",
+                    "团队记忆共享已关闭，当前贡献已从团队记忆库撤回。",
+                )
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Team Memory Sharing", f"设置保存失败，请重试: {e}")
+            QtWidgets.QMessageBox.critical(self, "Team Memory Sharing", f"设置或撤回失败，请重试: {e}")
 
     def _rebuild_team_memory_from_menu(self):
         """开发模式动作：全量扫描所有成员的 team_export.json，去重合并写入团队记忆库。
