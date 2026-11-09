@@ -3116,6 +3116,12 @@ QPushButton#memoryMgrBtnDanger:hover {
     background: rgba(180,60,60,28); color: #e0a8a8;
     border-color: rgba(180,60,60,35);
 }
+QPushButton#memoryMgrBtnPrimary:disabled,
+QPushButton#memoryMgrBtnSecondary:disabled,
+QPushButton#memoryMgrBtnDanger:disabled {
+    background: rgba(255,255,255,3); color: #4f4b46;
+    border: 1px solid rgba(255,255,255,4);
+}
 
 /* ── Footer ── */
 QFrame#memoryMgrFooter {

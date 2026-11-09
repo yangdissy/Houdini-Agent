@@ -84,6 +84,39 @@ class ProceduralMemoryTest(unittest.TestCase):
         self.assertEqual(saved.cited_count, 2)
         self.assertEqual(saved.scope, {"houdini_version": "21.0"})
 
+    def test_manual_lifecycle_transitions_are_strict_and_atomic(self):
+        approved = ProceduralRecord(
+            strategy_name="approved_strategy",
+            description="Validate approved node paths",
+            status="trial",
+        )
+        deprecated = ProceduralRecord(
+            strategy_name="deprecated_strategy",
+            description="Validate obsolete node paths",
+            status="trial",
+        )
+        self.store.add_procedural(approved)
+        self.store.add_procedural(deprecated)
+
+        self.assertTrue(self.store.transition_procedural_status(approved.id, "active"))
+        self.assertTrue(self.store.transition_procedural_status(deprecated.id, "deprecated"))
+
+        approved_saved = self.store.get_procedural(approved.id)
+        deprecated_saved = self.store.get_procedural(deprecated.id)
+        self.assertEqual(approved_saved.status, "active")
+        self.assertGreater(approved_saved.validated_at, 0)
+        self.assertEqual(deprecated_saved.status, "deprecated")
+        self.assertEqual(deprecated_saved.validated_at, 0)
+        self.assertEqual(
+            [record.id for record, _score in self.store.search_procedural("node paths", top_k=10)],
+            [approved.id],
+        )
+
+        self.assertFalse(self.store.transition_procedural_status(approved.id, "deprecated"))
+        self.assertFalse(self.store.transition_procedural_status(deprecated.id, "active"))
+        self.assertFalse(self.store.transition_procedural_status("missing", "active"))
+        self.assertFalse(self.store.transition_procedural_status(approved.id, "unknown"))
+
     def test_deep_sleep_does_not_count_strategy_consolidation_as_usage(self):
         record = ProceduralRecord(
             strategy_name="validate_before_cook",

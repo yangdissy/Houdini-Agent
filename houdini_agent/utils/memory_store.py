@@ -812,6 +812,22 @@ class MemoryStore:
         )
         self._commit()
 
+    def transition_semantic_status(self, record_id: str, target_status: str) -> bool:
+        """人工审核 trial 语义记忆；active/deprecated 均为终态。"""
+        if target_status not in {"active", "deprecated"}:
+            return False
+        now = time.time()
+        validated_at = now if target_status == "active" else 0.0
+        with self._db_lock:
+            cursor = self._get_conn().execute(
+                """UPDATE semantic_memory
+                   SET status=?, validated_at=?, updated_at=?
+                   WHERE id=? AND status='trial'""",
+                (target_status, validated_at, now, record_id),
+            )
+            self._get_conn().commit()
+            return cursor.rowcount == 1
+
     def find_duplicate_semantic(
         self,
         rule_text: str,
@@ -1081,6 +1097,21 @@ class MemoryStore:
             (priority_delta, record_id)
         )
         self._commit()
+
+    def transition_procedural_status(self, record_id: str, target_status: str) -> bool:
+        """人工审核 trial 策略记忆；active/deprecated 均为终态。"""
+        if target_status not in {"active", "deprecated"}:
+            return False
+        validated_at = time.time() if target_status == "active" else 0.0
+        with self._db_lock:
+            cursor = self._get_conn().execute(
+                """UPDATE procedural_memory
+                   SET status=?, validated_at=?
+                   WHERE id=? AND status='trial'""",
+                (target_status, validated_at, record_id),
+            )
+            self._get_conn().commit()
+            return cursor.rowcount == 1
 
     def count_procedural(self) -> int:
         row = self._fetchone("SELECT COUNT(*) FROM procedural_memory")

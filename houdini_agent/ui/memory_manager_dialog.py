@@ -19,6 +19,7 @@ from typing import Optional, Tuple
 from houdini_agent.qt_compat import QtWidgets, QtCore, QtGui
 
 from .i18n import tr, language_changed
+from .memory_lifecycle import lifecycle_ui_state, memory_status_prefix_key
 from .theme_engine import ThemeEngine
 from ..utils.memory_store import (
     get_memory_store,
@@ -643,6 +644,10 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         self._lbl_semid, self._sem_id = self._editable_line_pair(form)
         self._sem_id.setReadOnly(True)
         self._sem_id.setObjectName("memoryMgrLineReadOnly")
+        sem_meta = QtWidgets.QGridLayout()
+        self._lbl_semstatus, self._sem_status = self._ro_field(sem_meta, 0, 0, 2)
+        self._lbl_semvalidated, self._sem_validated = self._ro_field(sem_meta, 0, 2, 2)
+        form.addLayout(sem_meta)
 
         form.addWidget(self._section_label("memory_mgr.sec_rule"))
         self._lbl_semrule = QtWidgets.QLabel()
@@ -716,9 +721,15 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         sb = QtWidgets.QHBoxLayout()
         self._btn_sem_save = self._toolbar_btn_primary()
         self._btn_sem_save.clicked.connect(self._save_semantic)
+        self._btn_sem_approve = self._toolbar_btn_primary()
+        self._btn_sem_approve.clicked.connect(lambda: self._transition_semantic("active"))
+        self._btn_sem_deprecate = self._toolbar_btn_danger()
+        self._btn_sem_deprecate.clicked.connect(lambda: self._transition_semantic("deprecated"))
         self._btn_sem_delete = self._toolbar_btn_danger()
         self._btn_sem_delete.clicked.connect(self._delete_semantic)
         sb.addWidget(self._btn_sem_save)
+        sb.addWidget(self._btn_sem_approve)
+        sb.addWidget(self._btn_sem_deprecate)
         sb.addWidget(self._btn_sem_delete)
         sb.addStretch()
         form.addLayout(sb)
@@ -796,6 +807,10 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         self._lbl_pid, self._proc_id = self._editable_line_pair(form)
         self._proc_id.setReadOnly(True)
         self._proc_id.setObjectName("memoryMgrLineReadOnly")
+        proc_meta = QtWidgets.QGridLayout()
+        self._lbl_pstatus, self._proc_status = self._ro_field(proc_meta, 0, 0, 2)
+        self._lbl_pvalidated, self._proc_validated = self._ro_field(proc_meta, 0, 2, 2)
+        form.addLayout(proc_meta)
 
         form.addWidget(self._section_label("memory_mgr.sec_strategy"))
         self._lbl_pname = QtWidgets.QLabel()
@@ -842,9 +857,15 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         pb = QtWidgets.QHBoxLayout()
         self._btn_proc_save = self._toolbar_btn_primary()
         self._btn_proc_save.clicked.connect(self._save_procedural)
+        self._btn_proc_approve = self._toolbar_btn_primary()
+        self._btn_proc_approve.clicked.connect(lambda: self._transition_procedural("active"))
+        self._btn_proc_deprecate = self._toolbar_btn_danger()
+        self._btn_proc_deprecate.clicked.connect(lambda: self._transition_procedural("deprecated"))
         self._btn_proc_delete = self._toolbar_btn_danger()
         self._btn_proc_delete.clicked.connect(self._delete_procedural)
         pb.addWidget(self._btn_proc_save)
+        pb.addWidget(self._btn_proc_approve)
+        pb.addWidget(self._btn_proc_deprecate)
         pb.addWidget(self._btn_proc_delete)
         pb.addStretch()
         form.addLayout(pb)
@@ -1003,8 +1024,9 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         q = self._filter_sem.text().strip().lower()
         for rec in self._store.get_all_semantic(category=None):
             line = f"[L{rec.abstraction_level}][{rec.category}] {(rec.rule or '')[:80]}"
-            if rec.status == "trial":
-                line = tr("memory_mgr.trial_prefix") + " " + line
+            prefix_key = memory_status_prefix_key(rec.status)
+            if prefix_key:
+                line = tr(prefix_key) + " " + line
             if q and q not in line.lower() and q not in (rec.id or "").lower():
                 continue
             it = QtWidgets.QListWidgetItem(line if len(line) <= 200 else line[:197] + "…")
@@ -1018,17 +1040,22 @@ class MemoryManagerDialog(QtWidgets.QDialog):
     def _clear_sem_form(self):
         self._creating_semantic = False
         self._sem_id.clear()
+        self._sem_status.clear()
+        self._sem_validated.clear()
         self._sem_rule.clear()
         self._sem_cat.setCurrentIndex(0)
         self._sem_conf.setValue(0.8)
         self._sem_level.setValue(2)
         self._sem_act.setValue(0)
         self._sem_episodes.clear()
+        self._set_semantic_lifecycle_state(None)
 
     def _new_semantic(self):
         self._creating_semantic = True
         self._list_sem.clearSelection()
         self._sem_id.clear()
+        self._sem_status.setText("active")
+        self._sem_validated.clear()
         self._sem_rule.clear()
         _gi = self._sem_cat.findData("general")
         self._sem_cat.setCurrentIndex(_gi if _gi >= 0 else 0)
@@ -1036,6 +1063,7 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         self._sem_level.setValue(2)
         self._sem_act.setValue(0)
         self._sem_episodes.clear()
+        self._set_semantic_lifecycle_state("new")
 
     def _on_sem_selected(self, cur: Optional[QtWidgets.QListWidgetItem], prev):
         if not cur:
@@ -1048,6 +1076,8 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         if not rec:
             return
         self._sem_id.setText(rec.id)
+        self._sem_status.setText(rec.status)
+        self._sem_validated.setText(self._fmt_ts(rec.validated_at) if rec.validated_at else "")
         self._sem_rule.setPlainText(rec.rule or "")
         idx = self._sem_cat.findData(rec.category)
         if idx >= 0:
@@ -1061,6 +1091,29 @@ class MemoryManagerDialog(QtWidgets.QDialog):
             )
         except Exception:
             self._sem_episodes.setPlainText("[]")
+        self._set_semantic_lifecycle_state(rec.status)
+
+    def _set_semantic_lifecycle_state(self, status: Optional[str]):
+        can_approve, can_deprecate, can_edit, can_delete = lifecycle_ui_state(status)
+        self._btn_sem_approve.setEnabled(can_approve)
+        self._btn_sem_deprecate.setEnabled(can_deprecate)
+        for widget in (self._sem_rule, self._sem_cat, self._sem_conf, self._sem_level, self._sem_episodes):
+            widget.setEnabled(can_edit)
+        self._btn_sem_save.setEnabled(can_edit)
+        self._btn_sem_delete.setEnabled(can_delete and status != "new")
+
+    def _transition_semantic(self, target_status: str):
+        rid = self._sem_id.text().strip()
+        if not rid:
+            return
+        if target_status == "deprecated" and not self._sheet_confirm(tr("memory_mgr.deprecate_confirm")):
+            return
+        if not self._store.transition_semantic_status(rid, target_status):
+            self._sheet_warn(tr("memory_mgr.transition_failed"))
+            return
+        self._sheet_info(tr("memory_mgr.transition_ok"))
+        self._reload_semantic_list()
+        self._select_list_id(self._list_sem, rid)
 
     def _save_semantic(self):
         rule = self._sem_rule.toPlainText().strip()
@@ -1106,6 +1159,10 @@ class MemoryManagerDialog(QtWidgets.QDialog):
                 category=cat,
                 abstraction_level=self._sem_level.value(),
                 status=old.status,
+                origin=old.origin,
+                scope=old.scope,
+                validated_at=old.validated_at,
+                supersedes_id=old.supersedes_id,
                 embedding=None,
             )
             self._store.add_semantic(rec)
@@ -1130,8 +1187,9 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         q = self._filter_proc.text().strip().lower()
         for rec in self._store.get_all_procedural():
             line = f"{rec.strategy_name or '—'} | prio={rec.priority:.2f}"
-            if rec.status == "trial":
-                line = tr("memory_mgr.trial_prefix") + " " + line
+            prefix_key = memory_status_prefix_key(rec.status)
+            if prefix_key:
+                line = tr(prefix_key) + " " + line
             if q and q not in line.lower() and q not in (rec.id or "").lower():
                 continue
             it = QtWidgets.QListWidgetItem(line[:200])
@@ -1146,16 +1204,21 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         self._creating_procedural = False
         for w in (self._proc_id, self._proc_name, self._proc_last):
             w.clear()
+        self._proc_status.clear()
+        self._proc_validated.clear()
         self._proc_desc.clear()
         self._proc_priority.setValue(0.5)
         self._proc_srate.setValue(0.5)
         self._proc_usage.setValue(0)
         self._proc_conds.setPlainText("[]")
+        self._set_procedural_lifecycle_state(None)
 
     def _new_procedural(self):
         self._creating_procedural = True
         self._list_proc.clearSelection()
         self._proc_id.clear()
+        self._proc_status.setText("active")
+        self._proc_validated.clear()
         self._proc_name.clear()
         self._proc_desc.clear()
         self._proc_priority.setValue(0.5)
@@ -1163,6 +1226,7 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         self._proc_usage.setValue(0)
         self._proc_last.clear()
         self._proc_conds.setPlainText("[]")
+        self._set_procedural_lifecycle_state("new")
 
     def _on_proc_selected(self, cur: Optional[QtWidgets.QListWidgetItem], prev):
         if not cur:
@@ -1175,6 +1239,8 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         if not rec:
             return
         self._proc_id.setText(rec.id)
+        self._proc_status.setText(rec.status)
+        self._proc_validated.setText(self._fmt_ts(rec.validated_at) if rec.validated_at else "")
         self._proc_name.setText(rec.strategy_name or "")
         self._proc_desc.setPlainText(rec.description or "")
         self._proc_priority.setValue(float(rec.priority))
@@ -1187,6 +1253,29 @@ class MemoryManagerDialog(QtWidgets.QDialog):
             )
         except Exception:
             self._proc_conds.setPlainText("[]")
+        self._set_procedural_lifecycle_state(rec.status)
+
+    def _set_procedural_lifecycle_state(self, status: Optional[str]):
+        can_approve, can_deprecate, can_edit, can_delete = lifecycle_ui_state(status)
+        self._btn_proc_approve.setEnabled(can_approve)
+        self._btn_proc_deprecate.setEnabled(can_deprecate)
+        for widget in (self._proc_name, self._proc_desc, self._proc_priority, self._proc_srate, self._proc_conds):
+            widget.setEnabled(can_edit)
+        self._btn_proc_save.setEnabled(can_edit)
+        self._btn_proc_delete.setEnabled(can_delete and status != "new")
+
+    def _transition_procedural(self, target_status: str):
+        rid = self._proc_id.text().strip()
+        if not rid:
+            return
+        if target_status == "deprecated" and not self._sheet_confirm(tr("memory_mgr.deprecate_confirm")):
+            return
+        if not self._store.transition_procedural_status(rid, target_status):
+            self._sheet_warn(tr("memory_mgr.transition_failed"))
+            return
+        self._sheet_info(tr("memory_mgr.transition_ok"))
+        self._reload_procedural_list()
+        self._select_list_id(self._list_proc, rid)
 
     def _save_procedural(self):
         name = self._proc_name.text().strip()
@@ -1291,8 +1380,12 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         self._btn_epi_save.setText(tr("memory_mgr.save"))
         self._btn_epi_delete.setText(tr("memory_mgr.delete"))
         self._btn_sem_save.setText(tr("memory_mgr.save"))
+        self._btn_sem_approve.setText(tr("memory_mgr.approve"))
+        self._btn_sem_deprecate.setText(tr("memory_mgr.deprecate"))
         self._btn_sem_delete.setText(tr("memory_mgr.delete"))
         self._btn_proc_save.setText(tr("memory_mgr.save"))
+        self._btn_proc_approve.setText(tr("memory_mgr.approve"))
+        self._btn_proc_deprecate.setText(tr("memory_mgr.deprecate"))
         self._btn_proc_delete.setText(tr("memory_mgr.delete"))
         self._btn_close.setText(tr("btn.close"))
 
@@ -1310,6 +1403,8 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         self._lbl_epact.setText(tr("memory_mgr.field_actions_json"))
 
         self._lbl_semid.setText(tr("memory_mgr.field_id"))
+        self._lbl_semstatus.setText(tr("memory_mgr.field_status"))
+        self._lbl_semvalidated.setText(tr("memory_mgr.field_validated_at"))
         self._lbl_semrule.setText(tr("memory_mgr.field_rule"))
         self._lbl_semcat.setText(tr("memory_mgr.field_category"))
         self._lbl_semconf.setText(tr("memory_mgr.field_confidence"))
@@ -1318,6 +1413,8 @@ class MemoryManagerDialog(QtWidgets.QDialog):
         self._lbl_semeps.setText(tr("memory_mgr.field_sources_json"))
 
         self._lbl_pid.setText(tr("memory_mgr.field_id"))
+        self._lbl_pstatus.setText(tr("memory_mgr.field_status"))
+        self._lbl_pvalidated.setText(tr("memory_mgr.field_validated_at"))
         self._lbl_pname.setText(tr("memory_mgr.field_strategy"))
         self._lbl_pdesc.setText(tr("memory_mgr.field_description"))
         self._lbl_ppri.setText(tr("memory_mgr.field_priority"))

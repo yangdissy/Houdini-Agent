@@ -56,6 +56,39 @@ class SemanticMemoryTest(unittest.TestCase):
             with self.subTest(records=records):
                 self.assertEqual([record.id for record in records], [active.id])
 
+    def test_manual_lifecycle_transitions_are_strict_and_atomic(self):
+        approved = SemanticRecord(
+            rule="Validate approved node paths before cooking",
+            confidence=0.9,
+            status="trial",
+        )
+        deprecated = SemanticRecord(
+            rule="Validate obsolete node paths before cooking",
+            confidence=0.9,
+            status="trial",
+        )
+        self.store.add_semantic(approved)
+        self.store.add_semantic(deprecated)
+
+        self.assertTrue(self.store.transition_semantic_status(approved.id, "active"))
+        self.assertTrue(self.store.transition_semantic_status(deprecated.id, "deprecated"))
+
+        approved_saved = self.store.get_semantic(approved.id)
+        deprecated_saved = self.store.get_semantic(deprecated.id)
+        self.assertEqual(approved_saved.status, "active")
+        self.assertGreater(approved_saved.validated_at, 0)
+        self.assertEqual(deprecated_saved.status, "deprecated")
+        self.assertEqual(deprecated_saved.validated_at, 0)
+        self.assertEqual(
+            [record.id for record, _score in self.store.search_semantic("node paths", top_k=10)],
+            [approved.id],
+        )
+
+        self.assertFalse(self.store.transition_semantic_status(approved.id, "deprecated"))
+        self.assertFalse(self.store.transition_semantic_status(deprecated.id, "active"))
+        self.assertFalse(self.store.transition_semantic_status("missing", "active"))
+        self.assertFalse(self.store.transition_semantic_status(approved.id, "unknown"))
+
     def test_upsert_duplicate_merges_sources_without_claiming_usage(self):
         first, created = self.store.upsert_semantic(
             SemanticRecord(
