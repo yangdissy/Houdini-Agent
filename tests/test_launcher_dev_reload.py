@@ -17,9 +17,15 @@ class LauncherDevReloadTest(unittest.TestCase):
             name: module
             for name, module in sys.modules.items()
             if name == "houdini_agent" or name.startswith("houdini_agent.")
+            or name == "shared" or name.startswith("shared.")
+            or name == "plugins" or name.startswith("plugins.")
         }
         stale_module = types.ModuleType("houdini_agent.core.send_orchestrator_mixin")
         sys.modules[stale_module.__name__] = stale_module
+        stale_shared = types.ModuleType("shared.user_paths")
+        sys.modules[stale_shared.__name__] = stale_shared
+        stale_plugin = types.ModuleType("plugins.example")
+        sys.modules[stale_plugin.__name__] = stale_plugin
         observed_reload_values = []
 
         fake_main = types.ModuleType("houdini_agent.main")
@@ -46,7 +52,7 @@ class LauncherDevReloadTest(unittest.TestCase):
 
         old_reload = os.environ.get("HOUDINI_AGENT_DEV_RELOAD")
         os.environ["HOUDINI_AGENT_DEV_RELOAD"] = "1"
-        stale_module_was_cleared = False
+        stale_modules_were_cleared = False
         try:
             with mock.patch.object(
                 houdini_agent_launcher, "_is_dev_reload_enabled", return_value=True
@@ -66,8 +72,10 @@ class LauncherDevReloadTest(unittest.TestCase):
                     houdini_agent_launcher.__dict__, {"_register_pkg": fake_register}, clear=False
                 ):
                     result = houdini_agent_launcher.launch_houdini_agent()
-                    stale_module_was_cleared = (
+                    stale_modules_were_cleared = (
                         sys.modules.get(stale_module.__name__) is not stale_module
+                        and sys.modules.get(stale_shared.__name__) is not stale_shared
+                        and sys.modules.get(stale_plugin.__name__) is not stale_plugin
                     )
         finally:
             if old_reload is None:
@@ -75,12 +83,14 @@ class LauncherDevReloadTest(unittest.TestCase):
             else:
                 os.environ["HOUDINI_AGENT_DEV_RELOAD"] = old_reload
             for name in list(sys.modules):
-                if name == "houdini_agent" or name.startswith("houdini_agent."):
+                if name == "houdini_agent" or name.startswith("houdini_agent.") \
+                    or name == "shared" or name.startswith("shared.") \
+                    or name == "plugins" or name.startswith("plugins."):
                     sys.modules.pop(name, None)
             sys.modules.update(saved_modules)
 
         self.assertEqual("window", result)
-        self.assertTrue(stale_module_was_cleared)
+        self.assertTrue(stale_modules_were_cleared)
         self.assertEqual(["0"], observed_reload_values)
 
 

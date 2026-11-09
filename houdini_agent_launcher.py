@@ -79,9 +79,17 @@ def launch_houdini_agent():
             traceback.print_exc()
             return None
 
-    # 开发模式：清理整个包，确保新拆分出的 mixin、Registry 和 schema 都从磁盘重载。
+    # 开发模式：清理所有即将重新注册的包，避免新父包挂着旧子模块。
     for mod_name in list(sys.modules.keys()):
-        if mod_name == 'main' or mod_name == 'houdini_agent' or mod_name.startswith('houdini_agent.'):
+        if (
+            mod_name == 'main'
+            or mod_name == 'houdini_agent'
+            or mod_name.startswith('houdini_agent.')
+            or mod_name == 'shared'
+            or mod_name.startswith('shared.')
+            or mod_name == 'plugins'
+            or mod_name.startswith('plugins.')
+        ):
             del sys.modules[mod_name]
 
     try:
