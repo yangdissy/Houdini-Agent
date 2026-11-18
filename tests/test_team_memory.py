@@ -16,6 +16,7 @@ from houdini_agent.utils.team_memory_export import (
 from houdini_agent.utils.team_memory_document import (
     MAX_EXPORT_FILE_BYTES,
     parse_team_export_file,
+    semantic_eligibility,
 )
 from houdini_agent.utils.team_memory_settings import (
     is_team_export_enabled,
@@ -125,6 +126,32 @@ class BuildTeamExportPayloadTest(unittest.TestCase):
             self.assertEqual(payload["semantic"][0]["embedding_dimension"], store.embedder.dim)
             self.assertEqual(payload["semantic"][0]["embedding_format_version"], 1)
             store.close()
+
+
+class TeamMemoryEligibilityTest(unittest.TestCase):
+    def test_rejects_context_bound_rules_but_keeps_general_houdini_knowledge(self):
+        def entry(rule):
+            return SemanticRecord(
+                rule=rule,
+                category="knowledge",
+                abstraction_level=2,
+                confidence=0.8,
+            )
+
+        accepted = semantic_eligibility(entry(
+            "烟雾不可见时先检查缓存体积数据以及 Display 和 Render 标志。"
+        ))
+        self.assertEqual(accepted, (True, "eligible"))
+
+        rejected = {
+            "当前工程中 /obj/FX_eyes/pathdeform6 的输入来自 null21。": "semantic_project_context",
+            "用户允许助手读取当前选中节点和内部 DOP 参数。": "semantic_user_context",
+            "Houdini Agent 的某个 skill 不支持 attributes 参数。": "semantic_agent_internal",
+            "Attribute Noise 旧版参数包括 basis 和 attrib": "semantic_truncated",
+        }
+        for rule, reason in rejected.items():
+            with self.subTest(rule=rule):
+                self.assertEqual(semantic_eligibility(entry(rule)), (False, reason))
 
 
 class ExportTeamMemoryToggleTest(unittest.TestCase):
@@ -439,6 +466,18 @@ class RebuildTeamMemoryTest(unittest.TestCase):
             self.assertEqual(path.read_bytes(), b"old-live-db")
             self.assertIn("final team text", embedder.encoded_texts)
 
+    def test_rebuild_sidecar_cleanup_failure_preserves_live_db(self):
+        with TemporaryDirectory() as db_dir:
+            live_path = Path(db_dir) / "team_memory.db"
+            live_path.write_bytes(b"old-live-db")
+            with mock.patch(
+                "houdini_agent.utils.team_memory_store._remove_sqlite_sidecars",
+                side_effect=OSError("sidecar locked"),
+            ):
+                with self.assertRaises(OSError):
+                    rebuild_team_memory(FakeEmbedder(), live_path, [])
+            self.assertEqual(live_path.read_bytes(), b"old-live-db")
+
     def test_rebuild_refreshes_default_singleton(self):
         import houdini_agent.utils.team_memory_store as module
         with TemporaryDirectory() as export_dir, TemporaryDirectory() as local_dir:
@@ -558,8 +597,14 @@ class RebuildTeamMemoryTest(unittest.TestCase):
     def test_rebuild_with_no_export_files_publishes_empty_database(self):
         with TemporaryDirectory() as db_dir:
             live_path = Path(db_dir) / "team_memory.db"
+            wal_path = Path(str(live_path) + "-wal")
+            shm_path = Path(str(live_path) + "-shm")
+            wal_path.write_bytes(b"stale-wal")
+            shm_path.write_bytes(b"stale-shm")
             stats = rebuild_team_memory(FakeEmbedder(), live_path, [])
             self.assertEqual(stats["scanned_users"], 0)
+            self.assertFalse(wal_path.exists())
+            self.assertFalse(shm_path.exists())
             store = TeamMemoryStore(live_path, FakeEmbedder())
             try:
                 self.assertEqual(store.count_semantic(), 0)

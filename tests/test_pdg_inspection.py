@@ -12,6 +12,7 @@ _install_thirdparty_stubs()
 
 import houdini_agent.utils.mcp.client as mcp_client
 from houdini_agent.utils.pdg_inspection import (
+    analyze_top_dependencies,
     build_pdg_expression,
     get_top_errors,
     inspect_top_network,
@@ -49,13 +50,14 @@ class _WorkItem:
 
 
 class _PDGNode:
-    def __init__(self):
-        self.name = "ropgeometry1"
+    def __init__(self, name="ropgeometry1", with_items=True):
+        self.name = name
+        self.inputs = []
         self.workItems = [
             _WorkItem(0, "CookedSuccess"),
             _WorkItem(1, "CookFailed"),
             _WorkItem(2, "Waiting"),
-        ]
+        ] if with_items else []
 
 
 class _Context:
@@ -65,8 +67,11 @@ class _Context:
 
 class _TopNode:
     def __init__(self):
+        upstream = _PDGNode("upstream", with_items=False)
         self.pdg_node = _PDGNode()
+        self.pdg_node.inputs = [upstream]
         self.context = _Context(self.pdg_node)
+        self.context.graph.nodes.insert(0, upstream)
 
     def path(self):
         return "/obj/topnet1/ropgeometry1"
@@ -92,9 +97,26 @@ class PDGInspectionTest(unittest.TestCase):
         data = result["data"]
         self.assertEqual(data["node_path"], "/obj/topnet1/ropgeometry1")
         self.assertEqual(data["scheduler_path"], "/obj/topnet1/localscheduler")
-        self.assertEqual(data["pdg_node_count"], 1)
+        self.assertEqual(data["pdg_node_count"], 2)
         self.assertEqual(data["work_item_count"], 3)
         self.assertEqual(data["state_counts"]["CookFailed"], 1)
+
+    def test_dependency_graph_is_bounded_and_read_only(self):
+        result = analyze_top_dependencies(
+            self.node, max_nodes=10, max_edges=10, pdg_module=object()
+        )
+
+        self.assertTrue(result["success"])
+        data = result["data"]
+        self.assertEqual([node["id"] for node in data["nodes"]], ["upstream", "ropgeometry1"])
+        self.assertEqual(data["edges"], [{"from": "upstream", "to": "ropgeometry1"}])
+        self.assertFalse(data["truncated"])
+
+        truncated = analyze_top_dependencies(
+            self.node, max_nodes=1, max_edges=10, pdg_module=object()
+        )
+        self.assertTrue(truncated["data"]["truncated"])
+        self.assertEqual(truncated["data"]["edges"], [])
 
     def test_work_items_are_paginated_and_bounded(self):
         result = list_work_items(
@@ -161,6 +183,9 @@ class PDGToolHandlerTest(unittest.TestCase):
             status = self.client._tool_get_top_network_status({
                 "node_path": "/obj/topnet1/ropgeometry1"
             })
+            dependencies = self.client._tool_analyze_top_dependencies({
+                "node_path": "/obj/topnet1/ropgeometry1"
+            })
             items = self.client._tool_list_top_work_items({
                 "node_path": "/obj/topnet1/ropgeometry1", "count": 1
             })
@@ -170,6 +195,8 @@ class PDGToolHandlerTest(unittest.TestCase):
 
         self.assertTrue(status["success"])
         self.assertEqual(status["data"]["work_item_count"], 3)
+        self.assertTrue(dependencies["success"])
+        self.assertEqual(dependencies["data"]["edges"], [{"from": "upstream", "to": "ropgeometry1"}])
         self.assertTrue(items["success"])
         self.assertEqual(items["data"]["count"], 1)
         self.assertTrue(errors["success"])

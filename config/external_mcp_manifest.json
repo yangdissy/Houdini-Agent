@@ -2,6 +2,17 @@
   "schema_version": 1,
   "tools": [
     {
+      "feature": "pdg",
+      "handler": "_tool_analyze_top_dependencies",
+      "long_running": false,
+      "minimum_houdini_version": null,
+      "mutating": false,
+      "name": "analyze_top_dependencies",
+      "readonly": true,
+      "risk_level": "low",
+      "runtime": "houdini"
+    },
+    {
       "feature": null,
       "handler": "_tool_get_geometry_points",
       "long_running": false,

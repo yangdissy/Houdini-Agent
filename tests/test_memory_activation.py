@@ -172,6 +172,26 @@ class FakeTeamMemoryStore:
 
 
 class MemoryMixinActivationTest(unittest.TestCase):
+    def test_init_memory_system_warms_team_memory_snapshot(self):
+        mixin = MemoryMixin()
+        mixin._username = "alice"
+        mixin._memory_initialized = False
+        mixin._maybe_notify_team_memory_export = mock.Mock()
+
+        with mock.patch("houdini_agent.core.memory_mixin.get_memory_store") as personal_store, \
+             mock.patch("houdini_agent.core.memory_mixin.get_reward_engine"), \
+             mock.patch("houdini_agent.core.memory_mixin.get_reflection_module"), \
+             mock.patch("houdini_agent.core.memory_mixin.get_growth_tracker"), \
+             mock.patch("houdini_agent.utils.team_memory_store.get_team_memory_store") as team_store, \
+             mock.patch("houdini_agent.core.memory_mixin.threading.Thread") as thread:
+            personal_store.return_value.embedding_diagnostic = None
+            personal_store.return_value.get_stats.return_value = {}
+            thread.side_effect = lambda target, daemon: mock.Mock(start=target)
+            mixin._init_memory_system()
+
+        team_store.assert_called_once_with("alice")
+        self.assertTrue(mixin._memory_initialized)
+
     def test_activate_long_term_memory_selects_diverse_candidates(self):
         mixin = MemoryMixin()
         mixin._memory_initialized = True

@@ -5,7 +5,7 @@ import html
 import re
 import sys
 
-from houdini_agent.qt_compat import QtWidgets, QtCore, QtGui
+from houdini_agent.qt_compat import QtWidgets, QtCore, QtGui, is_qobject_alive
 
 from .cursor_theme import CursorTheme
 from .node_links import _linkify_node_paths
@@ -16,7 +16,7 @@ from .node_links import _linkify_node_paths
 # ============================================================
 
 class SimpleMarkdown:
-    """将 Markdown 转换为 Qt Rich Text HTML（增强版）
+    """将 Maerkdown 转换为 Qt Rich Txt HTML（增强版）
 
     支持特性：
     - 标题 (# ~ ####)
@@ -1451,7 +1451,10 @@ class CodeBlockWidget(QtWidgets.QFrame):
         btn = self.sender()
         if btn:
             btn.setText("已复制")
-            QtCore.QTimer.singleShot(1500, lambda: btn.setText("复制"))
+            QtCore.QTimer.singleShot(
+                1500,
+                lambda: btn.setText("复制") if is_qobject_alive(btn) else None,
+            )
 
     # _btn_css removed — styling now via QSS objectName selectors
 

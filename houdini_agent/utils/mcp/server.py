@@ -199,6 +199,8 @@ def ensure_mcp_running(auto_start: bool = True) -> tuple[bool, str]:
 		from fastmcp import FastMCP  # type: ignore
 	except Exception:
 		return False, "fastmcp 未安装，跳过 MCP 服务器启动。"
+	if "host_origin_protection" not in inspect.signature(FastMCP).parameters:
+		return False, "fastmcp 版本缺少 Host/Origin 防护支持，拒绝启动外部 MCP。"
 	if hou is None:
 		return False, "未检测到 Houdini 环境（hou），跳过 MCP 服务器启动。"
 	if not s.enabled:
@@ -210,7 +212,7 @@ def ensure_mcp_running(auto_start: bool = True) -> tuple[bool, str]:
 		return False, "External MCP adapter is stopped; configure a new adapter before restart."
 	if mcp_thread_handle and mcp_thread_handle.is_alive():
 		return True, "MCP 服务器已在运行。"
-	mcp = FastMCP("Houdini MCP Server")  # type: ignore
+	mcp = FastMCP("Houdini MCP Server", host_origin_protection="auto")  # type: ignore
 	_setup_governed_fastmcp_tools(s)
 	if auto_start:
 		stop_event.clear()

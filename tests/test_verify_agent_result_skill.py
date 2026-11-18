@@ -39,7 +39,11 @@ class VerifyAgentResultSkillTest(unittest.TestCase):
         self.assertIn("stale viewport", result["instructions"])
         self.assertIn("Fail closed", result["instructions"])
         self.assertIn("Agent itself performs the review", result["instructions"])
-        self.assertIn("require switching to a vision-capable model", result["instructions"])
+        self.assertIn("complete the applicable technical checks", result["instructions"])
+        self.assertIn("visual_observations as not reviewed", result["instructions"])
+        self.assertIn("recommend switching to a vision-capable model", result["instructions"])
+        self.assertIn("Do not automatically capture_viewport", result["instructions"])
+        self.assertIn("Preserve established technical facts", result["instructions"])
         self.assertIn("Do not fall back to a human-only screenshot", result["instructions"])
         self.assertIn("technical_facts", result["instructions"])
 

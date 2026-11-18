@@ -48,6 +48,12 @@ class MemoryMixin:
                 if self._memory_store.embedding_diagnostic:
                     self._memoryMigrationRequired.emit()
                 self._maybe_notify_team_memory_export()
+                try:
+                    from ..utils.team_memory_store import get_team_memory_store
+                    get_team_memory_store(self._username)
+                    print("[Memory] 团队记忆快照已同步")
+                except Exception as e:
+                    print(f"[Memory] 团队记忆启动同步跳过 (非致命): {e}")
             except Exception as e:
                 print(f"[Memory] 初始化失败 (非致命): {e}")
                 self._memory_initialized = False

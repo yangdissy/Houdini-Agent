@@ -79,7 +79,7 @@ _READONLY_TOOLS = frozenset({
     'suggest_connection', 'preview_node_operation', 'validate_node_network', 'list_children', 'find_nodes',
     'get_geometry_summary', 'get_geometry_points', 'get_geometry_primitives',
     'get_usd_prim_info', 'get_usd_layer_stack', 'get_top_network_status',
-    'list_top_work_items', 'get_top_errors', 'build_pdg_expression',
+    'analyze_top_dependencies', 'list_top_work_items', 'get_top_errors', 'build_pdg_expression',
     'get_scene_snapshot',
     'read_selection', 'search_node_types', 'semantic_search_nodes',
     'check_errors',
@@ -132,6 +132,7 @@ _EXTERNAL_MCP_VISIBLE_TOOLS = frozenset({
     "get_usd_prim_info",
     "get_usd_layer_stack",
     "get_top_network_status",
+    "analyze_top_dependencies",
     "list_top_work_items",
     "get_top_errors",
     "read_selection",
@@ -282,7 +283,7 @@ def _infer_tags(name: str) -> Set[str]:
         tags.add("task")
     if name in {"get_usd_prim_info", "get_usd_layer_stack"}:
         tags.update({"usd", "feature:pxr"})
-    if name in {"get_top_network_status", "list_top_work_items", "get_top_errors"}:
+    if name in {"get_top_network_status", "analyze_top_dependencies", "list_top_work_items", "get_top_errors"}:
         tags.update({"pdg", "feature:pdg"})
     return tags
 
@@ -669,7 +670,8 @@ class ToolRegistry:
 
                 # 只读工具默认可去重；异步工具不参与当前轮去重缓存。
                 if readonly and not is_async:
-                    dedup_tools.add(meta.name)
+                    if meta.name not in {"visual_review", "capture_viewport"}:
+                        dedup_tools.add(meta.name)
                     batch_readonly_tools.add(meta.name)
                     if meta.cache_invalidation:
                         cache_invalidate_tools.add(meta.name)
@@ -856,7 +858,10 @@ class ToolRegistry:
         'create': {
             'create_node', 'create_nodes_batch', 'create_wrangle_node',
             'create_object_merges_batch', 'connect_nodes', 'copy_node', 'create_named_null',
-            'verify_network',
+            'verify_network', 'visual_review',
+        },
+        'visual': {
+            'visual_review',
         },
         'connection': {
             'get_node_connections', 'suggest_connection',
@@ -893,6 +898,7 @@ class ToolRegistry:
         'modify': {
             'set_node_parameter', 'set_parameter_expression', 'batch_set_parameters',
             'upsert_spare_parameter', 'set_node_flags', 'set_update_mode',
+            'visual_review',
         },
         'operation': {
             'get_network_structure', 'inspect_node', 'get_parameter_schema',
@@ -928,8 +934,8 @@ class ToolRegistry:
             'get_usd_prim_info', 'get_usd_layer_stack',
         },
         'pdg': {
-            'get_top_network_status', 'list_top_work_items', 'get_top_errors',
-            'build_pdg_expression',
+            'get_top_network_status', 'analyze_top_dependencies', 'list_top_work_items',
+            'get_top_errors', 'build_pdg_expression',
         },
         'tools': {
             'inspect_tool_contract', 'search_tool_contracts',
@@ -951,6 +957,9 @@ class ToolRegistry:
                   '查看', '检查', '分析', '看看', '显示', '状态', '有什么', '哪些'],
         'create': ['create', 'build', 'make', 'add', 'generate', 'construct',
                    '创建', '搭建', '添加', '生成', '新建', '建立', '建一', '建个', '制作', '新增'],
+        'visual': ['visual', 'viewport', 'screenshot', 'modeling', 'modelling',
+               'material', 'lighting', 'camera', 'composition', 'lookdev', 'scatter', 'terrain',
+               '视觉', '验收', '视口', '截图', '建模', '材质', '灯光', '相机', '构图', '散布', '地形'],
         'connection': ['connect', 'disconnect', 'wire', 'input', 'output', 'link',
                        '连接', '接线', '断开', '输入', '输出', '端口', '插到'],
         'parameter': ['parameter', 'parm', 'param', 'value', 'menu', 'tuple',

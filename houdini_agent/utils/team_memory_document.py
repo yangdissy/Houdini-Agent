@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -29,6 +30,23 @@ ELIGIBLE_ABSTRACTION_LEVELS = frozenset({2, 3, 4})
 MIN_SEMANTIC_CONFIDENCE = 0.5
 MIN_PROCEDURAL_SUCCESS_RATE = 0.55
 MIN_PROCEDURAL_USAGE = 2
+
+_PROJECT_CONTEXT_PATTERN = re.compile(
+    r"(?:当前项目|本项目|当前工程|当前案例|本案例|该项目|该工程)|(?:^|[\s`])/(?:obj|stage|mat|out|shop|ch|img)/",
+    re.IGNORECASE,
+)
+_USER_CONTEXT_PATTERN = re.compile(
+    r"用户(?:允许助手|定义|指定[^，。；]{0,40}(?:节点|路径|参考|来源|语义)|明确否定过)",
+    re.IGNORECASE,
+)
+_AGENT_INTERNAL_PATTERN = re.compile(
+    r"(?:Houdini[ -]?Agent|Auto-read|工具环境|工具接口|runtime/list_skills|unexpected keyword|某个 skill|某些 skill)",
+    re.IGNORECASE,
+)
+_TRUNCATED_RULE_PATTERN = re.compile(
+    r"(?:\bAtt|\bAttr|\bAttrib|\bpara|\bparam|\bexp|\bVEX/|\bSOP/)$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -79,6 +97,14 @@ def semantic_eligibility(entry) -> Tuple[bool, str]:
         return False, "semantic_rule_empty"
     if find_memory_threat(entry.rule):
         return False, "semantic_security"
+    if _PROJECT_CONTEXT_PATTERN.search(entry.rule):
+        return False, "semantic_project_context"
+    if _USER_CONTEXT_PATTERN.search(entry.rule):
+        return False, "semantic_user_context"
+    if _AGENT_INTERNAL_PATTERN.search(entry.rule):
+        return False, "semantic_agent_internal"
+    if _TRUNCATED_RULE_PATTERN.search(entry.rule):
+        return False, "semantic_truncated"
     return True, "eligible"
 
 

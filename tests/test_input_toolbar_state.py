@@ -29,14 +29,18 @@ class _Widget:
     def __init__(self):
         self.text = ""
         self.tooltip = ""
+        self.set_text_calls = 0
+        self.set_tooltip_calls = 0
         self.visible = True
         self.properties = {}
         self._style = _Style()
 
     def setText(self, text):
+        self.set_text_calls += 1
         self.text = text
 
     def setToolTip(self, text):
+        self.set_tooltip_calls += 1
         self.tooltip = text
 
     def setVisible(self, visible):
@@ -100,10 +104,32 @@ class InputToolbarStateTest(unittest.TestCase):
         self.assertTrue(tab.policy_timeline_btn.properties["failures"])
         self.assertIn("操作确认", tab.policy_timeline_btn.tooltip)
 
+    def test_unchanged_token_stats_do_not_retrigger_button_updates(self):
+        tab = self._tab()
+        tab.token_stats_btn = _Widget()
+        tab._token_stats = {
+            "total_tokens": 1500,
+            "estimated_cost": 0.02,
+            "cache_read": 400,
+            "cache_write": 100,
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "reasoning_tokens": 0,
+            "requests": 1,
+        }
+
+        AITab._update_token_stats_display(tab)
+        AITab._update_token_stats_display(tab)
+
+        self.assertEqual(tab.token_stats_btn.text, "1.5K | $0.02")
+        self.assertEqual(tab.token_stats_btn.set_text_calls, 1)
+        self.assertEqual(tab.token_stats_btn.set_tooltip_calls, 1)
+
     def test_context_menu_scope_and_export_location(self):
         root = Path(__file__).resolve().parents[1]
         input_area = (root / "houdini_agent/ui/input_area.py").read_text(encoding="utf-8")
         header = (root / "houdini_agent/ui/header.py").read_text(encoding="utf-8")
+        rich_content = (root / "houdini_agent/ui/cursor_rich_content.py").read_text(encoding="utf-8")
 
         menu_body = input_area.split("def _show_attach_menu", 1)[1].split(
             "def _on_confirm_mode_toggled", 1
@@ -123,6 +149,11 @@ class InputToolbarStateTest(unittest.TestCase):
         self.assertIn('update_action = menu.addAction("Update")', overflow_body)
         self.assertIn("update_action.setEnabled(False)", overflow_body)
         self.assertNotIn('menu.addAction("Update", self.btn_update.click)', overflow_body)
+        self.assertIn('is_qobject_alive(btn)', rich_content)
+        self.assertNotIn(
+            'QtCore.QTimer.singleShot(1500, lambda: btn.setText("复制"))',
+            rich_content,
+        )
 
 
 if __name__ == "__main__":

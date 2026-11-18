@@ -77,6 +77,7 @@ class VisualReviewContractTest(unittest.TestCase):
         self.assertEqual(capture["fingerprint"]["frame"], 12.5)
         self.assertEqual(capture["fingerprint"]["viewport"], "persp1")
         self.assertEqual(capture["fingerprint"]["resolution"], [800, 450])
+        settings.useResolution.assert_called_with(True)
         self.assertTrue(result["success"])
         self.assertEqual(result["_viewport_image"], "anBlZy1kYXRh")
 
@@ -136,6 +137,7 @@ class VisualReviewContractTest(unittest.TestCase):
             "_image_media_type": "image/jpeg",
         }
         client._tool_capture_viewport = mock.Mock(return_value=capture)
+        client._prepare_visual_review_target = mock.Mock(return_value=({"freshness": "fresh"}, None))
 
         result = client._tool_visual_review({
             "review_type": "composition",
@@ -152,6 +154,7 @@ class VisualReviewContractTest(unittest.TestCase):
         })
         self.assertTrue(result["success"])
         self.assertEqual(result["review_type"], "composition")
+        self.assertEqual(result["framing"], "current")
         self.assertEqual(result["target_path"], "/obj/geo1")
         self.assertEqual(result["technical_status"], "not_evaluated")
         self.assertEqual(result["visual_status"], "pending_model_review")
@@ -161,6 +164,7 @@ class VisualReviewContractTest(unittest.TestCase):
     def test_handler_rejects_unknown_review_type_without_capture(self):
         client = object.__new__(HoudiniMCP)
         client._tool_capture_viewport = mock.Mock()
+        client._prepare_visual_review_target = mock.Mock()
 
         result = client._tool_visual_review({"review_type": "beauty"})
 
@@ -174,6 +178,7 @@ class VisualReviewContractTest(unittest.TestCase):
             "success": False,
             "error": "找不到 Scene Viewer 面板",
         })
+        client._prepare_visual_review_target = mock.Mock(return_value=({}, None))
 
         result = client._tool_visual_review({"review_type": "general"})
 
@@ -182,6 +187,96 @@ class VisualReviewContractTest(unittest.TestCase):
             "error": "找不到 Scene Viewer 面板",
         })
         self.assertNotIn("visual_status", result)
+
+    def test_geometry_review_frames_target_and_restores_view(self):
+        client = object.__new__(HoudiniMCP)
+        viewport = mock.Mock()
+        viewport.camera.return_value = None
+        camera_state = mock.Mock()
+        viewport.defaultCamera.return_value.stash.return_value = camera_state
+        viewer = mock.Mock()
+        viewer.curViewport.return_value = viewport
+        desktop = mock.Mock()
+        desktop.paneTabOfType.return_value = viewer
+        geometry = mock.Mock()
+        bbox = mock.Mock()
+        geometry.boundingBox.return_value = bbox
+        node = mock.Mock()
+        node.needsToCook.return_value = False
+        node.geometry.return_value = geometry
+        client._resolve_geometry_node = mock.Mock(return_value=(node, None))
+        client._tool_capture_viewport = mock.Mock(return_value={
+            "success": True,
+            "result": "captured",
+            "_viewport_image": "encoded",
+            "_image_media_type": "image/jpeg",
+        })
+        hou = mock.Mock()
+        hou.ui.curDesktop.return_value = desktop
+        hou.updateModeSetting.return_value = "AutoUpdate"
+        hou.updateMode.Manual = "Manual"
+
+        with mock.patch.object(mcp_client, "hou", hou):
+            result = client._tool_visual_review({
+                "review_type": "geometry",
+                "target_path": "/obj/geo1/OUT",
+            })
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["framing"], "target")
+        viewport.frameBoundingBox.assert_called_once_with(bbox)
+        viewport.setDefaultCamera.assert_called_once_with(camera_state)
+
+    def test_visual_review_fails_closed_when_manual_validation_fails(self):
+        client = object.__new__(HoudiniMCP)
+        node = mock.Mock()
+        node.needsToCook.return_value = True
+        client._resolve_geometry_node = mock.Mock(return_value=(node, None))
+        client._tool_temporary_auto_validate_geometry = mock.Mock(return_value={
+            "success": False,
+            "error": "cook failed",
+        })
+        client._tool_capture_viewport = mock.Mock()
+        hou = mock.Mock()
+        hou.updateModeSetting.return_value = hou.updateMode.Manual
+
+        with mock.patch.object(mcp_client, "hou", hou):
+            result = client._tool_visual_review({
+                "review_type": "geometry",
+                "target_path": "/obj/geo1/OUT",
+            })
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["failure_stage"], "cook")
+        client._tool_capture_viewport.assert_not_called()
+
+    def test_target_framing_failure_is_reported_before_capture(self):
+        client = object.__new__(HoudiniMCP)
+        node = mock.Mock()
+        node.needsToCook.return_value = False
+        node.geometry.side_effect = RuntimeError("no geometry")
+        client._resolve_geometry_node = mock.Mock(return_value=(node, None))
+        client._tool_capture_viewport = mock.Mock()
+        viewport = mock.Mock()
+        viewport.camera.return_value = None
+        viewer = mock.Mock()
+        viewer.curViewport.return_value = viewport
+        desktop = mock.Mock()
+        desktop.paneTabOfType.return_value = viewer
+        hou = mock.Mock()
+        hou.ui.curDesktop.return_value = desktop
+        hou.updateModeSetting.return_value = "AutoUpdate"
+        hou.updateMode.Manual = "Manual"
+
+        with mock.patch.object(mcp_client, "hou", hou):
+            result = client._tool_visual_review({
+                "review_type": "geometry",
+                "target_path": "/obj/geo1",
+            })
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["failure_stage"], "frame")
+        client._tool_capture_viewport.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -121,6 +121,56 @@ def inspect_top_network(top_node, pdg_module=None) -> Dict[str, Any]:
     }
 
 
+def analyze_top_dependencies(top_node, max_nodes: int = 500,
+                             max_edges: int = 2000,
+                             pdg_module=None) -> Dict[str, Any]:
+    """Return a bounded PDG node dependency graph without scheduling or cooking."""
+    pdg_module = pdg_module or _load_pdg()
+    if pdg_module is None:
+        return {"success": False, "error_code": "pdg_unavailable", "error": "PDG module is unavailable"}
+    if top_node is None:
+        return {"success": False, "error_code": "top_node_unavailable", "error": "TOP node is unavailable"}
+    if _resolve_pdg_node(top_node) is None:
+        return {"success": False, "error_code": "pdg_node_unavailable", "error": "Node has no PDG node"}
+
+    max_nodes = max(1, min(int(max_nodes), 2000))
+    max_edges = max(1, min(int(max_edges), 10000))
+    context = _safe_call(lambda: top_node.getPDGGraphContext(), None)
+    graph = _value(context, "graph", None) if context is not None else None
+    all_nodes = list(_value(graph, "nodes", ()) or ())
+    selected_nodes = all_nodes[:max_nodes]
+    node_ids = {id(node): str(_value(node, "name", "")) for node in selected_nodes}
+    nodes = [{
+        "id": node_ids[id(node)],
+        "work_item_count": len(_work_items(node)),
+    } for node in selected_nodes]
+    edges = []
+    edge_limit_hit = False
+    for node in selected_nodes:
+        target = node_ids[id(node)]
+        for upstream in list(_value(node, "inputs", ()) or ()):
+            source = node_ids.get(id(upstream))
+            if source is None:
+                continue
+            if len(edges) >= max_edges:
+                edge_limit_hit = True
+                break
+            edges.append({"from": source, "to": target})
+        if edge_limit_hit:
+            break
+
+    return {
+        "success": True,
+        "data": {
+            "node_path": str(_safe_call(lambda: top_node.path(), "")),
+            "nodes": nodes,
+            "edges": edges,
+            "total_node_count": len(all_nodes),
+            "truncated": len(all_nodes) > len(selected_nodes) or edge_limit_hit,
+        },
+    }
+
+
 def list_work_items(top_node, start: int = 0, count: int = 100,
                     max_attributes: int = 50, max_output_files: int = 50,
                     payload_limit_bytes: int = 256 * 1024,

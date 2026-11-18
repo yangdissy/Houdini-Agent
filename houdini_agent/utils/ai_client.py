@@ -1324,6 +1324,22 @@ HOUDINI_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "analyze_top_dependencies",
+            "description": "只读返回 TOP/PDG 节点依赖图。节点和边均有硬上限，不触发 cook、dirty、pause 或 cancel。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_path": {"type": "string", "description": "TOP 节点路径"},
+                    "max_nodes": {"type": "integer", "description": "最大节点数，默认 500，最大 2000"},
+                    "max_edges": {"type": "integer", "description": "最大依赖边数，默认 2000，最大 10000"}
+                },
+                "required": ["node_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_top_work_items",
             "description": "分页读取一个 TOP 节点的 work items：index、name、state、关键 attributes 和输出文件元数据。结果有条目与字节硬上限，不读取日志正文或触发 cook。",
             "parameters": {
@@ -1981,7 +1997,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "visual_review",
-            "description": "截取当前 Houdini 视口并按明确的视觉目标进行审查。仅用于建模、材质、灯光、相机、构图或 USD lookdev 等视觉任务；它不替代 verify_network、几何 freshness 或材质绑定等技术验证。不会修改场景、相机或视口状态。",
+            "description": "截取当前 Houdini 视口并按明确的视觉目标进行审查。仅用于建模、材质、灯光、相机、构图或 USD lookdev 等视觉任务；它不替代 verify_network、几何 freshness 或材质绑定等技术验证。target/all framing 会临时调整自由视口并在截图后恢复；不会修改场景或相机节点。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2005,6 +2021,11 @@ HOUDINI_TOOLS = [
                     "height": {
                         "type": "integer",
                         "description": "截图高度(像素)，默认540，范围120-1080"
+                    },
+                    "framing": {
+                        "type": "string",
+                        "enum": ["current", "target", "all"],
+                        "description": "视口取景策略。current 保持当前构图；target 按 target_path 的几何包围盒临时居中；all 临时框选全部可见内容。geometry 审查且提供 target_path 时默认 target，其余默认 current。"
                     }
                 },
                 "required": ["review_type"]
@@ -2298,6 +2319,32 @@ class AIClient:
                 "请根据已有结果总结，或在下一次请求中更换策略。"
             )
         return None
+
+    @staticmethod
+    def _missing_write_tool_correction(content: str, exposed_names: set) -> Optional[str]:
+        """纠正模型在场景写工具已暴露时错误声称缺少修改能力。"""
+        text = content or ""
+        claims_missing_tool = any(phrase in text for phrase in (
+            "缺少可执行的参数修改工具",
+            "没有可执行的参数修改工具",
+            "缺少参数修改工具",
+            "无法直接修改场景",
+        ))
+        write_tools = sorted(exposed_names & {
+            "set_node_parameter",
+            "batch_set_parameters",
+            "set_parameter_expression",
+            "set_parameter_reference",
+            "execute_python",
+        })
+        if not claims_missing_tool or not write_tools:
+            return None
+        return (
+            "[Capability Check] 你的上一条回复错误地声称缺少场景修改工具。"
+            f"本轮已暴露以下写工具：{', '.join(write_tools)}。"
+            "请重新核对用户要求和参数 schema，立即调用最合适的专用工具完成修改；"
+            "仅当专用工具确实无法表达操作且 execute_python 已暴露时才使用 Python。"
+        )
 
     # ----------------------------------------------------------
     # 工具结果分页：按行分段，让 AI 自主判断是否需要更多
@@ -4439,6 +4486,12 @@ class AIClient:
         
         model = self._normalize_model_id(model)
         working_messages = list(messages)
+        run_messages = []
+
+        def _append_working_message(message):
+            working_messages.append(message)
+            run_messages.append(message)
+
         incomplete_callback = on_incomplete or on_plan_incomplete
         
         # ── 预处理：非视觉模型剥离所有 image_url 内容 ──
@@ -4447,7 +4500,6 @@ class AIClient:
             if n_stripped > 0:
                 print(f"[AI Client] 非视觉模型 ({model})：已剥离 {n_stripped} 张图片")
         
-        initial_msg_count = len(working_messages)  # 跟踪初始消息数量，用于提取新消息链
         tool_calls_history = []
         call_records = []  # 每次 API 调用的详细记录（对齐 Cursor）
         full_content = ""
@@ -4472,11 +4524,15 @@ class AIClient:
         # 防止死循环：检测重复工具调用
         total_tool_calls = 0
         _wrap_up_hinted = False
+        _capability_correction_used = False
+        _loaded_tool_obligation = frozenset()
         consecutive_same_calls = 0  # 连续相同调用计数（工具名+参数完全相同）
         last_call_signature = None
         recent_call_signatures = []  # 最近调用签名滑动窗口（交替循环检测）
         consecutive_same_tool = 0  # 同工具名连续调用计数（不看参数，捕获换参数循环）
         last_tool_name = None
+        consecutive_fully_cached_rounds = 0
+        loop_stop_reason = None
         server_error_retries = 0    # 连续服务端错误重试计数
         max_server_retries = 3      # 最多重试 3 次服务端错误
 
@@ -4494,7 +4550,7 @@ class AIClient:
                     'error': '用户停止了请求',
                     'content': full_content,
                     'final_content': '',
-                    'new_messages': working_messages[initial_msg_count:],
+                    'new_messages': run_messages,
                     'tool_calls_history': tool_calls_history,
                     'call_records': call_records,
                     'iterations': iteration,
@@ -4504,8 +4560,13 @@ class AIClient:
             
             iteration += 1
             if tool_exposure is not None:
+                previous_exposed_names = exposed_names if iteration > 1 else set()
                 effective_tools = tool_exposure.snapshot()
             exposed_names = {tool.get('function', {}).get('name', '') for tool in effective_tools}
+            if tool_exposure is not None and iteration > 1:
+                newly_exposed_names = exposed_names - previous_exposed_names
+                if newly_exposed_names:
+                    _loaded_tool_obligation = frozenset(newly_exposed_names)
             _call_start = time.time()  # 记录本次 API 调用起始时间（对齐 Cursor 延迟统计）
             
             # 收集本轮的内容和工具调用
@@ -4597,7 +4658,7 @@ class AIClient:
                         'error': '用户停止了请求',
                         'content': full_content + round_content,
                         'final_content': round_content,
-                        'new_messages': working_messages[initial_msg_count:],
+                        'new_messages': run_messages,
                         'tool_calls_history': tool_calls_history,
                         'call_records': call_records,
                         'iterations': iteration,
@@ -4613,7 +4674,7 @@ class AIClient:
                         'error': '用户停止了请求',
                         'content': full_content + round_content,
                         'final_content': round_content,
-                        'new_messages': working_messages[initial_msg_count:],
+                        'new_messages': run_messages,
                         'tool_calls_history': tool_calls_history,
                         'call_records': call_records,
                         'iterations': iteration,
@@ -4766,7 +4827,7 @@ class AIClient:
                                     'error': '用户停止了请求',
                                     'content': full_content + round_content,
                                     'final_content': round_content,
-                                    'new_messages': working_messages[initial_msg_count:],
+                                    'new_messages': run_messages,
                                     'tool_calls_history': tool_calls_history,
                                     'call_records': call_records,
                                     'iterations': iteration,
@@ -4868,15 +4929,50 @@ class AIClient:
                     'error': abort_error,
                     'content': full_content,
                     'final_content': '',
-                    'new_messages': working_messages[initial_msg_count:],
+                    'new_messages': run_messages,
                     'tool_calls_history': tool_calls_history,
                     'call_records': call_records,
                     'iterations': iteration,
                     'usage': total_usage
                 }
             
+            if _loaded_tool_obligation and any(
+                tool_call.get('function', {}).get('name') in _loaded_tool_obligation
+                for tool_call in round_tool_calls
+            ):
+                _loaded_tool_obligation = frozenset()
+
             # 如果没有工具调用，完成
             if not round_tool_calls:
+                if _loaded_tool_obligation:
+                    loaded_names = ', '.join(sorted(_loaded_tool_obligation))
+                    _append_working_message({'role': 'assistant', 'content': round_content or ''})
+                    _append_working_message({
+                        'role': 'user',
+                        'content': (
+                            f"The requested tools are now available in this internal model iteration: {loaded_names}. "
+                            "Continue the current task now; do not wait for another user message."
+                        ),
+                    })
+                    _loaded_tool_obligation = frozenset()
+                    _needs_sanitize = True
+                    _round_content_started = False
+                    full_content += round_content
+                    continue
+
+                if not _capability_correction_used:
+                    _capability_correction = self._missing_write_tool_correction(
+                        round_content, exposed_names
+                    )
+                    if _capability_correction:
+                        _capability_correction_used = True
+                        _append_working_message({'role': 'assistant', 'content': round_content or ''})
+                        _append_working_message({'role': 'user', 'content': _capability_correction})
+                        _needs_sanitize = True
+                        _round_content_started = False
+                        full_content += round_content
+                        continue
+
                 # ★ Plan 续接检测：AI 输出了纯文本，但 Plan 可能还有未完成步骤
                 # 通过回调询问 UI 层 Plan 是否已完成
                 _plan_resume_msg = None
@@ -4894,10 +4990,10 @@ class AIClient:
                     # 1. 将 AI 的纯文本回复作为 assistant 消息存入 working_messages
                     # ★ 不回灌 reasoning_content：避免模型在下一轮把"答复"也误放进 thinking
                     _assistant_msg = {'role': 'assistant', 'content': round_content or ''}
-                    working_messages.append(_assistant_msg)
+                    _append_working_message(_assistant_msg)
                     
                     # 2. 注入 "Plan 未完成" 的提醒消息作为 user 消息
-                    working_messages.append({'role': 'user', 'content': _plan_resume_msg})
+                    _append_working_message({'role': 'user', 'content': _plan_resume_msg})
                     _needs_sanitize = True
                     _round_content_started = False
                     continue  # 继续 while 循环，开始新一轮 API 请求
@@ -4914,7 +5010,7 @@ class AIClient:
                     'ok': True,
                     'content': full_content,
                     'final_content': round_content,  # 最后一轮的回复（不含中间轮次）
-                    'new_messages': working_messages[initial_msg_count:],  # 原生工具交互链
+                    'new_messages': run_messages,  # 原生工具交互链
                     'tool_calls_history': tool_calls_history,
                     'call_records': call_records,
                     'iterations': iteration,
@@ -4971,7 +5067,7 @@ class AIClient:
             # Duojie 的 reasoning_content 无需在后续请求中回传
             if self.is_reasoning_model(model) and provider in ('deepseek', 'glm', 'siliconflow'):
                 assistant_msg['reasoning_content'] = round_thinking or ''
-            working_messages.append(assistant_msg)
+            _append_working_message(assistant_msg)
             
             # 执行工具调用（web 工具并行，Houdini 工具串行）
             # 预处理所有工具调用
@@ -4993,7 +5089,7 @@ class AIClient:
                 for tool_id, _tn, _ta, _tc in parsed_calls:
                     if tool_exposure is not None:
                         tool_exposure.record_skip(_tn, 'tool_limit', tool_id)
-                    working_messages.append({
+                    _append_working_message({
                         'role': 'tool',
                         'tool_call_id': tool_id,
                         'content': _TOOL_LIMIT_SKIPPED_RESULT,
@@ -5005,7 +5101,7 @@ class AIClient:
                     'ok': True,
                     'content': full_content + round_content + _notice,
                     'final_content': round_content + _notice,
-                    'new_messages': working_messages[initial_msg_count:],
+                    'new_messages': run_messages,
                     'tool_calls_history': tool_calls_history,
                     'call_records': call_records,
                     'iterations': iteration,
@@ -5061,14 +5157,27 @@ class AIClient:
                 if _early_skip_count > 0:
                     print(f"[AI Client] ⏭️ 早期终止: 跳过 {_early_skip_count} 个冗余查询")
 
+                _fully_cached_round = (
+                    bool(parsed_calls)
+                    and len(dedup_flags) == len(parsed_calls)
+                    and all(dedup_flags)
+                    and _async_count == 0
+                    and _failed_count == 0
+                    and not rejected_calls
+                )
+                if _fully_cached_round:
+                    consecutive_fully_cached_rounds += 1
+                else:
+                    consecutive_fully_cached_rounds = 0
+
                 should_break_tool_limit = False
                 _loop_abort_reason = None  # 非 None 表示因循环检测硬熔断
+                _viewport_messages = []
                 for i, (tool_id, tool_name, arguments, _tc) in enumerate(parsed_calls):
                     result = results_ordered[i] if i < len(results_ordered) else {
                         'success': False,
                         'error': '工具执行器返回索引越界'
                     }
-
                     # 防止死循环：检测重复工具调用
                     total_tool_calls += 1
                     call_signature = f"{tool_name}:{json.dumps(arguments, sort_keys=True)}"
@@ -5157,7 +5266,7 @@ class AIClient:
                     if _loop_inject:
                         result_content += _loop_hint
 
-                    working_messages.append({
+                    _append_working_message({
                         'role': 'tool',
                         'tool_call_id': tool_id,
                         'content': result_content,
@@ -5171,7 +5280,7 @@ class AIClient:
                             '_image_prompt',
                             '[viewport snapshot attached — please analyze the current viewport state, check for visual issues or confirm the result is correct]',
                         )
-                        working_messages.append({
+                        _viewport_messages.append({
                             'role': 'user',
                             'content': [
                                 {"type": "text", "text": _img_prompt},
@@ -5179,6 +5288,15 @@ class AIClient:
                             ],
                         })
                         print(f"[AI Client] 📸 视口截图已注入消息 ({len(_img_b64)//1024}KB base64)")
+
+                if consecutive_fully_cached_rounds == 2 and working_messages and working_messages[-1].get('role') == 'tool':
+                    working_messages[-1]['content'] += (
+                        "\n\n[无进展检测] 连续两轮只得到缓存结果。请停止重复查询，"
+                        "改用能产生新证据的参数或工具；如果没有新的判别路径，请直接总结当前结论与未确定项。"
+                    )
+                elif consecutive_fully_cached_rounds >= 3:
+                    loop_stop_reason = 'no_progress'
+                    break
 
                 if should_break_tool_limit:
                     # 本轮工具已全部执行（含触发熔断的那个），必须如实回填结果，否则清洗会补"被中断"占位误导模型重做
@@ -5193,7 +5311,7 @@ class AIClient:
                         tool_calls_history.append({'tool_name': _tname, 'arguments': _targs, 'result': _res})
                         if on_tool_result:
                             on_tool_result(_tname, _targs, _res)
-                        working_messages.append({
+                        _append_working_message({
                             'role': 'tool',
                             'tool_call_id': _tid,
                             'content': self._compress_tool_result(_tname, _res),
@@ -5203,7 +5321,7 @@ class AIClient:
                         'ok': True,
                         'content': full_content + f"\n\n{_abort_msg}",
                         'final_content': f"\n\n{_abort_msg}",
-                        'new_messages': working_messages[initial_msg_count:],
+                        'new_messages': run_messages,
                         'tool_calls_history': tool_calls_history,
                         'call_records': call_records,
                         'iterations': iteration,
@@ -5233,16 +5351,19 @@ class AIClient:
                         _wrap_up_hinted = True
                         working_messages[-1]['content'] += _LIMIT_WRAP_UP_HINT
 
+                for _viewport_message in _viewport_messages:
+                    _append_working_message(_viewport_message)
+
                 full_content += round_content
                 continue
 
-        # 如果循环结束但内容为空，且有工具调用历史，强制要求生成总结
+        # 工具循环触达上限或无进展停止时，过程文字不能替代最终总结。
         summary_content = ""
         _summary_stopped = self._stop_event.is_set()
-        if not _summary_stopped and not full_content.strip() and tool_calls_history:
-            print("[AI Client] ⚠️ Stream模式：工具调用完成但无回复内容，强制要求生成总结")
+        if not _summary_stopped and tool_calls_history:
+            print("[AI Client] ⚠️ Stream模式：工具循环停止，强制要求生成总结")
             # 最后一次请求，强制要求总结
-            working_messages.append({
+            _append_working_message({
                 'role': 'user',
                 'content': '请生成最终总结，说明已完成的操作和结果。'
             })
@@ -5277,7 +5398,7 @@ class AIClient:
                 'error': '用户停止了请求',
                 'content': full_content,
                 'final_content': summary_content,
-                'new_messages': working_messages[initial_msg_count:],
+                'new_messages': run_messages,
                 'tool_calls_history': tool_calls_history,
                 'call_records': call_records,
                 'iterations': iteration,
@@ -5285,8 +5406,12 @@ class AIClient:
                 'usage': total_usage,
             }
 
-        print(f"[AI Client] Reached max iterations ({iteration})")
-        _notice = _run_limit_notice('max_iterations', max_iterations)
+        if loop_stop_reason == 'no_progress':
+            print(f"[AI Client] Stopped after {consecutive_fully_cached_rounds} fully cached rounds")
+            _notice = "\n\n重复查询没有产生新证据，已停止工具调用。"
+        else:
+            print(f"[AI Client] Reached max iterations ({iteration})")
+            _notice = _run_limit_notice('max_iterations', max_iterations)
         if on_content:
             on_content(_notice)
         # 计算 cache 命中率
@@ -5299,12 +5424,12 @@ class AIClient:
             'ok': True,
             'content': full_content + _notice,
             'final_content': summary_content + _notice,
-            'new_messages': working_messages[initial_msg_count:],
+            'new_messages': run_messages,
             'tool_calls_history': tool_calls_history,
             'call_records': call_records,
             'iterations': iteration,
             'usage': total_usage,
-            'stop_reason': 'max_iterations',
+            'stop_reason': loop_stop_reason or 'max_iterations',
         }
 
     def _execute_web_search(self, arguments: dict) -> dict:
@@ -5586,6 +5711,7 @@ class AIClient:
         
         # 防止死循环：检测重复工具调用
         total_tool_calls = 0
+        _capability_correction_used = False
         consecutive_same_calls = 0
         last_call_signature = None
         recent_call_signatures = []  # 最近调用签名滑动窗口（交替循环检测）
@@ -5799,6 +5925,19 @@ class AIClient:
             
             # 如果没有工具调用，检查是否完成
             if not tool_calls:
+                exposed_names = {
+                    tool.get('function', {}).get('name', '') for tool in effective_tools
+                }
+                if not _capability_correction_used:
+                    _capability_correction = self._missing_write_tool_correction(
+                        cleaned_content, exposed_names
+                    )
+                    if _capability_correction:
+                        _capability_correction_used = True
+                        working_messages.append({'role': 'assistant', 'content': cleaned_content or ''})
+                        working_messages.append({'role': 'user', 'content': _capability_correction})
+                        continue
+
                 # 清理后的内容添加到full_content（只添加一次，避免重复）
                 if cleaned_content.strip():
                     # 检查是否与已有内容重复（避免重复添加）

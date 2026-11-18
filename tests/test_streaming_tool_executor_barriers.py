@@ -4,6 +4,7 @@
 import unittest
 
 from houdini_agent.core.streaming_tool_executor import StreamingToolExecutor
+from houdini_agent.utils.tool_registry import ToolRegistry
 
 
 def _call(index, name, args=None):
@@ -11,6 +12,43 @@ def _call(index, name, args=None):
 
 
 class StreamingToolExecutorBarrierTest(unittest.TestCase):
+    def test_viewport_recapture_always_executes_with_registry_profile(self):
+        registry = ToolRegistry()
+        names = ("visual_review", "capture_viewport", "inspect_node", "set_node_parameter")
+        registry.register_core_tools([
+            {"type": "function", "function": {"name": name, "parameters": {}}}
+            for name in names
+        ])
+        for name in ("visual_review", "capture_viewport"):
+            with self.subTest(tool=name):
+                calls = []
+
+                def execute(tool_name, args):
+                    calls.append(tool_name)
+                    return {"success": True, "result": "live-%s" % len(calls)}
+
+                executor = StreamingToolExecutor(
+                    execute, lambda args: {}, lambda args: {},
+                    runtime_profile_provider=registry.build_streaming_executor_profile,
+                )
+                args = {"target_path": "/obj/geo1/OUT"} if name == "visual_review" else {}
+                first = executor.execute_round([_call(1, name, args)])
+                second = executor.execute_round([_call(2, name, args)])
+                executor.execute_round([_call(3, "set_node_parameter", {
+                    "node_path": "/obj/geo1/box1", "parm_name": "sizex", "value": 2,
+                })])
+                third = executor.execute_round([_call(4, name, args)])
+
+                self.assertEqual(calls.count(name), 3)
+                self.assertEqual([result["dedup_flags"][0] for result in (first, second, third)],
+                                 [False, False, False])
+                self.assertEqual(len({result["results_ordered"][0]["result"]
+                                      for result in (first, second, third)}), 3)
+                executor.execute_round([_call(5, "inspect_node")])
+                cached = executor.execute_round([_call(6, "inspect_node")])
+                self.assertTrue(cached["dedup_flags"][0])
+                self.assertEqual(calls.count("inspect_node"), 1)
+
     def _executor(self, calls, profile):
         def execute(name, args):
             calls.append(name)

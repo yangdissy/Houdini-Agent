@@ -2,6 +2,7 @@
 """Serializable cache record tests."""
 
 import unittest
+import json
 
 from houdini_agent.core.cache_records import (
     DEFAULT_TOKEN_STATS,
@@ -80,6 +81,30 @@ class CacheRecordsTest(unittest.TestCase):
         self.assertEqual(data['message_count'], 1)
         self.assertEqual(data['conversation_history'][0]['content'][0]['text'], '[Image: image/png]')
         self.assertEqual(data['token_stats'], DEFAULT_TOKEN_STATS)
+
+    def test_tool_call_and_result_pair_survive_cache_roundtrip(self):
+        history = [
+            {'role': 'user', 'content': 'inspect'},
+            {'role': 'assistant', 'content': None, 'tool_calls': [{
+                'id': 'call_1', 'type': 'function',
+                'function': {'name': 'inspect_node', 'arguments': '{"path":"/obj/geo1"}'},
+            }]},
+            {'role': 'tool', 'tool_call_id': 'call_1', 'content': '{"success":true}'},
+            {'role': 'assistant', 'content': 'Inspection complete.'},
+        ]
+
+        cache_data = build_session_cache_record('abc12345', {
+            'conversation_history': history,
+        })
+        restored = SessionCacheRecord.from_cache_data(
+            json.loads(json.dumps(cache_data))
+        )
+
+        assistant_call = restored.conversation_history[1]['tool_calls'][0]
+        tool_result = restored.conversation_history[2]
+        self.assertEqual(assistant_call['id'], 'call_1')
+        self.assertEqual(tool_result['tool_call_id'], assistant_call['id'])
+        self.assertEqual(restored.conversation_history[-1]['content'], 'Inspection complete.')
 
 
 if __name__ == "__main__":

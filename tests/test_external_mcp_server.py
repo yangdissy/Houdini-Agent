@@ -19,7 +19,9 @@ from houdini_agent.utils.tool_registry import ToolRegistry
 
 
 class _FastMCPStub:
-    def __init__(self):
+    def __init__(self, name=None, host_origin_protection=None):
+        self.name = name
+        self.host_origin_protection = host_origin_protection
         self.tools = {}
 
     def tool(self, function=None, **options):
@@ -53,6 +55,30 @@ class GovernedExternalMCPServerTest(unittest.TestCase):
 
         self.assertEqual(set(server.mcp.tools), {"health"})
         self.assertNotIn("execute_python_code", server.mcp.tools)
+
+    def test_startup_enables_host_origin_protection(self):
+        settings = MCPSettings(enabled=True, allowed_tools=("health",))
+        with patch.object(server, "read_settings", return_value=settings), patch.dict(
+            "sys.modules", {"fastmcp": type("Module", (), {"FastMCP": _FastMCPStub})()}
+        ):
+            result = server.ensure_mcp_running(auto_start=False)
+
+        self.assertTrue(result[0])
+        self.assertEqual(server.mcp.host_origin_protection, "auto")
+
+    def test_startup_fails_closed_when_fastmcp_lacks_origin_protection(self):
+        class LegacyFastMCP:
+            def __init__(self, name):
+                self.name = name
+
+        settings = MCPSettings(enabled=True, allowed_tools=("health",))
+        with patch.object(server, "read_settings", return_value=settings), patch.dict(
+            "sys.modules", {"fastmcp": type("Module", (), {"FastMCP": LegacyFastMCP})()}
+        ):
+            result = server.ensure_mcp_running(auto_start=False)
+
+        self.assertFalse(result[0])
+        self.assertIn("Host/Origin", result[1])
 
     def test_startup_rejects_executable_allowlist_without_adapter(self):
         settings = MCPSettings(enabled=True, allowed_tools=("health", "inspect"))
@@ -328,7 +354,7 @@ class ExternalMCPSettingsTest(unittest.TestCase):
         self.assertEqual(settings.allowed_tools, (
             "health", "get_network_structure", "get_geometry_points",
             "get_geometry_primitives", "get_usd_prim_info", "get_usd_layer_stack",
-            "get_top_network_status", "list_top_work_items", "get_top_errors",
+            "get_top_network_status", "analyze_top_dependencies", "list_top_work_items", "get_top_errors",
             "read_selection",
         ))
         self.assertNotIn("execute_python", settings.allowed_tools)

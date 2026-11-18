@@ -15,6 +15,16 @@ from ..utils.dev_feature_toggles import (
     set_toggle_enabled,
 )
 from ..utils.team_memory_settings import is_team_export_enabled, set_team_export_enabled
+from ..utils.model_catalog import ModelCatalog, PROVIDER_SOURCES
+
+
+class _ModelCatalogSignals(QtCore.QObject):
+    """Marshal model-catalog worker results back to the Qt UI thread."""
+
+    finished = QtCore.Signal(str, object)
+
+
+_MODEL_CATALOG = ModelCatalog()
 
 
 class HeaderMixin:
@@ -63,48 +73,10 @@ class HeaderMixin:
         # 模型
         self.model_combo = QtWidgets.QComboBox()
         self.model_combo.setObjectName("modelCombo")
+        # 当前 UI 启用 Provider 的唯一模型目录来源；隐藏 Provider 不在此注册表中。
         self._model_map = {
-            'ollama': ['qwen2.5:14b', 'qwen2.5:7b', 'llama3:8b', 'mistral:7b'],
-            'deepseek': ['deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-chat', 'deepseek-reasoner'],  # chat/reasoner 将于 2026/07/24 弃用
-            'glm': ['glm-4.7'],
-            'openai': ['gpt-5.2', 'gpt-5.3-codex'],
-            'duojie': [
-                'claude-opus-4-6-gemini',
-                'claude-opus-4-6-max',
-                'claude-sonnet-4-5',
-                'claude-sonnet-4-6',
-                'gemini-3-flash',
-                'gemini-3.1-pro',
-                'glm-5-turbo',
-                'glm-5.1',
-                'MiniMax-M2.7',
-                'MiniMax-M2.7-highspeed',
-            ],
-            'openrouter': [
-                'anthropic/claude-sonnet-4.6',
-                'anthropic/claude-opus-4.6',
-                'anthropic/claude-sonnet-4.5',
-                'anthropic/claude-haiku-4.5',
-                'openai/gpt-5.2',
-                'openai/gpt-5.3-codex',
-                'openai/o4-mini',
-                'google/gemini-3-flash-preview',
-                'google/gemini-2.5-pro',
-                'google/gemini-2.5-flash',
-                'deepseek/deepseek-v3.2',
-                'deepseek/deepseek-r1',
-                'x-ai/grok-4.1-fast',
-                'meta-llama/llama-4-maverick',
-                'qwen/qwen3-235b-a22b',
-                'mistralai/mistral-large-2512',
-            ],
-            'kimi_coding': ['k3', 'k3-256k', 'kimi-for-coding', 'kimi-for-coding-highspeed'],
-            'of3d': ['gpt-5.6', 'chatgpt-4o-latest'],
-            'siliconflow': [
-                'deepseek-ai/DeepSeek-V4.1-Flash',
-                'zai-org/GLM-5.3',
-            ],
-            'custom': [],  # 由用户通过配置对话框动态填充
+            provider_id: list(source.static_models)
+            for provider_id, source in PROVIDER_SOURCES.items()
         }
         # Custom provider 的运行时配置（从持久化配置加载）
         self._custom_provider_config = {
@@ -228,6 +200,17 @@ class HeaderMixin:
         self.model_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.model_combo.setEditable(False)  # 默认不可编辑，Custom 时切换为可编辑
         row.addWidget(self.model_combo, 1)
+
+        self.btn_refresh_models = QtWidgets.QPushButton("↻")
+        self.btn_refresh_models.setObjectName("btnRefreshModels")
+        self.btn_refresh_models.setFixedSize(26, 26)
+        self.btn_refresh_models.setCursor(QtCore.Qt.PointingHandCursor)
+        self.btn_refresh_models.setToolTip("后台刷新模型目录（失败时保留当前列表）")
+        self.btn_refresh_models.clicked.connect(self._refresh_model_catalog_async)
+        self._model_catalog_signals = _ModelCatalogSignals(self)
+        self._model_catalog_signals.finished.connect(self._on_model_catalog_finished)
+        self._model_catalog_refreshing = False
+        row.addWidget(self.btn_refresh_models)
         
         # API Key 状态 — 紧凑指示（行内，限宽 + 省略号）
         self.key_status = QtWidgets.QLabel()
@@ -589,15 +572,61 @@ class HeaderMixin:
             print(f"[Header] 同步 Custom 配置到 Client 失败: {e}")
 
     def _on_provider_changed_custom_visibility(self):
-        """Provider 切换时更新 Custom 配置按钮可见性和模型下拉框可编辑状态"""
+        """Provider 切换时更新 Custom 配置按钮和模型目录刷新状态。"""
         provider = self._current_provider()
         is_custom = (provider == 'custom')
         self.btn_custom_config.setVisible(is_custom)
-        # Custom 模式下允许用户直接在 model_combo 中输入模型名
         self.model_combo.setEditable(is_custom)
+        api_key = self._model_catalog_api_key(provider)
+        source = PROVIDER_SOURCES.get(provider)
+        self.btn_refresh_models.setVisible(bool(source and source.models_url))
+        self.btn_refresh_models.setEnabled(
+            not self._model_catalog_refreshing
+            and _MODEL_CATALOG.can_refresh(provider, api_key)
+        )
         if is_custom and not self._custom_provider_config.get('api_url'):
-            # 首次选择 Custom 且未配置，自动弹出配置对话框
             QtCore.QTimer.singleShot(100, self._open_custom_provider_dialog)
+
+    def _model_catalog_api_key(self, provider):
+        """Read the already-loaded key without persisting or logging it."""
+        try:
+            return self.client._api_keys.get(provider, '')
+        except (AttributeError, TypeError):
+            return ''
+
+    def _refresh_model_catalog_async(self):
+        """Refresh the selected provider off the UI thread with re-entry protection."""
+        if self._model_catalog_refreshing:
+            return
+        provider = self._current_provider()
+        api_key = self._model_catalog_api_key(provider)
+        if not _MODEL_CATALOG.can_refresh(provider, api_key):
+            return
+        self._model_catalog_refreshing = True
+        self.btn_refresh_models.setEnabled(False)
+
+        import threading
+
+        def worker():
+            models = _MODEL_CATALOG.refresh_provider(provider, api_key)
+            self._model_catalog_signals.finished.emit(provider, models)
+
+        threading.Thread(target=worker, name="model-catalog-refresh", daemon=True).start()
+
+    def _on_model_catalog_finished(self, provider, models):
+        """Apply a non-empty result only if it still belongs to the selected provider."""
+        self._model_catalog_refreshing = False
+        if provider == self._current_provider() and models:
+            selected = self.model_combo.currentText()
+            self._model_map[provider] = list(models)
+            self.model_combo.blockSignals(True)
+            self.model_combo.clear()
+            self.model_combo.addItems(models)
+            index = self.model_combo.findText(selected)
+            if index >= 0:
+                self.model_combo.setCurrentIndex(index)
+            self.model_combo.blockSignals(False)
+        self._on_provider_changed_custom_visibility()
 
     def _open_custom_provider_dialog(self):
         """打开 Custom Provider 配置对话框"""

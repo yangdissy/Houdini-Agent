@@ -118,6 +118,49 @@ def test_core_and_fallback_use_request_scoped_verification(monkeypatch):
         assert 'Fix issues and repeat until healthy' not in prompt
 
 
+def test_visual_verification_is_conditional_in_core_full_and_fallback(monkeypatch):
+    for full_rules, fallback in ((False, False), (True, False), (False, True)):
+        with monkeypatch.context() as patches:
+            if fallback:
+                patches.setattr(
+                    'houdini_agent.core.prompt_manager.load_prompt_template',
+                    lambda name: '',
+                )
+            sections = build_system_prompt_sections(
+                with_thinking=False, full_rules=full_rules, language='en',
+            )
+            prompt = ''.join(section.content for section in sections)
+
+        assert 'For vision-capable models, call visual_review exactly once' in prompt
+        assert 'visual_observations as not reviewed' in prompt
+        assert 'visual verdict as inconclusive' in prompt
+        assert 'Do not automatically capture_viewport' in prompt
+        assert 'Preserve established technical facts' in prompt
+        assert 'screenshot success alone is not verification' in prompt
+        assert 'call capture_viewport to take a viewport screenshot' not in prompt
+
+
+def test_core_and_fallback_require_evidence_first_diagnostics(monkeypatch):
+    for fallback in (False, True):
+        with monkeypatch.context() as patches:
+            if fallback:
+                patches.setattr(
+                    'houdini_agent.core.prompt_manager.load_prompt_template',
+                    lambda name: '',
+                )
+            sections = build_system_prompt_sections(
+                with_thinking=False, full_rules=False, language='en',
+            )
+            prompt = ''.join(section.content for section in sections)
+
+        assert prompt.count('Diagnostic Evidence Discipline:') == 1
+        assert 'newest verifiable tool evidence' in prompt
+        assert 'active and connected to the actual solve/output path' in prompt
+        assert 'one leading hypothesis and one smallest discriminating check' in prompt
+        assert 'read the exact error and code context' in prompt
+        assert 'one next step with its expected result' in prompt
+
+
 def test_budget_keeps_required_sections_whole_and_omits_optional(monkeypatch):
     sections = [
         PromptSection('persona', 'PERSONA'),

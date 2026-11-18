@@ -27,6 +27,22 @@ _INTERNAL_FIELDS = frozenset({
     'python_shells', 'system_shells',
 })
 
+_VISION_CAPABILITY_DIRECTIVES: Dict[bool, str] = {
+    True: (
+        'Current Model Vision Capability: supports_vision=true. '
+        'Review attached viewport images against the requested goal and report technical facts '
+        'separately. Screenshot success alone is not verification; use inconclusive when evidence is missing.'
+    ),
+    False: (
+        'Current Model Vision Capability: supports_vision=false. '
+        'Complete applicable technical checks and preserve their findings. For a viewport-visible task, '
+        'report visual_observations as not reviewed and the visual verdict as inconclusive; '
+        'recommend a vision-capable model. Do not automatically capture_viewport or repeatedly discover '
+        'visual_review. Use capture_viewport only when the user explicitly requests a saved screenshot '
+        'with output_path; that file is not model visual verification.'
+    ),
+}
+
 
 @dataclass
 class AgentRequest:
@@ -74,6 +90,10 @@ class ToolExposureState:
     def snapshot(self) -> List[dict]:
         with self._lock:
             return self._schemas(self._names)
+
+    def exposed_names(self) -> frozenset:
+        with self._lock:
+            return frozenset(self._names)
 
     def load(self, query: str = "", tags=None, mode: str = "", limit: int = 5) -> dict:
         if mode and mode != self.mode:
@@ -288,6 +308,11 @@ def finalize_context_request(
     summarize_tool_content: Optional[Callable[[str, int], str]],
 ) -> AgentRequest:
     """Finalize an existing context while preserving one owner of provider messages."""
+    assembly.prefix_messages = [
+        message for message in assembly.prefix_messages
+        if message.get('role') != 'system'
+        or message.get('content') not in _VISION_CAPABILITY_DIRECTIVES.values()
+    ] + [{'role': 'system', 'content': _VISION_CAPABILITY_DIRECTIVES[supports_vision]}]
     tools = finalize_tools(selected_tools, registry_tools, supports_vision)
     budget_result = prune_context_assembly_to_token_target(
         assembly,

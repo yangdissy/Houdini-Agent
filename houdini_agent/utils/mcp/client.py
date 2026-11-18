@@ -6227,6 +6227,25 @@ class HoudiniMCP:
         data = inspected["data"]
         return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2), "data": data}
 
+    def _tool_analyze_top_dependencies(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        from ..pdg_inspection import analyze_top_dependencies
+
+        node_path = str(args.get("node_path", "") or "")
+        node = hou.node(node_path) if hou and node_path else None
+        inspected = analyze_top_dependencies(
+            node,
+            max_nodes=int(args.get("max_nodes", 500) or 500),
+            max_edges=int(args.get("max_edges", 2000) or 2000),
+        )
+        if not inspected.get("success"):
+            return {
+                "success": False,
+                "error": inspected.get("error", "TOP dependency 查询失败"),
+                "error_code": inspected.get("error_code", "pdg_inspection_failed"),
+            }
+        data = inspected["data"]
+        return {"success": True, "result": json.dumps(data, ensure_ascii=False, indent=2), "data": data}
+
     def _tool_list_top_work_items(self, args: Dict[str, Any]) -> Dict[str, Any]:
         from ..pdg_inspection import list_work_items
 
@@ -7507,6 +7526,7 @@ class HoudiniMCP:
         "get_usd_prim_info": "_tool_get_usd_prim_info",
         "get_usd_layer_stack": "_tool_get_usd_layer_stack",
         "get_top_network_status": "_tool_get_top_network_status",
+        "analyze_top_dependencies": "_tool_analyze_top_dependencies",
         "list_top_work_items": "_tool_list_top_work_items",
         "get_top_errors": "_tool_get_top_errors",
         "build_pdg_expression": "_tool_build_pdg_expression",
@@ -7985,10 +8005,15 @@ class HoudiniMCP:
                     flip_settings.output(tmp_file)
                     flip_settings.frameRange((current_frame, current_frame))
                     flip_settings.resolution((width, height))
+                    flip_settings.useResolution(True)
                     flip_settings.outputToMPlay(False)
                     viewer.flipbook(viewport, flip_settings)
                 except Exception as e:
-                    return {"success": False, "error": f"Flipbook 截图失败: {e}"}
+                    return {
+                        "success": False,
+                        "error": f"Flipbook 截图失败: {e}",
+                        "failure_stage": "flipbook",
+                    }
 
                 if not os.path.exists(tmp_file):
                     import glob
@@ -7996,13 +8021,21 @@ class HoudiniMCP:
                     if candidates:
                         tmp_file = candidates[0]
                     else:
-                        return {"success": False, "error": "截图文件未生成，请检查视口状态"}
+                        return {
+                            "success": False,
+                            "error": "截图文件未生成，请检查视口状态",
+                            "failure_stage": "file",
+                        }
 
                 with open(tmp_file, 'rb') as f:
                     img_bytes = f.read()
 
             if len(img_bytes) == 0:
-                return {"success": False, "error": "截图文件为空"}
+                return {
+                    "success": False,
+                    "error": "截图文件为空",
+                    "failure_stage": "file",
+                }
 
             viewport_name = ""
             try:
@@ -8041,7 +8074,94 @@ class HoudiniMCP:
         except Exception as e:
             import traceback
             traceback.print_exc()
-            return {"success": False, "error": f"视口截图失败: {str(e)}"}
+            return {
+                "success": False,
+                "error": f"视口截图失败: {str(e)}",
+                "failure_stage": "capture",
+            }
+
+    def _prepare_visual_review_target(
+        self, target_path: str, framing: str
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Any]]:
+        """Validate and frame a visual-review target, returning restorable camera state."""
+        evidence: Dict[str, Any] = {
+            "target_path": target_path,
+            "framing": framing,
+            "freshness": "not_checked",
+        }
+        target = None
+        if target_path:
+            target, error = self._resolve_geometry_node(target_path)
+            if error:
+                return {"success": False, "error": error, "failure_stage": "cook"}, None
+            assert target is not None
+
+            needs_cook = None
+            try:
+                needs_cook = bool(target.needsToCook())
+            except Exception:
+                pass
+            try:
+                manual_mode = hou.updateModeSetting() == hou.updateMode.Manual
+            except Exception:
+                manual_mode = False
+
+            if manual_mode or needs_cook is not False:
+                validation = self._tool_temporary_auto_validate_geometry({"node_path": target_path})
+                evidence["validation"] = validation
+                if not validation.get("success"):
+                    return {
+                        "success": False,
+                        "error": validation.get("error") or "截图前目标 cook/read 验证失败",
+                        "failure_stage": "cook",
+                        "validation": validation,
+                    }, None
+                evidence["freshness"] = validation.get("freshness", {}).get("status", "unknown")
+            else:
+                evidence["freshness"] = "fresh"
+
+        if framing == "current":
+            return evidence, None
+
+        try:
+            viewer = hou.ui.curDesktop().paneTabOfType(hou.paneTabType.SceneViewer)
+            if viewer is None:
+                return {
+                    "success": False,
+                    "error": "找不到 Scene Viewer 面板，无法调整截图 framing",
+                    "failure_stage": "frame",
+                }, None
+            viewport = viewer.curViewport()
+            if viewport.camera() is not None:
+                return {
+                    "success": False,
+                    "error": "当前视口正在使用相机，拒绝自动 framing 以免改变相机构图",
+                    "failure_stage": "frame",
+                }, None
+            camera_state = viewport.defaultCamera().stash()
+            if framing == "all":
+                viewport.frameAll()
+            else:
+                if target is None:
+                    return {
+                        "success": False,
+                        "error": "target framing 需要有效的 target_path",
+                        "failure_stage": "frame",
+                    }, None
+                geometry = target.geometry()
+                if geometry is None:
+                    raise RuntimeError(f"目标没有可用于 framing 的几何体: {target_path}")
+                bbox = geometry.boundingBox()
+                viewport.frameBoundingBox(bbox)
+            viewport.draw()
+            evidence["framed"] = True
+            return evidence, (viewport, camera_state)
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": f"视口 framing 失败: {exc}",
+                "failure_stage": "frame",
+            }, None
 
     def _tool_capture_viewport(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """截取当前 Houdini 3D 视口的快照，返回 base64 编码的图片。"""
@@ -8106,12 +8226,32 @@ class HoudiniMCP:
 
         target_path = str(args.get("target_path") or "").strip()
         visual_goal = str(args.get("visual_goal") or "").strip()
+        framing = str(args.get("framing") or "").strip().lower()
+        if not framing:
+            framing = "target" if review_type == "geometry" and target_path else "current"
+        if framing not in {"current", "target", "all"}:
+            return {
+                "success": False,
+                "error": "framing must be one of: current, target, all",
+            }
         capture_args = {
             key: args[key]
             for key in ("width", "height", "target_path")
             if key in args
         }
-        result = self._tool_capture_viewport(capture_args)
+        preparation, restore_state = self._prepare_visual_review_target(target_path, framing)
+        if preparation is not None and preparation.get("success") is False:
+            return preparation
+        try:
+            result = self._tool_capture_viewport(capture_args)
+        finally:
+            if restore_state is not None:
+                viewport, camera_state = restore_state
+                try:
+                    viewport.setDefaultCamera(camera_state)
+                    viewport.draw()
+                except Exception:
+                    pass
         if not result.get("success"):
             return result
 
@@ -8122,6 +8262,8 @@ class HoudiniMCP:
         result.update({
             "review_type": review_type,
             "target_path": target_path,
+            "framing": framing,
+            "capture_preparation": preparation or {},
             "technical_status": "not_evaluated",
             "visual_status": "pending_model_review",
             "evidence": {

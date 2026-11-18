@@ -56,6 +56,15 @@ def _snapshot_version(path: Path) -> Tuple[int, int, bytes]:
     return stat.st_size, stat.st_mtime_ns, digest.digest()
 
 
+def _remove_sqlite_sidecars(db_path: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(db_path) + suffix)
+        try:
+            sidecar.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _sync_local_team_db(shared_path: Path, local_path: Path) -> bool:
     """Copy a changed shared snapshot locally without replacing a usable old cache on failure."""
     shared_version = _snapshot_version(shared_path)
@@ -596,6 +605,7 @@ def rebuild_team_memory(
         store.close()
     closed_singleton = _close_live_team_singleton(live_path)
     try:
+        _remove_sqlite_sidecars(live_path)
         os.replace(str(temp_path), str(live_path))
     except Exception:
         try:

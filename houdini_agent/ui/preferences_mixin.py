@@ -227,10 +227,11 @@ class PreferencesMixin:
         else:
             cost_display = ""
 
-        if cost_display:
-            self.token_stats_btn.setText(f"{tok_display} | {cost_display}")
-        else:
-            self.token_stats_btn.setText(tok_display)
+        button_text = f"{tok_display} | {cost_display}" if cost_display else tok_display
+        cache = self.__dict__.setdefault('_token_stats_display_cache', {})
+        if cache.get('text') != button_text:
+            self.token_stats_btn.setText(button_text)
+            cache['text'] = button_text
 
         cache_read = self._token_stats['cache_read']
         cache_write = self._token_stats['cache_write']
@@ -240,15 +241,16 @@ class PreferencesMixin:
         reasoning = self._token_stats.get('reasoning_tokens', 0)
         reasoning_line = tr('token.reasoning_line', reasoning) if reasoning > 0 else ""
 
-        self.token_stats_btn.setToolTip(
-            tr('token.summary',
-               self._token_stats['requests'],
-               self._token_stats['input_tokens'],
-               self._token_stats['output_tokens'],
-               reasoning_line,
-               cache_read, cache_write, hit_rate_display,
-               total, cost_display or '$0.00')
-        )
+        tooltip = tr('token.summary',
+                     self._token_stats['requests'],
+                     self._token_stats['input_tokens'],
+                     self._token_stats['output_tokens'],
+                     reasoning_line,
+                     cache_read, cache_write, hit_rate_display,
+                     total, cost_display or '$0.00')
+        if cache.get('tooltip') != tooltip:
+            self.token_stats_btn.setToolTip(tooltip)
+            cache['tooltip'] = tooltip
 
     def _show_token_stats_dialog(self):
         """显示详细 Token 统计对话框（对齐 Cursor：使用 TokenAnalyticsPanel）"""

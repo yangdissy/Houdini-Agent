@@ -22,6 +22,79 @@ def _call(tool_name, args=None):
 
 
 class AIClientThinkingHintTest(unittest.TestCase):
+    def test_stream_retries_false_missing_write_tool_claim(self):
+        tool = {
+            "type": "function",
+            "function": {"name": "set_node_parameter", "description": "set", "parameters": {}},
+        }
+        client = self._loop_client([
+            [
+                {"type": "content", "content": "当前缺少可执行的参数修改工具，我暂时无法直接修改场景。"},
+                {"type": "done", "usage": {}},
+            ],
+            [
+                {"type": "content", "content": "已继续执行。"},
+                {"type": "done", "usage": {}},
+            ],
+        ])
+
+        result = client.agent_loop_stream(
+            messages=[{"role": "user", "content": "关闭 File Range"}],
+            tools_override=[tool],
+            model="test-model",
+            provider="test-provider",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.chat_stream.call_count, 2)
+        retry_messages = client.chat_stream.call_args_list[1].kwargs["messages"]
+        self.assertIn("set_node_parameter", retry_messages[-1]["content"])
+
+    def test_missing_write_tool_claim_is_not_retried_without_write_tools(self):
+        client = self._loop_client([
+            [
+                {"type": "content", "content": "当前无法直接修改场景。"},
+                {"type": "done", "usage": {}},
+            ],
+        ])
+
+        result = client.agent_loop_stream(
+            messages=[{"role": "user", "content": "修改场景"}],
+            tools_override=[],
+            model="test-model",
+            provider="test-provider",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.chat_stream.call_count, 1)
+
+    def test_json_mode_retries_false_missing_write_tool_claim(self):
+        tool = {
+            "type": "function",
+            "function": {"name": "set_node_parameter", "description": "set", "parameters": {}},
+        }
+        responses = iter([
+            "当前缺少可执行的参数修改工具，我暂时无法直接修改场景。",
+            "已继续执行。",
+        ])
+        client = self._loop_client([])
+        client.chat_stream = mock.Mock(side_effect=lambda **kwargs: iter([
+            {"type": "content", "content": next(responses)},
+            {"type": "done", "usage": {}},
+        ]))
+
+        result = client.agent_loop_json_mode(
+            messages=[{"role": "user", "content": "关闭 File Range"}],
+            tools_override=[tool],
+            model="test-model",
+            provider="test-provider",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.chat_stream.call_count, 2)
+        retry_messages = client.chat_stream.call_args_list[1].kwargs["messages"]
+        self.assertIn("set_node_parameter", retry_messages[-1]["content"])
+
     def test_json_discovery_refreshes_one_tool_prompt_and_rejects_early_call(self):
         import copy
         from houdini_agent.core.agent_request_assembly import ToolExposureState
@@ -61,6 +134,47 @@ class AIClientThinkingHintTest(unittest.TestCase):
         self.assertNotIn("**get_usd_prim_info**", '\n'.join(first_prompts))
         self.assertIn("**get_usd_prim_info**", '\n'.join(second_prompts))
         self.assertEqual(sum(prompt.count("## 可用工具") for prompt in second_prompts), 1)
+
+    def test_native_discovery_does_not_finish_before_using_loaded_tool(self):
+        from houdini_agent.core.agent_request_assembly import ToolExposureState
+        from houdini_agent.core.streaming_tool_executor import StreamingToolExecutor
+        from houdini_agent.utils.tool_registry import ToolRegistry
+
+        registry = ToolRegistry()
+        schemas = [{"type": "function", "function": {"name": name, "description": name, "parameters": {}}}
+                   for name in ("search_tool_contracts", "execute_python")]
+        registry.register_core_tools(schemas)
+        exposure = ToolExposureState(registry, schemas[:1])
+        search = {"type": "tool_call", "tool_call": {
+            "id": "search-1", "type": "function", "function": {
+                "name": "search_tool_contracts", "arguments": '{"query":"execute_python","load":true}',
+            },
+        }}
+        execute = self._tool_call_chunk("execute-1", "execute_python")
+        client = self._loop_client([
+            [search, {"type": "done", "usage": {}}],
+            [{"type": "content", "content": "The tool is loaded; continue next turn."}, {"type": "done", "usage": {}}],
+            [execute, {"type": "done", "usage": {}}],
+            [{"type": "content", "content": "Complete."}, {"type": "done", "usage": {}}],
+        ])
+        calls = []
+        client._tool_executor = lambda name, **args: (
+            exposure.load(args["query"]) if name == "search_tool_contracts"
+            else calls.append(name) or {"success": True, "result": "executed"}
+        )
+        client._get_streaming_tool_executor.return_value = StreamingToolExecutor(
+            lambda name, args: client._tool_executor(name, **args), lambda args: {}, lambda args: {},
+        )
+
+        result = client.agent_loop_stream(
+            messages=[{"role": "user", "content": "load Python and fix the node"}],
+            tool_exposure=exposure, tools_override=schemas[:1],
+            model="test-model", provider="test-provider",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls, ["execute_python"])
+        self.assertEqual(result["final_content"].strip(), "Complete.")
 
     def test_native_discovery_refreshes_schemas_only_after_current_response(self):
         from houdini_agent.core.agent_request_assembly import ToolExposureState
@@ -171,6 +285,124 @@ class AIClientThinkingHintTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         resume.assert_not_called()
         self.assertEqual(client.chat_stream.call_count, 1)
+
+    def test_visual_review_finishes_without_forced_correction(self):
+        visual_result = {
+            "success": True,
+            "technical_status": "not_evaluated",
+            "visual_status": "pending_model_review",
+            "_viewport_image": "encoded",
+            "_image_media_type": "image/jpeg",
+        }
+        native_call = {
+            "type": "tool_call",
+            "tool_call": {
+                "id": "visual-1",
+                "type": "function",
+                "function": {"name": "visual_review", "arguments": "{}"},
+            },
+        }
+        tool = {"type": "function", "function": {"name": "visual_review", "description": "review", "parameters": {}}}
+        for mode in ("native", "json"):
+            for verdict in ("pass: technical checks passed; the target is visible",
+                            "inconclusive: the target is obstructed"):
+                with self.subTest(mode=mode, verdict=verdict):
+                    call = native_call if mode == "native" else {
+                        "type": "content",
+                        "content": '```json\n{"tool":"visual_review","args":{}}\n```',
+                    }
+                    client = self._loop_client([
+                        [call, {"type": "done", "usage": {}}],
+                        [{"type": "content", "content": verdict}, {"type": "done", "usage": {}}],
+                        [{"type": "content", "content": "unwanted correction"}, {"type": "done", "usage": {}}],
+                    ])
+                    client._tool_executor = lambda name, **args: visual_result
+                    client._get_streaming_tool_executor.return_value.execute_round.return_value = {
+                        "results_ordered": [visual_result],
+                        "dedup_flags": [False],
+                        "early_skip_count": 0,
+                    }
+                    streamed = []
+                    loop = client.agent_loop_stream if mode == "native" else client.agent_loop_json_mode
+                    result = loop(
+                        messages=[{"role": "user", "content": "Review the completed result"}],
+                        model="test-model", provider="test-provider",
+                        tools_override=[tool], on_content=streamed.append,
+                    )
+
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(client.chat_stream.call_count, 2)
+                    final_content = result.get("final_content", result["content"])
+                    self.assertEqual(final_content.count(verdict), 1)
+                    self.assertEqual("".join(streamed).count(verdict), 1)
+                    self.assertNotIn("unwanted correction", final_content)
+                    self.assertNotIn("unwanted correction", "".join(streamed))
+                    review_request = client.chat_stream.call_args_list[1].kwargs["messages"]
+                    images = [part for message in review_request
+                              if isinstance(message.get("content"), list)
+                              for part in message["content"] if part.get("type") == "image_url"]
+                    self.assertEqual(len(images), 1)
+
+    def test_viewport_batch_keeps_all_tool_results_before_images(self):
+        cases = (
+            ("visual_review", "update_todo"),
+            ("update_todo", "capture_viewport", "inspect_node"),
+            ("update_todo", "visual_review"),
+            ("visual_review", "capture_viewport", "inspect_node"),
+        )
+        for names in cases:
+            for supports_vision in (True, False):
+                with self.subTest(names=names, supports_vision=supports_vision):
+                    calls = [self._tool_call_chunk("batch-%s" % index, name)
+                             for index, name in enumerate(names)]
+                    results = []
+                    expected_images = []
+                    for index, name in enumerate(names):
+                        result = {"success": True, "result": "result-%s" % index}
+                        if name in ("visual_review", "capture_viewport"):
+                            result.update({
+                                "_viewport_image": "image-%s" % index,
+                                "_image_media_type": "image/png",
+                                "_image_prompt": "Review capture %s" % index,
+                            })
+                            expected_images.append("data:image/png;base64,image-%s" % index)
+                        elif name == "inspect_node":
+                            result = {"success": False, "error": "result-%s" % index}
+                        results.append(result)
+                    client = self._loop_client([
+                        calls + [{"type": "done", "usage": {}}],
+                        [{"type": "content", "content": "Reviewed."}, {"type": "done", "usage": {}}],
+                    ])
+                    del client._sanitize_working_messages
+                    client._get_streaming_tool_executor.return_value.execute_round.return_value = {
+                        "results_ordered": results,
+                        "dedup_flags": [False] * len(names),
+                    }
+                    result = client.agent_loop_stream(
+                        messages=[{"role": "user", "content": "Review"}],
+                        model="test-model", provider="test-provider",
+                        tools_override=[{"type": "function", "function": {"name": name}}
+                                        for name in set(names)],
+                        supports_vision=supports_vision,
+                    )
+
+                    self.assertTrue(result["ok"])
+                    request = client.chat_stream.call_args_list[1].kwargs["messages"]
+                    for messages in (request, result["new_messages"]):
+                        start = next(index for index, message in enumerate(messages)
+                                     if message.get("tool_calls"))
+                        tool_messages = messages[start + 1:start + 1 + len(names)]
+                        self.assertEqual([message["role"] for message in tool_messages],
+                                         ["tool"] * len(names))
+                        self.assertEqual([message["tool_call_id"] for message in tool_messages],
+                                         ["batch-%s" % index for index in range(len(names))])
+                        self.assertEqual(sum(message["role"] == "tool" for message in messages), len(names))
+                        for index, message in enumerate(tool_messages):
+                            self.assertIn("result-%s" % index, message["content"])
+                        images = [part["image_url"]["url"] for message in messages
+                                  if isinstance(message.get("content"), list)
+                                  for part in message["content"] if part.get("type") == "image_url"]
+                        self.assertEqual(images, expected_images if supports_vision else [])
 
     @staticmethod
     def _tool_call_chunk(call_id, name="inspect_node"):
@@ -345,6 +577,31 @@ class AIClientThinkingHintTest(unittest.TestCase):
         self.assertIn("继续", result["final_content"])
         self.assertTrue(any("继续" in s for s in streamed))
 
+    def test_max_iterations_summarizes_after_progress_content(self):
+        tool_round = [
+            {"type": "content", "content": "正在检查场景。"},
+            self._tool_call_chunk("a"),
+            {"type": "done", "usage": {}},
+        ]
+        summary = [{"type": "content", "content": "检查完成，节点尚未接入求解器。"},
+                   {"type": "done", "usage": {}}]
+        client = self._loop_client([tool_round, summary])
+
+        result = client.agent_loop_stream(
+            messages=[{"role": "user", "content": "检查连接"}],
+            model="test-model",
+            provider="test-provider",
+            tools_override=[],
+            max_iterations=1,
+        )
+
+        self.assertEqual(client.chat_stream.call_count, 2)
+        summary_request = client.chat_stream.call_args.kwargs
+        self.assertIsNone(summary_request["tools"])
+        self.assertIsNone(summary_request["tool_choice"])
+        self.assertIn("节点尚未接入求解器", result["final_content"])
+        self.assertEqual(result["stop_reason"], "max_iterations")
+
     def test_agent_loop_summary_preserves_user_thinking_setting(self):
         for enabled in (False, True):
             with self.subTest(enabled=enabled):
@@ -448,6 +705,51 @@ class AIClientThinkingHintTest(unittest.TestCase):
         tool_msgs = [m for m in result["new_messages"] if m.get("role") == "tool"]
         hinted = [m for m in tool_msgs if "上限" in m["content"]]
         self.assertEqual(len(hinted), 1)
+
+    def test_three_fully_cached_readonly_batches_stop_with_summary(self):
+        tool_names = [
+            "inspect_node",
+            "get_node_connections",
+            "get_node_parameters",
+            "get_network_structure",
+            "check_errors",
+            "get_scene_snapshot",
+        ]
+
+        def tool_round(round_index):
+            chunks = [
+                self._tool_call_chunk(f"{round_index}-{index}", name)
+                for index, name in enumerate(tool_names)
+            ]
+            return chunks + [{"type": "done", "usage": {}}]
+
+        summary = [{"type": "content", "content": "没有获得新证据，停止重复查询。"},
+                   {"type": "done", "usage": {}}]
+        client = self._loop_client([tool_round(index) for index in range(4)] + [summary])
+        executor = client._get_streaming_tool_executor.return_value
+        results = [{"success": True, "result": name} for name in tool_names]
+        executor.execute_round.side_effect = [
+            {"results_ordered": results, "dedup_flags": [False] * 6,
+             "dedup_hit_count": 0, "early_skip_count": 0},
+            *[
+                {"results_ordered": results, "dedup_flags": [True] * 6,
+                 "dedup_hit_count": 6, "early_skip_count": 0}
+                for _ in range(3)
+            ],
+        ]
+
+        result = client.agent_loop_stream(
+            messages=[{"role": "user", "content": "检查场景问题"}],
+            model="test-model",
+            provider="test-provider",
+            tools_override=[],
+            max_iterations=15,
+        )
+
+        self.assertEqual(executor.execute_round.call_count, 4)
+        self.assertEqual(client.chat_stream.call_count, 5)
+        self.assertEqual(result["stop_reason"], "no_progress")
+        self.assertIn("没有获得新证据", result["final_content"])
 
     def test_loop_abort_keeps_real_results_of_already_executed_calls(self):
         client = self._loop_client([
@@ -912,6 +1214,41 @@ class AIClientContextTrimTest(unittest.TestCase):
         self.assertEqual(client._progressive_trim.call_args.kwargs["trim_level"], 1)
         self.assertTrue(any("请求体过大" in update for update in content_updates))
         self.assertFalse(any("上下文超限" in update for update in content_updates))
+
+    def test_new_messages_survive_initial_history_trim(self):
+        client = AIClientThinkingHintTest._loop_client([
+            [{"type": "error", "error": "context_length_exceeded"}],
+            [AIClientThinkingHintTest._tool_call_chunk("fresh-call"),
+             {"type": "done", "usage": {}}],
+            [{"type": "content", "content": "Fresh answer."}, {"type": "done", "usage": {}}],
+        ])
+        client._progressive_trim = mock.Mock(return_value=[
+            {"role": "user", "content": "current request"},
+        ])
+
+        result = client.agent_loop_stream(
+            messages=[
+                {"role": "user", "content": "old request"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "current request"},
+            ],
+            model="test-model",
+            provider="test-provider",
+            tools_override=[],
+            max_iterations=3,
+        )
+
+        assistant_calls = [
+            message for message in result["new_messages"]
+            if message.get("role") == "assistant" and message.get("tool_calls")
+        ]
+        tool_results = [
+            message for message in result["new_messages"]
+            if message.get("tool_call_id") == "fresh-call"
+        ]
+        self.assertEqual(len(assistant_calls), 1)
+        self.assertEqual(len(tool_results), 1)
+        self.assertEqual(result["final_content"].strip(), "Fresh answer.")
 
     def test_request_body_budget_removes_old_images_before_current_image(self):
         old_image = "data:image/png;base64," + ("A" * 2500)

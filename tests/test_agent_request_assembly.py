@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 
 import unittest
+import copy
 import json
+import threading
 from unittest import mock
 
 from houdini_agent.core.agent_request_assembly import (
@@ -23,6 +25,66 @@ def _image(text, url):
 
 
 class AgentRequestAssemblyTest(unittest.TestCase):
+    def test_chat_stream_serializes_tool_protocol_into_http_payload(self):
+        requests_stub = mock.Mock()
+        requests_stub.exceptions.Timeout = TimeoutError
+        requests_stub.exceptions.RequestException = Exception
+        with mock.patch.dict('sys.modules', {'requests': requests_stub}):
+            from houdini_agent.utils.ai_client import AIClient
+
+        captured_payloads = []
+
+        class FakeResponse(object):
+            status_code = 200
+            encoding = 'utf-8'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def iter_content(self, chunk_size=None, decode_unicode=False):
+                yield b'data: [DONE]\n\n'
+
+        class FakeSession(object):
+            def post(self, url, **kwargs):
+                captured_payloads.append(copy.deepcopy(kwargs['json']))
+                return FakeResponse()
+
+        reference = 'res_' + 'b' * 32
+        messages = [
+            {'role': 'user', 'content': 'inspect'},
+            {'role': 'assistant', 'content': None, 'tool_calls': [{
+                'id': 'call_1', 'type': 'function',
+                'function': {'name': 'get_scene_snapshot', 'arguments': '{}'},
+            }]},
+            {'role': 'tool', 'tool_call_id': 'call_1', 'content': json.dumps({
+                'success': True, 'result_ref': reference, 'next_offset': 600,
+            })},
+        ]
+        client = object.__new__(AIClient)
+        client._http_session = FakeSession()
+        client._stop_event = threading.Event()
+        client._max_retries = 1
+        client._chunk_timeout = 30
+        client._get_api_key = mock.Mock(return_value='')
+        client._get_api_url = mock.Mock(return_value='http://example.invalid/chat')
+        client._is_anthropic_protocol = mock.Mock(return_value=False)
+
+        events = list(client.chat_stream(
+            messages=messages,
+            model='test-model',
+            provider='custom',
+            tools=[],
+        ))
+
+        self.assertEqual(events[-1]['type'], 'done')
+        outgoing = captured_payloads[0]['messages']
+        self.assertEqual(outgoing[1]['tool_calls'][0]['id'], 'call_1')
+        self.assertEqual(outgoing[2]['tool_call_id'], 'call_1')
+        self.assertEqual(json.loads(outgoing[2]['content'])['result_ref'], reference)
+
     def test_natural_language_discovery_ranks_names_and_intent(self):
         from houdini_agent.core.agent_request_assembly import ToolExposureState
         from houdini_agent.utils.tool_registry import ToolRegistry
@@ -245,6 +307,54 @@ class AgentRequestAssemblyTest(unittest.TestCase):
         }
         tools = finalize_tools([], [visual_review], supports_vision=False)
         self.assertEqual(tools, [])
+
+    def test_request_vision_directive_matches_exposure_and_budget(self):
+        from houdini_agent.core.agent_request_assembly import ToolExposureState
+        from houdini_agent.utils.tool_registry import ToolRegistry
+
+        registry = ToolRegistry()
+        registry.register_core_tools([
+            {'type': 'function', 'function': {
+                'name': name, 'description': name, 'parameters': {},
+            }} for name in ('create_node', 'visual_review', 'capture_viewport', 'verify_network')
+        ])
+        prefix = [{'role': 'system', 'content': 'shared cached rules'}]
+        assembly = build_context(prefix, [{'role': 'user', 'content': 'create a box'}], [])
+        counted_messages = []
+
+        def count_tokens(messages, tools):
+            counted_messages.append(copy.deepcopy(messages))
+            return sum(len(str(message.get('content', ''))) for message in messages) + len(tools)
+
+        for supports_vision in (True, False, True):
+            with self.subTest(supports_vision=supports_vision):
+                exposure = ToolExposureState(
+                    registry, registry.select_tools_for_request('create a box'),
+                    supports_vision=supports_vision,
+                )
+                counted_messages.clear()
+                request = finalize_context_request(
+                    assembly, exposure.snapshot(), [], supports_vision, False,
+                    10000, count_tokens, None,
+                )
+                directives = [message['content'] for message in request.messages
+                              if message['role'] == 'system'
+                              and message['content'].startswith('Current Model Vision Capability:')]
+                self.assertEqual(len(directives), 1)
+                self.assertIn('supports_vision=%s' % str(supports_vision).lower(), directives[0])
+                self.assertEqual('visual_review' in {tool['function']['name'] for tool in request.tools},
+                                 supports_vision)
+                self.assertTrue(request.budget_result.within_budget)
+                self.assertTrue(any(message.get('content') == directives[0]
+                                    for message in counted_messages[0]))
+                self.assertEqual(request.budget_result.final_tokens,
+                                 count_tokens(request.messages, request.tools))
+                if not supports_vision:
+                    self.assertIn('inconclusive', directives[0])
+                    self.assertIn('technical', directives[0])
+                    self.assertIn('Do not automatically capture_viewport', directives[0])
+                    self.assertIn('explicitly requests a saved screenshot', directives[0])
+        self.assertEqual(prefix, [{'role': 'system', 'content': 'shared cached rules'}])
 
     def test_selected_tools_are_not_expanded_without_registry_supplements(self):
         selected = {

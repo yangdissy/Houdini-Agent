@@ -57,7 +57,7 @@ class MCPSettings:
 	allowed_tools: Tuple[str, ...] = (
 		"health", "get_network_structure", "get_geometry_points",
 		"get_geometry_primitives", "get_usd_prim_info", "get_usd_layer_stack",
-		"get_top_network_status", "list_top_work_items", "get_top_errors", "read_selection",
+		"get_top_network_status", "analyze_top_dependencies", "list_top_work_items", "get_top_errors", "read_selection",
 	)
 	denied_tools: Tuple[str, ...] = (
 		"execute_python", "execute_python_code", "execute_shell", "load_hip",
@@ -104,7 +104,7 @@ def read_settings() -> MCPSettings:
 	allowed_tools = tuple(
 		name.strip() for name in str(cfg_dict.get(
 			"mcp_allowed_tools",
-			"health,get_network_structure,get_geometry_points,get_geometry_primitives,get_usd_prim_info,get_usd_layer_stack,get_top_network_status,list_top_work_items,get_top_errors,read_selection"
+			"health,get_network_structure,get_geometry_points,get_geometry_primitives,get_usd_prim_info,get_usd_layer_stack,get_top_network_status,analyze_top_dependencies,list_top_work_items,get_top_errors,read_selection"
 		)).split(",")
 		if name.strip()
 	)

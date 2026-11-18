@@ -99,6 +99,20 @@ class InferHelpersTest(unittest.TestCase):
 
 
 class ToolSemanticFactsTest(unittest.TestCase):
+    def test_viewport_captures_are_readonly_but_not_deduplicated(self):
+        reg = ToolRegistry()
+        reg.register_core_tools([_schema(name) for name in (
+            "visual_review", "capture_viewport", "inspect_node",
+        )])
+        profile = reg.build_streaming_executor_profile()
+
+        for name in ("visual_review", "capture_viewport"):
+            with self.subTest(tool=name):
+                self.assertIn("readonly", reg.get_meta(name).tags)
+                self.assertIn(name, profile["batch_readonly_tools"])
+                self.assertNotIn(name, profile["dedup_tools"])
+        self.assertIn("inspect_node", profile["dedup_tools"])
+
     def test_memory_tools_use_houdini_dispatch_runtime(self):
         reg = ToolRegistry()
         reg.register_core_tools([
@@ -449,6 +463,25 @@ class LegacyPluginRegistrationTest(unittest.TestCase):
 class IntentTest(unittest.TestCase):
     def setUp(self):
         self.reg = ToolRegistry()
+
+    def test_visual_tasks_prewarm_review_without_exposing_it_globally(self):
+        self.reg.register_core_tools([_schema("visual_review")])
+        for message in (
+            "create a box", "change its size", "build a mountain terrain",
+            "review the material and lighting", "check the viewport",
+            "modeling review", "composition review", "take a screenshot",
+            "创建一个球", "修改半径", "视觉验收", "看看视口",
+            "检查材质和灯光", "检查相机构图", "地形散布验收",
+        ):
+            with self.subTest(message=message):
+                names = {tool["function"]["name"]
+                         for tool in self.reg.select_tools_for_request(message)}
+                self.assertIn("visual_review", names)
+        for message in ("hello", "你好", "check node errors", "查看网络结构"):
+            with self.subTest(message=message):
+                names = {tool["function"]["name"]
+                         for tool in self.reg.select_tools_for_request(message)}
+                self.assertNotIn("visual_review", names)
 
     def test_intent_groups_and_keywords_stay_in_sync(self):
         groups = set(ToolRegistry._INTENT_TOOL_GROUPS)
