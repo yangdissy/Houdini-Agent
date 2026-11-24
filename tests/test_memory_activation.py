@@ -156,6 +156,24 @@ class FakeMemoryStore:
         self.procedural_updates.append((record_id, success))
 
 
+class SemanticOnlyStore(FakeMemoryStore):
+    def __init__(self, score, is_semantic=False):
+        super().__init__()
+        self.score = score
+        self.embedder.is_semantic = is_semantic
+
+    def search_by_level(self, query, level, top_k=3, threshold=0.0):
+        if level != 2:
+            return []
+        return [(SemanticRecord(id="match", rule="Relevant Houdini workflow", confidence=0.8), self.score)]
+
+    def search_episodic(self, query, top_k=2, min_importance=0.3):
+        return []
+
+    def search_procedural(self, query, top_k=2):
+        return []
+
+
 class FakeTeamMemoryStore:
     def search_semantic(self, query, top_k=3):
         return [(
@@ -172,6 +190,38 @@ class FakeTeamMemoryStore:
 
 
 class MemoryMixinActivationTest(unittest.TestCase):
+    def test_team_memory_notice_emits_without_marking(self):
+        mixin = MemoryMixin()
+        mixin._username = "alice"
+        mixin._teamMemoryNoticeRequired = mock.Mock()
+
+        with mock.patch(
+            "houdini_agent.utils.team_memory_settings.has_shown_team_export_notice",
+            return_value=False,
+        ), mock.patch(
+            "houdini_agent.utils.team_memory_settings.mark_team_export_notice_shown",
+        ) as mark:
+            mixin._maybe_notify_team_memory_export()
+
+        mixin._teamMemoryNoticeRequired.emit.assert_called_once_with()
+        mark.assert_not_called()
+
+    def test_team_memory_notice_marks_after_dialog(self):
+        from tests.test_import_smoke import _install_qt_stubs, _install_thirdparty_stubs
+        _install_thirdparty_stubs()
+        _install_qt_stubs()
+        mixin = MemoryMixin()
+        mixin._username = "alice"
+
+        with mock.patch("houdini_agent.qt_compat.QtWidgets.QMessageBox.information") as information, \
+             mock.patch(
+                 "houdini_agent.utils.team_memory_settings.mark_team_export_notice_shown",
+             ) as mark:
+            mixin._on_team_memory_notice_required()
+
+        information.assert_called_once()
+        mark.assert_called_once_with("alice")
+
     def test_init_memory_system_warms_team_memory_snapshot(self):
         mixin = MemoryMixin()
         mixin._username = "alice"
@@ -210,6 +260,47 @@ class MemoryMixinActivationTest(unittest.TestCase):
         self.assertEqual(mixin._memory_store.episodic_updates, [])
         self.assertEqual({item['record_id'] for item in mixin._pending_memory_reinforcement.values()}, {'s1', 'e1', 'p1'})
         self.assertIn('[M1]', result)
+
+    def test_fallback_semantic_activation_abstains_below_policy_score(self):
+        mixin = MemoryMixin()
+        mixin._username = "tester"
+        mixin._memory_initialized = True
+        mixin._memory_store = SemanticOnlyStore(score=0.34)
+
+        with mock.patch("houdini_agent.utils.team_memory_store.get_team_memory_store", side_effect=RuntimeError):
+            self.assertEqual(mixin._activate_long_term_memory("unrelated question"), "")
+        self.assertIsNone(mixin._pending_memory_reinforcement)
+
+    def test_fallback_semantic_activation_keeps_strong_match(self):
+        mixin = MemoryMixin()
+        mixin._username = "tester"
+        mixin._memory_initialized = True
+        mixin._memory_store = SemanticOnlyStore(score=0.35)
+
+        with mock.patch("houdini_agent.utils.team_memory_store.get_team_memory_store", side_effect=RuntimeError):
+            result = mixin._activate_long_term_memory("relevant Houdini workflow")
+        self.assertIn("Relevant Houdini workflow", result)
+
+    def test_semantic_backend_does_not_apply_fallback_score_gate(self):
+        mixin = MemoryMixin()
+        mixin._username = "tester"
+        mixin._memory_initialized = True
+        mixin._memory_store = SemanticOnlyStore(score=0.2, is_semantic=True)
+
+        with mock.patch("houdini_agent.utils.team_memory_store.get_team_memory_store", side_effect=RuntimeError):
+            result = mixin._activate_long_term_memory("relevant Houdini workflow")
+        self.assertIn("Relevant Houdini workflow", result)
+
+    def test_invalid_fallback_policy_fails_closed(self):
+        mixin = MemoryMixin()
+        mixin._username = "tester"
+        mixin._memory_initialized = True
+        mixin._memory_store = SemanticOnlyStore(score=0.9)
+
+        with mock.patch("houdini_agent.utils.team_memory_store.get_team_memory_store", side_effect=RuntimeError), \
+             mock.patch("houdini_agent.core.memory_mixin.load_quality_policy", side_effect=ValueError("bad policy")):
+            self.assertEqual(mixin._activate_long_term_memory("relevant Houdini workflow"), "")
+        self.assertIsNone(mixin._pending_memory_reinforcement)
 
     def test_positive_task_result_reinforces_pending_memories(self):
         mixin = MemoryMixin()

@@ -48,6 +48,29 @@ class WorkspacePersistenceTest(unittest.TestCase):
             self.assertEqual(json.loads((root / 'session_one.json').read_text()), old_one)
             self.assertEqual(json.loads((root / 'sessions_manifest.json').read_text()), old_manifest)
 
+    def test_failed_rollback_preserves_backup_with_old_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_one = {'session_id': 'one', 'conversation_history': [{'content': 'old'}]}
+            (root / 'session_one.json').write_text(json.dumps(old_one))
+            states = {
+                'one': SessionState('one', 'now', [{'content': 'new one'}]),
+                'two': SessionState('two', 'now', [{'content': 'new two'}]),
+            }
+
+            def fail_publish_and_rollback(source, target):
+                if target.name == 'session_two.json' or source.name.endswith('.rollback'):
+                    raise PermissionError('occupied')
+                source.replace(target)
+
+            with self.assertRaises(PermissionError):
+                save_workspace(root, states, [('one', 'One'), ('two', 'Two')], 'one',
+                               fail_publish_and_rollback)
+
+            backups = list(root.glob('.session_one.json.*.rollback'))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(json.loads(backups[0].read_text()), old_one)
+
     def test_manifest_suppresses_orphan_but_missing_manifest_restores_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

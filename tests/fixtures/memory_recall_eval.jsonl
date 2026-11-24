@@ -23,3 +23,7 @@
 {"query":"Who wrote Pride and Prejudice?","expected":[]}
 {"query":"What is the capital of Argentina?","expected":[]}
 {"query":"推荐一首钢琴曲","expected":[]}
+{"query":"How do I change viewport background colors in Houdini?","expected":[]}
+{"query":"Write a generic Python function to sort a list","expected":[]}
+{"query":"Where is the Houdini main menu preference setting?","expected":[]}
+{"query":"Which render engine should I choose for an animation?","expected":[]}

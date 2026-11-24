@@ -92,6 +92,11 @@ from ..core.diagnostics_retention import (
     is_retention_cleanup_enabled,
     retention_days_from_env,
 )
+from ..core.conversation_retention import (
+    cleanup_conversation_retention,
+    conversation_retention_days_from_env,
+    is_conversation_retention_enabled,
+)
 from ..core.harness_engine import (
     HarnessRuntimeState,
     HarnessToolPolicyEngine,
@@ -166,6 +171,7 @@ class AITab(
     _askQuestionRequest = QtCore.Signal(dict)
     _finishAskQuestionRequest = QtCore.Signal(str, str)
     _episodicRecorded = QtCore.Signal(str)            # 任务反思完成：写入 episodic 记忆 (episodic_id)
+    _teamMemoryNoticeRequired = QtCore.Signal()
     _memoryMigrationRequired = QtCore.Signal()
     _memoryMigrationFinished = QtCore.Signal(bool, str)
 
@@ -342,6 +348,7 @@ class AITab(
         self._askQuestionRequest.connect(self._on_render_ask_question, QtCore.Qt.QueuedConnection)
         self._finishAskQuestionRequest.connect(self._on_finish_ask_question, QtCore.Qt.QueuedConnection)
         self._episodicRecorded.connect(self._on_episodic_recorded, QtCore.Qt.QueuedConnection)
+        self._teamMemoryNoticeRequired.connect(self._on_team_memory_notice_required, QtCore.Qt.QueuedConnection)
         self._memoryMigrationRequired.connect(self._on_memory_migration_required, QtCore.Qt.QueuedConnection)
         self._memoryMigrationFinished.connect(self._on_memory_migration_finished, QtCore.Qt.QueuedConnection)
         self._init_memory_system()
@@ -378,6 +385,7 @@ class AITab(
         self._refresh_mode_guard_ui()
         
         QtCore.QTimer.singleShot(5000, self._run_diagnostics_retention_cleanup)
+        QtCore.QTimer.singleShot(6000, self._run_conversation_retention_cleanup)
         
         # 定期自动保存（每 60 秒），防止 Houdini 退出时丢失会话
         self._auto_save_timer = QtCore.QTimer(self)
@@ -467,6 +475,27 @@ class AITab(
                 )
         except Exception as exc:
             print(f"[Diagnostics Retention] cleanup failed: {exc}")
+
+    def _run_conversation_retention_cleanup(self):
+        if not is_conversation_retention_enabled():
+            return
+        if getattr(self, '_agent_session_id', None) is not None:
+            return
+        try:
+            summary = cleanup_conversation_retention(
+                self._cache_dir,
+                retention_days=conversation_retention_days_from_env(),
+                current_session_id=self._session_id,
+            )
+            if summary.get('deleted') or summary.get('errors') or summary.get('blocked'):
+                print(
+                    "[Conversation Retention] "
+                    f"deleted={summary.get('deleted', 0)} "
+                    f"errors={summary.get('errors', 0)} "
+                    f"blocked={summary.get('blocked', '')}"
+                )
+        except Exception as exc:
+            print(f"[Conversation Retention] cleanup failed: {exc}")
 
     def _rebuild_system_prompts(self, _lang: str = ''):
         """语言切换后重建系统提示词（含 Ask/Agent 模式强制语言规则）"""

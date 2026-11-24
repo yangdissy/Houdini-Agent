@@ -181,7 +181,7 @@ class HistoryRenderingMixin:
         batch_end = self._batch_cursor
         start_time = time.time()
         messages = self._conversation_history
-        insert_pos = self._batch_insert_pos
+        insert_pos = 0
 
         for gi in range(batch_start, batch_end):
             si, ei = self._batch_groups[gi]
@@ -205,7 +205,6 @@ class HistoryRenderingMixin:
             elapsed_ms = (time.time() - start_time) * 1000
             if elapsed_ms > self._BATCH_BUDGET_MS and gi < batch_end - 1:
                 self._batch_cursor = gi + 1
-                self._batch_insert_pos = insert_pos
                 remaining = gi + 1
                 if hasattr(self, '_batch_placeholder') and self._batch_placeholder:
                     try:
@@ -218,7 +217,6 @@ class HistoryRenderingMixin:
                 return
 
         self._batch_cursor = batch_start
-        self._batch_insert_pos = insert_pos
 
         if self._batch_cursor > 0:
             if hasattr(self, '_batch_placeholder') and self._batch_placeholder:

@@ -1550,7 +1550,7 @@ HOUDINI_TOOLS = [
         "type": "function",
         "function": {
             "name": "inspect_python",
-            "description": "在 Houdini 主线程执行只读 Python 观察代码。AST 检查会拒绝已知 HOM 写调用及属性/下标赋值；不能用于修改场景。",
+            "description": "在 Houdini 主线程执行只读 Python 观察代码。AST 检查仅放行查询类方法，其余调用及属性/下标赋值会被拒绝；不能用于修改场景。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2249,16 +2249,16 @@ class AIClient:
         def _runtime_profile_provider() -> Dict[str, set]:
             return self._build_tool_execution_profile()
 
-        if self._streaming_tool_executor is None:
+        if getattr(self, '_streaming_tool_executor', None) is None:
             self._streaming_tool_executor = StreamingToolExecutor(
                 tool_executor=self._call_tool_executor,
                 web_search_executor=lambda arguments: self._call_tool_executor('web_search', arguments),
                 fetch_webpage_executor=lambda arguments: self._call_tool_executor('fetch_webpage', arguments),
-                batch_tool_executor=self._batch_tool_executor,
+                batch_tool_executor=getattr(self, '_batch_tool_executor', None),
                 runtime_profile_provider=_runtime_profile_provider,
             )
         else:
-            self._streaming_tool_executor.update_batch_executor(self._batch_tool_executor)
+            self._streaming_tool_executor.update_batch_executor(getattr(self, '_batch_tool_executor', None))
             self._streaming_tool_executor.update_runtime_profile_provider(_runtime_profile_provider)
         return self._streaming_tool_executor
 
@@ -5719,6 +5719,9 @@ class AIClient:
         last_tool_name = None
         server_error_retries = 0    # 连续服务端错误重试计数
         max_server_retries = 3      # 最多重试 3 次服务端错误
+
+        _stream_tool_executor = self._get_streaming_tool_executor()
+        _stream_tool_executor.reset()
         
         while iteration < max_iterations:
             if self._stop_event.is_set():
@@ -6020,83 +6023,25 @@ class AIClient:
                     'stop_reason': 'max_tool_calls',
                 }
             
-            # 执行工具调用（web 工具并行，Houdini 工具串行）
+            # 执行工具调用
             tool_results = []
-
-            _json_execution_profile = self._build_tool_execution_profile()
-            _async_tools_json = set(_json_execution_profile.get('async_tools') or [])
-            _batch_readonly_json = set(_json_execution_profile.get('batch_readonly_tools') or [])
-            exec_results = [None] * len(tool_calls)
-            for index, call in enumerate(tool_calls):
-                if tool_exposure is not None and call['name'] not in exposed_names:
-                    exec_results[index] = tool_exposure.reject(call['name'])
-            async_tc = [(i, tc) for i, tc in enumerate(tool_calls) if exec_results[i] is None and tc['name'] in _async_tools_json]
-            houdini_tc = [(i, tc) for i, tc in enumerate(tool_calls) if exec_results[i] is None and tc['name'] not in _async_tools_json]
-
-            # 并行 async 工具（web + shell）
-            if len(async_tc) > 1:
-                import concurrent.futures
-                def _exec_async_json(idx_tc):
-                    idx, tc = idx_tc
-                    tname, targs = tc['name'], tc['arguments']
-                    if tname == 'web_search':
-                        return idx, self._call_tool_executor('web_search', targs)
-                    elif tname == 'fetch_webpage':
-                        return idx, self._call_tool_executor('fetch_webpage', targs)
-                    else:  # execute_shell
-                        return idx, self._tool_executor(tname, **targs)
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(async_tc))) as pool:
-                    for idx, res in pool.map(_exec_async_json, async_tc):
-                        exec_results[idx] = res
-            elif len(async_tc) == 1:
-                idx, tc = async_tc[0]
-                tname, targs = tc['name'], tc['arguments']
-                if tname == 'web_search':
-                    exec_results[idx] = self._call_tool_executor('web_search', targs)
-                elif tname == 'fetch_webpage':
-                    exec_results[idx] = self._call_tool_executor('fetch_webpage', targs)
-                else:  # execute_shell
-                    exec_results[idx] = self._tool_executor(tname, **targs)
-
-            # Houdini 工具（只读批量 / 写入串行）
-            readonly_batch_j = [(i, tc) for i, tc in houdini_tc if tc['name'] in _batch_readonly_json]
-            mutating_calls_j = [(i, tc) for i, tc in houdini_tc if tc['name'] not in _batch_readonly_json]
-
-            if len(readonly_batch_j) > 1 and self._batch_tool_executor:
-                batch_input = [(tc['name'], tc['arguments']) for _, tc in readonly_batch_j]
-                try:
-                    batch_results = self._batch_tool_executor(batch_input)
-                    for (idx, _), result in zip(readonly_batch_j, batch_results):
-                        exec_results[idx] = result
-                except Exception as e:
-                    print(f"[AI Client] JSON模式批量执行失败，回退串行: {e}")
-                    for idx, tc in readonly_batch_j:
-                        tname, targs = tc['name'], tc['arguments']
-                        try:
-                            exec_results[idx] = self._tool_executor(tname, **targs)
-                        except Exception as ex:
-                            exec_results[idx] = {"success": False, "error": str(ex)}
-            else:
-                for idx, tc in readonly_batch_j:
-                    tname, targs = tc['name'], tc['arguments']
-                    if not self._tool_executor:
-                        exec_results[idx] = {"success": False, "error": f"工具执行器未设置: {tname}"}
-                    else:
-                        try:
-                            exec_results[idx] = self._tool_executor(tname, **targs)
-                        except Exception as e:
-                            exec_results[idx] = {"success": False, "error": str(e)}
-
-            for idx, tc in mutating_calls_j:
-                tname, targs = tc['name'], tc['arguments']
-                if not self._tool_executor:
-                    exec_results[idx] = {"success": False, "error": f"工具执行器未设置: {tname}"}
-                else:
-                    try:
-                        exec_results[idx] = self._tool_executor(tname, **targs)
-                    except Exception as e:
-                        import traceback
-                        exec_results[idx] = {"success": False, "error": f"工具执行异常: {str(e)}\n{traceback.format_exc()[:200]}"}
+            rejected_calls = {
+                index: tool_exposure.reject(call['name'])
+                for index, call in enumerate(tool_calls)
+                if tool_exposure is not None and call['name'] not in exposed_names
+            }
+            executable_calls = [
+                ("", call['name'], call['arguments'], call)
+                for index, call in enumerate(tool_calls)
+                if index not in rejected_calls
+            ]
+            execution = _stream_tool_executor.execute_round(executable_calls)
+            executed_results = iter(execution.get('results_ordered', []))
+            exec_results = [
+                rejected_calls[index] if index in rejected_calls
+                else next(executed_results, {'success': False, 'error': 'Tool result missing'})
+                for index in range(len(tool_calls))
+            ]
 
             # 统一处理结果
             should_break_limit = False
@@ -6210,7 +6155,9 @@ class AIClient:
                     'ok': True,
                     'content': full_content + f"\n\n{_abort_msg}",
                     'tool_calls_history': tool_calls_history,
-                    'iterations': iteration
+                    'call_records': call_records,
+                    'iterations': iteration,
+                    'usage': total_usage,
                 }
             
             # 极简格式：工具结果，继续或总结

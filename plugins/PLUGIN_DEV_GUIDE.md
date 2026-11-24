@@ -10,7 +10,7 @@
 
 The plugin system integrates with the unified ToolRegistry which manages all tools:
 
-- Core Tools (77): Built-in Houdini operations
+- Core Tools (78): Built-in Houdini operations
 - Skills (68 across 10 categories): Pre-optimized Python analysis scripts
 - Plugin Tools: Tools registered by plugins via ctx.register_tool()
 - User Skills: User-defined skills in a custom directory

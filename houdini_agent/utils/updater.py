@@ -20,8 +20,9 @@ from typing import Tuple
 
 # ---------- 常量 ----------
 
-GITHUB_OWNER = "Kazama-Suichiku"
+GITHUB_OWNER = "yangdissy"
 GITHUB_REPO = "Houdini-Agent"
+_GITHUB_REPOSITORY = f"{GITHUB_OWNER}/{GITHUB_REPO}"
 
 # GitHub API 端点 — 基于 Release（而非 branch）
 _API_LATEST_RELEASE = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
@@ -101,7 +102,9 @@ def _load_etag_cache() -> dict:
     try:
         if _ETAG_CACHE_FILE.exists():
             with open(_ETAG_CACHE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                if data.get("repo") == _GITHUB_REPOSITORY:
+                    return data
     except Exception:
         pass
     return {}
@@ -112,7 +115,7 @@ def _save_etag_cache(data: dict):
     try:
         _ETAG_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(_ETAG_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump({"repo": _GITHUB_REPOSITORY, **data}, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 

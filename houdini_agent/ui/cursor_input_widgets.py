@@ -40,10 +40,11 @@ class NodeContextBar(QtWidgets.QFrame):
 
         lay.addStretch()
 
-        ref_btn = QtWidgets.QPushButton("R")
+        ref_btn = QtWidgets.QPushButton("↻")
         ref_btn.setFixedSize(22, 22)
         ref_btn.setFlat(True)
         ref_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        ref_btn.setToolTip(tr('context.refresh.tooltip'))
         ref_btn.setObjectName("ctxRefreshBtn")
         ref_btn.clicked.connect(self.refreshRequested.emit)
         lay.addWidget(ref_btn)

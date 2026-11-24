@@ -16,17 +16,17 @@ def recall_metrics(cases, retrieved, top_k=3):
         overlap = len(expected & actual)
         returned += len(actual)
         unrelated += len(actual - expected)
-        precisions += overlap / top_k
         if expected:
             positives += 1
             hits += bool(overlap)
+            precisions += overlap / top_k
             recalls += overlap / len(expected)
         else:
             negative_queries += 1
             false_queries += bool(actual)
     return {
         "hit_rate": hits / positives if positives else 0.0,
-        "precision_at_k": precisions / len(cases) if cases else 0.0,
+        "precision_at_k": precisions / positives if positives else 0.0,
         "recall_at_k": recalls / positives if positives else 0.0,
         "false_activation_rate": unrelated / returned if returned else 0.0,
         "negative_query_activation_rate": false_queries / negative_queries if negative_queries else 0.0,
@@ -62,11 +62,11 @@ def test_fallback_recall_quality_baseline(tmp_path):
                 retrieved.append([item["record_id"] for item in (mixin._pending_memory_reinforcement or {}).values()])
         metrics = recall_metrics(cases, retrieved)
         print("MEMORY_RECALL_BASELINE " + json.dumps(metrics, sort_keys=True))
-        assert len(cases) == 24 and not embedder.is_semantic
+        assert len(cases) == 28 and not embedder.is_semantic
         assert metrics["hit_rate"] >= 1.0
         assert metrics["recall_at_k"] >= 1.0
         assert metrics["precision_at_k"] >= 0.25 - 1e-9
-        assert metrics["false_activation_rate"] <= 0.75 + 1e-9
-        assert metrics["negative_query_activation_rate"] <= 1.0
+        assert metrics["false_activation_rate"] <= 0.20
+        assert metrics["negative_query_activation_rate"] <= 0.10
     finally:
         store.close()

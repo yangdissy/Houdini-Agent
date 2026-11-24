@@ -45,7 +45,7 @@ def load_security_policy(path: Path = POLICY_PATH) -> SecurityPolicy:
             raise ValueError("Invalid tool policy")
         if any(value not in {"low", "normal", "high"} for value in tools["risk_overrides"].values()):
             raise ValueError("Invalid tool risk")
-        for section in ("destructive_tools", "code_exec_tools", "scene_mutation_tools", "confirmation_tools", "controlled_write_skills", "sensitive_arg_keys", "python_blocked_modules", "python_blocked_calls"):
+        for section in ("destructive_tools", "code_exec_tools", "scene_mutation_tools", "confirmation_tools", "controlled_write_skills", "sensitive_arg_keys", "python_blocked_modules", "python_blocked_calls", "readonly_python_allowed_prefixes", "readonly_python_allowed_calls"):
             values = tools[section]
             if not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values):
                 raise ValueError("Invalid tool policy list")

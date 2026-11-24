@@ -115,9 +115,9 @@ QComboBox#modelCombo {
     color: #d4c5b0;
     border: 1px solid rgba(180,160,130,18);
     border-radius: 6px;
-    padding: 3px 8px;
+    padding: 2px 8px;
     font-size: {FS_SM}px;
-    min-height: 26px;
+    min-height: 18px;
 }
 QComboBox#providerCombo::drop-down,
 QComboBox#modelCombo::drop-down {
@@ -148,6 +148,7 @@ QCheckBox#chkThink {
     font-size: {FS_XS}px;
     spacing: 0px;
     padding: 3px 10px;
+    min-height: 16px;
     border-radius: 10px;
     border: 1px solid rgba(180,160,130,10);
     background: transparent;
@@ -212,7 +213,8 @@ QCheckBox#chkConfirm::indicator:checked {
 }
 
 /* --- Key Status (compact, truncated) --- */
-QLabel#keyStatus {
+QLabel#keyStatus,
+QLabel#userLabel {
     color: #8a7e6e;
     font-size: {FS_XS}px;
     padding: 0 2px;
@@ -332,6 +334,23 @@ QPushButton#btnCustomConfig {
 QPushButton#btnCustomConfig:hover {
     background: rgba(106,158,255,20);
     color: #6a9eff;
+}
+
+/* --- Refresh model catalog button --- */
+QPushButton#btnRefreshModels {
+    background: transparent;
+    color: #8a7e6e;
+    border: none;
+    border-radius: 4px;
+    font-size: {FS_SM}px;
+    padding: 0;
+}
+QPushButton#btnRefreshModels:hover {
+    background: rgba(180,160,130,8);
+    color: #b0a08c;
+}
+QPushButton#btnRefreshModels:disabled {
+    color: #5a5247;
 }
 
 /* --- Language combo (compact warm) --- */
@@ -984,19 +1003,18 @@ QPushButton#btnKeepAll:hover {
     border-color: rgba(16,185,129,120);
 }
 
-/* Toolbar controls — compact graphite pills */
+/* Toolbar controls — compact warm pills (same palette as header) */
 QPushButton#btnAttach,
 QComboBox#modeCombo,
 QPushButton#chkConfirm,
 QComboBox#readCombo,
 QLabel#modeGuardLabel,
 QPushButton#policyTimelineBtn {
-    background: rgba(24,25,29,210);
-    color: #b9c0c8;
-    border: 1px solid rgba(255,255,255,18);
-    border-radius: 5px;
+    background: rgba(45,40,32,200);
+    color: #b0a08c;
+    border: 1px solid rgba(180,160,130,18);
+    border-radius: 6px;
     font-size: {FS_XS}px;
-    font-weight: bold;
     min-height: 22px;
 }
 
@@ -1005,9 +1023,9 @@ QComboBox#modeCombo:hover,
 QPushButton#chkConfirm:hover,
 QComboBox#readCombo:hover,
 QPushButton#policyTimelineBtn:hover {
-    background: rgba(34,36,42,230);
-    border-color: rgba(255,255,255,34);
-    color: #edf1f5;
+    background: rgba(50,44,35,230);
+    border-color: rgba(212,165,116,50);
+    color: #d4c5b0;
 }
 
 QComboBox#modeCombo {
@@ -1020,11 +1038,11 @@ QComboBox#readCombo::drop-down {
 }
 QComboBox#modeCombo QAbstractItemView,
 QComboBox#readCombo QAbstractItemView {
-    background: rgba(22,24,28,248);
-    color: #d7dde5;
-    border: 1px solid rgba(255,255,255,24);
-    selection-background-color: rgba(212,165,116,54);
-    selection-color: #ffffff;
+    background: rgba(35,30,24,248);
+    color: #d4c5b0;
+    border: 1px solid rgba(180,160,130,20);
+    selection-background-color: rgba(212,165,116,40);
+    selection-color: #f0e6d6;
     font-size: {FS_XS}px;
     outline: none;
     border-radius: 6px;
@@ -1047,7 +1065,7 @@ QComboBox#modeCombo[mode="ask"]:hover {
 /* Plan = focused amber, integrated with the toolbar */
 QComboBox#modeCombo[mode="plan"] {
     background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
-        stop:0 rgba(72,50,20,238), stop:1 rgba(30,31,35,220));
+        stop:0 rgba(72,50,20,238), stop:1 rgba(45,40,32,220));
     color: #ffd27a;
     border-color: rgba(245,158,11,150);
     font-size: {FS_XS}px;
@@ -1055,21 +1073,13 @@ QComboBox#modeCombo[mode="plan"] {
 }
 QComboBox#modeCombo[mode="plan"]:hover {
     background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
-        stop:0 rgba(88,61,24,245), stop:1 rgba(36,37,42,235));
+        stop:0 rgba(88,61,24,245), stop:1 rgba(50,44,35,235));
     color: #ffe1a3;
 }
 
 QPushButton#btnAttach {
-    background: rgba(38,40,46,235);
-    color: #d5dbe2;
-    border-color: rgba(255,255,255,42);
     font-size: {FS_SM}px;
     padding: 0;
-}
-QPushButton#btnAttach:hover {
-    background: rgba(52,55,63,245);
-    color: #ffffff;
-    border-color: rgba(212,165,116,110);
 }
 QPushButton#btnAttach:pressed {
     background: rgba(63,52,38,245);
@@ -1092,7 +1102,6 @@ QPushButton#chkConfirm[confirm="off"] {
 
 QComboBox#readCombo {
     padding: 1px 18px 1px 9px;
-    color: #b8c0ca;
 }
 
 QLabel#modeGuardLabel {
@@ -1116,7 +1125,7 @@ QLabel#modeGuardLabel[risk="high"] {
 
 QPushButton#policyTimelineBtn {
     padding: 1px 10px;
-    color: #9ea7b2;
+    color: #8a7e6e;
 }
 QPushButton#policyTimelineBtn[failures="true"] {
     background: rgba(56,27,29,225);

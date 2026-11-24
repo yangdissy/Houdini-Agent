@@ -3,6 +3,8 @@
   "policy_id": "houdini-agent-tools",
   "tool_policy": {
     "risk_overrides": {},
+      "readonly_python_allowed_prefixes": ["get", "is", "has", "find", "list", "eval", "iter", "Get", "Is", "Has"],
+      "readonly_python_allowed_calls": ["node", "nodes", "item", "items", "parm", "parms", "parmTuple", "parmTuples", "path", "name", "type", "category", "nameWithCategory", "description", "label", "children", "allSubChildren", "allItems", "allNodes", "allParms", "parent", "inputs", "outputs", "input", "inputConnections", "outputConnections", "inputNames", "outputNames", "geometry", "points", "prims", "vertices", "pointAttribs", "primAttribs", "vertexAttribs", "globalAttribs", "attribValue", "attribType", "dataType", "size", "intrinsicNames", "intrinsicValue", "boundingBox", "errors", "warnings", "messages", "comment", "color", "position", "userData", "userDataDict", "parmTemplate", "parmTemplateGroup", "expression", "expressionLanguage", "rawValue", "unexpandedString", "keyframes", "frame", "time", "fps", "selectedNodes", "selectedItems", "pwd", "stage", "keys", "values", "get", "join", "split", "strip", "startswith", "endswith", "lower", "upper", "format", "count", "index"],
     "destructive_tools": ["delete_node", "save_hip"],
     "code_exec_tools": ["execute_python", "execute_shell"],
     "scene_mutation_tools": [

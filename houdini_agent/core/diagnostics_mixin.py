@@ -141,8 +141,8 @@ class DiagnosticsMixin:
     def _show_policy_menu(self):
         """显示策略/诊断菜单。"""
         menu = QtWidgets.QMenu(self)
-        menu.addAction("Policy Timeline", self._show_policy_timeline_dialog)
-        menu.addAction("Export Diagnostics JSON", self._export_diagnostics_json)
+        menu.addAction(tr('diagnostics.menu.timeline'), self._show_policy_timeline_dialog)
+        menu.addAction(tr('diagnostics.menu.export'), self._export_diagnostics_json)
         menu.exec_(self.policy_timeline_btn.mapToGlobal(
             QtCore.QPoint(0, self.policy_timeline_btn.height())
         ))

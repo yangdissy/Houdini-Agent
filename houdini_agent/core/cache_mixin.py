@@ -19,6 +19,7 @@ from houdini_agent.core.workspace_persistence import (
     write_manifest,
 )
 from houdini_agent.qt_compat import QtCore, QtGui, QtWidgets
+from houdini_agent.ui.i18n import tr
 
 
 class CacheMixin:
@@ -27,27 +28,27 @@ class CacheMixin:
         menu = QtWidgets.QMenu(self)
         
         # 保存存档（独立文件）
-        archive_action = menu.addAction("存档当前对话")
+        archive_action = menu.addAction(tr('cache.menu.archive'))
         archive_action.triggered.connect(self._archive_cache)
         
         # 加载对话
-        load_action = menu.addAction("加载对话...")
+        load_action = menu.addAction(tr('cache.menu.load'))
         load_action.triggered.connect(self._load_cache_dialog)
         
         menu.addSeparator()
         
         # 压缩为摘要（减少 token）
-        compress_action = menu.addAction("压缩旧对话为摘要")
+        compress_action = menu.addAction(tr('cache.menu.compress'))
         compress_action.triggered.connect(self._compress_to_summary)
         
         # 列出所有缓存
-        list_action = menu.addAction("查看所有缓存")
+        list_action = menu.addAction(tr('cache.menu.list'))
         list_action.triggered.connect(self._list_caches)
         
         menu.addSeparator()
         
         # 自动保存开关
-        auto_save_action = menu.addAction("[on] 自动保存" if self._auto_save_cache else "自动保存")
+        auto_save_action = menu.addAction(tr('cache.menu.auto_save'))
         auto_save_action.setCheckable(True)
         auto_save_action.setChecked(self._auto_save_cache)
         auto_save_action.triggered.connect(lambda: setattr(self, '_auto_save_cache', not self._auto_save_cache))
@@ -415,7 +416,7 @@ class CacheMixin:
             with open(archive_file, 'w', encoding='utf-8') as f:
                 json.dump(cache_data, f, ensure_ascii=False, indent=2)
             est = cache_data['estimated_tokens']
-            self._addStatus.emit(f"已存档: {filename} (~{est} tokens)")
+            QtWidgets.QMessageBox.information(self, "存档完成", f"已存档: {filename} (~{est} tokens)")
             return True
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "错误", f"存档失败: {str(e)}")
@@ -564,7 +565,7 @@ class CacheMixin:
             self._update_context_stats()
             
             if not silent:
-                self._addStatus.emit(f"缓存已加载: {cache_file.name}")
+                QtWidgets.QMessageBox.information(self, "加载完成", f"缓存已加载: {cache_file.name}")
             
             return True
             

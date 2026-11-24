@@ -75,6 +75,7 @@ class InputToolbarStateTest(unittest.TestCase):
         AITab._on_mode_changed(tab, 1)
 
         self.assertFalse(tab.chk_confirm_mode.visible)
+        self.assertTrue(tab.mode_guard_label.visible)
         self.assertEqual(tab.mode_guard_label.text, "只读")
         self.assertEqual(tab.mode_guard_label.properties["risk"], "readonly")
         self.assertEqual(tab.policy_timeline_btn.text, "安全记录 0")
@@ -84,6 +85,7 @@ class InputToolbarStateTest(unittest.TestCase):
         AITab._on_mode_changed(tab, 0)
 
         self.assertTrue(tab.chk_confirm_mode.visible)
+        self.assertFalse(tab.mode_guard_label.visible)
         self.assertEqual(tab.mode_guard_label.text, "需确认")
 
         AITab._on_confirm_mode_toggled(tab, False)
@@ -146,7 +148,7 @@ class InputToolbarStateTest(unittest.TestCase):
         self.assertIn("train.menu_label", overflow_body)
         self.assertIn("export_training_action.setEnabled(False)", overflow_body)
         self.assertNotIn("btn_export_train.click", overflow_body)
-        self.assertIn('update_action = menu.addAction("Update")', overflow_body)
+        self.assertIn("update_action = menu.addAction(tr('header.menu.update'))", overflow_body)
         self.assertIn("update_action.setEnabled(False)", overflow_body)
         self.assertNotIn('menu.addAction("Update", self.btn_update.click)', overflow_body)
         self.assertIn('is_qobject_alive(btn)', rich_content)

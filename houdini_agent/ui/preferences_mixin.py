@@ -334,26 +334,25 @@ class PreferencesMixin:
         """显示 Token 优化菜单"""
         menu = QtWidgets.QMenu(self)
 
-        optimize_now_action = menu.addAction("立即压缩对话")
+        optimize_now_action = menu.addAction(tr('optimize.menu.now'))
         optimize_now_action.triggered.connect(self._optimize_now)
 
         menu.addSeparator()
 
-        auto_label = "自动压缩 [on]" if self._auto_optimize else "自动压缩"
-        auto_opt_action = menu.addAction(auto_label)
+        auto_opt_action = menu.addAction(tr('optimize.menu.auto'))
         auto_opt_action.setCheckable(True)
         auto_opt_action.setChecked(self._auto_optimize)
         auto_opt_action.triggered.connect(lambda: setattr(self, '_auto_optimize', not self._auto_optimize))
 
         menu.addSeparator()
 
-        strategy_menu = menu.addMenu("压缩策略")
+        strategy_menu = menu.addMenu(tr('optimize.menu.strategy'))
         strategy_group = QtWidgets.QActionGroup(strategy_menu)
         strategy_group.setExclusive(True)
         for label, strat in [
-            ("激进 (最大节省)", CompressionStrategy.AGGRESSIVE),
-            ("平衡 (推荐)", CompressionStrategy.BALANCED),
-            ("保守 (保留细节)", CompressionStrategy.CONSERVATIVE),
+            (tr('optimize.menu.aggressive'), CompressionStrategy.AGGRESSIVE),
+            (tr('optimize.menu.balanced'), CompressionStrategy.BALANCED),
+            (tr('optimize.menu.conservative'), CompressionStrategy.CONSERVATIVE),
         ]:
             action = strategy_menu.addAction(label)
             action.setCheckable(True)

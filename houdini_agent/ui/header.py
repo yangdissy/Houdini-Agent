@@ -57,13 +57,13 @@ class HeaderMixin:
         self.provider_combo.addItem("OF3D", 'of3d')
         self.provider_combo.addItem("Custom", 'custom')
         self.provider_combo.setMinimumWidth(70)
-        self.provider_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        row.addWidget(self.provider_combo, 1)
+        self.provider_combo.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        row.addWidget(self.provider_combo)
         
         # Custom 配置按钮（仅在 Custom provider 时可见）
         self.btn_custom_config = QtWidgets.QPushButton("⚙")
         self.btn_custom_config.setObjectName("btnCustomConfig")
-        self.btn_custom_config.setFixedSize(26, 26)
+        self.btn_custom_config.setFixedSize(24, 24)
         self.btn_custom_config.setCursor(QtCore.Qt.PointingHandCursor)
         self.btn_custom_config.setToolTip("配置 Custom Model 的 URL、API Key 和模型名")
         self.btn_custom_config.setVisible(False)
@@ -203,7 +203,7 @@ class HeaderMixin:
 
         self.btn_refresh_models = QtWidgets.QPushButton("↻")
         self.btn_refresh_models.setObjectName("btnRefreshModels")
-        self.btn_refresh_models.setFixedSize(26, 26)
+        self.btn_refresh_models.setFixedSize(24, 24)
         self.btn_refresh_models.setCursor(QtCore.Qt.PointingHandCursor)
         self.btn_refresh_models.setToolTip("后台刷新模型目录（失败时保留当前列表）")
         self.btn_refresh_models.clicked.connect(self._refresh_model_catalog_async)
@@ -244,7 +244,7 @@ class HeaderMixin:
         # ⋯ 溢出菜单按钮
         self.btn_overflow = QtWidgets.QPushButton("···")
         self.btn_overflow.setObjectName("btnOverflow")
-        self.btn_overflow.setFixedSize(26, 26)
+        self.btn_overflow.setFixedSize(24, 24)
         self.btn_overflow.setCursor(QtCore.Qt.PointingHandCursor)
         self.btn_overflow.clicked.connect(self._show_overflow_menu)
         row.addWidget(self.btn_overflow)
@@ -294,31 +294,31 @@ class HeaderMixin:
         
         # OF3D 内置 key，不暴露 API Key 入口
         if self._current_provider() != 'of3d':
-            menu.addAction("API Key", self.btn_key.click)
-        menu.addAction("缓存设置", self.btn_cache.click)
-        menu.addAction("上下文压缩", self.btn_optimize.click)
+            menu.addAction(tr('header.menu.api_key'), self.btn_key.click)
+        menu.addAction(tr('header.menu.cache'), self.btn_cache.click)
+        menu.addAction(tr('header.menu.optimize'), self.btn_optimize.click)
         export_training_action = menu.addAction(tr('train.menu_label'))
         export_training_action.setEnabled(False)
         menu.addSeparator()
-        update_action = menu.addAction("Update")
+        update_action = menu.addAction(tr('header.menu.update'))
         update_action.setEnabled(False)
-        menu.addAction("Font (Aa)", self.btn_font_scale.click)
+        menu.addAction(tr('header.menu.font'), self.btn_font_scale.click)
         menu.addSeparator()
         menu.addAction(tr('rules.menu_label'), self._open_rules_editor)
         menu.addAction(tr('plugin.menu_label'), self._open_plugin_manager)
         if hasattr(self, "_request_user_switch"):
-            menu.addAction("Switch User", self._request_user_switch)
+            menu.addAction(tr('header.menu.switch_user'), self._request_user_switch)
         menu.addSeparator()
         self._add_team_memory_sharing_action(menu)
         if is_dev_reload_enabled():
             self._add_dev_feature_toggle_menu(menu)
-            menu.addAction("Rebuild Team Memory", self._rebuild_team_memory_from_menu)
+            menu.addAction(tr('header.menu.rebuild_team_memory'), self._rebuild_team_memory_from_menu)
             menu.addSeparator()
         
         # 语言子菜单
-        lang_menu = menu.addMenu("Language")
-        act_zh = lang_menu.addAction("中文")
-        act_en = lang_menu.addAction("EN")
+        lang_menu = menu.addMenu(tr('header.menu.language'))
+        act_zh = lang_menu.addAction(tr('header.menu.language.zh'))
+        act_en = lang_menu.addAction(tr('header.menu.language.en'))
         current_lang = get_language()
         act_zh.setCheckable(True)
         act_en.setCheckable(True)
@@ -373,16 +373,14 @@ class HeaderMixin:
         uname = getattr(self, "_username", "")
         if not uname:
             return
-        action = menu.addAction("Team Memory Sharing")
+        action = menu.addAction(tr('header.menu.team_memory_sharing'))
         self._team_memory_action_ref = action  # ★ 持久引用，排除 QAction 被提前 GC 的可能
         action.setCheckable(True)
         try:
             action.setChecked(is_team_export_enabled(uname))
         except Exception:
             action.setChecked(True)
-        action.setToolTip(
-            "睡眠维护时是否把技术类经验（不含个人偏好/身份信息）同步一份到共享盘，供团队记忆库使用。"
-        )
+        action.setToolTip(tr('header.menu.team_memory_sharing.tooltip'))
         action.triggered.connect(
             lambda checked=False, u=uname: self._toggle_team_memory_sharing(u)
         )

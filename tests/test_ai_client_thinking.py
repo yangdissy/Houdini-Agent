@@ -95,9 +95,43 @@ class AIClientThinkingHintTest(unittest.TestCase):
         retry_messages = client.chat_stream.call_args_list[1].kwargs["messages"]
         self.assertIn("set_node_parameter", retry_messages[-1]["content"])
 
+    def test_json_mode_passes_model_order_to_streaming_executor(self):
+        tools = [
+            {"type": "function", "function": {"name": name, "description": name, "parameters": {}}}
+            for name in ("create_node", "inspect_node")
+        ]
+        calls = (
+            '```json\n{"tool":"create_node","args":{"node_type":"geo"}}\n```\n'
+            '```json\n{"tool":"inspect_node","args":{"node_path":"/obj/geo1"}}\n```'
+        )
+        client = self._loop_client([
+            [{"type": "content", "content": calls}, {"type": "done", "usage": {}}],
+            [{"type": "content", "content": "Complete."}, {"type": "done", "usage": {}}],
+        ])
+        client._get_streaming_tool_executor.return_value.execute_round.return_value = {
+            "results_ordered": [
+                {"success": True, "result": "created"},
+                {"success": True, "result": "inspected"},
+            ],
+            "dedup_flags": [False, False],
+            "early_skip_count": 0,
+        }
+
+        result = client.agent_loop_json_mode(
+            messages=[{"role": "user", "content": "create then inspect"}],
+            tools_override=tools,
+            model="test-model",
+            provider="test-provider",
+        )
+
+        self.assertTrue(result["ok"])
+        executor_calls = client._get_streaming_tool_executor.return_value.execute_round.call_args.args[0]
+        self.assertEqual([call[1] for call in executor_calls], ["create_node", "inspect_node"])
+
     def test_json_discovery_refreshes_one_tool_prompt_and_rejects_early_call(self):
         import copy
         from houdini_agent.core.agent_request_assembly import ToolExposureState
+        from houdini_agent.core.streaming_tool_executor import StreamingToolExecutor
         from houdini_agent.utils.tool_registry import ToolRegistry
 
         registry = ToolRegistry()
@@ -115,6 +149,9 @@ class AIClientThinkingHintTest(unittest.TestCase):
         client._tool_executor = lambda name, **args: (
             exposure.load(args["query"]) if name == "search_tool_contracts"
             else calls.append(name) or {"success": True, "result": "inspected"}
+        )
+        client._get_streaming_tool_executor.return_value = StreamingToolExecutor(
+            lambda name, args: client._tool_executor(name, **args), lambda args: {}, lambda args: {},
         )
 
         def stream(**kwargs):

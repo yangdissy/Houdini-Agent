@@ -19,6 +19,7 @@ MemoryMixin — 长期记忆系统相关方法
 import threading
 
 from ..utils.memory_store import get_memory_store
+from ..utils.memory_quality import load_quality_policy
 from ..utils.token_optimizer import message_content_text
 from ..utils.reward_engine import get_reward_engine
 from ..utils.reflection import get_reflection_module
@@ -103,17 +104,25 @@ class MemoryMixin:
         try:
             from ..utils.team_memory_settings import (
                 has_shown_team_export_notice,
-                mark_team_export_notice_shown,
             )
             if has_shown_team_export_notice(self._username):
                 return
-            mark_team_export_notice_shown(self._username)
-            self._addStatus.emit(
-                "ℹ️ 已默认开启「团队记忆共享」：睡眠维护时会把技术类经验（不含个人偏好/身份信息）"
-                "同步一份到共享盘，供团队记忆库使用；可在顶部溢出菜单「Team Memory Sharing」随时关闭。"
-            )
+            self._teamMemoryNoticeRequired.emit()
         except Exception:
             pass
+
+    def _on_team_memory_notice_required(self):
+        """在主线程显示团队记忆告知，并在用户看到后记录。"""
+        from ..qt_compat import QtWidgets
+        from ..utils.team_memory_settings import mark_team_export_notice_shown
+
+        QtWidgets.QMessageBox.information(
+            self,
+            "团队记忆共享",
+            "已默认开启团队记忆共享：睡眠维护时会把技术类经验（不含个人偏好或身份信息）"
+            "同步一份到共享盘，供团队记忆库使用。可在顶部溢出菜单 Team Memory Sharing 随时关闭。",
+        )
+        mark_team_export_notice_shown(self._username)
 
     def _build_memory_query(self, user_message: str, scene_context: dict = None) -> str:
         """构建当前请求的召回查询，并补充上一条用户目标。"""
@@ -300,6 +309,12 @@ class MemoryMixin:
                 print(f"[Memory] 团队记忆自动激活跳过 (非致命): {e}")
 
             from ..utils.security_guard import find_memory_threat
+            if not _is_semantic:
+                min_score = load_quality_policy()["fallback_auto_activation_min_score"]
+                candidates = [
+                    item for item in candidates
+                    if item.kind not in {"semantic", "team_semantic"} or item.score >= min_score
+                ]
             safe_candidates = []
             for item in candidates:
                 source_text = "\n".join(str(getattr(item.source, name, "")) for name in (

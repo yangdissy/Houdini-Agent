@@ -4,6 +4,7 @@
 import json
 import os
 import shutil
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -90,6 +91,7 @@ def save_workspace(cache_dir: Path, states: Mapping[str, SessionState],
     atomic_write_json(staged_manifest, build_manifest(manifest_tabs, requested_id))
 
     backups = []
+    retained_backups = set()
     try:
         for staged, target in staged_files:
             backup = cache_dir / f'.{target.name}.{uuid.uuid4().hex}.rollback'
@@ -107,7 +109,16 @@ def save_workspace(cache_dir: Path, states: Mapping[str, SessionState],
                     if target.exists():
                         target.unlink()
                 else:
-                    replace(backup, target)
+                    for attempt in range(5):
+                        try:
+                            replace(backup, target)
+                            break
+                        except PermissionError:
+                            if attempt == 4:
+                                retained_backups.add(backup)
+                                print(f'[Cache] Rollback failed; old data retained at {backup}')
+                            else:
+                                time.sleep(0.05)
             except OSError:
                 pass
         raise
@@ -118,7 +129,7 @@ def save_workspace(cache_dir: Path, states: Mapping[str, SessionState],
         if staged_manifest.exists():
             staged_manifest.unlink()
         for _, backup in backups:
-            if backup is not None and backup.exists():
+            if backup is not None and backup not in retained_backups and backup.exists():
                 backup.unlink()
 
     for path in empty_files:

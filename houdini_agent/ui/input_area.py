@@ -85,7 +85,7 @@ class InputAreaMixin:
         self.image_preview_layout.addStretch()
         layout.addWidget(self.image_preview_container)
         
-        # -------- 工具栏第一行：+ | Mode | Cfm | Read | plugins --------
+        # -------- 工具栏：+ | Mode | Cfm | plugins ... token | context --------
         toolbar_top = QtWidgets.QHBoxLayout()
         toolbar_top.setSpacing(5)
         toolbar_top.setContentsMargins(0, 0, 0, 0)
@@ -145,7 +145,7 @@ class InputAreaMixin:
         self.read_combo.setVisible(False)
         self.read_combo.currentIndexChanged.connect(self._on_auto_read_changed)
 
-        # 模式风险徽标（持续可见）
+        # 只读徽标：仅 Ask 模式可见；Agent/Plan 的风险由确认开关颜色表达
         self.mode_guard_label = QtWidgets.QLabel(tr('guard.readonly'))
         self.mode_guard_label.setObjectName("modeGuardLabel")
         self.mode_guard_label.setProperty("risk", "readonly")
@@ -173,28 +173,21 @@ class InputAreaMixin:
         toolbar_top.addLayout(self._plugin_button_container)
 
         toolbar_top.addStretch()
-        layout.addLayout(toolbar_top)
-
-        # -------- 工具栏第二行：token | $ cost | context% | context size --------
-        toolbar_bottom = QtWidgets.QHBoxLayout()
-        toolbar_bottom.setSpacing(6)
-        toolbar_bottom.setContentsMargins(0, 0, 0, 0)
-
-        toolbar_bottom.addStretch()
 
         # Token 统计
         self.token_stats_btn = QtWidgets.QPushButton("Tokens: 0")
         self.token_stats_btn.setObjectName("tokenStats")
+        self.token_stats_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.token_stats_btn.setToolTip(tr('header.token_stats.tooltip'))
         self.token_stats_btn.clicked.connect(self._show_token_stats_dialog)
-        toolbar_bottom.addWidget(self.token_stats_btn)
+        toolbar_top.addWidget(self.token_stats_btn)
 
         # 上下文统计
         self.context_label = QtWidgets.QLabel("Context: 0K / 64K")
         self.context_label.setObjectName("contextLabel")
-        toolbar_bottom.addWidget(self.context_label)
+        toolbar_top.addWidget(self.context_label)
 
-        layout.addLayout(toolbar_bottom)
+        layout.addLayout(toolbar_top)
         
         # -------- 输入行：输入框 + Send/Stop --------
         input_row = QtWidgets.QHBoxLayout()
@@ -310,6 +303,7 @@ class InputAreaMixin:
         self._agent_mode = (mode == "agent")
         self._plan_mode = (mode == "plan")
         self.chk_confirm_mode.setVisible(mode != "ask")
+        self.mode_guard_label.setVisible(mode == "ask")
         self.mode_combo.setProperty("mode", mode)
         self.mode_combo.style().unpolish(self.mode_combo)
         self.mode_combo.style().polish(self.mode_combo)

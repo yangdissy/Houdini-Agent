@@ -19,8 +19,12 @@ def load_quality_policy() -> dict[str, Any]:
     policy = json.loads(_POLICY_PATH.read_text(encoding="utf-8"))
     policy.setdefault("promotion_reward_threshold", 0.6)
     policy.setdefault("negative_citation_decay", 0.9)
+    policy.setdefault("fallback_auto_activation_min_score", 0.35)
     policy.setdefault("generic_patterns", [])
-    for key in ("trial_confidence_cap", "unused_decay", "negative_citation_decay", "confidence_increment"):
+    for key in (
+        "trial_confidence_cap", "unused_decay", "negative_citation_decay",
+        "confidence_increment", "fallback_auto_activation_min_score",
+    ):
         value = policy[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 < value <= 1:
             raise ValueError(f"Invalid memory policy: {key}")
